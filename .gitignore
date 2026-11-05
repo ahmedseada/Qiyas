@@ -1,0 +1,17 @@
+# Idrak's code and the bench's lib column: not part of this repo.
+Lib/
+src/CpuCurrent.cs
+src/CudaHost.cs
+src/BenchCuda.cs
+
+# Build output and run logs
+bin/
+obj/
+*.log
+
+# Earlier experiments' outputs (kept locally)
+results-cuda-cpu.md
+results3-cuda-cpu.md
+results4-cpu.md
+results-qiyas-cpu.md
+results-qiyas-cuda.md
