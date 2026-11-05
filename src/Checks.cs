@@ -131,6 +131,76 @@ internal static class Checks
         ok &= Device<UInt8, uint>(ops, Lane.U32);
         ok &= Device<Int64, double>(ops, Lane.F64);
         ok &= Device<Int16, double>(ops, Lane.F64);
+        ok &= Sliced(ops);
+        return ok;
+    }
+
+    // The sliced float64 product (the 8-bit tensor lane) against float64 math accumulated in double-double on the CPU:
+    // the worst error in ulps of the result, over values of one scale and over rows and columns of scales 2^-20 .. 2^20.
+    private static bool Sliced(GpuOps ops)
+    {
+        const int M = 96, N = 80, K = 1000;
+        var random = new Random(23);
+        bool ok = true;
+        foreach (bool scaled in new[] { false, true })
+        {
+            var a = new double[M * K];
+            var b = new double[K * N];
+            for (int i = 0; i < M; i++)
+            {
+                double s = scaled ? Math.Pow(2, i % 41 - 20) : 1;
+                for (int p = 0; p < K; p++) a[i * K + p] = (random.NextDouble() * 2 - 1) * s;
+            }
+
+            for (int p = 0; p < K; p++)
+            {
+                for (int j = 0; j < N; j++) b[p * N + j] = (random.NextDouble() * 2 - 1) * (scaled ? Math.Pow(2, j % 37 - 18) : 1);
+            }
+
+            var gpu = ops.Gpu;
+            ulong da = gpu.Rent(a.Length * 8L), db = gpu.Rent(b.Length * 8L), dc = gpu.Rent((long)M * N * 8);
+            Qiyas.Gpu.Upload<double>(a, da);
+            Qiyas.Gpu.Upload<double>(b, db);
+            bool ran = ops.MatMulSliced(da, db, dc, M, N, K);
+            Qiyas.Gpu.Synchronize();
+            var got = new double[M * N];
+            if (ran) Qiyas.Gpu.Download<double>(dc, got);
+            gpu.Return(da); gpu.Return(db); gpu.Return(dc);
+            if (!ran)
+            {
+                Console.WriteLine($"check {"sliced float64 product",-36} not on this device: never chosen");
+                return true;
+            }
+
+            double worst = 0;
+            int worstAt = 0;
+            for (int i = 0; i < M; i++)
+            {
+                for (int j = 0; j < N; j++)
+                {
+                    double hi = 0, lo = 0;
+                    for (int p = 0; p < K; p++)
+                    {
+                        double x = a[i * K + p], y = b[p * N + j];
+                        double ph = x * y, pl = Math.FusedMultiplyAdd(x, y, -ph);
+                        double sum = hi + ph, bv = sum - hi, err = (hi - (sum - bv)) + (ph - bv);
+                        hi = sum;
+                        lo += err + pl;
+                    }
+
+                    double reference = hi + lo, value = got[i * N + j];
+                    double ulp = reference == 0 ? double.Epsilon : Math.BitIncrement(Math.Abs(reference)) - Math.Abs(reference);
+                    double e = Math.Abs(value - reference) / ulp;
+                    if (e > worst) { worst = e; worstAt = i * N + j; }
+                }
+            }
+
+            string name = scaled ? "sliced float64 (rows, columns scaled)" : "sliced float64 product";
+            Console.WriteLine($"check {name,-36} {M * N,9} values: worst {worst:0.000} ulp at {worstAt}{(worst <= 1 ? "" : "  TOO FAR")}");
+            ok &= worst <= 1;
+        }
+
+        ops.SlicedProven = ok;
         return ok;
     }
 

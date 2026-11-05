@@ -624,6 +624,8 @@ internal static class Ptx
     {
         public static readonly Kind S8 = new("s8", 8, Lane.S32, "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32", 16);
         public static readonly Kind U8 = new("u8", 8, Lane.U32, "mma.sync.aligned.m16n8k16.row.col.s32.u8.u8.s32", 16);
+        public static readonly Kind S8K32 = new("s8", 8, Lane.S32, "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32", 32);
+        public static readonly Kind U8K32 = new("u8", 8, Lane.U32, "mma.sync.aligned.m16n8k32.row.col.s32.u8.u8.s32", 32);
         public static readonly Kind S4 = new("s4", 4, Lane.S32, "mma.sync.aligned.m16n8k32.row.col.s32.s4.s4.s32", 32);
         public static readonly Kind U4 = new("u4", 4, Lane.U32, "mma.sync.aligned.m16n8k32.row.col.s32.u4.u4.s32", 32);
         public static readonly Kind F16 = new("f16", 16, Lane.F32, "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32", 16);
@@ -632,6 +634,11 @@ internal static class Ptx
         public int Per => 32 / Bits;
 
         public bool IsFloat => Bits == 16;
+
+        /// <summary>16-byte chunks of a row one tensor instruction consumes (one, or two: a fragment then spans two chunks).</summary>
+        public int StepChunks => KStep * Bits / 128;
+
+        public string Tag => $"{Name}k{KStep}";
 
         /// <summary>Values in a 16-byte chunk of a packed row.</summary>
         public int ChunkValues => 128 / Bits;
@@ -704,130 +711,215 @@ internal static class Ptx
     }
 
     // ---------------------------------------------------------------- C = A·Bᵀ on the tensor instructions
-    // A m×kp and Bt n×kp packed rows; 128×128 of C per block of 8 warps (each 64×32 as 4×4 m16n8 tiles). k walks in
-    // blocks of 64 bytes a row through two shared-memory stages filled by asynchronous copies (the next block lands
-    // while this one computes); fragments come from shared memory by ldmatrix, rows padded to 80 bytes so the eight
-    // rows a load touches sit in different banks.
+    // A m×kp and Bt n×kp packed rows; 128×BN of C per block of 8 warps (2 × 4; each 64 × BN/4 as 4 × BN/32 m16n8 tiles).
+    // k walks in blocks of rowBytes a row through a ring of shared-memory stages filled by asynchronous copies (the
+    // blocks ahead land while this one computes); fragments come from shared memory by ldmatrix, rows padded by 16
+    // bytes so the eight rows a load touches sit in different banks, and the next k-step's fragments are loaded while
+    // this step's tensor instructions run.
 
-    /// <summary>Shared bytes the tensor kernel takes for a configuration (two operands × 128 rows × padded row × stages).</summary>
-    public static int MmaShared(int rowBytes, int stages) => stages * 2 * 128 * (rowBytes + 16);
+    /// <summary>Shared bytes the tensor kernel takes for a configuration: (128 + BN) rows per stage, padded by 16 bytes
+    /// unless the chunks are swizzled instead.</summary>
+    public static int MmaShared(int rowBytes, int stages, int bn, bool swizzle) => stages * (128 + bn) * (rowBytes + (swizzle ? 0 : 16));
 
     /// <summary>Static shared memory a kernel may declare without the device's opt-in.</summary>
     public const int StaticShared = 48 * 1024;
 
-    public static string GemmMma(Gpu gpu, Kind kind, int rowBytes, int stages, out string entry)
+    // The chunk swizzle of a row: 64-byte rows (4 chunks) by (row / 2) mod 4, 128-byte rows (8 chunks) by row mod 8.
+    private static void Swizzle(PtxBuilder b, string dst, string row, int rowBytes)
     {
-        entry = $"gemm_mma_{kind.Name}_r{rowBytes}_s{stages}";
-        const int Tile = 128;
-        int stride = rowBytes + 16, stageBytes = 2 * Tile * stride, totalShared = stages * stageBytes;
-        int chunks = rowBytes / 16, copies = Tile * chunks / GemmThreads;    // 16-byte chunks per row; chunks per thread per operand per stage
+        if (rowBytes == 64) { b.L($"shr.u32 {dst}, {row}, 1;"); b.L($"and.b32 {dst}, {dst}, 3;"); }
+        else b.L($"and.b32 {dst}, {row}, 7;");
+    }
+
+    public static string GemmMma(Gpu gpu, Kind kind, int rowBytes, int stages, int bn, bool swizzle, out string entry)
+    {
+        entry = $"gemm_mma_{kind.Tag}_r{rowBytes}_s{stages}_n{bn}{(swizzle ? "_x" : "")}";
+        const int BM = 128;
+        int wn = bn / 4, nt = wn / 8;                                        // a warp's columns and its n-tiles
+        // Rows padded by 16 bytes, or unpadded with each row's 16-byte chunks XOR-swizzled by the row (64-byte rows: by
+        // row/2 mod 4; 128-byte rows: by row mod 8), so the eight rows a load touches sit in different banks either way.
+        int stride = rowBytes + (swizzle ? 0 : 16), stageBytes = (BM + bn) * stride, totalShared = stages * stageBytes, bBase = BM * stride;
+        int chunks = rowBytes / 16, copiesA = BM * chunks / GemmThreads, copiesB = bn * chunks / GemmThreads;
         int chunkShift = chunks switch { 4 => 2, 8 => 3, _ => throw new NotSupportedException("row bytes") };
         int stepBytes = kind.KStep * kind.Bits / 8, ksteps = rowBytes / stepBytes;
         int blockValues = rowBytes * 8 / kind.Bits, blockShift = (int)Math.Log2(blockValues);
         var acc = kind.Acc;
         var b = new PtxBuilder();
-        string tid = b.R(), bx = b.R(), by = b.R(), warp = b.R(), lane = b.R(), wm = b.R(), wn = b.R();
+        string tid = b.R(), bx = b.R(), by = b.R(), warp = b.R(), lane = b.R(), wmR = b.R(), wnR = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bx}, %ctaid.x;");
         b.L($"mov.u32 {by}, %ctaid.y;");
         b.L($"shr.u32 {warp}, {tid}, 5;");
         b.L($"and.b32 {lane}, {tid}, 31;");
-        b.L($"shr.u32 {wm}, {warp}, 2;");
-        b.L($"and.b32 {wn}, {warp}, 3;");
-        string pa = Param64(b, "p_a"), pb = Param64(b, "p_b"), pc = Param64(b, "p_c"), m = Param32(b, "p_m"), n = Param32(b, "p_n"), kp = Param32(b, "p_kp");
+        b.L($"shr.u32 {wmR}, {warp}, 2;");
+        b.L($"and.b32 {wnR}, {warp}, 3;");
+        string pa = Param64(b, "p_a"), pb = Param64(b, "p_b"), pc = Param64(b, "p_c"), m = Param32(b, "p_m"), n = Param32(b, "p_n"), kp = Param32(b, "p_kp"), ld = Param32(b, "p_ld");
         string row0 = b.R(), col0 = b.R(), smem = b.R();
-        b.L($"mul.lo.u32 {row0}, {by}, {Tile};");
-        b.L($"mul.lo.u32 {col0}, {bx}, {Tile};");
+        b.L($"mul.lo.u32 {row0}, {by}, {BM};");
+        b.L($"mul.lo.u32 {col0}, {bx}, {bn};");
         b.L($"mov.u32 {smem}, smem;");
 
-        var c = new string[4, 4, 4];
-        for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) for (int q = 0; q < 4; q++) { c[i, j, q] = acc.NewReg(b); b.L($"mov.{acc.Reg} {c[i, j, q]}, {acc.Zero};"); }
+        var c = new string[4, nt, 4];
+        for (int i = 0; i < 4; i++) for (int j = 0; j < nt; j++) for (int q = 0; q < 4; q++) { c[i, j, q] = acc.NewReg(b); b.L($"mov.{acc.Reg} {c[i, j, q]}, {acc.Zero};"); }
 
-        // Copies: chunk tid + 256·j → row chunk / chunks, part chunk % chunks. A row past m (B past n) copies nothing and zero-fills.
-        string rowBytesK = b.RD();                                            // bytes a packed row takes
-        b.L($"mul.wide.u32 {rowBytesK}, {kp}, {kind.Bits};");
+        // Copies: chunk tid + 256·j → row chunk / chunks, part chunk % chunks, for A (128 rows) and B (BN rows).
+        // A row past m (B past n) copies nothing and zero-fills.
+        string rowBytesK = b.RD();                                            // bytes a packed row takes (the stride)
+        b.L($"mul.wide.u32 {rowBytesK}, {ld}, {kind.Bits};");
         b.L($"shr.u64 {rowBytesK}, {rowBytesK}, 3;");
-        var gA = new string[copies]; var gB = new string[copies]; var sOff = new string[copies]; var szA = new string[copies]; var szB = new string[copies];
-        for (int j = 0; j < copies; j++)
+        (string[] G, string[] S, string[] Sz) Copies(int count, string basePtr, string origin, string limit, int sharedBase)
         {
-            string chunk = b.R(), row = b.R(), part = b.R(), gRowA = b.R(), gRowB = b.R(), pA = b.P(), pB = b.P(), t64 = b.RD(), partOff = b.RD(), rowA = b.R(), rowB = b.R();
-            b.L($"add.u32 {chunk}, {tid}, {j * GemmThreads};");
-            b.L($"shr.u32 {row}, {chunk}, {chunkShift};");
-            b.L($"and.b32 {part}, {chunk}, {chunks - 1};");
-            b.L($"add.u32 {gRowA}, {row0}, {row};");
-            b.L($"setp.lt.u32 {pA}, {gRowA}, {m};");
-            b.L($"add.u32 {gRowB}, {col0}, {row};");
-            b.L($"setp.lt.u32 {pB}, {gRowB}, {n};");
-            b.L($"selp.u32 {rowA}, {gRowA}, 0, {pA};");
-            b.L($"selp.u32 {rowB}, {gRowB}, 0, {pB};");
-            gA[j] = b.RD(); gB[j] = b.RD(); sOff[j] = b.R(); szA[j] = b.R(); szB[j] = b.R();
-            b.L($"cvt.u64.u32 {t64}, {rowA};");
-            b.L($"mul.lo.u64 {t64}, {t64}, {rowBytesK};");
-            b.L($"mul.wide.u32 {partOff}, {part}, 16;");
-            b.L($"add.u64 {t64}, {t64}, {partOff};");
-            b.L($"add.u64 {gA[j]}, {pa}, {t64};");
-            b.L($"cvt.u64.u32 {t64}, {rowB};");
-            b.L($"mul.lo.u64 {t64}, {t64}, {rowBytesK};");
-            b.L($"add.u64 {t64}, {t64}, {partOff};");
-            b.L($"add.u64 {gB[j]}, {pb}, {t64};");
-            b.L($"mad.lo.u32 {sOff[j]}, {row}, {stride}, {smem};");
-            b.L($"mad.lo.u32 {sOff[j]}, {part}, 16, {sOff[j]};");
-            b.L($"selp.u32 {szA[j]}, 16, 0, {pA};");
-            b.L($"selp.u32 {szB[j]}, 16, 0, {pB};");
+            var g = new string[count]; var s = new string[count]; var sz = new string[count];
+            for (int j = 0; j < count; j++)
+            {
+                string chunk = b.R(), row = b.R(), part = b.R(), gRow = b.R(), p = b.P(), t64 = b.RD(), partOff = b.RD(), rowSel = b.R();
+                b.L($"add.u32 {chunk}, {tid}, {j * GemmThreads};");
+                b.L($"shr.u32 {row}, {chunk}, {chunkShift};");
+                b.L($"and.b32 {part}, {chunk}, {chunks - 1};");
+                b.L($"add.u32 {gRow}, {origin}, {row};");
+                b.L($"setp.lt.u32 {p}, {gRow}, {limit};");
+                b.L($"selp.u32 {rowSel}, {gRow}, 0, {p};");
+                g[j] = b.RD(); s[j] = b.R(); sz[j] = b.R();
+                b.L($"cvt.u64.u32 {t64}, {rowSel};");
+                b.L($"mul.lo.u64 {t64}, {t64}, {rowBytesK};");
+                b.L($"mul.wide.u32 {partOff}, {part}, 16;");
+                b.L($"add.u64 {t64}, {t64}, {partOff};");
+                b.L($"add.u64 {g[j]}, {basePtr}, {t64};");
+                b.L($"mad.lo.u32 {s[j]}, {row}, {stride}, {smem};");
+                if (swizzle)
+                {
+                    string swz = b.R(), partX = b.R();
+                    Swizzle(b, swz, row, rowBytes);
+                    b.L($"xor.b32 {partX}, {part}, {swz};");
+                    b.L($"mad.lo.u32 {s[j]}, {partX}, 16, {s[j]};");
+                }
+                else b.L($"mad.lo.u32 {s[j]}, {part}, 16, {s[j]};");
+                if (sharedBase != 0) b.L($"add.u32 {s[j]}, {s[j]}, {sharedBase};");
+                b.L($"selp.u32 {sz[j]}, 16, 0, {p};");
+            }
+
+            return (g, s, sz);
         }
 
-        // Issues block `block` (a .b32 register) into stage `stageOff` (bytes), when the block exists; commits a group either way.
+        var ca = Copies(copiesA, pa, row0, m, 0);
+        var cb = Copies(copiesB, pb, col0, n, bBase);
+        string blocksReg = b.R();
+        b.L($"shr.u32 {blocksReg}, {kp}, {blockShift};");
+
+        // Issues block `block` into stage `stageOff` (bytes) when the block exists; commits a group either way.
         void Issue(string block, string stageOff, string label)
         {
             string pHas = b.P(), kBytes = b.RD();
-            b.L($"setp.ge.u32 {pHas}, {block}, {blocks()};");
+            b.L($"setp.ge.u32 {pHas}, {block}, {blocksReg};");
             b.L($"@{pHas} bra {label};");
             b.L($"mul.wide.u32 {kBytes}, {block}, {rowBytes};");
-            for (int j = 0; j < copies; j++)
+            foreach (var (g, s, sz) in new[] { ca, cb })
             {
-                string src = b.RD(), dst = b.R();
-                b.L($"add.u64 {src}, {gA[j]}, {kBytes};");
-                b.L($"add.u32 {dst}, {sOff[j]}, {stageOff};");
-                b.L($"cp.async.cg.shared.global [{dst}], [{src}], 16, {szA[j]};");
-                b.L($"add.u64 {src}, {gB[j]}, {kBytes};");
-                b.L($"add.u32 {dst}, {dst}, {Tile * stride};");
-                b.L($"cp.async.cg.shared.global [{dst}], [{src}], 16, {szB[j]};");
+                for (int j = 0; j < g.Length; j++)
+                {
+                    string src = b.RD(), dst = b.R();
+                    b.L($"add.u64 {src}, {g[j]}, {kBytes};");
+                    b.L($"add.u32 {dst}, {s[j]}, {stageOff};");
+                    b.L($"cp.async.cg.shared.global [{dst}], [{src}], 16, {sz[j]};");
+                }
             }
 
             b.Label(label);
             b.L("cp.async.commit_group;");
         }
 
-        string blocksReg = b.R();
-        string blocks() => blocksReg;
-        b.L($"shr.u32 {blocksReg}, {kp}, {blockShift};");
-
-        // Fragment addresses for ldmatrix.
-        string aAddr = b.R(), bAddr = b.R(), t1 = b.R(), t2 = b.R();
+        // Fragment addresses for ldmatrix: each lane's row address, plus the chunk its lane supplies within a k-step
+        // (f16: lane / 16 for A, (lane / 8) & 1 for B; 8-bit: none) XORed with the row's swizzle. Swizzled, the k-step's
+        // chunk is XORed in at use (a k-step's chunk count is even, so adding it is XORing it).
+        string aAddr = b.R(), bAddr = b.R(), t1 = b.R(), t2 = b.R(), aChunk = b.R(), bChunk = b.R(), aRow = b.R(), bRow = b.R();
         b.L($"and.b32 {t1}, {lane}, 15;");
-        b.L($"mad.lo.u32 {t1}, {wm}, 64, {t1};");
-        b.L($"mad.lo.u32 {aAddr}, {t1}, {stride}, {smem};");
-        b.L($"shr.u32 {t2}, {lane}, 4;");
-        b.L($"mad.lo.u32 {aAddr}, {t2}, 16, {aAddr};");
-        if (kind.IsFloat)
+        b.L($"mad.lo.u32 {aRow}, {wmR}, 64, {t1};");
+        b.L($"mad.lo.u32 {aAddr}, {aRow}, {stride}, {smem};");
+        b.L($"shr.u32 {aChunk}, {lane}, 4;");
+        if (kind.StepChunks == 2)
         {
             // Four matrices: (n 0-7, chunk 0), (n 0-7, chunk 1), (n 8-15, chunk 0), (n 8-15, chunk 1): b0, b1 of two n-tiles.
             b.L($"and.b32 {t1}, {lane}, 7;");
             b.L($"shr.u32 {t2}, {lane}, 4;");
             b.L($"mad.lo.u32 {t1}, {t2}, 8, {t1};");
-            b.L($"mad.lo.u32 {t1}, {wn}, 32, {t1};");
-            b.L($"mad.lo.u32 {bAddr}, {t1}, {stride}, {smem};");
-            b.L($"add.u32 {bAddr}, {bAddr}, {Tile * stride};");
-            b.L($"shr.u32 {t2}, {lane}, 3;");
-            b.L($"and.b32 {t2}, {t2}, 1;");
-            b.L($"mad.lo.u32 {bAddr}, {t2}, 16, {bAddr};");
+            b.L($"mad.lo.u32 {bRow}, {wnR}, {wn}, {t1};");
+            b.L($"shr.u32 {bChunk}, {lane}, 3;");
+            b.L($"and.b32 {bChunk}, {bChunk}, 1;");
         }
         else
         {
-            // Four matrices: n 0-7, 8-15, 16-23, 24-31 at the same chunk: b0 of the four n-tiles.
-            b.L($"mad.lo.u32 {t1}, {wn}, 32, {lane};");
-            b.L($"mad.lo.u32 {bAddr}, {t1}, {stride}, {smem};");
-            b.L($"add.u32 {bAddr}, {bAddr}, {Tile * stride};");
+            // Four matrices: n 0-7, 8-15, 16-23, 24-31 at the same chunk: b0 of four n-tiles.
+            b.L($"mad.lo.u32 {bRow}, {wnR}, {wn}, {lane};");
+            b.L($"mov.u32 {bChunk}, 0;");
+        }
+
+        b.L($"mad.lo.u32 {bAddr}, {bRow}, {stride}, {smem};");
+        b.L($"add.u32 {bAddr}, {bAddr}, {bBase};");
+        if (swizzle)
+        {
+            string sa = b.R(), sb2 = b.R();
+            Swizzle(b, sa, aRow, rowBytes);
+            Swizzle(b, sb2, bRow, rowBytes);
+            b.L($"xor.b32 {aChunk}, {aChunk}, {sa};");
+            b.L($"xor.b32 {bChunk}, {bChunk}, {sb2};");
+        }
+        else
+        {
+            b.L($"mad.lo.u32 {aAddr}, {aChunk}, 16, {aAddr};");
+            b.L($"mad.lo.u32 {bAddr}, {bChunk}, 16, {bAddr};");
+        }
+
+        // The address of a fragment's row at k-step chunk `chunk` (an even immediate for f16, any for 8-bit): swizzled, the
+        // per-lane chunk term XOR the step's chunk, times 16, from the row address; padded, an immediate offset.
+        string FragAddr(string stageAddr, string chunkTerm, int rowOffset, int chunk)
+        {
+            if (!swizzle) return $"[{stageAddr}+{rowOffset + chunk * 16}]";
+            string t = b.R(), a2 = b.R();
+            b.L($"xor.b32 {t}, {chunkTerm}, {chunk};");
+            b.L($"mad.lo.u32 {a2}, {t}, 16, {stageAddr};");
+            return $"[{a2}+{rowOffset}]";
+        }
+
+        // Fragment registers, two sets (this k-step's and the next's).
+        var af = new string[2][][];
+        var bf = new string[2][][];
+        for (int set = 0; set < 2; set++)
+        {
+            af[set] = new string[4][];
+            bf[set] = new string[nt][];
+            for (int i = 0; i < 4; i++) af[set][i] = kind.StepChunks == 2 ? [b.R(), b.R(), b.R(), b.R()] : [b.R(), b.R()];
+            for (int j = 0; j < nt; j++) bf[set][j] = kind.StepChunks == 2 ? [b.R(), b.R()] : [b.R()];
+        }
+
+        void LoadFrags(int set, string aStage, string bStage, int ks)
+        {
+            // Rows i·16 (A) or j·8 (B) further down keep the row's swizzle class only when the offset is a multiple of 8 rows: it is.
+            if (kind.StepChunks == 2)
+            {
+                for (int i = 0; i < 4; i++)
+                    b.L($"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{{string.Join(", ", af[set][i])}}}, {FragAddr(aStage, aChunk, i * 16 * stride, ks * 2)};");
+                for (int j = 0; j < nt; j += 2)
+                    b.L($"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{{bf[set][j][0]}, {bf[set][j][1]}, {bf[set][j + 1][0]}, {bf[set][j + 1][1]}}}, {FragAddr(bStage, bChunk, j * 8 * stride, ks * 2)};");
+            }
+            else
+            {
+                for (int i = 0; i < 4; i++)
+                    b.L($"ldmatrix.sync.aligned.m8n8.x2.shared.b16 {{{string.Join(", ", af[set][i])}}}, {FragAddr(aStage, aChunk, i * 16 * stride, ks)};");
+                for (int j = 0; j < nt; j += 4)
+                    b.L($"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{{bf[set][j][0]}, {bf[set][j + 1][0]}, {bf[set][j + 2][0]}, {bf[set][j + 3][0]}}}, {FragAddr(bStage, bChunk, j * 8 * stride, ks)};");
+            }
+        }
+
+        void Compute(int set)
+        {
+            for (int i = 0; i < 4; i++)
+            {
+                for (int j = 0; j < nt; j++)
+                {
+                    string d = $"{{{c[i, j, 0]}, {c[i, j, 1]}, {c[i, j, 2]}, {c[i, j, 3]}}}";
+                    b.L($"{kind.Mma} {d}, {{{string.Join(", ", af[set][i])}}}, {{{string.Join(", ", bf[set][j])}}}, {d};");
+                }
+            }
         }
 
         // The pipeline: stages 0 .. S-2 issued ahead; each block waits for its own, computes, then issues block + S - 1.
@@ -849,51 +941,14 @@ internal static class Ptx
         b.L($"@{pLoop} bra KDONE;");
         b.L($"cp.async.wait_group {stages - 2};");
         b.L("bar.sync 0;");
-
         string aStage = b.R(), bStage = b.R();
         b.L($"add.u32 {aStage}, {aAddr}, {stage};");
         b.L($"add.u32 {bStage}, {bAddr}, {stage};");
+        LoadFrags(0, aStage, bStage, 0);
         for (int ks = 0; ks < ksteps; ks++)
         {
-            var af = new string[4][];
-            var bf = new string[4][];
-            if (kind.IsFloat)
-            {
-                for (int i = 0; i < 4; i++)
-                {
-                    af[i] = [b.R(), b.R(), b.R(), b.R()];
-                    b.L($"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{{af[i][0]}, {af[i][1]}, {af[i][2]}, {af[i][3]}}}, [{aStage}+{i * 16 * stride + ks * 32}];");
-                }
-
-                for (int j = 0; j < 4; j += 2)
-                {
-                    string r0 = b.R(), r1 = b.R(), r2 = b.R(), r3 = b.R();
-                    b.L($"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{{r0}, {r1}, {r2}, {r3}}}, [{bStage}+{j * 8 * stride + ks * 32}];");
-                    bf[j] = [r0, r1];
-                    bf[j + 1] = [r2, r3];
-                }
-            }
-            else
-            {
-                for (int i = 0; i < 4; i++)
-                {
-                    af[i] = [b.R(), b.R()];
-                    b.L($"ldmatrix.sync.aligned.m8n8.x2.shared.b16 {{{af[i][0]}, {af[i][1]}}}, [{aStage}+{i * 16 * stride + ks * 16}];");
-                }
-
-                string r0 = b.R(), r1 = b.R(), r2 = b.R(), r3 = b.R();
-                b.L($"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{{r0}, {r1}, {r2}, {r3}}}, [{bStage}+{ks * 16}];");
-                bf[0] = [r0]; bf[1] = [r1]; bf[2] = [r2]; bf[3] = [r3];
-            }
-
-            for (int i = 0; i < 4; i++)
-            {
-                for (int j = 0; j < 4; j++)
-                {
-                    string d = $"{{{c[i, j, 0]}, {c[i, j, 1]}, {c[i, j, 2]}, {c[i, j, 3]}}}";
-                    b.L($"{kind.Mma} {d}, {{{string.Join(", ", af[i])}}}, {{{string.Join(", ", bf[j])}}}, {d};");
-                }
-            }
+            if (ks + 1 < ksteps) LoadFrags((ks + 1) % 2, aStage, bStage, ks + 1);
+            Compute(ks % 2);
         }
 
         b.L("bar.sync 0;");
@@ -910,13 +965,13 @@ internal static class Ptx
         b.Label("KDONE");
         b.L("cp.async.wait_group 0;");
 
-        // C: rows row0 + wm·64 + i·16 + lane/4 (+8), columns col0 + wn·32 + j·8 + 2·(lane%4) (+1).
+        // C: rows row0 + wm·64 + i·16 + lane/4 (+8), columns col0 + wn·WN + j·8 + 2·(lane%4) (+1).
         string l4 = b.R(), l3 = b.R(), rBase = b.R(), cBase = b.R();
         b.L($"shr.u32 {l4}, {lane}, 2;");
         b.L($"and.b32 {l3}, {lane}, 3;");
-        b.L($"mad.lo.u32 {rBase}, {wm}, 64, {row0};");
+        b.L($"mad.lo.u32 {rBase}, {wmR}, 64, {row0};");
         b.L($"add.u32 {rBase}, {rBase}, {l4};");
-        b.L($"mad.lo.u32 {cBase}, {wn}, 32, {col0};");
+        b.L($"mad.lo.u32 {cBase}, {wnR}, {wn}, {col0};");
         b.L($"mad.lo.u32 {cBase}, {l3}, 2, {cBase};");
         for (int i = 0; i < 4; i++)
         {
@@ -926,7 +981,7 @@ internal static class Ptx
                 b.L($"add.u32 {row}, {rBase}, {i * 16 + half * 8};");
                 b.L($"setp.lt.u32 {pr}, {row}, {m};");
                 b.L($"mul.wide.u32 {rowOff}, {row}, {n};");
-                for (int j = 0; j < 4; j++)
+                for (int j = 0; j < nt; j++)
                 {
                     string col = b.R(), pcol = b.P(), p2 = b.P(), idx = b.RD(), addr = b.RD(), col2 = b.R(), pOnly = b.P();
                     b.L($"add.u32 {col}, {cBase}, {j * 8};");
@@ -948,7 +1003,358 @@ internal static class Ptx
         }
 
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_a, .param .u64 p_b, .param .u64 p_c, .param .u32 p_m, .param .u32 p_n, .param .u32 p_kp", totalShared);
+        return b.Finish(Header(gpu), entry, ".param .u64 p_a, .param .u64 p_b, .param .u64 p_c, .param .u32 p_m, .param .u32 p_n, .param .u32 p_kp, .param .u32 p_ld", totalShared);
+    }
+
+    // ---------------------------------------------------------------- float64 products on the 8-bit tensor instructions, exactly
+    // Each value is scaled by the power of two of its row's (A) or column's (B) largest magnitude and rounded to a 62-bit
+    // integer, which is written as eight signed 8-bit digits (balanced base 256). A product of two such values is a sum
+    // of digit products weighted by powers of 2^-8; all pairs with the same weight (a diagonal d = t + u) form one
+    // integer product over a k that is (d + 1) times the original, computed on the tensor instructions in 32-bit
+    // integers, which cannot overflow (|digit| ≤ 128, so a product ≤ 2^14, and the terms are counted). Twelve
+    // diagonals are kept (the fifteen there are, less the three below 2^-96 of the scale, which no result the proof
+    // covers can feel), combined in 128-bit integer arithmetic and rounded once, to nearest even, into the float64 result.
+
+    /// <summary>Digits a value is sliced into (8 bits each: 64 bits, 62 of them significant).</summary>
+    public const int Slices = 8;
+
+    /// <summary>Diagonals (digit-product weights) kept: d = t + u from 0 to Diagonals − 1.</summary>
+    public const int Diagonals = 12;
+
+    private static string Exponent(PtxBuilder b, string absMax)
+    {
+        // floor(log2 x) + 3 for a normal x (a subnormal or zero: as if the smallest normal), held to what the slicing scale can take.
+        string bits = b.RD(), exp = b.R(), e = b.R(), p = b.P();
+        b.L($"mov.b64 {bits}, {absMax};");
+        b.L($"shr.u64 {bits}, {bits}, 52;");
+        b.L($"cvt.u32.u64 {exp}, {bits};");
+        b.L($"and.b32 {exp}, {exp}, 0x7FF;");
+        b.L($"setp.eq.u32 {p}, {exp}, 0;");
+        b.L($"@{p} mov.u32 {exp}, 1;");
+        b.L($"sub.s32 {e}, {exp}, 1020;");
+        b.L($"max.s32 {e}, {e}, -959;");
+        return e;
+    }
+
+    /// <summary>e[i] for each row of A (m × k float64): the slicing exponent of the row's largest magnitude; a block per row.</summary>
+    public static string RowExponents(Gpu gpu, out string entry)
+    {
+        entry = "rowexp_f64";
+        var b = new PtxBuilder();
+        string tid = b.R(), row = b.R();
+        b.L($"mov.u32 {tid}, %tid.x;");
+        b.L($"mov.u32 {row}, %ctaid.x;");
+        string pa = Param64(b, "p_a"), pe = Param64(b, "p_e"), k = Param32(b, "p_k");
+        string rowBase = b.RD(), off = b.RD(), max = b.FD(), p2 = b.R(), pEnd = b.P();
+        b.L($"mul.wide.u32 {rowBase}, {row}, {k};");
+        b.L($"shl.b64 {rowBase}, {rowBase}, 3;");
+        b.L($"add.u64 {rowBase}, {pa}, {rowBase};");
+        b.L($"mov.f64 {max}, 0d0000000000000000;");
+        b.L($"mov.u32 {p2}, {tid};");
+        b.Label("LOOP");
+        b.L($"setp.ge.u32 {pEnd}, {p2}, {k};");
+        b.L($"@{pEnd} bra DONE;");
+        string v = b.FD(), addr = b.RD();
+        b.L($"mul.wide.u32 {off}, {p2}, 8;");
+        b.L($"add.u64 {addr}, {rowBase}, {off};");
+        b.L($"ld.global.f64 {v}, [{addr}];");
+        b.L($"abs.f64 {v}, {v};");
+        b.L($"max.f64 {max}, {max}, {v};");
+        b.L($"add.u32 {p2}, {p2}, 256;");
+        b.L("bra LOOP;");
+        b.Label("DONE");
+        string all = BlockReduce(b, Lane.F64, tid, max, "max", 256);
+        string p0 = b.P();
+        b.L($"setp.ne.u32 {p0}, {tid}, 0;");
+        b.L($"@{p0} bra OUT;");
+        string e = Exponent(b, all), eAddr = b.RD();
+        b.L($"mul.wide.u32 {eAddr}, {row}, 4;");
+        b.L($"add.u64 {eAddr}, {pe}, {eAddr};");
+        b.L($"st.global.s32 [{eAddr}], {e};");
+        b.Label("OUT");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_a, .param .u64 p_e, .param .u32 p_k", ReduceBytes);
+    }
+
+    /// <summary>f[j] for each column of B (k × n float64): a thread per column.</summary>
+    public static string ColumnExponents(Gpu gpu, out string entry)
+    {
+        entry = "colexp_f64";
+        var b = new PtxBuilder();
+        string gid = GlobalIndex(b);
+        string pb = Param64(b, "p_b"), pf = Param64(b, "p_f"), k = Param32(b, "p_k"), n = Param32(b, "p_n");
+        string pEnd = b.P(), max = b.FD(), p2 = b.R(), stride = b.RD(), addr = b.RD(), pLoop = b.P();
+        b.L($"setp.ge.u32 {pEnd}, {gid}, {n};");
+        b.L($"@{pEnd} bra OUT;");
+        b.L($"mov.f64 {max}, 0d0000000000000000;");
+        b.L($"mul.wide.u32 {stride}, {n}, 8;");
+        b.L($"mul.wide.u32 {addr}, {gid}, 8;");
+        b.L($"add.u64 {addr}, {pb}, {addr};");
+        b.L($"mov.u32 {p2}, 0;");
+        b.Label("LOOP");
+        b.L($"setp.ge.u32 {pLoop}, {p2}, {k};");
+        b.L($"@{pLoop} bra DONE;");
+        string v = b.FD();
+        b.L($"ld.global.f64 {v}, [{addr}];");
+        b.L($"abs.f64 {v}, {v};");
+        b.L($"max.f64 {max}, {max}, {v};");
+        b.L($"add.u64 {addr}, {addr}, {stride};");
+        b.L($"add.u32 {p2}, {p2}, 1;");
+        b.L("bra LOOP;");
+        b.Label("DONE");
+        string e = Exponent(b, max), eAddr = b.RD();
+        b.L($"mul.wide.u32 {eAddr}, {gid}, 4;");
+        b.L($"add.u64 {eAddr}, {pf}, {eAddr};");
+        b.L($"st.global.s32 [{eAddr}], {e};");
+        b.Label("OUT");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_b, .param .u64 p_f, .param .u32 p_k, .param .u32 p_n");
+    }
+
+    // The value's 62-bit integer Y = round(v · 2^(64 - e)) and its eight balanced digits, least significant first.
+    private static string[] Digits(PtxBuilder b, string v, string e)
+    {
+        string scaleBits = b.RD(), scale = b.FD(), scaled = b.FD(), y = b.RD(), t32 = b.R();
+        b.L($"sub.s32 {t32}, 1087, {e};");
+        b.L($"cvt.u64.u32 {scaleBits}, {t32};");
+        b.L($"shl.b64 {scaleBits}, {scaleBits}, 52;");
+        b.L($"mov.b64 {scale}, {scaleBits};");
+        b.L($"mul.f64 {scaled}, {v}, {scale};");
+        b.L($"cvt.rni.s64.f64 {y}, {scaled};");
+        var digits = new string[Slices];
+        for (int t = Slices - 1; t >= 0; t--)
+        {
+            string d = b.RD(), t1 = b.RD();
+            b.L($"add.s64 {t1}, {y}, 128;");
+            b.L($"and.b64 {t1}, {t1}, 255;");
+            b.L($"sub.s64 {d}, {t1}, 128;");
+            b.L($"sub.s64 {y}, {y}, {d};");
+            b.L($"shr.s64 {y}, {y}, 8;");
+            digits[t] = d;
+        }
+
+        return digits;
+    }
+
+    /// <summary>A's values into packed rows of digits: S[i][t·kpad + p] = digit t of A[i][p] (t = 0 the most significant); a thread per value.</summary>
+    public static string SliceRows(Gpu gpu, out string entry)
+    {
+        entry = "slice_rows_f64";
+        var b = new PtxBuilder();
+        string gid = GlobalIndex(b);
+        string pa = Param64(b, "p_a"), pe = Param64(b, "p_e"), ps = Param64(b, "p_s"), m = Param32(b, "p_m"), k = Param32(b, "p_k"), kpad = Param32(b, "p_kpad");
+        string total = b.R(), pEnd = b.P(), i = b.R(), p2 = b.R(), eAddr = b.RD(), e = b.R(), aAddr = b.RD(), v = b.FD(), rowLen = b.R(), sBase = b.RD();
+        b.L($"mul.lo.u32 {total}, {m}, {k};");
+        b.L($"setp.ge.u32 {pEnd}, {gid}, {total};");
+        b.L($"@{pEnd} bra OUT;");
+        b.L($"div.u32 {i}, {gid}, {k};");
+        b.L($"rem.u32 {p2}, {gid}, {k};");
+        b.L($"mul.wide.u32 {eAddr}, {i}, 4;");
+        b.L($"add.u64 {eAddr}, {pe}, {eAddr};");
+        b.L($"ld.global.s32 {e}, [{eAddr}];");
+        b.L($"mul.wide.u32 {aAddr}, {gid}, 8;");
+        b.L($"add.u64 {aAddr}, {pa}, {aAddr};");
+        b.L($"ld.global.f64 {v}, [{aAddr}];");
+        var digits = Digits(b, v, e);
+        b.L($"mul.lo.u32 {rowLen}, {kpad}, {Slices};");
+        b.L($"mul.wide.u32 {sBase}, {i}, {rowLen};");
+        b.L($"add.u64 {sBase}, {ps}, {sBase};");
+        string pOff = b.RD();
+        b.L($"cvt.u64.u32 {pOff}, {p2};");
+        b.L($"add.u64 {sBase}, {sBase}, {pOff};");
+        string kpad64 = b.RD();
+        b.L($"cvt.u64.u32 {kpad64}, {kpad};");
+        for (int t = 0; t < Slices; t++)
+        {
+            string h = b.H();
+            b.L($"cvt.u16.u64 {h}, {digits[t]};");
+            b.L($"st.global.b8 [{sBase}], {h};");
+            if (t + 1 < Slices) b.L($"add.u64 {sBase}, {sBase}, {kpad64};");
+        }
+
+        b.Label("OUT");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_a, .param .u64 p_e, .param .u64 p_s, .param .u32 p_m, .param .u32 p_k, .param .u32 p_kpad");
+    }
+
+    /// <summary>B's values into stacked rows of digits: Bs[(Slices − 1 − t)·kpad + p][j] = digit t of B[p][j]; a thread per value, j fastest.</summary>
+    public static string SliceColumns(Gpu gpu, out string entry)
+    {
+        entry = "slice_cols_f64";
+        var b = new PtxBuilder();
+        string gid = GlobalIndex(b);
+        string pb = Param64(b, "p_b"), pf = Param64(b, "p_f"), ps = Param64(b, "p_s"), k = Param32(b, "p_k"), n = Param32(b, "p_n"), kpad = Param32(b, "p_kpad");
+        string total = b.R(), pEnd = b.P(), p2 = b.R(), j = b.R(), fAddr = b.RD(), e = b.R(), bAddr = b.RD(), v = b.FD();
+        b.L($"mul.lo.u32 {total}, {k}, {n};");
+        b.L($"setp.ge.u32 {pEnd}, {gid}, {total};");
+        b.L($"@{pEnd} bra OUT;");
+        b.L($"div.u32 {p2}, {gid}, {n};");
+        b.L($"rem.u32 {j}, {gid}, {n};");
+        b.L($"mul.wide.u32 {fAddr}, {j}, 4;");
+        b.L($"add.u64 {fAddr}, {pf}, {fAddr};");
+        b.L($"ld.global.s32 {e}, [{fAddr}];");
+        b.L($"mul.wide.u32 {bAddr}, {gid}, 8;");
+        b.L($"add.u64 {bAddr}, {pb}, {bAddr};");
+        b.L($"ld.global.f64 {v}, [{bAddr}];");
+        var digits = Digits(b, v, e);
+        // Row (Slices − 1 − t)·kpad + p of the stacked matrix, column j.
+        string blockRows = b.RD(), rowIdx = b.RD(), sAddr = b.RD(), n64 = b.RD(), p64 = b.RD(), j64 = b.RD();
+        b.L($"cvt.u64.u32 {n64}, {n};");
+        b.L($"cvt.u64.u32 {p64}, {p2};");
+        b.L($"cvt.u64.u32 {j64}, {j};");
+        b.L($"cvt.u64.u32 {blockRows}, {kpad};");
+        b.L($"mul.lo.u64 {blockRows}, {blockRows}, {n64};");                  // bytes per slice block
+        for (int t = 0; t < Slices; t++)
+        {
+            string h = b.H();
+            b.L($"mul.lo.u64 {rowIdx}, {p64}, {n64};");
+            b.L($"add.u64 {rowIdx}, {rowIdx}, {j64};");
+            b.L($"mad.lo.u64 {sAddr}, {blockRows}, {Slices - 1 - t}, {rowIdx};");
+            b.L($"add.u64 {sAddr}, {ps}, {sAddr};");
+            b.L($"cvt.u16.u64 {h}, {digits[t]};");
+            b.L($"st.global.b8 [{sAddr}], {h};");
+        }
+
+        b.Label("OUT");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_b, .param .u64 p_f, .param .u64 p_s, .param .u32 p_k, .param .u32 p_n, .param .u32 p_kpad");
+    }
+
+    /// <summary>C[i][j] = round(Σ_d D_d[i][j] · 2^(8(Diagonals−1−d))) · 2^(e_i + f_j − 16 − 8(Diagonals−1)): the diagonals' integers
+    /// summed in 128 bits, rounded once to nearest even into float64, scaled by the exact power of two; a thread per value.</summary>
+    public static string CombineSlices(Gpu gpu, out string entry)
+    {
+        entry = "combine_f64x";
+        var b = new PtxBuilder();
+        string gid = GlobalIndex(b);
+        string pd = Param64(b, "p_d"), pe = Param64(b, "p_e"), pf = Param64(b, "p_f"), pc = Param64(b, "p_c"), m = Param32(b, "p_m"), n = Param32(b, "p_n");
+        string total = b.R(), pEnd = b.P(), i = b.R(), j = b.R(), e = b.R(), f = b.R(), tAddr = b.RD();
+        b.L($"mul.lo.u32 {total}, {m}, {n};");
+        b.L($"setp.ge.u32 {pEnd}, {gid}, {total};");
+        b.L($"@{pEnd} bra OUT;");
+        b.L($"div.u32 {i}, {gid}, {n};");
+        b.L($"rem.u32 {j}, {gid}, {n};");
+        b.L($"mul.wide.u32 {tAddr}, {i}, 4;");
+        b.L($"add.u64 {tAddr}, {pe}, {tAddr};");
+        b.L($"ld.global.s32 {e}, [{tAddr}];");
+        b.L($"mul.wide.u32 {tAddr}, {j}, 4;");
+        b.L($"add.u64 {tAddr}, {pf}, {tAddr};");
+        b.L($"ld.global.s32 {f}, [{tAddr}];");
+
+        // S = Σ_d D_d << 8(Diagonals − 1 − d), in 128 bits (lo unsigned, hi signed).
+        string lo = b.RD(), hi = b.RD(), dAddr = b.RD(), stride = b.RD();
+        b.L($"mov.b64 {lo}, 0;");
+        b.L($"mov.b64 {hi}, 0;");
+        b.L($"mul.wide.u32 {stride}, {total}, 4;");
+        b.L($"mul.wide.u32 {dAddr}, {gid}, 4;");
+        b.L($"add.u64 {dAddr}, {pd}, {dAddr};");
+        for (int d = 0; d < Diagonals; d++)
+        {
+            string d32 = b.R(), d64 = b.RD(), tlo = b.RD(), thi = b.RD();
+            int sh = 8 * (Diagonals - 1 - d);
+            b.L($"ld.global.s32 {d32}, [{dAddr}];");
+            b.L($"cvt.s64.s32 {d64}, {d32};");
+            if (sh == 0)
+            {
+                b.L($"mov.b64 {tlo}, {d64};");
+                b.L($"shr.s64 {thi}, {d64}, 63;");
+            }
+            else if (sh < 64)
+            {
+                b.L($"shl.b64 {tlo}, {d64}, {sh};");
+                b.L($"shr.s64 {thi}, {d64}, {64 - sh};");
+            }
+            else
+            {
+                b.L($"mov.b64 {tlo}, 0;");
+                b.L($"shl.b64 {thi}, {d64}, {sh - 64};");
+            }
+
+            b.L($"add.cc.u64 {lo}, {lo}, {tlo};");
+            b.L($"addc.s64 {hi}, {hi}, {thi};");
+            if (d + 1 < Diagonals) b.L($"add.u64 {dAddr}, {dAddr}, {stride};");
+        }
+
+        // Sign and magnitude.
+        string neg = b.P(), nlo = b.RD(), nhi = b.RD();
+        b.L($"setp.lt.s64 {neg}, {hi}, 0;");
+        b.L($"not.b64 {nlo}, {lo};");
+        b.L($"not.b64 {nhi}, {hi};");
+        b.L($"add.cc.u64 {nlo}, {nlo}, 1;");
+        b.L($"addc.s64 {nhi}, {nhi}, 0;");
+        b.L($"selp.b64 {lo}, {nlo}, {lo}, {neg};");
+        b.L($"selp.b64 {hi}, {nhi}, {hi}, {neg};");
+
+        // Bits in the magnitude; the top 53 with the rest rounded to nearest even.
+        string clzHi = b.R(), clzLo = b.R(), nbits = b.R(), pHi = b.P(), shift = b.R(), mant = b.RD(), round = b.RD(), sticky = b.RD(), pSmall = b.P();
+        b.L($"clz.b64 {clzHi}, {hi};");
+        b.L($"clz.b64 {clzLo}, {lo};");
+        b.L($"setp.ne.s64 {pHi}, {hi}, 0;");
+        b.L($"sub.u32 {nbits}, 128, {clzHi};");
+        b.L($"sub.u32 {clzLo}, 64, {clzLo};");
+        b.L($"selp.u32 {nbits}, {nbits}, {clzLo}, {pHi};");
+        b.L($"setp.le.u32 {pSmall}, {nbits}, 53;");
+        b.L($"mov.u32 {shift}, 0;");
+        b.L($"mov.b64 {mant}, {lo};");
+        b.L($"@{pSmall} bra SCALE;");
+        b.L($"sub.u32 {shift}, {nbits}, 53;");
+        string pLow = b.P(), s1 = b.R(), a1 = b.RD(), a2 = b.RD(), one = b.RD(), mask = b.RD(), s2 = b.R(), pZero = b.P();
+        b.L($"setp.lt.u32 {pLow}, {shift}, 64;");
+        b.L($"@!{pLow} bra WIDE;");
+        // shift in 1..63: mant = (hi << (64 − shift)) | (lo >> shift); dropped bits are lo's low `shift` bits.
+        b.L($"sub.u32 {s1}, 64, {shift};");
+        b.L($"shl.b64 {a1}, {hi}, {s1};");
+        b.L($"shr.u64 {a2}, {lo}, {shift};");
+        b.L($"or.b64 {mant}, {a1}, {a2};");
+        b.L($"sub.u32 {s1}, {shift}, 1;");
+        b.L($"shr.u64 {round}, {lo}, {s1};");
+        b.L($"and.b64 {round}, {round}, 1;");
+        b.L($"mov.b64 {one}, 1;");
+        b.L($"shl.b64 {mask}, {one}, {s1};");
+        b.L($"sub.u64 {mask}, {mask}, 1;");
+        b.L($"and.b64 {sticky}, {lo}, {mask};");
+        b.L("bra ROUND;");
+        b.Label("WIDE");
+        // shift in 64..75: mant = hi >> (shift − 64); dropped: hi's low (shift − 64) bits and all of lo.
+        b.L($"sub.u32 {s2}, {shift}, 64;");
+        b.L($"shr.u64 {mant}, {hi}, {s2};");
+        b.L($"setp.eq.u32 {pZero}, {s2}, 0;");
+        string rh = b.RD(), sh2 = b.RD(), rl = b.RD(), sl = b.RD(), s3 = b.R();
+        b.L($"sub.u32 {s3}, {s2}, 1;");
+        b.L($"shr.u64 {rh}, {hi}, {s3};");
+        b.L($"and.b64 {rh}, {rh}, 1;");
+        b.L($"shl.b64 {mask}, {one}, {s3};");
+        b.L($"sub.u64 {mask}, {mask}, 1;");
+        b.L($"and.b64 {sh2}, {hi}, {mask};");
+        b.L($"or.b64 {sh2}, {sh2}, {lo};");
+        b.L($"shr.u64 {rl}, {lo}, 63;");
+        b.L($"and.b64 {sl}, {lo}, 0x7FFFFFFFFFFFFFFF;");
+        b.L($"selp.b64 {round}, {rl}, {rh}, {pZero};");
+        b.L($"selp.b64 {sticky}, {sl}, {sh2}, {pZero};");
+        b.Label("ROUND");
+        string odd = b.RD(), up = b.RD(), pSticky = b.P();
+        b.L($"and.b64 {odd}, {mant}, 1;");
+        b.L($"setp.ne.u64 {pSticky}, {sticky}, 0;");
+        b.L($"selp.b64 {up}, 1, {odd}, {pSticky};");
+        b.L($"and.b64 {up}, {up}, {round};");
+        b.L($"add.u64 {mant}, {mant}, {up};");
+        b.Label("SCALE");
+        string val = b.FD(), expo = b.R(), scaleBits = b.RD(), scale = b.FD(), cAddr = b.RD();
+        b.L($"cvt.rn.f64.u64 {val}, {mant};");
+        b.L($"add.s32 {expo}, {e}, {f};");
+        b.L($"add.s32 {expo}, {expo}, {shift};");
+        b.L($"add.s32 {expo}, {expo}, {1023 - 16 - 8 * (Diagonals - 1)};");
+        b.L($"cvt.u64.u32 {scaleBits}, {expo};");
+        b.L($"shl.b64 {scaleBits}, {scaleBits}, 52;");
+        b.L($"mov.b64 {scale}, {scaleBits};");
+        b.L($"mul.f64 {val}, {val}, {scale};");
+        b.L($"@{neg} neg.f64 {val}, {val};");
+        b.L($"mul.wide.u32 {cAddr}, {gid}, 8;");
+        b.L($"add.u64 {cAddr}, {pc}, {cAddr};");
+        b.L($"st.global.f64 [{cAddr}], {val};");
+        b.Label("OUT");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_d, .param .u64 p_e, .param .u64 p_f, .param .u64 p_c, .param .u32 p_m, .param .u32 p_n");
     }
 
     // ---------------------------------------------------------------- C = A·B in a lane (A m×k, B k×n, row-major lane arrays)

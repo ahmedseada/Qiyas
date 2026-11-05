@@ -43,7 +43,7 @@ public sealed class GpuOps(Gpu gpu)
     public ((double Min, double Max) A, (double Min, double Max) B) RangePair<TN>(ulong x, int nx, ulong y, int ny) where TN : struct, IQiyasNumber<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsFloat) return ((TN.Min, TN.Max), (TN.Min, TN.Max));
+        if (f.IsFloat || f.Bits <= 8) return ((TN.Min, TN.Max), (TN.Min, TN.Max));   // the type's range decides the lane already
         var fn = gpu.Cached($"range:{f.Name}", (out string e) => Ptx.Range(gpu, f, out e));
         int Blocks(int n) => (int)Math.Min(512, Math.Max(1, (f.Words(n) + Ptx.RangeThreads - 1) / Ptx.RangeThreads));
         int bx = Blocks(nx), by = ny > 0 ? Blocks(ny) : 0;
@@ -87,7 +87,7 @@ public sealed class GpuOps(Gpu gpu)
             // Values that fit 4 bits may take the 4-bit tensor instruction: whichever of the 4- and 8-bit ones the device
             // runs faster (measured once per shape), where it has them.
             bool tiny = f.Bits <= 4 || bounds.Within(f.Signed ? -8 : 0, f.Signed ? 7 : 15);
-            var kind = f.Signed ? Ptx.Kind.S8 : Ptx.Kind.U8;
+            var kind = EightBitKind(f.Signed, bounds.Terms);
             var kind4 = f.Signed ? Ptx.Kind.S4 : Ptx.Kind.U4;
             bool has8 = MmaSupported(kind), has4 = tiny && MmaSupported(kind4);
             if (has4 && (!has8 || FasterKind(kind4, kind, bounds.Terms))) return kind4.Name + "mma";
@@ -101,50 +101,49 @@ public sealed class GpuOps(Gpu gpu)
         return f.Signed ? "s64" : "u64";
     }
 
-    private readonly Dictionary<string, (int RowBytes, int Stages)?> _shapes = [];
+    public readonly record struct MmaConfig(int RowBytes, int Stages, int Bn, bool Swizzle);
 
-    /// <summary>The tensor kernel's shape for a kind: of the row widths and pipeline depths the device's shared memory
-    /// takes and its JIT accepts, the one it runs fastest (measured once, on a 1024³ product); null when it has none.</summary>
-    private (int RowBytes, int Stages)? MmaShape(Ptx.Kind kind)
+    private readonly Dictionary<string, MmaConfig?> _shapes = [];
+
+    /// <summary>The tensor kernel's shape for a kind: of the row widths, pipeline depths and block widths the device's
+    /// shared memory takes and its JIT accepts, the one it runs fastest (measured once, on a 2048³ product); null when it has none.</summary>
+    private MmaConfig? MmaShape(Ptx.Kind kind)
     {
-        if (_shapes.TryGetValue(kind.Name, out var known)) return known;
-        (int RowBytes, int Stages)? best = null;
+        if (_shapes.TryGetValue(kind.Tag, out var known)) return known;
+        MmaConfig? best = null;
         double bestMs = double.MaxValue;
         var report = new List<string>();
-        const int Size = 1024;
+        const int Size = 2048;
         int kp = Ptx.Padded(Size);
-        ulong x = gpu.Rent((long)Size * kp), y = gpu.Rent((long)Size * kp), z = gpu.Rent((long)Size * Size * 4);
-        foreach (var (rowBytes, stages) in new[] { (64, 2), (64, 3), (64, 4), (128, 2), (128, 3) })
+        ulong x = gpu.Rent((long)Size * kp * kind.Bits / 8), y = gpu.Rent((long)Size * kp * kind.Bits / 8), z = gpu.Rent((long)Size * Size * 4);
+        foreach (var cfg in new MmaConfig[]
         {
-            int shared = Ptx.MmaShared(rowBytes, stages);
+            new(64, 3, 128, false), new(64, 4, 128, false), new(128, 2, 128, false), new(64, 3, 256, false),
+            new(64, 3, 256, true), new(64, 4, 256, true), new(128, 2, 256, true), new(128, 3, 128, true), new(64, 6, 128, true),
+        })
+        {
+            int shared = Ptx.MmaShared(cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle);
             if (shared > gpu.SharedOptIn) continue;
-            string ptx = Ptx.GemmMma(gpu, kind, rowBytes, stages, out string entry);
+            string ptx = Ptx.GemmMma(gpu, kind, cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle, out string entry);
             if (!gpu.Accepts(ptx, entry)) continue;
-            var fn = gpu.Cached($"mma:{kind.Name}:{rowBytes}:{stages}", (out string e) => Ptx.GemmMma(gpu, kind, rowBytes, stages, out e));
+            var fn = gpu.Cached($"mma:{kind.Tag}:{cfg}", (out string e) => Ptx.GemmMma(gpu, kind, cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle, out e));
             gpu.AllowShared(fn, shared);
-            double ms = TimeMma(fn, Dynamic(shared), x, y, z, Size, kp);
-            report.Add($"rows {rowBytes} B × {stages} stages {ms:0.000} ms");
-            if (ms < bestMs) (bestMs, best) = (ms, (rowBytes, stages));
-        }
-
-        string tail = "";
-        if (best is { } b2)
-        {
-            var fn = gpu.Cached($"mma:{kind.Name}:{b2.RowBytes}:{b2.Stages}", (out string e) => Ptx.GemmMma(gpu, kind, b2.RowBytes, b2.Stages, out e));
-            double shortK = TimeMma(fn, Dynamic(Ptx.MmaShared(b2.RowBytes, b2.Stages)), x, y, z, Size, 128);
-            tail = $"; k = 128 alone {shortK:0.000} ms (the fixed part)";
+            double ms = TimeMma(fn, Dynamic(shared), cfg.Bn, x, y, z, Size, kp);
+            report.Add($"rows {cfg.RowBytes} B × {cfg.Stages} stages × {cfg.Bn} wide{(cfg.Swizzle ? " swizzled" : "")} {ms:0.000} ms");
+            if (ms < bestMs) (bestMs, best) = (ms, cfg);
         }
 
         gpu.Return(x); gpu.Return(y); gpu.Return(z);
-        if (best is { } shape) Console.WriteLine($"device measured {kind.Name} tensor kernel at {Size}³: {string.Join(", ", report)}: rows {shape.RowBytes} B × {shape.Stages} stages kept{tail}");
-        return _shapes[kind.Name] = best;
+        if (best is { } shape) Console.WriteLine($"device measured {kind.Tag} tensor kernel at {Size}³: {string.Join(", ", report)}: rows {shape.RowBytes} B × {shape.Stages} stages × {shape.Bn} wide{(shape.Swizzle ? " swizzled" : "")} kept");
+        return _shapes[kind.Tag] = best;
     }
 
-    private IntPtr MmaFunction(Ptx.Kind kind, out uint shared)
+    private IntPtr MmaFunction(Ptx.Kind kind, out uint shared, out int bn)
     {
-        var (rowBytes, stages) = MmaShape(kind) ?? throw new InvalidOperationException($"{kind.Name}: no tensor kernel on this device");
-        shared = Dynamic(Ptx.MmaShared(rowBytes, stages));
-        return gpu.Cached($"mma:{kind.Name}:{rowBytes}:{stages}", (out string e) => Ptx.GemmMma(gpu, kind, rowBytes, stages, out e));
+        var cfg = MmaShape(kind) ?? throw new InvalidOperationException($"{kind.Name}: no tensor kernel on this device");
+        shared = Dynamic(Ptx.MmaShared(cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle));
+        bn = cfg.Bn;
+        return gpu.Cached($"mma:{kind.Tag}:{cfg}", (out string e) => Ptx.GemmMma(gpu, kind, cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle, out e));
     }
 
     // Shared bytes to ask for at launch: only what a kernel declares as extern (beyond the static limit).
@@ -154,29 +153,43 @@ public sealed class GpuOps(Gpu gpu)
 
     private bool MmaSupported(Ptx.Kind kind) => MmaShape(kind) is not null;
 
+    private readonly Dictionary<bool, Ptx.Kind> _eightBit = [];
+
+    // The 8-bit tensor instruction the device runs faster: one taking 16 or 32 values of k (measured once).
+    private Ptx.Kind EightBitKind(bool signed, long terms)
+    {
+        if (_eightBit.TryGetValue(signed, out var known)) return known;
+        var k16 = signed ? Ptx.Kind.S8 : Ptx.Kind.U8;
+        var k32 = signed ? Ptx.Kind.S8K32 : Ptx.Kind.U8K32;
+        bool has16 = MmaSupported(k16), has32 = MmaSupported(k32);
+        var kind = has32 && (!has16 || FasterKind(k32, k16, terms)) ? k32 : k16;
+        return _eightBit[signed] = kind;
+    }
+
     private readonly Dictionary<string, bool> _faster = [];
 
     // Whether the first kind's kernel beats the second's on a square product of this many terms, measured once.
     private bool FasterKind(Ptx.Kind a, Ptx.Kind b, long terms)
     {
-        string key = $"{a.Name}<{b.Name}:{terms}";
+        string key = $"{a.Tag}<{b.Tag}:{terms}";
         if (_faster.TryGetValue(key, out bool faster)) return faster;
         int size = (int)Math.Min(terms, 2048), kp = Ptx.Padded(size);
-        ulong x = gpu.Rent((long)size * kp), y = gpu.Rent((long)size * kp), z = gpu.Rent((long)size * size * 4);
-        var fa = MmaFunction(a, out uint sa);
-        var fb = MmaFunction(b, out uint sb);
-        double ta = TimeMma(fa, sa, x, y, z, size, kp), tb = TimeMma(fb, sb, x, y, z, size, kp);
+        int bits = Math.Max(a.Bits, b.Bits);
+        ulong x = gpu.Rent((long)size * kp * bits / 8), y = gpu.Rent((long)size * kp * bits / 8), z = gpu.Rent((long)size * size * 4);
+        var fa = MmaFunction(a, out uint sa, out int bna);
+        var fb = MmaFunction(b, out uint sb, out int bnb);
+        double ta = TimeMma(fa, sa, bna, x, y, z, size, kp), tb = TimeMma(fb, sb, bnb, x, y, z, size, kp);
         gpu.Return(x); gpu.Return(y); gpu.Return(z);
-        Console.WriteLine($"device measured {a.Name} tensor kernel {ta:0.000} ms against {b.Name} {tb:0.000} ms at {size}³: {(ta < tb ? a.Name : b.Name)} kept");
+        Console.WriteLine($"device measured {a.Tag} tensor kernel {ta:0.000} ms against {b.Tag} {tb:0.000} ms at {size}³: {(ta < tb ? a.Tag : b.Tag)} kept");
         return _faster[key] = ta < tb;
     }
 
-    private double TimeMma(IntPtr fn, uint shared, ulong x, ulong y, ulong z, int size, int kp)
+    private double TimeMma(IntPtr fn, uint shared, int bn, ulong x, ulong y, ulong z, int size, int kp)
     {
-        Gpu.Launch(fn, Grid(size, 128), Grid(size, 128), Ptx.GemmThreads, 1, shared, x, y, z, Gpu.U(size), Gpu.U(size), Gpu.U(kp));
+        Gpu.Launch(fn, Grid(size, bn), Grid(size, 128), Ptx.GemmThreads, 1, shared, x, y, z, Gpu.U(size), Gpu.U(size), Gpu.U(kp), Gpu.U(kp));
         Gpu.Synchronize();
         long start = Stopwatch.GetTimestamp();
-        for (int i = 0; i < 3; i++) Gpu.Launch(fn, Grid(size, 128), Grid(size, 128), Ptx.GemmThreads, 1, shared, x, y, z, Gpu.U(size), Gpu.U(size), Gpu.U(kp));
+        for (int i = 0; i < 3; i++) Gpu.Launch(fn, Grid(size, bn), Grid(size, 128), Ptx.GemmThreads, 1, shared, x, y, z, Gpu.U(size), Gpu.U(size), Gpu.U(kp), Gpu.U(kp));
         Gpu.Synchronize();
         return Stopwatch.GetElapsedTime(start).TotalMilliseconds / 3;
     }
@@ -209,7 +222,9 @@ public sealed class GpuOps(Gpu gpu)
             {
                 var kind = laneName[..^(laneName.EndsWith("mma", StringComparison.Ordinal) ? 3 : 2)] switch
                 {
-                    "s8" => Ptx.Kind.S8, "u8" => Ptx.Kind.U8, "s4" => Ptx.Kind.S4, "u4" => Ptx.Kind.U4, "f16" => Ptx.Kind.F16, _ => Ptx.Kind.BF16,
+                    "s8" => laneName.EndsWith("mma", StringComparison.Ordinal) ? EightBitKind(true, k) : Ptx.Kind.S8,
+                    "u8" => laneName.EndsWith("mma", StringComparison.Ordinal) ? EightBitKind(false, k) : Ptx.Kind.U8,
+                    "s4" => Ptx.Kind.S4, "u4" => Ptx.Kind.U4, "f16" => Ptx.Kind.F16, _ => Ptx.Kind.BF16,
                 };
                 int kp = Ptx.Padded(k);
                 // A's rows as stored already have the kind's layout when the type is the kind and k is whole blocks.
@@ -224,8 +239,8 @@ public sealed class GpuOps(Gpu gpu)
                 if (!cAsIs) rented.Add(lc);
                 if (laneName.EndsWith("mma", StringComparison.Ordinal))
                 {
-                    var fn = MmaFunction(kind, out uint shared);
-                    Gpu.Launch(fn, Grid(n, 128), Grid(m, 128), Ptx.GemmThreads, 1, shared, pa, pb, lc, Gpu.U(m), Gpu.U(n), Gpu.U(kp));
+                    var fn = MmaFunction(kind, out uint shared, out int bn);
+                    Gpu.Launch(fn, Grid(n, bn), Grid(m, 128), Ptx.GemmThreads, 1, shared, pa, pb, lc, Gpu.U(m), Gpu.U(n), Gpu.U(kp), Gpu.U(kp));
                 }
                 else
                 {
@@ -239,6 +254,7 @@ public sealed class GpuOps(Gpu gpu)
                 return laneName;
             }
 
+            if (f.Is("float64") && SlicedProven && SlicedFaster(m, n, k, a, b, c) && MatMulSliced(a, b, c, m, n, k)) return "f64x";
             bool direct = f.Natural == lane && f.Bits == lane.Size * 8 && (f.IsFloat == lane.IsFloat);
             ulong la = direct ? a : Lanes(f, lane, a, (long)m * k, rented);
             ulong lb = direct ? b : Lanes(f, lane, b, (long)k * n, rented);
@@ -265,6 +281,95 @@ public sealed class GpuOps(Gpu gpu)
         finally
         {
             foreach (var p in rented) gpu.Return(p);
+        }
+    }
+
+    // ---------------------------------------------------------------- float64 products through the 8-bit tensor lane
+
+    /// <summary>Set by the device proof (Checks.Gpu): the sliced product reproduces float64 math to within an ulp on this device.</summary>
+    public bool SlicedProven { get; set; }
+
+    private readonly Dictionary<string, bool> _slicedFaster = [];
+
+    /// <summary>Whether the sliced product beats the plain float64 kernel at this shape (measured once per shape).</summary>
+    private bool SlicedFaster(int m, int n, int k, ulong a, ulong b, ulong c)
+    {
+        string key = $"{m}x{n}x{k}";
+        if (_slicedFaster.TryGetValue(key, out bool known)) return known;
+        double Time(Action run)
+        {
+            run();
+            Gpu.Synchronize();
+            long start = Stopwatch.GetTimestamp();
+            for (int i = 0; i < 3; i++) run();
+            Gpu.Synchronize();
+            return Stopwatch.GetElapsedTime(start).TotalMilliseconds / 3;
+        }
+
+        double plain = Time(() => PlainF64(a, b, c, m, n, k));
+        double sliced = Time(() => { if (!MatMulSliced(a, b, c, m, n, k)) throw new InvalidOperationException("sliced product refused"); });
+        Console.WriteLine($"device measured float64 product at {key}: float64 lane {plain:0.000} ms, sliced 8-bit tensor lane {sliced:0.000} ms: {(sliced < plain ? "sliced" : "float64")} kept");
+        return _slicedFaster[key] = sliced < plain;
+    }
+
+    private void PlainF64(ulong a, ulong b, ulong c, int m, int n, int k)
+    {
+        var lane = Lane.F64;
+        var g = gpu.Cached($"gemm:{lane.Name}:4", (out string e) => Ptx.Gemm(gpu, lane, 4, out e));
+        Gpu.Launch(g, Grid(n, 64), Grid(m, 64), Ptx.GemmThreads, 1, 0, a, b, c, Gpu.U(m), Gpu.U(n), Gpu.U(k));
+    }
+
+    /// <summary>C = A·B for float64 operands through the 8-bit tensor instructions (see Ptx: sliced float64). False when the
+    /// device has no 8-bit tensor kind or the data's exponents are beyond what the slicing scale takes: nothing was computed.</summary>
+    public bool MatMulSliced(ulong a, ulong b, ulong c, int m, int n, int k)
+    {
+        if (!MmaSupported(Ptx.Kind.S8) && !MmaSupported(Ptx.Kind.S8K32)) return false;
+        var kind = EightBitKind(true, k);
+        int kpad = Ptx.Padded(k), rowLen = Ptx.Slices * kpad;
+        long mn = (long)m * n;
+        ulong e = gpu.Rent(m * 4L), f = gpu.Rent(n * 4L), sa = gpu.Rent((long)m * rowLen), stack = gpu.Rent((long)rowLen * n), bt = gpu.Rent((long)n * rowLen), d = gpu.Rent(Ptx.Diagonals * mn * 4);
+        try
+        {
+            var rowExp = gpu.Cached("rowexp_f64", (out string x) => Ptx.RowExponents(gpu, out x));
+            var colExp = gpu.Cached("colexp_f64", (out string x) => Ptx.ColumnExponents(gpu, out x));
+            var sliceRows = gpu.Cached("slice_rows_f64", (out string x) => Ptx.SliceRows(gpu, out x));
+            var sliceCols = gpu.Cached("slice_cols_f64", (out string x) => Ptx.SliceColumns(gpu, out x));
+            var combine = gpu.Cached("combine_f64x", (out string x) => Ptx.CombineSlices(gpu, out x));
+            Gpu.Launch(rowExp, (uint)m, 1, 256, 1, 0, a, e, Gpu.U(k));
+            Gpu.Launch(colExp, Grid(n, 256), 1, 256, 1, 0, b, f, Gpu.U(k), Gpu.U(n));
+            // The exponents must keep every scale a normal float64 (the slicing scale 2^(64 − e), the result's 2^(e + f + shift − 72)).
+            var ea = new int[m];
+            var fa = new int[n];
+            Gpu.Download<int>(e, ea);
+            Gpu.Download<int>(f, fa);
+            int eMin = ea.Min(), eMax = ea.Max(), fMin = fa.Min(), fMax = fa.Max();
+            if (eMax > 1086 || fMax > 1086 || eMin + fMin < -918 || eMax + fMax > 1057) return false;
+            if (kpad != k) Gpu.Clear(sa, (long)m * rowLen);
+            Gpu.Clear(stack, (long)rowLen * n);
+            Gpu.Launch(sliceRows, Grid((long)m * k, 256), 1, 256, 1, 0, a, e, sa, Gpu.U(m), Gpu.U(k), Gpu.U(kpad));
+            Gpu.Launch(sliceCols, Grid((long)k * n, 256), 1, 256, 1, 0, b, f, stack, Gpu.U(k), Gpu.U(n), Gpu.U(kpad));
+            // The stacked digits of B (rowLen × n, signed bytes) transposed into packed rows Bt[j][0..rowLen).
+            var int8 = new Fmt("int8", 8, false, true);
+            var ft = gpu.Cached($"packt:{int8.Name}:{kind.Name}", (out string x) => Ptx.PackTransposed(gpu, int8, kind, out x));
+            Gpu.Launch(ft, Grid(n, 64), (uint)(rowLen / 32), 256, 1, 0, stack, bt, Gpu.U(n), Gpu.U(rowLen), Gpu.U(rowLen));
+            // One product per diagonal d: the digit pairs (t, u) with t + u = d. B's digits are stacked most significant last,
+            // so for d below the slice count A's first d + 1 slices meet B's last d + 1; above it, A's last 15 − d meet B's first.
+            var fn = MmaFunction(kind, out uint shared, out int bn);
+            for (int diag = 0; diag < Ptx.Diagonals; diag++)
+            {
+                int pairs = diag < Ptx.Slices ? diag + 1 : 2 * Ptx.Slices - 1 - diag, extent = pairs * kpad;
+                ulong pa = diag < Ptx.Slices ? sa : sa + (ulong)((diag - Ptx.Slices + 1) * kpad);
+                ulong pb = diag < Ptx.Slices ? bt + (ulong)((Ptx.Slices - 1 - diag) * kpad) : bt;
+                ulong pd = d + (ulong)(diag * mn * 4);
+                Gpu.Launch(fn, Grid(n, bn), Grid(m, 128), Ptx.GemmThreads, 1, shared, pa, pb, pd, Gpu.U(m), Gpu.U(n), Gpu.U(extent), Gpu.U(rowLen));
+            }
+
+            Gpu.Launch(combine, Grid(mn, 256), 1, 256, 1, 0, d, e, f, c, Gpu.U(m), Gpu.U(n));
+            return true;
+        }
+        finally
+        {
+            foreach (var p in new[] { e, f, sa, stack, bt, d }) gpu.Return(p);
         }
     }
 
