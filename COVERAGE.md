@@ -58,14 +58,36 @@ regression comparer and the baseline run.
 
 **Open, in the order they are taken:**
 
-1. The regression gate for the whole stretch: `python docs/wip/compare.py docs/wip/baseline.md <new run>` over a full
-   `cuda,cpu` run (> 5 % slower or error growth = regression). To settle there: the float64 product rows' reference
-   (a sequential f64 sum, whose own rounding is ~1e-13 at 2048³) against the sliced route, which the double-double
-   proof shows exact — the row's reference should be double-double so an exact lane reads 0.
-2. The todo rows below: flash-fused attention rows, ctc, the GRU sequence bench row, the block-scaled tiled product,
+1. The todo rows below: flash-fused attention rows, ctc, the GRU sequence bench row, the block-scaled tiled product,
    fusing the transposition into the product's packing, the radix step of scatter-add.
-3. A bump-allocated scope past the pool (buffers reserved once from the shapes; zero rents on the hot path).
-4. The known-slow list.
+2. A bump-allocated scope past the pool (buffers reserved once from the shapes; zero rents on the hot path).
+3. The known-slow list.
+4. An intermittent seen once, open: in one full `cuda,cpu --report` run (2026-11-06, the run after the product
+   reference became double-double) the device products gate reported `matmul_bwd dB device uint64 / uint32 / uint16
+   DIFFERS by 138 steps`, `uint2 by 3`, `bool by 1` — every unsigned type but uint8, the dB product only (Aᵀ·dC,
+   53 × 29 × 37, padded to 128 × 256 × 128), all by the same amount; that run's third tensor-kind timing had picked the
+   4-bit kind (`u4k32 kept`) where every other run picks `u8k32`. Not reproduced by: the same command twice; the 4-bit
+   kind forced for k = 37 (that run's choice); 30 passes of the device products gate under every tensor kind forced
+   (`--repeat 600`, the gate's pass repetition); the full run that followed. What is in place against it: the products
+   gate now runs on the device under every tensor kind the device accepts (the measured choice, then the 4-bit kinds
+   and the 32-deep 8-bit instruction forced on and off — `GpuOps.FourBit`, `GpuOps.K32`), and repeats under
+   `--repeat`. Suspected site, unproven: the unsigned pack of A (`Ptx.PackRows`, every failing type packs A; uint8 is
+   used as stored) or the padded buffers' history (`MatMulPadded`: cleared, padded, used — on one stream).
+
+**Settled — the regression gate for the stretch (items 1–3).** The full `cuda,cpu --report` run of 2026-11-06 12:38
+(every type, every gate green on both devices, 128 rows) against `docs/wip/baseline.md` (00:51): 36 new rows (the block
+formats and bool on both devices), no error grown except the float64 product rows' expected change under the double-
+double reference (cpu matmul float64 6.4e-14 → 1.1e-13: the f64 lane's own rounding, formerly hidden), and 15 cells
+beyond 5 % — all sub-2 ms cells re-timed three times and, for the two consistent ones (CUDA softmax/rms_norm of the
+16-bit floats 0.077 → 0.081 ms, CPU matmul float16 1.45 → 1.75 ms), timed back to back against a build of the baseline
+commit (c73a251): the old build measures the same today (0.083–0.085 and 1.76–2.62 ms), so the difference is the
+machine's state since 00:51, not the code. The CUDA float64 product took the sliced route (f64x: 4.19 ms against 22.7,
+exact under the double-double reference).
+
+**Settled — the float64 product reference.** `References.MatMul` (the bench's and the gates' float64 reference for every
+product, view and backward) accumulates in double-double: each product exact by a fused multiply-add, each sum with its
+error term. A lane that is exact now reads 0 (the sliced f64 route, the integer lanes) and a float64 lane shows its own
+rounding (~1e-13 at 2048³, which the sequential reference used to hide by rounding the same way).
 
 **Settled — the CPU int4 matmul `ArgumentOutOfRangeException`.** Reproduced: `cpu --types int4 --ops matmul --repeat 30`,
 the third of three runs, at `Kernels.cs` line 306 of `ProductBody.Run` (the tile's store, the first range-checked access

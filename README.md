@@ -18,8 +18,11 @@ does best for it, chosen per operation from the data itself. No type is fixed an
   reference written from the format's definition, the dot lanes against scalar sums, exp against the runtime's, and
   the device's conversions against the CPU's; then every operation of every family runs over every type it applies to
   on both devices, on small odd shapes, against float64 references (`src/Checks.cs`); the block codecs against blocks
-  laid out by hand from the formats' specifications; the thread team under 20 000 jobs of alternating chunk counts
-  (every chunk within its job, every index once). The bench refuses to time while any gate fails.
+  laid out by hand from the formats' specifications; the products on the device under every tensor kind the device
+  accepts (the measured choice, then the 4-bit kinds and the 32-deep 8-bit instruction forced on and off); the thread
+  team under 20 000 jobs of alternating chunk counts (every chunk within its job, every index once). The float64
+  reference of every product is accumulated in double-double, so an exact lane reads 0. The bench refuses to time while
+  any gate fails.
 - **The operation surface.** `COVERAGE.md` is the list, one row per operation with the lane rule on each device:
   element-wise formulas and their backward passes; reductions, broadcasts, transposes, gemv; the row family
   (softmax, log_softmax, the norms and their backward passes, rope, masked softmax, cross-entropy's backward); layout
@@ -97,7 +100,7 @@ checkout (files listed in `.gitignore`); a clone runs the other subjects.
 | `src/Types.cs` | the seventeen stored types and their lane rules |
 | `src/Blocks.cs`, `src/Ptx.Blocks.cs`, `src/BlockProducts.cs` | the block formats Q8_0, Q4_0, Q4_K, Q6_K and bool: the codecs (CPU and device encoders, a thread per block), the block-scaled integer gemv |
 | `src/Report.cs` | `--report`: the facts and measured decisions of each device, the pool's rent/return cost |
-| `docs/wip/` | the regression comparer (`compare.py`) and the baseline run it compares against (`baseline.md`) |
+| `docs/wip/` | the regression comparer (`compare.py`), the baseline run it compares against (`baseline.md`), the README Results generator (`readme_results.py`) |
 | `src/Convert.cs` | every load and store on vectors; `Widths`, any lane to any lane |
 | `src/Kernels.cs` | the CPU kernels: add, product (GotoBLAS-shaped, dot lanes in groups), softmax, rms_norm |
 | `src/Map.cs`, `src/Ptx.Map.cs` | the element-wise family: the catalogue of formulas (with float64 references), the CPU kernel, the device kernel |
@@ -120,59 +123,75 @@ checkout (files listed in `.gitignore`); a clone runs the other subjects.
 
 ## Results
 
-Measured on one machine, 2026-11-06: Intel Core Ultra 9 285 (24 cores, AVX2 with AVX-VNNI), 64 GB; NVIDIA GeForce RTX 5070 Ti
-(70 multiprocessors, compute capability 12.0, 16 GB, driver 610.88); Windows 11, .NET 10.0.12. The full table with every
+Measured on one machine, 2026-11-06 (the full `cuda,cpu --report` run of 12:38, compared cell by cell against the
+baseline run of 00:51 in `docs/wip/baseline.md` by `docs/wip/compare.py`: no cell slower beyond this laptop's swing,
+no error grown): Intel Core Ultra 9 285 (24 logical processors, 256-bit
+vectors, the s8/u8/s16/u16 dot lanes — as the runtime reports), 64 GB; NVIDIA GeForce RTX 5070 Ti (70 multiprocessors,
+compute capability 12.0, 16 GB, driver 610.88; PTX target sm_80); Windows 11, .NET 10.0.12. The full table with every
 subject's lane and error is `results-qiyas-cuda-cpu.md`; the three columns are the library Qiyas is measured against
 (`lib`, present only in the author's checkout), the `INumberBase<T>` version (`number`, — where .NET has no such type)
-and Qiyas. Times are medians in ms. Every subject's error against float64 math is in the full table; Qiyas's is equal
-to or below the library's on every row, and exact (0) wherever the lane is exact.
+and Qiyas. Times are medians in ms. Every subject's error against float64 math (products in double-double) is in the
+full table; Qiyas's is equal to or below the library's on every row, and exact (0) wherever the lane is exact — the
+CUDA float64 product now takes the sliced 8-bit tensor route (`f64x`, proven exact, 4.19 ms against 22.7 in the
+float64 lane). The block formats and bool have no lib or number column (—): the lib has no such types.
 
 **CUDA (2048³ product, 16M-value add, 4096×4096 rows)** — lib / number / **qiyas** / × (× = lib ÷ qiyas)
 
 | type | add | matmul | softmax | rms_norm |
 |---|---|---|---|---|
-| float64 | 125.849 / 0.520 / **0.521** / 241.60× | 30.943 / 22.802 / **22.710** / 1.36× | 78.319 / 0.393 / **1.738** / 45.07× | 77.926 / 0.373 / **0.549** / 141.84× |
-| float32 | 0.264 / 0.262 / **0.263** / 1.00× | 0.951 / 0.834 / **0.683** / 1.39× | 0.183 / 0.181 / **0.181** / 1.01× | 0.183 / 0.181 / **0.179** / 1.02× |
-| float16 | 0.662 / 0.140 / **0.125** / 5.30× | 1.014 / 0.657 / **0.287** / 3.53× | 0.442 / 0.090 / **0.078** / 5.68× | 0.441 / 0.088 / **0.076** / 5.79× |
-| bfloat16 | 0.662 / — / **0.124** / 5.34× | 1.003 / — / **0.284** / 3.53× | 0.441 / — / **0.077** / 5.75× | 0.442 / — / **0.077** / 5.76× |
-| float8_e4m3 | 489.831 / — / **0.050** / 9835.96× | 130.881 / — / **0.301** / 434.68× | 109.814 / — / **0.068** / 1624.47× | 462.157 / — / **0.046** / 10046.90× |
-| float8_e5m2 | 481.180 / — / **0.847** / 567.90× | 117.019 / — / **0.301** / 389.41× | 299.496 / — / **0.069** / 4372.20× | 350.423 / — / **0.050** / 7022.50× |
-| int64 | 120.177 / 0.520 / **0.520** / 231.11× | 30.041 / 4.418 / **0.421** / 71.41× |  |  |
-| int32 | 0.787 / 0.263 / **0.263** / 2.99× | 1.144 / 1.106 / **0.279** / 4.11× |  |  |
-| int16 | 67.399 / 0.139 / **0.124** / 543.98× | 17.225 / 1.585 / **0.231** / 74.44× |  |  |
-| int8 | 65.073 / 0.082 / **0.023** / 2780.90× | 21.861 / 1.548 / **0.214** / 102.20× |  |  |
-| int4 | 81.782 / — / **0.018** / 4444.68× | 38.206 / — / **0.221** / 173.03× |  |  |
-| int2 | 76.942 / — / **0.018** / 4181.61× | 18.738 / — / **0.232** / 80.80× |  |  |
-| uint64 | 143.842 / 1.000 / **0.520** / 276.57× | 32.614 / 4.359 / **0.416** / 78.46× |  |  |
-| uint32 | 103.208 / 0.263 / **0.263** / 392.58× | 22.980 / 1.076 / **0.271** / 84.67× |  |  |
-| uint16 | 68.127 / 0.139 / **0.124** / 547.64× | 17.984 / 1.325 / **0.225** / 79.82× |  |  |
-| uint8 | 65.224 / 0.074 / **0.022** / 3033.67× | 18.122 / 1.280 / **0.212** / 85.44× |  |  |
-| uint2 | 68.037 / — / **0.017** / 3955.65× | 17.815 / — / **0.226** / 78.72× |  |  |
+| float64 | 108.071 / 1.000 / **0.520** / 207.83× | 30.089 / 22.694 / **4.188** / 7.18× | 82.790 / 0.396 / **1.745** / 47.44× | 81.723 / 0.372 / **0.554** / 147.51× |
+| float32 | 0.263 / 0.263 / **0.263** / 1.00× | 0.990 / 0.843 / **0.688** / 1.44× | 0.181 / 0.182 / **0.179** / 1.01× | 0.184 / 0.183 / **0.180** / 1.02× |
+| float16 | 0.662 / 0.139 / **0.126** / 5.25× | 1.025 / 0.661 / **0.245** / 4.18× | 0.443 / 0.092 / **0.083** / 5.34× | 0.443 / 0.089 / **0.080** / 5.54× |
+| bfloat16 | 0.659 / — / **0.125** / 5.27× | 1.019 / — / **0.245** / 4.16× | 0.444 / — / **0.082** / 5.41× | 0.442 / — / **0.079** / 5.59× |
+| float8_e4m3 | 489.377 / — / **0.051** / 9595.63× | 131.827 / — / **0.260** / 507.03× | 105.340 / — / **0.069** / 1526.67× | 444.929 / — / **0.046** / 9672.37× |
+| float8_e5m2 | 475.449 / — / **0.877** / 542.13× | 116.661 / — / **0.264** / 441.90× | 296.343 / — / **0.070** / 4233.47× | 361.874 / — / **0.050** / 7237.48× |
+| int64 | 114.436 / 0.520 / **0.520** / 220.07× | 29.298 / 4.449 / **0.376** / 77.92× |  |  |
+| int32 | 0.788 / 0.263 / **0.263** / 3.00× | 1.148 / 1.099 / **0.214** / 5.36× |  |  |
+| int16 | 66.940 / 0.139 / **0.125** / 535.52× | 18.546 / 1.592 / **0.174** / 106.59× |  |  |
+| int8 | 62.942 / 0.078 / **0.023** / 2736.61× | 21.669 / 1.554 / **0.094** / 230.52× |  |  |
+| int4 | 78.370 / — / **0.018** / 4353.89× | 38.037 / — / **0.103** / 369.29× |  |  |
+| int2 | 77.427 / — / **0.018** / 4301.50× | 23.917 / — / **0.113** / 211.65× |  |  |
+| uint64 | 125.069 / 0.522 / **0.520** / 240.52× | 32.828 / 4.386 / **0.361** / 90.94× |  |  |
+| uint32 | 103.178 / 0.264 / **0.263** / 392.31× | 23.652 / 1.101 / **0.214** / 110.52× |  |  |
+| uint16 | 67.499 / 0.139 / **0.126** / 535.71× | 17.226 / 1.335 / **0.178** / 96.78× |  |  |
+| uint8 | 64.178 / 0.074 / **0.023** / 2790.35× | 16.759 / 1.301 / **0.094** / 178.29× |  |  |
+| uint2 | 71.151 / — / **0.017** / 4185.35× | 18.032 / — / **0.114** / 158.18× |  |  |
+| q8_0 | — / — / **1.409** / — | — / — / **0.864** / — | — / — / **0.779** / — | — / — / **0.775** / — |
+| q4_0 | — / — / **0.660** / — | — / — / **0.788** / — | — / — / **0.457** / — | — / — / **0.454** / — |
+| q4_k | — / — / **1.191** / — | — / — / **0.868** / — | — / — / **0.988** / — | — / — / **0.984** / — |
+| q6_k | — / — / **1.401** / — | — / — / **0.958** / — | — / — / **1.190** / — | — / — / **1.193** / — |
+| bool | — / — / **0.017** / — | — / — / **0.122** / — |  |  |
 
 **CPU (1024³ product, 16M-value add, 4096×4096 rows)** — lib / number / **qiyas** / × (× = lib ÷ qiyas)
 
 | type | add | matmul | softmax | rms_norm |
 |---|---|---|---|---|
-| float64 | 7.344 / 6.823 / **6.714** / 1.09× | 6.378 / 15.905 / **3.286** / 1.94× | 31.993 / 6.411 / **5.565** / 5.75× | 30.889 / 4.377 / **4.605** / 6.71× |
-| float32 | 3.048 / 3.005 / **2.922** / 1.04× | 2.713 / 5.988 / **1.625** / 1.67× | 3.531 / 4.294 / **2.922** / 1.21× | 2.394 / 1.894 / **1.596** / 1.50× |
-| float16 | 2.808 / 7.501 / **1.742** / 1.61× | 6.838 / 765.105 / **1.454** / 4.70× | 45.965 / 55.323 / **2.241** / 20.52× | 45.370 / 23.947 / **0.827** / 54.87× |
-| bfloat16 | 1.261 / — / **0.915** / 1.38× | 4.736 / — / **1.386** / 3.42× | 23.833 / — / **1.786** / 13.35× | 23.501 / — / **0.474** / 49.55× |
-| float8_e4m3 | 26.282 / — / **2.222** / 11.83× | 37.162 / — / **1.477** / 25.17× | 89.788 / — / **3.686** / 24.36× | 429.956 / — / **1.914** / 224.65× |
-| float8_e5m2 | 21.284 / — / **2.422** / 8.79× | 29.022 / — / **1.491** / 19.47× | 283.307 / — / **3.878** / 73.05× | 313.137 / — / **2.083** / 150.31× |
-| int64 | 19.776 / 6.763 / **6.615** / 2.99× | 6.126 / 24.649 / **0.876** / 7.00× |  |  |
-| int32 | 20.288 / 2.959 / **2.948** / 6.88× | 5.923 / 6.204 / **0.607** / 9.76× |  |  |
-| int16 | 1.639 / 1.425 / **0.840** / 1.95× | 5.658 / 2.371 / **0.992** / 5.71× |  |  |
-| int8 | 1.564 / 0.432 / **0.154** / 10.14× | 6.123 / 2.507 / **0.597** / 10.26× |  |  |
-| int4 | 2.437 / — / **0.101** / 24.11× | 11.926 / — / **0.532** / 22.43× |  |  |
-| int2 | 2.868 / — / **0.267** / 10.74× | 6.899 / — / **0.514** / 13.42× |  |  |
-| uint64 | 6.599 / 6.738 / **6.705** / 0.98× | 6.337 / 22.120 / **0.810** / 7.82× |  |  |
-| uint32 | 5.172 / 2.943 / **2.933** / 1.76× | 6.090 / 3.922 / **0.429** / 14.18× |  |  |
-| uint16 | 1.375 / 1.283 / **0.796** / 1.73× | 5.178 / 1.925 / **0.698** / 7.42× |  |  |
-| uint8 | 1.630 / 0.423 / **0.130** / 12.59× | 6.154 / 2.198 / **0.569** / 10.81× |  |  |
-| uint2 | 2.761 / — / **0.232** / 11.91× | 6.861 / — / **0.402** / 17.08× |  |  |
+| float64 | 6.471 / 6.750 / **6.629** / 0.98× | 5.946 / 14.260 / **3.114** / 1.91× | 31.524 / 6.596 / **4.857** / 6.49× | 30.759 / 4.253 / **4.640** / 6.63× |
+| float32 | 2.965 / 2.957 / **2.871** / 1.03× | 1.851 / 4.715 / **1.769** / 1.05× | 3.282 / 4.028 / **1.876** / 1.75× | 2.481 / 2.137 / **1.635** / 1.52× |
+| float16 | 3.085 / 7.432 / **1.738** / 1.78× | 6.819 / 910.367 / **1.741** / 3.92× | 46.245 / 49.926 / **2.218** / 20.85× | 45.339 / 20.933 / **0.825** / 54.96× |
+| bfloat16 | 1.114 / — / **0.807** / 1.38× | 4.882 / — / **1.207** / 4.04× | 24.582 / — / **1.765** / 13.93× | 23.979 / — / **0.405** / 59.21× |
+| float8_e4m3 | 26.617 / — / **2.120** / 12.56× | 27.486 / — / **1.762** / 15.60× | 92.300 / — / **3.075** / 30.02× | 397.020 / — / **1.612** / 246.29× |
+| float8_e5m2 | 22.414 / — / **2.358** / 9.51× | 24.259 / — / **1.793** / 13.53× | 280.242 / — / **3.885** / 72.13× | 317.788 / — / **1.515** / 209.76× |
+| int64 | 25.181 / 6.761 / **6.569** / 3.83× | 6.275 / 21.757 / **0.887** / 7.07× |  |  |
+| int32 | 25.915 / 3.092 / **2.943** / 8.81× | 5.700 / 5.119 / **0.513** / 11.11× |  |  |
+| int16 | 1.610 / 1.323 / **1.184** / 1.36× | 5.307 / 2.096 / **0.531** / 9.99× |  |  |
+| int8 | 1.833 / 0.338 / **0.129** / 14.21× | 6.091 / 2.981 / **0.529** / 11.51× |  |  |
+| int4 | 2.926 / — / **0.144** / 20.32× | 12.123 / — / **0.484** / 25.05× |  |  |
+| int2 | 2.865 / — / **0.284** / 10.09× | 6.908 / — / **0.471** / 14.67× |  |  |
+| uint64 | 10.966 / 6.742 / **6.656** / 1.65× | 6.664 / 21.610 / **0.896** / 7.44× |  |  |
+| uint32 | 12.747 / 3.093 / **2.846** / 4.48× | 6.038 / 4.366 / **0.542** / 11.14× |  |  |
+| uint16 | 1.557 / 1.425 / **0.885** / 1.76× | 5.437 / 3.124 / **0.531** / 10.24× |  |  |
+| uint8 | 1.612 / 0.398 / **0.139** / 11.60× | 5.828 / 2.116 / **0.399** / 14.61× |  |  |
+| uint2 | 2.673 / — / **0.160** / 16.71× | 6.525 / — / **0.486** / 13.43× |  |  |
+| q8_0 | — / — / **6.415** / — | — / — / **8.297** / — | — / — / **7.484** / — | — / — / **4.521** / — |
+| q4_0 | — / — / **4.287** / — | — / — / **8.595** / — | — / — / **5.381** / — | — / — / **3.241** / — |
+| q4_k | — / — / **5.039** / — | — / — / **9.111** / — | — / — / **6.232** / — | — / — / **4.498** / — |
+| q6_k | — / — / **10.020** / — | — / — / **10.080** / — | — / — / **11.789** / — | — / — / **7.230** / — |
+| bool | — / — / **4.882** / — | — / — / **2.150** / — |  |  |
 
-Where Qiyas is not ahead: the memory-bound adds of 32- and 64-bit types (the same bytes moved, within a few percent),
-and CUDA float64 matmul, which runs at the device's float64 rate and exact where the library computes it in float32.
+Where Qiyas is not ahead: the memory-bound adds of 32- and 64-bit types (the same bytes moved, within a few percent).
+The CUDA float64 product is exact where the library computes it in float32 (its error 1.6e-4), through the sliced
+8-bit tensor route where the device measures it faster than its float64 lane.
 
 The tables above are the four core rows of the full `cuda,cpu` run the regression gate compares against
 (`docs/wip/baseline.md`); the other families' rows, the block formats and bool are in `results-qiyas-cuda-cpu.md` of

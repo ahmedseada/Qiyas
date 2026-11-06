@@ -391,7 +391,7 @@ public sealed partial class GpuOps(Gpu gpu)
             var kind = EightBitKind(f.Signed, bounds.Terms);
             var kind4 = f.Signed ? Ptx.Kind.S4 : Ptx.Kind.U4;
             bool has8 = MmaSupported(kind), has4 = tiny && MmaSupported(kind4);
-            if (has4 && (!has8 || FasterKind(kind4, kind, bounds.Terms))) return kind4.Name + "mma";
+            if (has4 && (!has8 || (FourBit ?? FasterKind(kind4, kind, bounds.Terms)))) return kind4.Name + "mma";
             if (has8) return kind.Name + "mma";
             if (Dp4aSupported(f.Signed)) return kind.Name + "dp";
         }
@@ -454,17 +454,23 @@ public sealed partial class GpuOps(Gpu gpu)
 
     private bool MmaSupported(Ptx.Kind kind) => MmaShape(kind) is not null;
 
-    private readonly Dictionary<bool, Ptx.Kind> _eightBit = [];
+    private readonly Dictionary<string, Ptx.Kind> _eightBit = [];
+
+    /// <summary>The gates' overrides of the measured tensor-kind choices (null: measured): the 4-bit kinds over the 8-bit ones
+    /// where values fit, and the 32-deep 8-bit instruction over the 16-deep one — so every kind the device accepts is
+    /// checked, not only the one a timing happened to pick.</summary>
+    internal bool? FourBit, K32;
 
     // The 8-bit tensor instruction the device runs faster: one taking 16 or 32 values of k (measured once).
     private Ptx.Kind EightBitKind(bool signed, long terms)
     {
-        if (_eightBit.TryGetValue(signed, out var known)) return known;
+        string key = $"{signed}:{K32}";
+        if (_eightBit.TryGetValue(key, out var known)) return known;
         var k16 = signed ? Ptx.Kind.S8 : Ptx.Kind.U8;
         var k32 = signed ? Ptx.Kind.S8K32 : Ptx.Kind.U8K32;
         bool has16 = MmaSupported(k16), has32 = MmaSupported(k32);
-        var kind = has32 && (!has16 || FasterKind(k32, k16, terms)) ? k32 : k16;
-        return _eightBit[signed] = kind;
+        var kind = has32 && (!has16 || (K32 ?? FasterKind(k32, k16, terms))) ? k32 : k16;
+        return _eightBit[key] = kind;
     }
 
     private readonly Dictionary<string, bool> _faster = [];

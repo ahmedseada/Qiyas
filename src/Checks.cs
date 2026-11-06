@@ -802,6 +802,27 @@ internal static class Checks
         bool ok = true;
         string where = ops is null ? "cpu" : "device";
         const int M = 37, N = 29, K = 53;
+        // On the device, every tensor kind it accepts: the measured choice, then the 4-bit kinds forced on and off with the
+        // 32-deep 8-bit instruction forced on and off (a timing may pick any of them on a run).
+        var kinds = ops is null ? [(null, null, "")] : new (bool? four, bool? k32, string name)[] { (null, null, ""), (true, true, " [4-bit, k32]"), (true, false, " [4-bit, k16]"), (false, true, " [8-bit, k32]"), (false, false, " [8-bit, k16]") };
+        // The device's pass repeated under --repeat (Stress / 20 passes): a fault that depends on the buffers' history shows.
+        for (int pass = 0, passes = ops is null ? 1 : Math.Max(1, Stress / 20); pass < passes && ok; pass++)
+        {
+            foreach (var (four, k32, kindName) in kinds)
+            {
+                if (ops is not null) { ops.FourBit = four; ops.K32 = k32; }
+                ok &= ProductsWith(ops, where, M, N, K, pass == 0 ? kindName : $"{kindName} pass {pass + 1}");
+            }
+        }
+
+        if (ops is not null) { ops.FourBit = null; ops.K32 = null; }
+        if (ok) Console.WriteLine($"check products               {where,-6} every type at 37 x 29 x 53, transposed, batched, and the backward pair{(ops is null ? "" : ", under every tensor kind")}: within the product's rounding");
+        return ok;
+    }
+
+    private static bool ProductsWith(GpuOps? ops, string where, int M, int N, int K, string kindName)
+    {
+        bool ok = true;
         foreach (var type in Bench.Registry.Names)
         {
             var views = new List<ProductView>();
@@ -815,7 +836,7 @@ internal static class Checks
                 var c = new byte[Bench.Registry.Bytes(type, v.ValuesC)];
                 var want = v.Reference(Bench.Registry.Values(type, a, (int)v.ValuesA), Bench.Registry.Values(type, b, (int)v.ValuesB));
                 Bench.Registry.With(type, new ProductRun(ops, v, a, b, c, null, null));
-                ok &= Close(type, $"product{(v.TransA ? " Aᵀ" : "")}{(v.TransB ? " Bᵀ" : "")}{(v.Batch > 1 ? $" x{v.Batch}" : "")}", where, c, want, (int)v.ValuesC, K);
+                ok &= Close(type, $"product{(v.TransA ? " Aᵀ" : "")}{(v.TransB ? " Bᵀ" : "")}{(v.Batch > 1 ? $" x{v.Batch}" : "")}{kindName}", where, c, want, (int)v.ValuesC, K);
             }
 
             {
@@ -827,12 +848,11 @@ internal static class Checks
                 var wantA = new ProductView(M, K, N, false, true).Reference(Bench.Registry.Values(type, dc, M * N), Bench.Registry.Values(type, b, K * N));
                 var wantB = new ProductView(K, N, M, true, false).Reference(Bench.Registry.Values(type, a, M * K), Bench.Registry.Values(type, dc, M * N));
                 Bench.Registry.With(type, new ProductRun(ops, new ProductView(M, N, K, false, false), a, b, dc, da, db));
-                ok &= Close(type, "matmul_bwd dA", where, da, wantA, M * K, N);
-                ok &= Close(type, "matmul_bwd dB", where, db, wantB, K * N, M);
+                ok &= Close(type, "matmul_bwd dA" + kindName, where, da, wantA, M * K, N);
+                ok &= Close(type, "matmul_bwd dB" + kindName, where, db, wantB, K * N, M);
             }
         }
 
-        if (ok) Console.WriteLine($"check products               {where,-6} every type at 37 x 29 x 53, transposed, batched, and the backward pair: within the product's rounding");
         return ok;
     }
 

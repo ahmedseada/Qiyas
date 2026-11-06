@@ -875,18 +875,30 @@ internal static class References
         return r;
     }
 
+    /// <summary>The float64 reference product, accumulated in double-double (each product exact by a fused multiply-add,
+    /// each sum with its error term), so a lane that is exact reads 0 and a float64 lane shows its own rounding.</summary>
     public static double[] MatMul(double[] a, double[] b, int m, int n, int k)
     {
         var c = new double[m * n];
         Parallel.For(0, m, i =>
         {
-            var row = c.AsSpan(i * n, n);
+            var hi = new double[n];
+            var lo = new double[n];
             for (int p = 0; p < k; p++)
             {
                 double x = a[i * k + p];
                 var bp = b.AsSpan(p * n, n);
-                for (int j = 0; j < n; j++) row[j] += x * bp[j];
+                for (int j = 0; j < n; j++)
+                {
+                    double y = bp[j], ph = x * y, pl = Math.FusedMultiplyAdd(x, y, -ph);
+                    double h = hi[j], sum = h + ph, bv = sum - h, err = (h - (sum - bv)) + (ph - bv);
+                    hi[j] = sum;
+                    lo[j] += err + pl;
+                }
             }
+
+            var row = c.AsSpan(i * n, n);
+            for (int j = 0; j < n; j++) row[j] = hi[j] + lo[j];
         });
         return c;
     }
