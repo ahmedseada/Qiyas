@@ -957,10 +957,16 @@ internal static class Checks
 
             // The backward: the case it had, and the fused rows' cases (head-dimension capacities, tile edges, causal, spans
             // with starts, rows that see no key); on the device the fused kernels and the composition each.
+            const int Limited = 48 * 1024;
             foreach (var a in fusedCases.Prepend(new AttentionArgs(2, 37, 53, 24, 0.2, true)))
-            foreach (bool? fusedBack in ops is null ? new bool?[] { true, false } : [null, false])
+            foreach (int mode in ops is null ? new[] { 0, 1 } : [0, 1, 2, 3])
             {
-                if (ops is not null) ops.FusedBackward = fusedBack; else Kernels.FusedBackwardCpu = fusedBack;
+                // CPU: 0 the fused passes, 1 the composition. Device: 0 the default (the tensor backward for a type with a
+                // tensor kind), 1 the composition, 2 the FMA fused kernels, 3 the default as on a device whose blocks may
+                // opt into 48 KB of shared memory only (a kernel past it not taken: the next route instead).
+                bool? fusedBack = mode == 0 ? (ops is null ? true : null) : mode == 1 ? false : true;
+                if (ops is not null) { ops.FusedBackward = mode == 1 ? false : null; ops.MmaBackward = mode == 2 ? false : null; ops.AttentionSharedLimit = mode == 3 ? Limited : null; ops.BackwardRoute = null; }
+                else Kernels.FusedBackwardCpu = fusedBack;
                 var q = Bench.Registry.Make(type, (int)a.QValues, 41, -1, 1);
                 var k = Bench.Registry.Make(type, (int)a.KValues, 42, -1, 1);
                 var v = Bench.Registry.Make(type, (int)a.KValues, 43, -1, 1);
@@ -970,11 +976,27 @@ internal static class Checks
                 var dk = new byte[k.Length];
                 var dv = new byte[v.Length];
                 Bench.Registry.WithFloat(type, new AttentionRun(ops, a, q, k, v, dO, false, dq, dk, dv));
-                string tag = $"{(fusedBack == false ? " composed" : "")}{(a.Causal ? " causal" : "")}{(a.Spans is not null ? " spans" : "")}{(a.SpanStarts is not null ? " starts" : "")} {a.Heads}h {a.Lq}x{a.Lk} d{a.D}";
+                string tag = $"{(mode == 1 ? " composed" : ops is not null && mode == 2 ? " fma" : mode == 3 ? " shared 48 KB" : "")}{(a.Causal ? " causal" : "")}{(a.Spans is not null ? " spans" : "")}{(a.SpanStarts is not null ? " starts" : "")} {a.Heads}h {a.Lq}x{a.Lk} d{a.D}";
                 ok &= Close(type, "attention_bwd dQ" + tag, where, dq, wq, (int)a.QValues, 2 * (a.Lk + a.D));
                 ok &= Close(type, "attention_bwd dK" + tag, where, dk, wk, (int)a.KValues, 2 * (a.Lq + a.D));
                 ok &= Close(type, "attention_bwd dV" + tag, where, dv, wv, (int)a.KValues, a.Lq + a.D);
-                if (ops is not null) ops.FusedBackward = null; else Kernels.FusedBackwardCpu = null;
+                if (mode == 3 && ops is not null)
+                {
+                    // The route the limit leaves: the tensor kernels where both fit, else the FMA fused kernels where both fit,
+                    // else the composition.
+                    int dCap = a.D <= 32 ? 32 : a.D <= 64 ? 64 : 128;
+                    var lane = type == "float64" ? Lane.F64 : Lane.F32;
+                    bool tensor = Ptx.AttentionKind(new Fmt(type, 16, true, true)) is not null && Ptx.AttentionMmaShared(dCap) <= Limited && Ptx.AttentionBackKeysMmaShared(dCap) <= Limited;
+                    bool fma = Ptx.AttentionBackRowsShared(lane, dCap) <= Limited && Ptx.AttentionBackKeysShared(lane, dCap) <= Limited;
+                    string want = tensor ? "mma" : fma ? "fused" : "composed";
+                    if (ops.BackwardRoute != want)
+                    {
+                        Console.WriteLine($"check attention_bwd{tag} {where} {type,-12} took the {ops.BackwardRoute} route, not {want}");
+                        ok = false;
+                    }
+                }
+
+                if (ops is not null) { ops.FusedBackward = null; ops.MmaBackward = null; ops.AttentionSharedLimit = null; } else Kernels.FusedBackwardCpu = null;
             }
         }
 

@@ -461,6 +461,32 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
     dropping each run's last query row) fails at 126 cells.
   - Measured: see COVERAGE (the backward row). float32 error 1.47e-7 → 1.72e-7 (dK, dV summed in another order).
 
+- 6j part 3 (the tensor attention backward for the 16-bit kinds): done, reported (uncommitted until go).
+  - `src/Ptx.AttentionBackMma.cs`: `AttentionBackRowsMma` / `AttentionBackKeysMma` and the shared `MmaBackPieces` (the
+    tensor rows' three tile loads, the A / B fragment addresses, products from registers or shared, the two-slice
+    accumulate, quad reductions, stores as the type). Rows: 4 warps per (head, 64 query rows); Q's and dO's fragments
+    in registers; pass 1 the tensor rows' forward → m, 1/l and D = dO · O (dO read from its fragments: n-tile 2ks + t,
+    row A / B, is register 2t / 2t + 1 of k-step ks), stored per row in f32 (12 bytes); pass 2, 32 keys at a time: S
+    and dP by mma, dS = scale·P·(dP − D), dQ += dS·K (K by ldmatrix.trans). Keys: 4 warps per (head, 64 keys); query
+    tiles of 64 (QueryRanges) with their rows' stats and key ranges in shared, 32 queries at a time: Sᵀ = K·Qᵀ and
+    dPᵀ = V·dOᵀ (K's and V's fragments by ldmatrix from the block's tiles each step: registers kept for dK and dV),
+    dV += Pᵀ·dO, dK += dSᵀ·Q. 70.9 KB of shared (dynamic). `GpuOps.BackwardMma`, `GpuOps.MmaBackward` (false: the FMA
+    fused kernels). The forward's kernel is unchanged (its loads are repeated in MmaBackPieces, not shared).
+  - Gate (`Checks.Attentions`, device): the backward's seven shapes now three ways (default, composed, FMA fused).
+    Mutation (the lo slice dropped) fails at 22 cells (float16 dV by 70–1080 steps).
+  - Measured: see COVERAGE (the CUDA attention backward row). Errors equal to the baseline's.
+  - The coordinator's review (card-agnostic): the routes did not compare their dynamic shared memory with the device's
+    opt-in limit, and the forward's tensor rows did not ask whether the device builds them. Now
+    `GpuOps.MmaBackwardUsable` (both kernels' shared ≤ the limit, `gpu.Accepts` both, once per key in `AttnAccepts`),
+    `FusedBackwardFits` (the FMA kernels' shared ≤ the limit; else the composition), and the forward's tensor rows only
+    where they fit and are accepted. `GpuOps.AttentionSharedLimit` replaces the device's limit for the attention routes
+    only (the products' configurations are measured and cached once; forcing the device-wide limit would change them for
+    the rest of the run). Gate: a fourth device variant at 48 KB, the route (`GpuOps.BackwardRoute`) asserted against the
+    kernels' sizes: d ≤ 64 keeps the tensor (16-bit kinds) or FMA (other types) kernels, d = 120 / 128 takes the
+    composition (the FMA kernels need 71.8 / 76.7 KB there, more than the tensor ones: no limit takes the FMA route
+    from a 16-bit kind by shared memory alone; a device refusing the tensor PTX does, by `Accepts`). Mutation (the
+    tensor route ignoring the limit) fails at 8 cells: the d = 120 / 128 shapes of the four kinds.
+
 ## Item 5 progress
 
 - Done, reported (uncommitted until the coordinator's go). What landed:

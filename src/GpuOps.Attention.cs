@@ -125,6 +125,9 @@ public sealed partial class GpuOps
             }
 
             var kind = MmaRows != false ? Ptx.AttentionKind(f) : null;
+            char mLoad = f.Bits == 16 && a.D % 8 == 0 && (q | k | v) % 16 == 0 ? 'c' : f.Bits == 8 && a.D % 4 == 0 && (q | k | v) % 4 == 0 ? 'w' : 'v';
+            if (kind is not null && !(Ptx.AttentionMmaShared(dCap) <= AttnSharedLimit
+                && AttnAccepts($"attention_rows_mma:{f.Name}:{dCap}:{mLoad}", (out string e) => Ptx.AttentionRowsMma(gpu, f, kind, dCap, mLoad, out e)))) kind = null;
             if (kind is not null)
             {
                 // The tensor rows (Ptx.AttentionMma.cs): Q, K, V exact in the kind; 16-byte copies or 32-bit words where the
@@ -294,6 +297,9 @@ public sealed partial class GpuOps
         var rented = new List<ulong>();
         try
         {
+            // A format the tensor kinds hold exactly: the tensor backward (Ptx.AttentionBackMma.cs) on the stored values.
+            var kind = FusedBackward != false && MmaBackward != false && a.D <= FusedHeadMax && !f.IsBlock ? Ptx.AttentionKind(f) : null;
+            if (kind is not null && MmaBackwardUsable(f, kind, a, q, k, v, dO)) { BackwardMma(f, kind, a, q, k, v, dO, dq, dk, dv, rented); BackwardRoute = "mma"; return kind.Name + "mma"; }
             var lane = RowLane(f);
             bool own = f.Is("float32") || f.Is("float64");
             ulong lq = ToLane<TN>(q, a.QValues, rented), lk = ToLane<TN>(k, a.KValues, rented), lv = ToLane<TN>(v, a.KValues, rented), ldo = ToLane<TN>(dO, a.QValues, rented);
@@ -314,9 +320,70 @@ public sealed partial class GpuOps
     /// <summary>The gate's override: false takes the backward's composition, null the fused kernels where they apply (d ≤ 128).</summary>
     public bool? FusedBackward;
 
+    /// <summary>The gate's override: false keeps a type with a tensor kind on the FMA fused backward.</summary>
+    public bool? MmaBackward;
+
+    /// <summary>The gate's override of the device's shared-memory limit a block may opt into, for the attention routes only
+    /// (null: the device's): a kernel whose shared memory exceeds it is not taken, as on a device with that limit.</summary>
+    public int? AttentionSharedLimit;
+
+    /// <summary>The backward's last route ("mma", "fused", "composed"), for the gate.</summary>
+    public string? BackwardRoute;
+
+    private int AttnSharedLimit => AttentionSharedLimit ?? gpu.SharedOptIn;
+
+    private readonly Dictionary<string, bool> _attnAccepted = [];
+
+    // Whether the device builds a kernel (once per key; a kernel the device refuses is never launched).
+    private bool AttnAccepts(string key, Gpu.Maker make)
+    {
+        if (_attnAccepted.TryGetValue(key, out bool known)) return known;
+        string ptx = make(out string entry);
+        return _attnAccepted[key] = gpu.Accepts(ptx, entry);
+    }
+
+    // The tensor backward where both kernels' shared memory fits the limit and the device builds both.
+    private bool MmaBackwardUsable(Fmt f, Ptx.Kind kind, AttentionArgs a, ulong q, ulong k, ulong v, ulong dO)
+    {
+        int dCap = a.D <= 32 ? 32 : a.D <= 64 ? 64 : 128;
+        if (Ptx.AttentionMmaShared(dCap) > AttnSharedLimit || Ptx.AttentionBackKeysMmaShared(dCap) > AttnSharedLimit) return false;
+        char load = BackLoad(f, a, q, k, v, dO);
+        return AttnAccepts($"attention_back_rows_mma:{f.Name}:{dCap}:{load}", (out string e) => Ptx.AttentionBackRowsMma(gpu, f, kind, dCap, load, out e))
+            && AttnAccepts($"attention_back_keys_mma:{f.Name}:{dCap}:{load}", (out string e) => Ptx.AttentionBackKeysMma(gpu, f, kind, dCap, load, out e));
+    }
+
+    private static char BackLoad(Fmt f, AttentionArgs a, ulong q, ulong k, ulong v, ulong dO) =>
+        f.Bits == 16 && a.D % 8 == 0 && (q | k | v | dO) % 16 == 0 ? 'c' : f.Bits == 8 && a.D % 4 == 0 && (q | k | v | dO) % 4 == 0 ? 'w' : 'v';
+
+    // The FMA fused backward where both kernels' shared memory fits the limit (the lane's kernels build on every device).
+    private bool FusedBackwardFits(Lane lane, int d)
+    {
+        int dCap = d <= 32 ? 32 : d <= 64 ? 64 : 128;
+        return Ptx.AttentionBackRowsShared(lane, dCap) <= AttnSharedLimit && Ptx.AttentionBackKeysShared(lane, dCap) <= AttnSharedLimit;
+    }
+
+    // The tensor backward: the rows kernel (dQ, each row's m, 1/l, D in f32), then the keys kernel (dK, dV), on the stored values.
+    private void BackwardMma(Fmt f, Ptx.Kind kind, AttentionArgs a, ulong q, ulong k, ulong v, ulong dO, ulong dq, ulong dk, ulong dv, List<ulong> rented)
+    {
+        int dCap = a.D <= 32 ? 32 : a.D <= 64 ? 64 : 128;
+        ulong limits = Limits(a, rented), starts = Starts(a, rented), rowRanges = KeyRanges(a, Ptx.MmaRowsBr, rented), keyRanges = QueryRanges(a, Ptx.MmaRowsBc, rented);
+        ulong stats = gpu.Rent((long)a.Heads * a.Lq * 12);
+        rented.Add(stats);
+        char load = BackLoad(f, a, q, k, v, dO);
+        var scale = Gpu.F((float)a.Scale);
+        var fr = gpu.Cached($"attention_back_rows_mma:{f.Name}:{dCap}:{load}", (out string e) => Ptx.AttentionBackRowsMma(gpu, f, kind, dCap, load, out e));
+        Gpu.Launch(fr, (uint)((a.Lq + Ptx.MmaRowsBr - 1) / Ptx.MmaRowsBr), (uint)a.Heads, Ptx.MmaRowsThreads, 1, 0, q, k, v, dO, dq, stats, limits, starts, rowRanges, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), scale);
+        int keysShared = Ptx.AttentionBackKeysMmaShared(dCap);
+        var fk = gpu.Cached($"attention_back_keys_mma:{f.Name}:{dCap}:{load}", (out string e) => Ptx.AttentionBackKeysMma(gpu, f, kind, dCap, load, out e));
+        gpu.AllowShared(fk, keysShared);
+        Gpu.Launch(fk, (uint)((a.Lk + Ptx.MmaRowsBc - 1) / Ptx.MmaRowsBc), (uint)a.Heads, Ptx.MmaRowsThreads, 1, Dynamic(keysShared), q, k, v, dO, stats, dk, dv, limits, starts, keyRanges, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), scale);
+        Gpu.Flush();
+    }
+
     private void BackwardIn<TS>(AttentionArgs a, ulong q, ulong k, ulong v, ulong dO, ulong dq, ulong dk, ulong dv, List<ulong> rented) where TS : struct, IQiyasFloat<TS>
     {
-        if (FusedBackward != false && a.D <= FusedHeadMax) { BackwardFused<TS>(a, q, k, v, dO, dq, dk, dv, rented); return; }
+        if (FusedBackward != false && a.D <= FusedHeadMax && FusedBackwardFits(TS.Bits == 64 ? Lane.F64 : Lane.F32, a.D)) { BackwardFused<TS>(a, q, k, v, dO, dq, dk, dv, rented); BackwardRoute = "fused"; return; }
+        BackwardRoute = "composed";
         int size = TS.Bits / 8;
         long sBytes = (long)a.Lq * a.Lk * size;
         ulong p = gpu.Rent(sBytes), dp = gpu.Rent(sBytes);
