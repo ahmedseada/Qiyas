@@ -58,14 +58,28 @@ regression comparer and the baseline run.
 
 **Open, in the order they are taken:**
 
-1. The CPU int4 matmul `ArgumentOutOfRangeException` seen once in a full run, not reproduced in three targeted runs:
-   `--repeat N` repeats the matmul rows; reproduce on odd shapes and in the full run's order, or document the attempt.
-2. The regression gate for the whole stretch: `python docs/wip/compare.py docs/wip/baseline.md <new run>` over a full
-   `cuda,cpu` run (> 5 % slower or error growth = regression).
-3. The todo rows below: flash-fused attention rows, ctc, the GRU sequence bench row, the block-scaled tiled product,
+1. The regression gate for the whole stretch: `python docs/wip/compare.py docs/wip/baseline.md <new run>` over a full
+   `cuda,cpu` run (> 5 % slower or error growth = regression). To settle there: the float64 product rows' reference
+   (a sequential f64 sum, whose own rounding is ~1e-13 at 2048³) against the sliced route, which the double-double
+   proof shows exact — the row's reference should be double-double so an exact lane reads 0.
+2. The todo rows below: flash-fused attention rows, ctc, the GRU sequence bench row, the block-scaled tiled product,
    fusing the transposition into the product's packing, the radix step of scatter-add.
-4. A bump-allocated scope past the pool (buffers reserved once from the shapes; zero rents on the hot path).
-5. The known-slow list.
+3. A bump-allocated scope past the pool (buffers reserved once from the shapes; zero rents on the hot path).
+4. The known-slow list.
+
+**Settled — the CPU int4 matmul `ArgumentOutOfRangeException`.** Reproduced: `cpu --types int4 --ops matmul --repeat 30`,
+the third of three runs, at `Kernels.cs` line 306 of `ProductBody.Run` (the tile's store, the first range-checked access
+of the tile: the panel, transpose and micro-kernel before it address by reference without checks). The site is the
+thread team, not the product: `Team.Take` read the job's counter (generation, next chunk) and then the chunk count as
+two reads; a worker that read the counter at the end of job G and the chunk count after the caller had begun describing
+job G+1 (a larger count, the description half written: body pointer, invoke, sizes) could take chunk `chunks(G)` under
+that mixed description — a tile of garbage fields, and a chunk of G+1 accounted as done without running. Fixed in
+`Team.For`: a job is closed when its last chunk completes (its chunk counter set past any count), so the worker's
+exchange finds the counter changed and takes nothing. The gate `TeamJobs` (`check team`) runs 20 000 jobs (raised by
+`--repeat`) of alternating chunk counts — a chunk per thread, then 256 chunks — and requires every chunk within its job
+and every index run exactly once; it did not reproduce the window on the unfixed team in 60 000 jobs (the window is a
+few nanoseconds wide unless a thread is preempted inside it), so the fix rests on the analysis above and on the
+reproduction not recurring: 150 repeats of the int4 product after the fix.
 
 ## Known slow
 

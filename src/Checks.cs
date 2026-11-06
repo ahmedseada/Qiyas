@@ -125,7 +125,47 @@ internal static class Checks
         ok &= Recurrents(null);
         ok &= Routings(null);
         ok &= BlockFormats(null);
+        ok &= TeamJobs();
         return ok;
+    }
+
+    // ---------------------------------------------------------------- the thread team
+
+    /// <summary>The team under a run of jobs of alternating chunk counts (a few chunks, then many): every chunk a worker runs
+    /// lies within its job and every index runs exactly once. A worker late out of a job must never take a chunk of the
+    /// next job's count under the old job's description (the fault once seen as an out-of-range product tile).</summary>
+    public static bool TeamJobs()
+    {
+        int jobs = Stress * 500;
+        var hits = new int[1 << 16];
+        var bad = new int[1];
+        bool ok = true;
+        for (int j = 0; j < jobs && ok; j++)
+        {
+            // A job of a chunk per thread (every worker contending at its end), then one of many chunks.
+            int count = (j & 1) == 0 ? 4 * Team.Size : hits.Length, size = (j & 1) == 0 ? 1 : 256;
+            Array.Clear(hits, 0, count);
+            Team.For(count, size, long.MaxValue, new TeamProbe(hits, bad, count));
+            int missed = 0, twice = 0;
+            for (int i = 0; i < count; i++) { if (hits[i] == 0) missed++; else if (hits[i] > 1) twice++; }
+            if (bad[0] != 0 || missed != 0 || twice != 0)
+            {
+                Console.WriteLine($"check team                   cpu    job {j} of {count} in chunks of {size}: {bad[0]} chunks outside the job, {missed} indices missed, {twice} run twice");
+                ok = false;
+            }
+        }
+
+        if (ok) Console.WriteLine($"check team                   cpu    {jobs} jobs of alternating chunk counts: every chunk within its job, every index once");
+        return ok;
+    }
+
+    private readonly struct TeamProbe(int[] hits, int[] bad, int count) : Team.IBody
+    {
+        public void Run(int first, int last)
+        {
+            if (first < 0 || last > count || first >= last) { Interlocked.Increment(ref bad[0]); return; }
+            for (int i = first; i < last; i++) Interlocked.Increment(ref hits[i]);
+        }
     }
 
     // ---------------------------------------------------------------- the block formats

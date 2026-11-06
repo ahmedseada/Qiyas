@@ -18,7 +18,8 @@ does best for it, chosen per operation from the data itself. No type is fixed an
   reference written from the format's definition, the dot lanes against scalar sums, exp against the runtime's, and
   the device's conversions against the CPU's; then every operation of every family runs over every type it applies to
   on both devices, on small odd shapes, against float64 references (`src/Checks.cs`); the block codecs against blocks
-  laid out by hand from the formats' specifications. The bench refuses to time while any gate fails.
+  laid out by hand from the formats' specifications; the thread team under 20 000 jobs of alternating chunk counts
+  (every chunk within its job, every index once). The bench refuses to time while any gate fails.
 - **The operation surface.** `COVERAGE.md` is the list, one row per operation with the lane rule on each device:
   element-wise formulas and their backward passes; reductions, broadcasts, transposes, gemv; the row family
   (softmax, log_softmax, the norms and their backward passes, rope, masked softmax, cross-entropy's backward); layout
@@ -110,7 +111,7 @@ checkout (files listed in `.gitignore`); a clone runs the other subjects.
 | `src/Layout.cs`, `src/Ptx.Layout.cs`, `src/GpuOps.Layout.cs`, `src/Bench/LayoutCases.cs` | layout and indexing: the references, the CPU kernels, the device kernels, the gate's and the bench's cases |
 | `src/Reduce.cs`, `src/Ptx.Reduce.cs` | reductions (sum, sum of squares, max, min, argmax: whole, rows, columns), row-vector broadcasts, transpose, gemv: the CPU kernels, the device kernels |
 | `src/Functions.cs` | log, sin, cos, expm1, tanh, sigmoid, erf, erfc on vectors: coefficient tables shared with the device emitter |
-| `src/Team.cs` | the CPU thread team |
+| `src/Team.cs` | the CPU thread team (jobs closed on completion, so a late worker never takes a chunk under the next job's half-written description) |
 | `src/Gpu.cs`, `src/Ptx.cs`, `src/GpuOps.cs` | the CUDA side: driver binding, PTX generation, the operations |
 | `src/Checks.cs` | the proofs |
 | `src/CpuGeneric.cs`, `src/GenericPtx.cs` | the `INumberBase<T>` version (the `number` column) |

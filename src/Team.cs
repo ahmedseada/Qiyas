@@ -5,7 +5,9 @@
 // spinning workers first, and a waiting worker sits at a lower priority so that whatever else must run takes a
 // spinner's core rather than a working thread's. Nothing allocates per job: the body is passed by address and called through a function
 // pointer of its type, and the body is read only by a worker that has taken a chunk, so it is never read after the
-// caller returns.
+// caller returns. A job is closed when its last chunk completes (its chunk counter set past any count), so a worker
+// that read the old generation's counter and then the next job's chunk count cannot take a chunk under a description
+// half overwritten (seen once as an out-of-range product tile).
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
@@ -80,6 +82,9 @@ internal static unsafe class Team
 
             var spin = new SpinWait();
             while (Volatile.Read(ref s_done) < chunks) spin.SpinOnce(-1);
+            // The job closed: its next chunk set past any count, so a worker that read this job's generation before the
+            // next job is described can take nothing under that description (its exchange finds the counter changed).
+            Interlocked.Exchange(ref s_state, (long)generation << 32 | int.MaxValue);
             s_body = null;
             s_error?.Throw();
         }
