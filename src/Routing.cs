@@ -6,8 +6,9 @@
 //                   from unnormalized weights with a uniform draw per row (ties and an empty row give the last column)
 //   route           for n indices into `buckets`: counts[b], offsets[b + 1] (exclusive prefix), order (the sources
 //                   grouped by bucket in source order): the expert placement of a router
-//   cross_entropy   the composition log_softmax → pick_rows (the loss per row, negated by the caller); its backward is
-//                   the row operation cross_entropy_bwd (softmax(x) − one_hot(target)) in Rows.cs
+//   cross_entropy   the loss per row from logits and a target per row: log Σ exp(x[r]) − x[r][t[r]], one pass over the
+//                   row (also the composition log_softmax → pick_rows, negated); its backward is the row operation
+//                   cross_entropy_bwd (softmax(x) − one_hot(target)) in Rows.cs
 using System.Buffers;
 using System.Runtime.InteropServices;
 
@@ -33,6 +34,21 @@ public static class Routing
     {
         var y = new double[rows];
         for (int r = 0; r < rows; r++) y[r] = x[r * cols + index[r]];
+        return y;
+    }
+
+    /// <summary>The cross-entropy loss per row in float64: max + log Σ exp(x − max) − x[target].</summary>
+    public static double[] CrossEntropyReference(double[] x, int rows, int cols, int[] targets)
+    {
+        var y = new double[rows];
+        for (int r = 0; r < rows; r++)
+        {
+            double m = double.NegativeInfinity, sum = 0;
+            for (int c = 0; c < cols; c++) m = Math.Max(m, x[r * cols + c]);
+            for (int c = 0; c < cols; c++) sum += Math.Exp(x[r * cols + c] - m);
+            y[r] = m + Math.Log(sum) - x[r * cols + targets[r]];
+        }
+
         return y;
     }
 
@@ -193,6 +209,56 @@ internal static partial class Kernels
             var one = new TLane[1];
             for (int r = 0; r < rows; r++) { TN.Load(x, r * cols + index[r], one.AsSpan(0, 1)); picked[r] = one[0]; }
             TN.Store(picked, output, 0);
+        }
+    }
+
+    /// <summary>loss[r] = log Σ exp(x[r]) − x[r][t[r]] as the type, in the type's float lane: a row's max, its Σ exp(x − max),
+    /// then (max − x[t]) + log Σ.</summary>
+    public static string CrossEntropy<TN>(byte[] x, int rows, int cols, int[] targets, byte[] output) where TN : struct, IQiyasFloat<TN>
+    {
+        var v = new CrossEntropyVisitor(x, rows, cols, targets, output);
+        TN.Float(ref v);
+        return v.Lane;
+    }
+
+    private struct CrossEntropyVisitor(byte[] x, int rows, int cols, int[] targets, byte[] output) : IFloatLaneVisitor
+    {
+        public string Lane = "";
+
+        public void Run<TN, TLane, TL>() where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+        {
+            Lane = TL.Name;
+            var losses = new TLane[rows];
+            Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)rows * cols * 4, new CrossEntropyBody<TN, TLane, TL>(x, cols, targets, losses));
+            TN.Store(losses, output, 0);
+        }
+    }
+
+    private struct CrossEntropyBody<TN, TLane, TL>(byte[] x, int cols, int[] targets, TLane[] losses) : Team.IBody
+        where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+    {
+        public readonly void Run(int first, int last)
+        {
+            var pool = ArrayPool<TLane>.Shared;
+            var row = TN.Direct ? null : pool.Rent(cols);
+            var e = pool.Rent(cols);
+            try
+            {
+                for (int r = first; r < last; r++)
+                {
+                    ReadOnlySpan<TLane> xs;
+                    if (TN.Direct) xs = MemoryMarshal.Cast<byte, TLane>(x.AsSpan()).Slice(r * cols, cols);
+                    else { TN.Load(x, r * cols, row.AsSpan(0, cols)); xs = row.AsSpan(0, cols); }
+                    TLane m = RowMath<TLane, TL>.Max(xs);
+                    TLane sum = RowMath<TLane, TL>.ExpSum(xs, m, e.AsSpan(0, cols));
+                    losses[r] = TL.Add(TL.Sub(m, xs[targets[r]]), RowMath<TLane, TL>.Log(sum));
+                }
+            }
+            finally
+            {
+                if (row is not null) pool.Return(row);
+                pool.Return(e);
+            }
         }
     }
 

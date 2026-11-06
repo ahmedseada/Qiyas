@@ -426,6 +426,10 @@ internal static class Checks
                 int off = 0;
                 for (int r = 0; r < rows; r++) if (Math.Abs(picks[r] - wantS[r]) > 1) off++;
                 if (off > 0) { Console.WriteLine($"check sample        {where,-6} {type,-12} DIFFERS at {off} rows by more than one column"); ok = false; }
+                // The cross-entropy loss per row: the type's step at the loss plus the lane's rounding of a sum of cols terms.
+                var loss = new byte[Bench.Registry.Bytes(type, rows)];
+                using (var ce = new Bench.QiyasSubject().CrossEntropy(ops is null ? Bench.Device.Cpu : Bench.Device.Cuda, type, x, rows, cols, index, loss)!) { ce.Run(); ce.Collect(); }
+                ok &= Close(type, "cross_entropy", where, loss, Routing.CrossEntropyReference(xv, rows, cols, index), rows, terms: cols);
             }
         }
 
@@ -463,7 +467,7 @@ internal static class Checks
             if (!counts.SequenceEqual(wc) || !offsets.SequenceEqual(wo) || !order.SequenceEqual(worder)) { Console.WriteLine($"check route {n} into {buckets} ({kind}) {where,-6} DIFFERS"); ok = false; }
         }
 
-        if (ok) Console.WriteLine($"check routing                {where,-6} every type: top-k, pick, sampling (float types) and the route as the references (also 1M into 64, 1 000 003 into 100 000, all into one, descending into 65 536)");
+        if (ok) Console.WriteLine($"check routing                {where,-6} every type: top-k, pick, sampling and the cross-entropy loss (float types) and the route as the references (also 1M into 64, 1 000 003 into 100 000, all into one, descending into 65 536)");
         return ok;
     }
 

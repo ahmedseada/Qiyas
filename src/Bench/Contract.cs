@@ -101,6 +101,10 @@ public interface IBenchSubject
     /// <summary>top-k of each row of x (rows × cols): values (rows × k, as the type) and indices (s32), largest first.</summary>
     IBenchRun? TopK(Device device, string type, byte[] x, int rows, int cols, int k, byte[] values, int[] indices) => null;
 
+    /// <summary>loss[r] = log Σ exp(x[r]) − x[r][targets[r]] as the type (the cross-entropy of each row's logits; null: the
+    /// bench composes log_softmax, pick and neg).</summary>
+    IBenchRun? CrossEntropy(Device device, string type, byte[] x, int rows, int cols, int[] targets, byte[] loss) => null;
+
     /// <summary>output[r] = x[r][index[r]] as the type.</summary>
     IBenchRun? Pick(Device device, string type, byte[] x, int rows, int cols, int[] index, byte[] output) => null;
 

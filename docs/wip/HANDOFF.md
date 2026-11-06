@@ -263,6 +263,19 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
   Possible later: the whole sums' chunk pass with word loads too (6b's float16 0.025 → 0.032 is the same per-value
   load cost).
 
+- 6d (the device cross_entropy round trips): done, reported. A fused loss per row on both devices: contract
+  `CrossEntropy(device, type, x, rows, cols, targets, loss)` (null: the bench composes log_softmax, pick, neg — the lib
+  column's way); CPU `Kernels.CrossEntropy` (src/Routing.cs: per row Max, ExpSum, (max − x[t]) + log Σ in the float
+  lane); device `GpuOps.CrossEntropy` → `Ptx.CrossEntropyRows` (a block per row, any length, one pass: each thread's
+  running (m, s) with one exp a value, e = exp(−|x − m|), `MaxSumStep`; the threads' pairs joined by the same rule in
+  `BlockReduceMaxSum`; block formats through f32 lane storage); the reference moved to
+  `Routing.CrossEntropyReference`. Gate: `check routing` (both devices, every float type, 37 × 1001) adds the loss
+  against float64 (`Close` with terms = cols); mutation (the join never rescales): float32 1.9M steps, fails. Measured
+  (qiyas, against item 4's baseline): CUDA float32 95.1 → 0.646 ms, float16 47.8 → 0.640, bfloat16 46.8 → 0.642,
+  float8_e4m3 18.7 → 0.672, float64 175 → 12.8, q8_0 31.7 → 3.06, q4_k 24.6 → 2.08; CPU float32 21.9 → 11.6, float16
+  18.1 → 13.1, float64 46.0 → 36.1, q8_0 59.8 → 14.2. Errors equal or below (q8_0 1.25e-1 → 6.42e-2, q4_k 9.02e-1 →
+  5.44e-1). The device float32 and float16 rows are near the bandwidth (float32 512 MB) and the exp rate (float16).
+
 ## Item 5 progress
 
 - Done, reported (uncommitted until the coordinator's go). What landed:
@@ -670,6 +683,7 @@ Each: measure against the baseline cell, change, re-measure (the full run or the
   32768 — the row chains three subject runs through host arrays (`Program.cs` RoutingRow "cross_entropy"), so the
   device time is the 512 MB upload of logp and the downloads, not the kernels (log_softmax alone 0.075 ms float16).
   Give the contract a device-resident chaining (or a fused cross-entropy loss row on both devices) and re-measure.
+  Done in 6d (the fused loss row).
 - GRU sequence backward (the owner's rule for open timing questions, from its piece): 4.5–6× the forward on both
   devices where the products imply ~4× (float32 device 12.4–15.8 ms vs 2.55–2.76; CPU 102–114 vs 21–22; two runs).
   Per step `GruStepBackward` recomputes gx, gh that the forward recompute already made, and dW, dU, db, dbh are summed by

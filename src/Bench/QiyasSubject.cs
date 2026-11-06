@@ -149,6 +149,24 @@ public sealed class QiyasSubject : IBenchSubject
     public IBenchRun? Pick(Device device, string type, byte[] x, int rows, int cols, int[] index, byte[] output) =>
         Registry.With(type, new PickVisitor(device, x, rows, cols, index, output));
 
+    public IBenchRun? CrossEntropy(Device device, string type, byte[] x, int rows, int cols, int[] targets, byte[] loss) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new CrossEntropyVisitor(device, x, rows, cols, targets, loss)) : null;
+
+    private sealed class CrossEntropyVisitor(Device device, byte[] x, int rows, int cols, int[] targets, byte[] loss) : IFloatTypeVisitor<IBenchRun?>
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float>
+        {
+            string lane = "";
+            if (device == Device.Cpu) return new BenchRun(() => lane = Kernels.CrossEntropy<TN>(x, rows, cols, targets, loss), lane: () => lane);
+            var ops = Devices.Ops;
+            var gpu = ops.Gpu;
+            ulong dx = gpu.Rent(x.Length), dt = gpu.Rent(targets.Length * 4L), dl = gpu.Rent(loss.Length);
+            Gpu.Upload<byte>(x, dx); Gpu.Upload<int>(targets, dt);
+            return new BenchRun(() => { lane = ops.CrossEntropy<TN>(dx, rows, cols, dt, dl); Gpu.Synchronize(); },
+                () => Gpu.Download<byte>(dl, loss), () => { gpu.Return(dx); gpu.Return(dt); gpu.Return(dl); }, () => lane);
+        }
+    }
+
     public IBenchRun? Ctc(Device device, string type, CtcArgs a, byte[] logits, byte[] loss, byte[]? grad) =>
         Registry.IsFloat(type) ? Registry.WithFloat(type, new CtcVisitor(device, a, logits, loss, grad)) : null;
 

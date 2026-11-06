@@ -54,6 +54,31 @@ public sealed partial class GpuOps
         return f.Natural.Name;
     }
 
+    /// <summary>loss[r] = log Σ exp(x[r]) − x[r][t[r]] as the type (t: s32 targets), in the type's float lane: a block per row.</summary>
+    public string CrossEntropy<TN>(ulong x, int rows, int cols, ulong targets, ulong output) where TN : struct, IQiyasNumber<TN>
+    {
+        var f = Fmt.Of<TN>();
+        if (f.IsBlock)
+        {
+            var r = new List<ulong>();
+            try
+            {
+                ulong lx = Lanes(f, Lane.F32, x, (long)rows * cols, r), lo = gpu.Rent(rows * 4L);
+                r.Add(lo);
+                CrossEntropy<Float32>(lx, rows, cols, targets, lo);
+                Back(f, Lane.F32, lo, output, rows);
+                return "f32 (blocks through lane storage)";
+            }
+            finally { foreach (var q in r) gpu.Return(q); }
+        }
+
+        var lane = RowLane(f);
+        var fn = gpu.Cached($"cross_entropy:{f.Name}", (out string e) => Ptx.CrossEntropyRows(gpu, f, lane, out e));
+        if (f.Bits < 8) Gpu.Clear(output, f.Words(rows) * 4);
+        Gpu.Launch(fn, (uint)rows, 1, Ptx.ReduceThreads, 1, 0, x, targets, output, Gpu.U(cols));
+        return lane.Name;
+    }
+
     /// <summary>The sampled column of each row from weights x and a uniform draw u per row (as the type); in the float lane.</summary>
     public string Sample<TN>(ulong x, int rows, int cols, ulong u, ulong picks) where TN : struct, IQiyasNumber<TN>
     {

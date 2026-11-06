@@ -423,21 +423,15 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
                 if (!Registry.IsFloat(type)) return;
                 var x = Registry.Make(type, rows * cols, 95, -4, 4);
                 var targets = Enumerable.Range(0, rows).Select(_ => random.Next(cols)).ToArray();
-                var xv = Registry.Values(type, x, rows * cols);
-                var want = new double[rows];
-                for (int r = 0; r < rows; r++)
-                {
-                    double m = double.NegativeInfinity, sum = 0;
-                    for (int c = 0; c < cols; c++) m = Math.Max(m, xv[r * cols + c]);
-                    for (int c = 0; c < cols; c++) sum += Math.Exp(xv[r * cols + c] - m);
-                    want[r] = m + Math.Log(sum) - xv[r * cols + targets[r]];
-                }
-
+                var want = Routing.CrossEntropyReference(Registry.Values(type, x, rows * cols), rows, cols, targets);
                 var logp = new byte[x.Length];
                 var op = RowOps.Find("log_softmax");
                 var neg = Qiyas.Ops.Find("neg");
                 Measure(device, name, type, $"{rows}x{cols}", want, (s, o) =>
                 {
+                    // The subject's own loss per row where it has one; else the composition.
+                    var fused = s.CrossEntropy(device, type, x, rows, cols, targets, o);
+                    if (fused is not null) return fused;
                     // log_softmax, pick at the target, negate: three of the subject's runs timed as one.
                     var a = s.RowOp(device, op, type, x, null, null, null, null, null, logp, null, rows, cols, 0, 0);
                     var b = s.Pick(device, type, logp, rows, cols, targets, o);

@@ -172,6 +172,139 @@ internal static partial class Ptx
         return (rv, ra);
     }
 
+    /// <summary>loss[r] = log Σ_c exp(x[r][c]) − x[r][t[r]] (the cross-entropy of the row's logits at its target), a block per
+    /// row, any row length, stored as the type: one pass, each thread's running max m and Σ exp(x − m) (a larger value
+    /// rescales the sum: one exp a value, e = exp(−|x − m|)), the threads' pairs joined by the same rule, then
+    /// (m − x[t]) + log Σ.</summary>
+    public static string CrossEntropyRows(Gpu gpu, Fmt f, Lane lane, out string entry)
+    {
+        entry = $"cross_entropy_rows_{f.Name}_{lane.Name}";
+        var b = new PtxBuilder();
+        string tid = b.R(), row = b.R();
+        b.L($"mov.u32 {tid}, %tid.x;");
+        b.L($"mov.u32 {row}, %ctaid.x;");
+        string x = Param64(b, "p_x"), tp = Param64(b, "p_t"), outp = Param64(b, "p_out"), cols = Param32(b, "p_cols");
+        string start = b.R(), i = b.R(), idx = b.R(), pEnd = b.P();
+        b.L($"mul.lo.u32 {start}, {row}, {cols};");
+        // The running pair starts at the lane's lowest finite value (not −∞: m − M stays finite when both are empty).
+        string m = lane.NewReg(b), s = lane.NewReg(b);
+        b.L($"mov.{lane.Reg} {m}, {Lowest(lane)};");
+        b.L($"mov.{lane.Reg} {s}, {lane.Zero};");
+        b.L($"mov.u32 {i}, {tid};");
+        b.Label("LOOP");
+        b.L($"setp.ge.u32 {pEnd}, {i}, {cols};");
+        b.L($"@{pEnd} bra DONE;");
+        b.L($"add.u32 {idx}, {start}, {i};");
+        string v = Codec.UnpackAt(b, f, x, idx, lane);
+        MaxSumStep(b, lane, m, s, v, null);
+        b.L($"add.u32 {i}, {i}, {ReduceThreads};");
+        b.L("bra LOOP;");
+        b.Label("DONE");
+        var (bm, bs) = BlockReduceMaxSum(b, lane, tid, m, s, ReduceThreads);
+        string p0 = b.P();
+        b.L($"setp.ne.u32 {p0}, {tid}, 0;");
+        b.L($"@{p0} bra OUT;");
+        string ta = b.RD(), t = b.R(), ti = b.R();
+        b.L($"mul.wide.u32 {ta}, {row}, 4;");
+        b.L($"add.u64 {ta}, {tp}, {ta};");
+        b.L($"ld.global.u32 {t}, [{ta}];");
+        b.L($"add.u32 {ti}, {start}, {t};");
+        string xt = Codec.UnpackAt(b, f, x, ti, lane), d = lane.NewReg(b), loss = lane.NewReg(b);
+        b.L($"sub.rn.{lane.Op} {d}, {bm}, {xt};");
+        string ls = Fn.Log(b, lane, bs);
+        b.L($"add.rn.{lane.Op} {loss}, {d}, {ls};");
+        StoreAnyValue(b, f, lane, loss, outp, row);
+        b.Label("OUT");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_t, .param .u64 p_out, .param .u32 p_cols", ReduceBytes * 2);
+    }
+
+    private static string Lowest(Lane lane) => lane.Literal(lane.Wide ? -double.MaxValue : -float.MaxValue);
+
+    // (m, s) joined with a value v (sv = null: s gains exp(v − m)) or with another pair (v, sv): the larger max kept, the
+    // other side's sum scaled by e = exp(−|v − m|) — one exp.
+    private static void MaxSumStep(PtxBuilder b, Lane lane, string m, string s, string v, string? sv)
+    {
+        string d = lane.NewReg(b), e = lane.NewReg(b), up = lane.NewReg(b), keep = lane.NewReg(b), pGt = b.P();
+        b.L($"sub.rn.{lane.Op} {d}, {v}, {m};");
+        b.L($"setp.gt.{lane.Op} {pGt}, {d}, {lane.Zero};");
+        b.L($"abs.{lane.Op} {e}, {d};");
+        b.L($"neg.{lane.Op} {e}, {e};");
+        string ex = Codec.Exp(b, lane, e);
+        string other = sv ?? lane.Literal(1);
+        // v larger: s·e + the other's sum, m = v; else s + the other's sum·e.
+        b.L(lane.Fma(up, s, ex, other));
+        b.L(lane.Fma(keep, other, ex, s));
+        b.L($"selp.{lane.Op} {s}, {up}, {keep}, {pGt};");
+        b.L($"max.{lane.Op} {m}, {m}, {v};");
+    }
+
+    // The block's join of the threads' (m, s) pairs: butterflies within each warp, the warps' pairs through shared memory
+    // (two slots each), the first warp's butterfly over those; the result read by all.
+    private static (string M, string S) BlockReduceMaxSum(PtxBuilder b, Lane lane, string tid, string m, string s, int threads)
+    {
+        int warps = threads / 32, size = lane.Size;
+        string tag = $"REDMS{b.P().TrimStart('%')}";
+        void Shfl(string dst, string src, int off)
+        {
+            if (lane.Wide)
+            {
+                string lo = b.R(), hi = b.R(), lo2 = b.R(), hi2 = b.R();
+                b.L($"mov.b64 {{{lo}, {hi}}}, {src};");
+                b.L($"shfl.sync.bfly.b32 {lo2}, {lo}, {off}, 0x1f, 0xffffffff;");
+                b.L($"shfl.sync.bfly.b32 {hi2}, {hi}, {off}, 0x1f, 0xffffffff;");
+                b.L($"mov.b64 {dst}, {{{lo2}, {hi2}}};");
+            }
+            else
+            {
+                string bits = b.R(), bits2 = b.R();
+                b.L($"mov.b32 {bits}, {src};");
+                b.L($"shfl.sync.bfly.b32 {bits2}, {bits}, {off}, 0x1f, 0xffffffff;");
+                b.L($"mov.b32 {dst}, {bits2};");
+            }
+        }
+
+        void Warp()
+        {
+            for (int off = 16; off >= 1; off /= 2)
+            {
+                string om = lane.NewReg(b), os = lane.NewReg(b);
+                Shfl(om, m, off);
+                Shfl(os, s, off);
+                MaxSumStep(b, lane, m, s, om, os);
+            }
+        }
+
+        Warp();
+        string smem = b.R(), laneId = b.R(), warp = b.R(), slot = b.R(), p0 = b.P();
+        b.L($"mov.u32 {smem}, smem;");
+        b.L($"and.b32 {laneId}, {tid}, 31;");
+        b.L($"shr.u32 {warp}, {tid}, 5;");
+        b.L($"mad.lo.u32 {slot}, {warp}, {2 * size}, {smem};");
+        b.L($"setp.ne.u32 {p0}, {laneId}, 0;");
+        b.L($"@!{p0} st.shared.{lane.Mem} [{slot}], {m};");
+        b.L($"@!{p0} st.shared.{lane.Mem} [{slot}+{size}], {s};");
+        b.L("bar.sync 0;");
+        string pw = b.P(), pl = b.P(), mine = b.R();
+        b.L($"setp.ne.u32 {pw}, {warp}, 0;");
+        b.L($"@{pw} bra {tag}_SKIP;");
+        b.L($"setp.lt.u32 {pl}, {laneId}, {warps};");
+        b.L($"mad.lo.u32 {mine}, {laneId}, {2 * size}, {smem};");
+        b.L($"mov.{lane.Reg} {m}, {Lowest(lane)};");
+        b.L($"mov.{lane.Reg} {s}, {lane.Zero};");
+        b.L($"@{pl} ld.shared.{lane.Mem} {m}, [{mine}];");
+        b.L($"@{pl} ld.shared.{lane.Mem} {s}, [{mine}+{size}];");
+        Warp();
+        b.L($"@!{p0} st.shared.{lane.Mem} [{smem}+{64 * size}], {m};");
+        b.L($"@!{p0} st.shared.{lane.Mem} [{smem}+{65 * size}], {s};");
+        b.Label($"{tag}_SKIP");
+        b.L("bar.sync 0;");
+        string rm = lane.NewReg(b), rs = lane.NewReg(b);
+        b.L($"ld.shared.{lane.Mem} {rm}, [{smem}+{64 * size}];");
+        b.L($"ld.shared.{lane.Mem} {rs}, [{smem}+{65 * size}];");
+        return (rm, rs);
+    }
+
     /// <summary>out[r] = x[r][index[r]], a thread per row, stored as the type (value-wise).</summary>
     public static string PickRows(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
