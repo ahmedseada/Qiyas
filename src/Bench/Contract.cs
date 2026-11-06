@@ -125,6 +125,11 @@ public interface IBenchSubject
     /// <summary>A GRU sequence of T steps (x: T × B × D; h0; W, U, b, bh as the step's; h out: T × B × H).</summary>
     IBenchRun? GruSequence(Device device, string type, CellArgs a, int T, byte[] x, byte[] h0, byte[] w, byte[] u, byte[] b, byte[] bh, byte[] hOut) => null;
 
+    /// <summary>The GRU sequence's backward: from dhOut (T × B × H, the loss's gradient at every step) the gradients dx (T × B × D),
+    /// dh0 (B × H), dw, du, db, dbh (summed over the steps).</summary>
+    IBenchRun? GruSequenceBackward(Device device, string type, CellArgs a, int T, byte[] x, byte[] h0, byte[] w, byte[] u, byte[] b, byte[] bh, byte[] dhOut,
+        byte[] dx, byte[] dh0, byte[] dw, byte[] du, byte[] db, byte[] dbh) => null;
+
     /// <summary>A recurrent step (CellArgs: lstm or gru): h' (and c' for LSTM) from x, h (, c) and the weights W (GH × D), U (GH × H),
     /// b (GH), bh (GRU's second bias, GH); when dx is given the backward pass instead: hOut (, cOut) are then dh', dc', and the
     /// gradients go to dx, dh, dc, dw, du, db, dbh.</summary>

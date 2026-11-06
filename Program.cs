@@ -108,7 +108,7 @@ internal sealed class Options
     public static readonly string[] Group5 = ["attention", "attention_causal", "attention_fused", "attention_fused_causal", "attention_decode", "attention_bwd"];
     public static readonly string[] Group7 = [.. OptimizerArgs.Names.Select(n => "optimizer:" + n)];
     public static readonly string[] Group6 = ["conv", "conv_bwd"];
-    public static readonly string[] Group8 = ["lstm_step", "gru_step", "lstm_step_bwd", "gru_step_bwd", "lstm_seq", "lstm_seq_bwd", "gru_seq"];
+    public static readonly string[] Group8 = ["lstm_step", "gru_step", "lstm_step_bwd", "gru_step_bwd", "lstm_seq", "lstm_seq_bwd", "gru_seq", "gru_seq_bwd"];
     public static readonly string[] Group9 = ["topk_rows", "pick_rows", "sample_rows", "route", "route_wide", "cross_entropy", "ctc", "ctc_bwd"];
     public List<string>? Subjects;
     public string? Baseline;
@@ -488,6 +488,24 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             double[] V(byte[] s, int n) => Registry.Values(type, s, n);
             var wantH = RecurrentCase.GruSequenceReference(ga, T, V(x, T * ga.B * ga.D), V(h0, ga.B * ga.H), V(w, GH * ga.D), V(u, GH * ga.H), V(b, GH), V(bh, GH));
             Measure(device, name, type, $"T{T} B{ga.B} D{ga.D} H{ga.H}", wantH, (s, hOut) => s.GruSequence(device, type, ga, T, x, h0, w, u, b, bh, hOut), (int)Registry.Bytes(type, T * ga.B * ga.H));
+            return;
+        }
+
+        if (name == "gru_seq_bwd")
+        {
+            // The GRU sequence's backward at gru_seq's shape (dx scored; dh0, dW, dU, db, dbh computed too); the block formats too.
+            var ga = new CellArgs("gru", Prime(256), Prime(512), Prime(512));
+            const int T = 16;
+            int GH = ga.Gates * ga.H;
+            double sc = 1 / Math.Sqrt(ga.D + ga.H);
+            var x = Registry.Make(type, T * ga.B * ga.D, 91, -1, 1); var h0 = Registry.Make(type, ga.B * ga.H, 92, -1, 1);
+            var w = Registry.Make(type, GH * ga.D, 94, -sc, sc); var u = Registry.Make(type, GH * ga.H, 95, -sc, sc);
+            var b = Registry.Make(type, GH, 96, -0.1, 0.1); var bh = Registry.Make(type, GH, 97, -0.1, 0.1);
+            var dhOut = Registry.Make(type, T * ga.B * ga.H, 98, -1, 1);
+            double[] V(byte[] s, int n) => Registry.Values(type, s, n);
+            var (wdx, _, _, _, _, _) = RecurrentCase.GruSequenceBackwardReference(ga, T, V(x, T * ga.B * ga.D), V(h0, ga.B * ga.H), V(w, GH * ga.D), V(u, GH * ga.H), V(b, GH), V(bh, GH), V(dhOut, T * ga.B * ga.H));
+            var dh0 = new byte[h0.Length]; var dw = new byte[w.Length]; var du = new byte[u.Length]; var db = new byte[b.Length]; var dbh = new byte[bh.Length];
+            Measure(device, name, type, $"T{T} B{ga.B} D{ga.D} H{ga.H}", wdx, (s, dx) => s.GruSequenceBackward(device, type, ga, T, x, h0, w, u, b, bh, dhOut, dx, dh0, dw, du, db, dbh), x.Length);
             return;
         }
 

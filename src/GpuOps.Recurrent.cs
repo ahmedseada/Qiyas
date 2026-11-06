@@ -373,6 +373,72 @@ public sealed partial class GpuOps
         }
     }
 
+    /// <summary>The GRU sequence's backward on the device: dx, dh0, dW, dU, db, dbh from dh per step (the forward recomputed;
+    /// the weights' gradients summed over the steps); a narrower type or a block format through its lane's storage.</summary>
+    public string GruSequenceBackward<TN>(CellArgs a, int T, ulong x, ulong h0, ulong w, ulong u, ulong bias, ulong biasH, ulong dhOut, ulong dx, ulong dh0, ulong dw, ulong du, ulong db, ulong dbh) where TN : struct, IQiyasNumber<TN>
+    {
+        var f = Fmt.Of<TN>();
+        if (!OwnLane(f))
+        {
+            var ln = RowLane(f);
+            var rented2 = new List<ulong>();
+            try
+            {
+                long bd = (long)a.B * a.D, bh = (long)a.B * a.H, GH = a.Gates * a.H;
+                ulong R2(long n) { ulong p = gpu.Rent(n * ln.Size); rented2.Add(p); return p; }
+                ulong ldx = R2(T * bd), ldh0 = R2(bh), ldw = R2(GH * a.D), ldu = R2(GH * a.H), ldb = R2(GH), ldbh = R2(GH);
+                ulong lx = ToLane<TN>(x, T * bd, rented2), lh0 = ToLane<TN>(h0, bh, rented2), lw = ToLane<TN>(w, GH * a.D, rented2), lu = ToLane<TN>(u, GH * a.H, rented2), lb = ToLane<TN>(bias, GH, rented2), lbh = ToLane<TN>(biasH, GH, rented2), ldho = ToLane<TN>(dhOut, T * bh, rented2);
+                string name = ln.Wide ? GruSequenceBackward<Float64>(a, T, lx, lh0, lw, lu, lb, lbh, ldho, ldx, ldh0, ldw, ldu, ldb, ldbh) : GruSequenceBackward<Float32>(a, T, lx, lh0, lw, lu, lb, lbh, ldho, ldx, ldh0, ldw, ldu, ldb, ldbh);
+                FromLane<TN>(ldx, dx, T * bd); FromLane<TN>(ldh0, dh0, bh); FromLane<TN>(ldw, dw, GH * a.D); FromLane<TN>(ldu, du, GH * a.H); FromLane<TN>(ldb, db, GH); FromLane<TN>(ldbh, dbh, GH);
+                return f.IsBlock ? $"{name} (blocks through lane storage)" : name;
+            }
+            finally
+            {
+                foreach (var p in rented2) gpu.Return(p);
+            }
+        }
+
+        if (f.IsBlock || ((long)a.B * a.D * f.Bits % 8 != 0) || ((long)a.B * a.H * f.Bits % 8 != 0)) throw new NotSupportedException($"{f.Name}: a sequence's steps must end on a byte");
+        long xStep = (long)a.B * a.D * f.Bits / 8, hStep = (long)a.B * a.H * f.Bits / 8;
+        long dwBytes = f.Words((long)a.Gates * a.H * a.D) * (f.WordBits / 8), duBytes = f.Words((long)a.Gates * a.H * a.H) * (f.WordBits / 8), dbBytes = f.Words(a.Gates * a.H) * (f.WordBits / 8);
+        ulong hs = gpu.Rent(hStep * T + 4);
+        var rented = new List<ulong> { hs };
+        ulong R(long n) { ulong p = gpu.Rent(n); rented.Add(p); return p; }
+        try
+        {
+            ulong hPrev = h0;
+            for (int t = 0; t < T; t++)
+            {
+                ulong ht = hs + (ulong)(t * hStep);
+                GruStep<TN>(a, x + (ulong)(t * xStep), hPrev, w, u, bias, biasH, ht);
+                hPrev = ht;
+            }
+
+            ulong dhNext = R(hStep + 4), dht = R(hStep + 4), dhp = R(hStep + 4), dwt = R(dwBytes), dut = R(duBytes), dbt = R(dbBytes), dbht = R(dbBytes);
+            Gpu.Clear(dhNext, hStep);
+            Gpu.Clear(dw, dwBytes); Gpu.Clear(du, duBytes); Gpu.Clear(db, dbBytes); Gpu.Clear(dbh, dbBytes);
+            var add = Qiyas.Ops.Find("add");
+            string lane = "";
+            for (int t = T - 1; t >= 0; t--)
+            {
+                Map<TN>(add, dhOut + (ulong)(t * hStep), dhNext, 0, dht, (int)((long)a.B * a.H), 0, 0);
+                lane = GruStepBackward<TN>(a, x + (ulong)(t * xStep), t == 0 ? h0 : hs + (ulong)((t - 1) * hStep), w, u, bias, biasH, dht, dx + (ulong)(t * xStep), dhp, dwt, dut, dbt, dbht);
+                Map<TN>(add, dw, dwt, 0, dw, (int)((long)a.Gates * a.H * a.D), 0, 0);
+                Map<TN>(add, du, dut, 0, du, (int)((long)a.Gates * a.H * a.H), 0, 0);
+                Map<TN>(add, db, dbt, 0, db, a.Gates * a.H, 0, 0);
+                Map<TN>(add, dbh, dbht, 0, dbh, a.Gates * a.H, 0, 0);
+                Gpu.Copy(dhp, dhNext, hStep);
+            }
+
+            Gpu.Copy(dhNext, dh0, hStep);
+            return lane;
+        }
+        finally
+        {
+            foreach (var p in rented) gpu.Return(p);
+        }
+    }
+
     /// <summary>A GRU step: h' from x, h and W (3H × D), U (3H × H), b (3H), bh (3H); a narrow float's in its lane's storage.</summary>
     public string GruStep<TN>(CellArgs a, ulong x, ulong h, ulong w, ulong u, ulong bias, ulong biasH, ulong hOut) where TN : struct, IQiyasNumber<TN>
     {

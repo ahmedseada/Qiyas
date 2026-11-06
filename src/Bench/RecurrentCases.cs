@@ -99,6 +99,38 @@ public sealed class RecurrentCase
         return (dx, dhNext, dcNext, dw, du, db);
     }
 
+    /// <summary>The GRU sequence's backward in float64, from dh per step (T × B × H): dx (T × B × D), dh0, dW, dU, db, dbh
+    /// (summed over the steps). Per step: gx = x·Wᵀ + b, gh = h·Uᵀ + bh; the cell's backward gives dgx, dgh and its direct dh;
+    /// dx = dgx·W, dW += dgxᵀ·x, db += Σ dgx; dh_prev = dh_cell + dgh·U, dU += dghᵀ·h, dbh += Σ dgh.</summary>
+    public static (double[] DX, double[] DH0, double[] DW, double[] DU, double[] DB, double[] DBH) GruSequenceBackwardReference(CellArgs a, int T, double[] x, double[] h0, double[] w, double[] u, double[] b, double[] bh, double[] dhOut)
+    {
+        int bd = a.B * a.D, bhn = a.B * a.H, GH = a.Gates * a.H;
+        var hs = GruSequenceReference(a, T, x, h0, w, u, b, bh);
+        var dx = new double[T * bd]; var dw = new double[GH * a.D]; var du = new double[GH * a.H]; var db = new double[GH]; var dbh = new double[GH];
+        var dhNext = new double[bhn];
+        for (int t = T - 1; t >= 0; t--)
+        {
+            var xt = x.AsSpan(t * bd, bd).ToArray();
+            var hPrev = t == 0 ? h0 : hs.AsSpan((t - 1) * bhn, bhn).ToArray();
+            var (gx, gh) = Gates(a, xt, hPrev, w, u, b, bh);
+            var dht = new double[bhn];
+            for (int i = 0; i < bhn; i++) dht[i] = dhOut[t * bhn + i] + dhNext[i];
+            var dgx = new double[gx.Length]; var dgh = new double[gx.Length]; var dhp = new double[bhn];
+            a.GruCellBackward(gx, gh, hPrev, dht, dgx, dgh, dhp);
+            for (int bb = 0; bb < a.B; bb++) for (int k = 0; k < GH; k++)
+            {
+                double v = dgx[(long)bb * GH + k], v2 = dgh[(long)bb * GH + k];
+                for (int d = 0; d < a.D; d++) { dx[t * bd + bb * a.D + d] += v * w[k * a.D + d]; dw[k * a.D + d] += v * xt[bb * a.D + d]; }
+                for (int j = 0; j < a.H; j++) { dhp[bb * a.H + j] += v2 * u[k * a.H + j]; du[k * a.H + j] += v2 * hPrev[bb * a.H + j]; }
+                db[k] += v; dbh[k] += v2;
+            }
+
+            dhNext = dhp;
+        }
+
+        return (dx, dhNext, dw, du, db, dbh);
+    }
+
     public static RecurrentCase Make(CellArgs a, string type, bool backward)
     {
         bool lstm = a.Kind == "lstm";

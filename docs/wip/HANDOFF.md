@@ -155,7 +155,9 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
     full run.
 - 4d committed as a784145 (the coordinator: keep AggressiveOptimization; the full run settles the ~10 %).
 - 2 steps left in item 4 after 4g: the GRU sequence backward (below), then item 4's full run.
-- 4g: done, reported as its own boundary (uncommitted until the coordinator's go). What landed:
+- GRU sequence backward: done, reported as its own boundary (uncommitted until the coordinator's go). See its entry
+  below. 1 step left in item 4: the full run.
+- 4g: done, committed as d9939ff. What landed:
   - CPU: `Kernels.Operands.ImageB` (a ConvArgs): `PackBody` builds each row of the columns from the image
     (`ImageRow`: row p = (c, kh, kw), an image row read in place or loaded once, stride 1 by a contiguous copy with the
     padding cleared, otherwise gathered) — the micro-kernel, A and C untouched. `Kernels.Conv` takes it where
@@ -244,6 +246,23 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
   the way the LSTM sequence backward is (float64 reference looped over the steps, gate in `Checks.Recurrents` on every
   float type incl. blocks, contract method, bench row `gru_seq_bwd` in Group8). "A complete core cannot leave it out."
   When it lands, COVERAGE's GRU sequences row stops saying the backward is not provided.
+  Done. What landed:
+  - `RecurrentCase.GruSequenceBackwardReference(a, T, x, h0, w, u, b, bh, dhOut)` → (dx, dh0, dW, dU, db, dbh): the
+    forward by `GruSequenceReference`, then per step back: dh_t = dhOut[t] + the next step's dh; the step's gates;
+    `CellArgs.GruCellBackward` → dgx, dgh, the cell's direct dh; dx_t = dgx·W, dW += dgxᵀ·x_t, db += Σ dgx; dh_prev =
+    dh_cell + dgh·U, dU += dghᵀ·h_prev, dbh += Σ dgh. The gate checks it against central differences of the forward
+    reference (loss Σ dhOut · h, every input, T 3, B 2, D 3, H 4, worst ≤ 1e-7).
+  - `Kernels.GruSequenceBackward<TN>` (src/Recurrent.cs) and `GpuOps.GruSequenceBackward<TN>`
+    (src/GpuOps.Recurrent.cs): the LSTM sequence backward's shape with `GruStepBackward` per step and dbh summed too; a
+    narrower type or a block format widened once (lane storage; on the device block formats included, as the GRU
+    forward).
+  - contract `IBenchSubject.GruSequenceBackward(device, type, a, T, x, h0, w, u, b, bh, dhOut, dx, dh0, dw, du, db,
+    dbh)` (default null), `QiyasSubject.GruSequenceBackwardVisitor`; gate in `Checks.Recurrents` (3 steps of 5 × 7 →
+    11, every float type incl. blocks, both devices, all six gradients); bench row `gru_seq_bwd` (dx scored).
+  - mutation (dh's carry from the next step dropped): the CPU gate fails 55 checks, the device gate 55, on every float type.
+  - measured `cuda,cpu --subjects qiyas --ops gru_seq,gru_seq_bwd` (new rows, no before), float32: device 15.8 / 12.4 ms
+    (two runs), f16 12.7 / 14.3, f64 111, q8_0 12.7; CPU 114 / 102, f16 119 / 89, f64 214, q8_0 97. 4.5–6× the forward:
+    a Known slow row and item 6 below.
 
 ## Item 4a — flash-fused attention rows
 
@@ -495,7 +514,13 @@ Each: measure against the baseline cell, change, re-measure (the full run or the
   run and flipped the conv choice. Time `SlicedFaster` by `Measure.Faster`; consider the image packed straight into the
   sliced route's digits (`Ptx.SliceColumns` reading through the conv index map) so float64 conv is fused there too.
 - CPU recurrent sequences (the coordinator's observation at 4c): gru_seq 65–71 ms, lstm_seq 83 ms against ~15–20 ms
-  implied by the f32 product rate (COVERAGE Known slow).
+  implied by the f32 product rate (COVERAGE Known slow). The GRU sequence backward piece's runs read CPU gru_seq float32
+  at 20.7 and 22.1 ms (after 4e's in-place products): re-measure lstm_seq too; the row may be done.
+- GRU sequence backward (the owner's rule for open timing questions, from its piece): 4.5–6× the forward on both
+  devices where the products imply ~4× (float32 device 12.4–15.8 ms vs 2.55–2.76; CPU 102–114 vs 21–22; two runs).
+  Per step `GruStepBackward` recomputes gx, gh that the forward recompute already made, and dW, dU, db, dbh are summed by
+  separate `Map add`s (CPU: fresh arrays per step). Re-measure; if it holds, keep the forward's gates (T × B × 3H each)
+  and accumulate the weights' gradients in place (the products' C += form), for the LSTM sequence backward too.
 
 ## End of item 6 — the final readiness check (the owner's addition)
 

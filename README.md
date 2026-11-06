@@ -36,7 +36,7 @@ does best for it, chosen per operation from the data itself. No type is fixed an
   and indexing (strided copies, one-hot, gathers, scatter-add, im2col/col2im, interpolation, shift, pad, the pools and
   their backward, depthwise convolution); products on views (transposed, batched) and the matmul backward; attention
   (rows by the composition or the fused rows, whichever is measured faster; causal, spans, decode, backward); convolution forward and backward; the optimizer steps; LSTM and GRU cells and
-  steps with their backward passes, LSTM sequences with theirs, GRU sequences; top-k, pick, sampling, routing, cross-entropy and ctc (loss and
+  steps with their backward passes, LSTM and GRU sequences with theirs; top-k, pick, sampling, routing, cross-entropy and ctc (loss and
   gradient); and the block formats and bool
   through all of it. What is still open is listed in COVERAGE.md's "State" and marked **todo** in its rows.
 
@@ -74,7 +74,7 @@ at its end with `--report`. A single name works too
 named in the lane column); `conv` adds `conv` and `conv_bwd` (a 64 × 128 × 128 image by 128 filters of 3 × 3); the
 pools and the depthwise convolution are layout operations (`layout:maxpool`, `layout:avgpool`, their `_bwd`,
 `layout:adaptive_maxpool`, `layout:adaptive_avgpool`, `layout:depthwise_conv`); `recurrent` adds `lstm_step`, `gru_step`
-and their `_bwd` (a batch of 1024, input 1024, hidden 1024), `lstm_seq`, `lstm_seq_bwd` and `gru_seq` (16 steps of 256 × 512 → 512); `routing` adds `topk_rows`, `pick_rows`, `sample_rows`
+and their `_bwd` (a batch of 1024, input 1024, hidden 1024), `lstm_seq`, `lstm_seq_bwd`, `gru_seq` and `gru_seq_bwd` (16 steps of 256 × 512 → 512); `routing` adds `topk_rows`, `pick_rows`, `sample_rows`
 (4096 rows of 32768), `route` (1M indices into 64 buckets), `route_wide` (1M into 65 536), `cross_entropy` (the loss by log_softmax, pick, neg), and
 `ctc`, `ctc_bwd` (256 frames of 32 sequences over 1024 classes, 64 labels each; the loss scored, then the gradient).
 `COVERAGE.md` lists every operation with its lane rule on each device. The block formats and bool run through every

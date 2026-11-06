@@ -582,7 +582,66 @@ internal static class Checks
             ok &= Close(type, "gru_seq h", where, hOut, wantH, T * a.B * a.H, T * (a.D + a.H));
         }
 
-        if (ok) Console.WriteLine($"check recurrent              {where,-6} every float type: LSTM and GRU steps, forward and backward, LSTM sequences and their backward, GRU sequences (block formats too), within the products' rounding");
+        // The GRU sequence backward's reference against central differences of the forward reference (the formula, independently
+        // of any kernel): the loss Σ dhOut · h over every step, its gradient in every input (x, h0, W, U, b, bh).
+        {
+            var a = new CellArgs("gru", 2, 3, 4);
+            const int T = 3;
+            int GH = a.Gates * a.H;
+            double[] R(int n, int seed, double lo, double hi) => Bench.Registry.Values("float64", Bench.Registry.Make("float64", n, seed, lo, hi), n);
+            var ins = new[] { R(T * a.B * a.D, 91, -1, 1), R(a.B * a.H, 92, -1, 1), R(GH * a.D, 94, -0.5, 0.5), R(GH * a.H, 95, -0.5, 0.5), R(GH, 96, -0.1, 0.1), R(GH, 97, -0.1, 0.1) };
+            var dhOut = R(T * a.B * a.H, 98, -1, 1);
+            var g = Bench.RecurrentCase.GruSequenceBackwardReference(a, T, ins[0], ins[1], ins[2], ins[3], ins[4], ins[5], dhOut);
+            var grads = new[] { g.DX, g.DH0, g.DW, g.DU, g.DB, g.DBH };
+            double Loss()
+            {
+                var hs = Bench.RecurrentCase.GruSequenceReference(a, T, ins[0], ins[1], ins[2], ins[3], ins[4], ins[5]);
+                double s = 0;
+                for (int i = 0; i < hs.Length; i++) s += dhOut[i] * hs[i];
+                return s;
+            }
+
+            double worst = 0;
+            for (int v = 0; v < ins.Length; v++) for (int i = 0; i < ins[v].Length; i++)
+            {
+                const double step = 1e-5;
+                double keep = ins[v][i];
+                ins[v][i] = keep + step; double up = Loss();
+                ins[v][i] = keep - step; double down = Loss();
+                ins[v][i] = keep;
+                worst = Math.Max(worst, Math.Abs((up - down) / (2 * step) - grads[v][i]));
+            }
+
+            if (worst > 1e-7) { Console.WriteLine($"check gru_seq_bwd reference: the gradient differs from the loss's differences by {worst:R}"); ok = false; }
+        }
+
+        // GRU sequence backward: 3 steps of 5 × 7 → 11 (dx, dh0, dW, dU, db, dbh), every float type, the block formats through lane storage.
+        foreach (var type in Bench.Registry.Names)
+        {
+            if (!Bench.Registry.IsFloat(type)) continue;
+            var a = new CellArgs("gru", 5, 7, 11);
+            const int T = 3;
+            int GH = a.Gates * a.H;
+            double scale = 1 / Math.Sqrt(a.D + a.H);
+            var x = Bench.Registry.Make(type, T * a.B * a.D, 91, -1, 1); var h0 = Bench.Registry.Make(type, a.B * a.H, 92, -1, 1);
+            var w = Bench.Registry.Make(type, GH * a.D, 94, -scale, scale); var u = Bench.Registry.Make(type, GH * a.H, 95, -scale, scale);
+            var b = Bench.Registry.Make(type, GH, 96, -0.1, 0.1); var bh = Bench.Registry.Make(type, GH, 97, -0.1, 0.1);
+            var dhOut = Bench.Registry.Make(type, T * a.B * a.H, 98, -1, 1);
+            double[] V(byte[] s, int n) => Bench.Registry.Values(type, s, n);
+            var (wdx, wdh0, wdw, wdu, wdb, wdbh) = Bench.RecurrentCase.GruSequenceBackwardReference(a, T, V(x, T * a.B * a.D), V(h0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH), V(bh, GH), V(dhOut, T * a.B * a.H));
+            var dx = new byte[x.Length]; var dh0 = new byte[h0.Length]; var dw = new byte[w.Length]; var du = new byte[u.Length]; var db = new byte[b.Length]; var dbh = new byte[bh.Length];
+            var dev = ops is null ? Bench.Device.Cpu : Bench.Device.Cuda;
+            using (var run = new Bench.QiyasSubject().GruSequenceBackward(dev, type, a, T, x, h0, w, u, b, bh, dhOut, dx, dh0, dw, du, db, dbh)!) { run.Run(); run.Collect(); }
+            int terms = 8 * T * (a.D + a.H + GH + a.B);
+            ok &= Close(type, "gru_seq_bwd dx", where, dx, wdx, T * a.B * a.D, terms);
+            ok &= Close(type, "gru_seq_bwd dh0", where, dh0, wdh0, a.B * a.H, terms);
+            ok &= Close(type, "gru_seq_bwd dw", where, dw, wdw, GH * a.D, terms);
+            ok &= Close(type, "gru_seq_bwd du", where, du, wdu, GH * a.H, terms);
+            ok &= Close(type, "gru_seq_bwd db", where, db, wdb, GH, terms);
+            ok &= Close(type, "gru_seq_bwd dbh", where, dbh, wdbh, GH, terms);
+        }
+
+        if (ok) Console.WriteLine($"check recurrent              {where,-6} every float type: LSTM and GRU steps, forward and backward, LSTM sequences and their backward, GRU sequences and their backward (block formats too; the backward's reference by central differences), within the products' rounding");
         return ok;
     }
 

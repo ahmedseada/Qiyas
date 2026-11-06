@@ -276,6 +276,30 @@ public sealed class QiyasSubject : IBenchSubject
         }
     }
 
+    public IBenchRun? GruSequenceBackward(Device device, string type, CellArgs a, int T, byte[] x, byte[] h0, byte[] w, byte[] u, byte[] b, byte[] bh, byte[] dhOut,
+        byte[] dx, byte[] dh0, byte[] dw, byte[] du, byte[] db, byte[] dbh) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new GruSequenceBackwardVisitor(device, a, T, x, h0, w, u, b, bh, dhOut, dx, dh0, dw, du, db, dbh)) : null;
+
+    private sealed class GruSequenceBackwardVisitor(Device device, CellArgs a, int T, byte[] x, byte[] h0, byte[] w, byte[] u, byte[] b, byte[] bh, byte[] dhOut,
+        byte[] dx, byte[] dh0, byte[] dw, byte[] du, byte[] db, byte[] dbh) : IFloatTypeVisitor<IBenchRun?>
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float>
+        {
+            string lane = "";
+            if (device == Device.Cpu) return new BenchRun(() => lane = Kernels.GruSequenceBackward<TN>(a, T, x, h0, w, u, b, bh, dhOut, dx, dh0, dw, du, db, dbh), lane: () => lane);
+            var ops = Devices.Ops;
+            var gpu = ops.Gpu;
+            var rented = new List<ulong>();
+            ulong Up(byte[] array) { ulong d = gpu.Rent(array.Length + 4); rented.Add(d); Gpu.Upload<byte>(array, d); return d; }
+            ulong Out(byte[] array) { ulong d = gpu.Rent(array.Length + 4); rented.Add(d); return d; }
+            ulong dX = Up(x), dH0 = Up(h0), dW = Up(w), dU = Up(u), dB = Up(b), dBh = Up(bh), dHo = Up(dhOut);
+            ulong gx = Out(dx), gh0 = Out(dh0), gw = Out(dw), gu = Out(du), gb = Out(db), gbh = Out(dbh);
+            return new BenchRun(() => { lane = ops.GruSequenceBackward<TN>(a, T, dX, dH0, dW, dU, dB, dBh, dHo, gx, gh0, gw, gu, gb, gbh); Gpu.Synchronize(); },
+                () => { Gpu.Download<byte>(gx, dx); Gpu.Download<byte>(gh0, dh0); Gpu.Download<byte>(gw, dw); Gpu.Download<byte>(gu, du); Gpu.Download<byte>(gb, db); Gpu.Download<byte>(gbh, dbh); },
+                () => { foreach (var p in rented) gpu.Return(p); }, () => lane);
+        }
+    }
+
     private sealed class SequenceVisitor(Device device, CellArgs a, int T, byte[] x, byte[] h0, byte[] c0, byte[] w, byte[] u, byte[] b, byte[] hOut, byte[] cOut,
         byte[]? dx, byte[]? dh0, byte[]? dc0, byte[]? dw, byte[]? du, byte[]? db) : IFloatTypeVisitor<IBenchRun?>
     {

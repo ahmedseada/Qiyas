@@ -529,6 +529,56 @@ internal static partial class Kernels
         return lane;
     }
 
+    /// <summary>The GRU sequence's backward: from dh (T × B × H, the loss's gradient at every step): dx (T × B × D), dh0, dW, dU,
+    /// db, dbh (summed over the steps). The forward's h are recomputed from h0; a narrower type or a block format widened once.</summary>
+    public static string GruSequenceBackward<TN>(CellArgs a, int T, byte[] x, byte[] h0, byte[] w, byte[] u, byte[] bias, byte[] biasH, byte[] dhOut, byte[] dx, byte[] dh0, byte[] dw, byte[] du, byte[] db, byte[] dbh) where TN : struct, IQiyasFloat<TN>
+    {
+        long bd = (long)a.B * a.D, bh = (long)a.B * a.H;
+        if (!OwnLane<TN>())
+        {
+            long GH = a.Gates * a.H;
+            var ldx = LOut<TN>(T * bd); var ldh0 = LOut<TN>(bh); var ldw = LOut<TN>(GH * a.D); var ldu = LOut<TN>(GH * a.H); var ldb = LOut<TN>(GH); var ldbh = LOut<TN>(GH);
+            string name = TN.Bits == 64
+                ? GruSequenceBackward<Float64>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), L<TN>(dhOut, T * bh), ldx, ldh0, ldw, ldu, ldb, ldbh)
+                : GruSequenceBackward<Float32>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), L<TN>(dhOut, T * bh), ldx, ldh0, ldw, ldu, ldb, ldbh);
+            FromLane<TN>(ldx, dx, T * bd); FromLane<TN>(ldh0, dh0, bh); FromLane<TN>(ldw, dw, GH * a.D); FromLane<TN>(ldu, du, GH * a.H); FromLane<TN>(ldb, db, GH); FromLane<TN>(ldbh, dbh, GH);
+            return name;
+        }
+
+        int xBytes = (int)TN.Bytes(bd), hBytes = (int)TN.Bytes(bh);
+        var hs = new byte[T][];
+        var hPrev = h0;
+        for (int t = 0; t < T; t++)
+        {
+            var xt = new byte[xBytes]; Array.Copy(x, (long)t * xBytes, xt, 0, xBytes);
+            hs[t] = new byte[hBytes];
+            GruStep<TN>(a, xt, hPrev, w, u, bias, biasH, hs[t]);
+            hPrev = hs[t];
+        }
+
+        var dhNext = new byte[hBytes];
+        var dwSum = new byte[dw.Length]; var duSum = new byte[du.Length]; var dbSum = new byte[db.Length]; var dbhSum = new byte[dbh.Length];
+        string lane = "";
+        for (int t = T - 1; t >= 0; t--)
+        {
+            var xt = new byte[xBytes]; Array.Copy(x, (long)t * xBytes, xt, 0, xBytes);
+            var dht = new byte[hBytes]; Array.Copy(dhOut, (long)t * hBytes, dht, 0, hBytes);
+            Map<TN>("add", dht, dhNext, null, dht, (int)bh, 0, 0);                        // the loss's gradient plus the next step's
+            var dxt = new byte[xBytes]; var dhp = new byte[hBytes];
+            var dwt = new byte[dw.Length]; var dut = new byte[du.Length]; var dbt = new byte[db.Length]; var dbht = new byte[dbh.Length];
+            lane = GruStepBackward<TN>(a, xt, t == 0 ? h0 : hs[t - 1], w, u, bias, biasH, dht, dxt, dhp, dwt, dut, dbt, dbht);
+            Array.Copy(dxt, 0, dx, (long)t * xBytes, xBytes);
+            Map<TN>("add", dwSum, dwt, null, dwSum, (int)(a.Gates * a.H * (long)a.D), 0, 0);
+            Map<TN>("add", duSum, dut, null, duSum, (int)(a.Gates * a.H * (long)a.H), 0, 0);
+            Map<TN>("add", dbSum, dbt, null, dbSum, a.Gates * a.H, 0, 0);
+            Map<TN>("add", dbhSum, dbht, null, dbhSum, a.Gates * a.H, 0, 0);
+            dhNext = dhp;
+        }
+
+        dhNext.CopyTo(dh0, 0); dwSum.CopyTo(dw, 0); duSum.CopyTo(du, 0); dbSum.CopyTo(db, 0); dbhSum.CopyTo(dbh, 0);
+        return lane;
+    }
+
     /// <summary>A GRU step: h' from x, h and W (3H × D), U (3H × H), b (3H), bh (3H).</summary>
     public static string GruStep<TN>(CellArgs a, byte[] x, byte[] h, byte[] w, byte[] u, byte[] bias, byte[] biasH, byte[] hOut) where TN : struct, IQiyasFloat<TN>
     {
