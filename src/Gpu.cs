@@ -64,6 +64,7 @@ internal static unsafe partial class Driver
     public const int FunctionAttributeMaxThreadsPerBlock = 0;
 
     public const int AttributeMultiprocessors = 16, AttributeMajor = 75, AttributeMinor = 76, AttributeSharedPerBlock = 8, AttributeSharedOptIn = 97;
+    public const int AttributeThreadsPerMultiprocessor = 39;
     public const int FunctionAttributeMaxDynamicShared = 8;
     public const int JitErrorLogBuffer = 5, JitErrorLogBufferSizeBytes = 6;
 
@@ -97,6 +98,8 @@ public sealed unsafe partial class Gpu : IDisposable
         int optIn = shared;
         if (Driver.cuDeviceGetAttribute(out int optInValue, Driver.AttributeSharedOptIn, device) == 0) optIn = Math.Max(shared, optInValue);
         SharedOptIn = optIn;
+        // The threads a multiprocessor holds at once (2048 assumed where the driver does not say).
+        ThreadsPerMultiprocessor = Driver.cuDeviceGetAttribute(out int perSm, Driver.AttributeThreadsPerMultiprocessor, device) == 0 && perSm > 0 ? perSm : 2048;
         var name = stackalloc byte[256];
         Driver.Check(Driver.cuDeviceGetName(name, 256, device), "cuDeviceGetName");
         Name = Marshal.PtrToStringAnsi((IntPtr)name) ?? "cuda";
@@ -108,6 +111,9 @@ public sealed unsafe partial class Gpu : IDisposable
     public string Name { get; }
 
     public int Multiprocessors { get; }
+
+    /// <summary>The most threads a multiprocessor holds resident, as the device reports.</summary>
+    public int ThreadsPerMultiprocessor { get; }
 
     /// <summary>The compute capability the device reports, as major·10 + minor.</summary>
     public int Capability { get; }

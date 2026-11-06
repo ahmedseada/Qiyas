@@ -138,6 +138,48 @@ internal static partial class Ptx
         return (i, valid, key, digit);
     }
 
+    /// <summary>Item 6j: a one-pass sort's scanned table (targets ≤ 256: the digit is the target) as the route's counts and
+    /// offsets — offsets[t] = table[t · tiles] (target t's first place), offsets[targets] = n, counts[t] the difference.
+    /// No atomics (the counts were 1M atomics on 64 counters).</summary>
+    public static string RadixTableOffsets(Gpu gpu, out string entry)
+    {
+        entry = "radix_table_offsets";
+        var b = new PtxBuilder();
+        string tid = b.R(), bid = b.R(), i = b.R();
+        b.L($"mov.u32 {tid}, %tid.x;");
+        b.L($"mov.u32 {bid}, %ctaid.x;");
+        b.L($"mad.lo.u32 {i}, {bid}, 256, {tid};");
+        string table = Param64(b, "p_table"), counts = Param64(b, "p_counts"), offsets = Param64(b, "p_offsets"), targets = Param32(b, "p_targets"), tiles = Param32(b, "p_tiles"), n = Param32(b, "p_n");
+        string pPast = b.P(), pLast = b.P(), oa = b.RD();
+        b.L($"setp.gt.u32 {pPast}, {i}, {targets};");
+        b.L($"@{pPast} bra DONE;");
+        b.L($"mul.wide.u32 {oa}, {i}, 4;");
+        b.L($"add.u64 {oa}, {offsets}, {oa};");
+        b.L($"setp.eq.u32 {pLast}, {i}, {targets};");
+        b.L($"@{pLast} st.global.u32 [{oa}], {n};");
+        b.L($"@{pLast} bra DONE;");
+        string at = b.R(), ta = b.RD(), start = b.R(), next = b.R(), pIn = b.P(), i1 = b.R(), at2 = b.R(), ta2 = b.RD(), ca = b.RD(), count = b.R();
+        b.L($"mul.lo.u32 {at}, {i}, {tiles};");
+        b.L($"mul.wide.u32 {ta}, {at}, 4;");
+        b.L($"add.u64 {ta}, {table}, {ta};");
+        b.L($"ld.global.u32 {start}, [{ta}];");
+        b.L($"add.u32 {i1}, {i}, 1;");
+        b.L($"setp.lt.u32 {pIn}, {i1}, {targets};");
+        b.L($"mov.u32 {next}, {n};");
+        b.L($"mul.lo.u32 {at2}, {i1}, {tiles};");
+        b.L($"mul.wide.u32 {ta2}, {at2}, 4;");
+        b.L($"add.u64 {ta2}, {table}, {ta2};");
+        b.L($"@{pIn} ld.global.u32 {next}, [{ta2}];");
+        b.L($"st.global.u32 [{oa}], {start};");
+        b.L($"sub.u32 {count}, {next}, {start};");
+        b.L($"mul.wide.u32 {ca}, {i}, 4;");
+        b.L($"add.u64 {ca}, {counts}, {ca};");
+        b.L($"st.global.u32 [{ca}], {count};");
+        b.Label("DONE");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_table, .param .u64 p_counts, .param .u64 p_offsets, .param .u32 p_targets, .param .u32 p_tiles, .param .u32 p_n");
+    }
+
     /// <summary>table[digit · tiles + tile] = the count of digit ((key >> shift) &amp; 255) among the tile's 2048 keys.</summary>
     public static string RadixCount(Gpu gpu, out string entry)
     {

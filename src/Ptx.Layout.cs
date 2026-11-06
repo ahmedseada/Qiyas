@@ -10,8 +10,16 @@ internal static partial class Ptx
     private const string LayoutParams = ".param .u64 p_x, .param .u64 p_x2, .param .u64 p_idx, .param .u64 p_aux, .param .u64 p_out, .param .u32 p_count, .param .u32 p_rows, .param .u32 p_cols, "
         + ".param .u32 p_p0, .param .u32 p_p1, .param .u32 p_p2, .param .u32 p_p3, .param .u32 p_p4, .param .u32 p_p5, .param .u32 p_p6, .param .u32 p_p7, .param .u32 p_p8, .param .u32 p_p9, .param .u32 p_p10, .param .u32 p_p11";
 
-    public static string Layout(Gpu gpu, Fmt f, Lane lane, string name, out string entry)
+    public static string Layout(Gpu gpu, Fmt f, Lane lane, string name, out string entry) => Layout(gpu, f, lane, name, false, out entry);
+
+    /// <summary>perValue (a packed 32-bit word of 2, 4, 8, 16 or 32 values; GpuOps.LayoutPerValue): a thread per output
+    /// value, not per word, the word's values joined by the word's lanes (shfl.sync, a group of Per lanes a word) and
+    /// stored by its first: Per times the threads for an output too small to fill the device (an adaptive pool's few
+    /// windows).</summary>
+    public static string Layout(Gpu gpu, Fmt f, Lane lane, string name, bool perValue, out string entry)
     {
+        if (perValue && !PerValueFits(f)) throw new NotSupportedException($"{f.Name}: a thread per value takes a word of 2 to 32 whole values");
+        if (perValue) return LayoutPerValue(gpu, f, lane, name, out entry);
         entry = $"layout_{name}_{f.Name}_{lane.Name}";
         var b = new PtxBuilder();
         string tid = b.R(), bid = b.R(), word = b.R();
@@ -52,6 +60,159 @@ internal static partial class Ptx
         b.L($"mul.wide.u32 {addr}, {word}, {f.WordBits / 8};");
         b.L($"add.u64 {addr}, {outp}, {addr};");
         b.L($"st.global.{(f.WordBits == 64 ? "b64" : "b32")} [{addr}], {code};");
+        b.Label("DONE");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, LayoutParams);
+    }
+
+    /// <summary>A format the per-value layout kernel packs: whole values filling a 32-bit word, 2 to 32 of them.</summary>
+    public static bool PerValueFits(Fmt f) => !f.IsBlock && f.WordBits == 32 && f.Per >= 2 && f.Per * f.Bits == 32;
+
+    private static string LayoutPerValue(Gpu gpu, Fmt f, Lane lane, string name, out string entry)
+    {
+        entry = $"layout_{name}_{f.Name}_{lane.Name}_v";
+        var b = new PtxBuilder();
+        string tid = b.R(), bid = b.R(), at = b.R();
+        b.L($"mov.u32 {tid}, %tid.x;");
+        b.L($"mov.u32 {bid}, %ctaid.x;");
+        b.L($"mad.lo.u32 {at}, {bid}, 256, {tid};");
+        string x = Param64(b, "p_x"), x2 = Param64(b, "p_x2"), idx = Param64(b, "p_idx"), aux = Param64(b, "p_aux"), outp = Param64(b, "p_out");
+        string count = Param32(b, "p_count"), cols = Param32(b, "p_cols");
+        var p = new string[12];
+        for (int k = 0; k < 12; k++) p[k] = Param32(b, $"p_p{k}");
+        // Every launched thread runs to the shuffles (a warp's lanes all take part); past the count a thread computes the
+        // last value (dropped) and past the last word stores nothing.
+        string words = b.R(), word = b.R(), slot = b.R(), last = b.R(), v = b.R(), pv = b.P(), pw = b.P(), r = b.R(), c = b.R(), t = b.R();
+        b.L($"add.u32 {words}, {count}, {f.Per - 1};");
+        b.L($"div.u32 {words}, {words}, {f.Per};");
+        b.L($"shr.u32 {word}, {at}, {System.Numerics.BitOperations.Log2((uint)f.Per)};");
+        b.L($"and.b32 {slot}, {at}, {f.Per - 1};");
+        b.L($"sub.u32 {last}, {count}, 1;");
+        b.L($"setp.lt.u32 {pv}, {at}, {count};");
+        b.L($"min.u32 {v}, {at}, {last};");
+        b.L($"div.u32 {r}, {v}, {cols};");
+        b.L($"mul.lo.u32 {t}, {r}, {cols};");
+        b.L($"sub.u32 {c}, {v}, {t};");
+        var natural = f.Natural;
+        string value = LayoutValue(b, f, lane, name, x, x2, idx, aux, p, cols, v, r, c, 0);
+        string stored = lane == natural ? value : Codec.Convert(b, lane, value, natural, f);
+        string kept = natural.NewReg(b), code = b.R(), shift = b.R();
+        b.L($"selp.{natural.Reg} {kept}, {stored}, {natural.Zero}, {pv};");
+        b.L($"mov.b32 {code}, 0;");
+        Codec.Pack(b, f, kept, natural, 0, code);                    // the value's bits low in the word, the rest 0
+        b.L($"mul.lo.u32 {shift}, {slot}, {f.Bits};");
+        b.L($"shl.b32 {code}, {code}, {shift};");
+        for (int off = f.Per / 2; off >= 1; off /= 2)
+        {
+            string other = b.R();
+            b.L($"shfl.sync.bfly.b32 {other}, {code}, {off}, 0x1f, 0xffffffff;");
+            b.L($"or.b32 {code}, {code}, {other};");
+        }
+
+        string pFirst = b.P(), addr = b.RD();
+        b.L($"setp.ne.u32 {pFirst}, {slot}, 0;");
+        b.L($"setp.ge.or.u32 {pw}, {word}, {words}, {pFirst};");
+        b.L($"@{pw} bra DONE;");
+        b.L($"mul.wide.u32 {addr}, {word}, 4;");
+        b.L($"add.u64 {addr}, {outp}, {addr};");
+        b.L($"st.global.b32 [{addr}], {code};");
+        b.Label("DONE");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, LayoutParams);
+    }
+
+    /// <summary>The max-pool backward's first largest of every window of the forward input (p_x2), a thread per window
+    /// (p_count windows, in the output's order): its index into the input, 0xFFFFFFFF for a window with no pixel, into
+    /// p_out (u32). The backward then reads each window's choice (LayoutValue) instead of scanning every window a pixel
+    /// lies in; compared in the backward's lane, as the scan was.</summary>
+    public static string LayoutWindowArgmax(Gpu gpu, Fmt f, Lane lane, string name, out string entry)
+    {
+        if (name is not ("maxpool_bwd" or "adaptive_maxpool_bwd")) throw new NotSupportedException($"window first largest of {name}");
+        bool adaptive = name == "adaptive_maxpool_bwd";
+        entry = $"layout_argmax_{name}_{f.Name}_{lane.Name}";
+        var b = new PtxBuilder();
+        string tid = b.R(), bid = b.R(), i = b.R(), pd = b.P();
+        b.L($"mov.u32 {tid}, %tid.x;");
+        b.L($"mov.u32 {bid}, %ctaid.x;");
+        b.L($"mad.lo.u32 {i}, {bid}, 256, {tid};");
+        string x2 = Param64(b, "p_x2"), outp = Param64(b, "p_out"), count = Param32(b, "p_count");
+        var p = new string[12];
+        for (int k = 0; k < 12; k++) p[k] = Param32(b, $"p_p{k}");
+        b.L($"setp.ge.u32 {pd}, {i}, {count};");
+        b.L($"@{pd} bra DONE;");
+        string H = p[1], W = p[2], OH = adaptive ? p[3] : PoolHeight(b, p, false), OW = adaptive ? p[4] : PoolWidth(b, p, false);
+        string ow = b.R(), oh = b.R(), ch = b.R(), t = b.R(), h0 = b.R(), kh = b.R(), w0 = b.R(), kw = b.R();
+        b.L($"rem.u32 {ow}, {i}, {OW};");
+        b.L($"div.u32 {t}, {i}, {OW};");
+        b.L($"rem.u32 {oh}, {t}, {OH};");
+        b.L($"div.u32 {ch}, {t}, {OH};");
+        if (adaptive)
+        {
+            // [floor(i*n/o), ceil((i + 1)*n/o)) along each axis.
+            void Span(string o, string n, string outs, string start, string len)
+            {
+                string e = b.R();
+                b.L($"mul.lo.u32 {start}, {o}, {n};");
+                b.L($"div.u32 {start}, {start}, {outs};");
+                b.L($"add.u32 {e}, {o}, 1;");
+                b.L($"mul.lo.u32 {e}, {e}, {n};");
+                b.L($"add.u32 {e}, {e}, {outs};");
+                b.L($"sub.u32 {e}, {e}, 1;");
+                b.L($"div.u32 {e}, {e}, {outs};");
+                b.L($"sub.u32 {len}, {e}, {start};");
+            }
+
+            Span(oh, H, OH, h0, kh);
+            Span(ow, W, OW, w0, kw);
+        }
+        else
+        {
+            // From o*s - pad over k pixels; a pixel outside the input (above or left: unsigned past H or W) is skipped.
+            b.L($"mul.lo.u32 {h0}, {oh}, {p[5]};");
+            b.L($"sub.u32 {h0}, {h0}, {p[7]};");
+            b.L($"mov.u32 {kh}, {p[3]};");
+            b.L($"mul.lo.u32 {w0}, {ow}, {p[6]};");
+            b.L($"sub.u32 {w0}, {w0}, {p[8]};");
+            b.L($"mov.u32 {kw}, {p[4]};");
+        }
+
+        string aa = b.R(), bb = b.R(), hh = b.R(), ww = b.R(), cand = b.R(), bestAt = b.R(), best = lane.NewReg(b), pa = b.P(), pb = b.P();
+        b.L($"mov.u32 {bestAt}, 0xFFFFFFFF;");
+        b.L($"mov.{lane.Reg} {best}, {ReduceIdentity(lane, "max")};");
+        b.L($"mov.u32 {aa}, 0;");
+        b.Label("WA");
+        b.L($"setp.ge.u32 {pa}, {aa}, {kh};");
+        b.L($"@{pa} bra WA_END;");
+        b.L($"add.u32 {hh}, {h0}, {aa};");
+        b.L($"setp.ge.u32 {pa}, {hh}, {H};");
+        b.L($"@{pa} bra WA_NEXT;");
+        b.L($"mov.u32 {bb}, 0;");
+        b.Label("WB");
+        b.L($"setp.ge.u32 {pb}, {bb}, {kw};");
+        b.L($"@{pb} bra WA_NEXT;");
+        b.L($"add.u32 {ww}, {w0}, {bb};");
+        b.L($"setp.ge.u32 {pb}, {ww}, {W};");
+        b.L($"@{pb} bra WB_NEXT;");
+        b.L($"mad.lo.u32 {cand}, {ch}, {H}, {hh};");
+        b.L($"mad.lo.u32 {cand}, {cand}, {W}, {ww};");
+        // The first largest in row-major order: a later value takes it only when strictly larger.
+        string xv = Codec.UnpackAt(b, f, x2, cand, lane), pFirst = b.P(), pGt = b.P();
+        b.L($"setp.eq.u32 {pFirst}, {bestAt}, 0xFFFFFFFF;");
+        b.L($"setp.gt.{lane.Op} {pGt}, {xv}, {best};");
+        b.L($"or.pred {pGt}, {pGt}, {pFirst};");
+        b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {best}, {xv}, {best}, {pGt};");
+        b.L($"selp.u32 {bestAt}, {cand}, {bestAt}, {pGt};");
+        b.Label("WB_NEXT");
+        b.L($"add.u32 {bb}, {bb}, 1;");
+        b.L("bra WB;");
+        b.Label("WA_NEXT");
+        b.L($"add.u32 {aa}, {aa}, 1;");
+        b.L("bra WA;");
+        b.Label("WA_END");
+        string addr = b.RD();
+        b.L($"mul.wide.u32 {addr}, {i}, 4;");
+        b.L($"add.u64 {addr}, {outp}, {addr};");
+        b.L($"st.global.u32 [{addr}], {bestAt};");
         b.Label("DONE");
         b.L("ret;");
         return b.Finish(Header(gpu), entry, LayoutParams);
@@ -391,58 +552,45 @@ internal static partial class Ptx
                 b.L($"mad.lo.u32 {dyIdx}, {ch}, {OH}, {oh};");
                 b.L($"mad.lo.u32 {dyIdx}, {dyIdx}, {OW}, {ow};");
                 string dy = Load(dyIdx);
-                // The window (oh, ow): its valid count (avg) or its first largest (max).
-                string aa = b.R(), bbb = b.R(), hh = b.R(), ww = b.R(), pc = b.P(), pd = b.P(), cnt = b.R(), bestAt = b.R(), best = lane.NewReg(b), cand = b.R();
-                b.L($"mov.u32 {cnt}, 0;");
-                b.L($"mov.u32 {bestAt}, 0xFFFFFFFF;");
-                b.L($"mov.{lane.Reg} {best}, {ReduceIdentity(lane, "max")};");
-                b.L($"mov.u32 {aa}, 0;");
-                b.Label($"WA{tag}");
-                b.L($"setp.ge.u32 {pc}, {aa}, {kh};");
-                b.L($"@{pc} bra WA{tag}_END;");
-                b.L($"mul.lo.u32 {hh}, {oh}, {sh};");
-                b.L($"sub.u32 {hh}, {hh}, {ph};");
-                b.L($"add.u32 {hh}, {hh}, {aa};");
-                b.L($"setp.ge.u32 {pc}, {hh}, {H};");
-                b.L($"@{pc} bra WA{tag}_NEXT;");
-                b.L($"mov.u32 {bbb}, 0;");
-                b.Label($"WB{tag}");
-                b.L($"setp.ge.u32 {pd}, {bbb}, {kw};");
-                b.L($"@{pd} bra WB{tag}_END;");
-                b.L($"mul.lo.u32 {ww}, {ow}, {sw};");
-                b.L($"sub.u32 {ww}, {ww}, {pw};");
-                b.L($"add.u32 {ww}, {ww}, {bbb};");
-                b.L($"setp.ge.u32 {pd}, {ww}, {W};");
-                b.L($"@{pd} bra WB{tag}_NEXT;");
-                b.L($"add.u32 {cnt}, {cnt}, 1;");
                 if (max)
                 {
-                    b.L($"mad.lo.u32 {cand}, {ch}, {H}, {hh};");
-                    b.L($"mad.lo.u32 {cand}, {cand}, {W}, {ww};");
-                    string xv = Load2(cand), pFirst = b.P(), pGt = b.P();
-                    b.L($"setp.eq.u32 {pFirst}, {bestAt}, 0xFFFFFFFF;");
-                    b.L($"setp.gt.{lane.Op} {pGt}, {xv}, {best};");
-                    b.L($"or.pred {pGt}, {pGt}, {pFirst};");
-                    b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {best}, {xv}, {best}, {pGt};");
-                    b.L($"selp.u32 {bestAt}, {cand}, {bestAt}, {pGt};");
-                }
-
-                b.Label($"WB{tag}_NEXT");
-                b.L($"add.u32 {bbb}, {bbb}, 1;");
-                b.L($"bra WB{tag};");
-                b.Label($"WB{tag}_END");
-                b.Label($"WA{tag}_NEXT");
-                b.L($"add.u32 {aa}, {aa}, 1;");
-                b.L($"bra WA{tag};");
-                b.Label($"WA{tag}_END");
-                if (max)
-                {
-                    string pMine = b.P();
-                    b.L($"setp.eq.u32 {pMine}, {bestAt}, {me};");
-                    b.L($"@{pMine} {lane.Add(acc, acc, dy)}");
+                    // The window's first largest, found once for all its pixels (LayoutWindowArgmax, in aux).
+                    string chosen = Index(aux, dyIdx), pChosen = b.P();
+                    b.L($"setp.eq.u32 {pChosen}, {chosen}, {me};");
+                    b.L($"@{pChosen} {lane.Add(acc, acc, dy)}");
                 }
                 else
                 {
+                    // The window (oh, ow): its valid count (avg).
+                    string aa = b.R(), bbb = b.R(), hh = b.R(), ww = b.R(), pc = b.P(), pd = b.P(), cnt = b.R();
+                    b.L($"mov.u32 {cnt}, 0;");
+                    b.L($"mov.u32 {aa}, 0;");
+                    b.Label($"WA{tag}");
+                    b.L($"setp.ge.u32 {pc}, {aa}, {kh};");
+                    b.L($"@{pc} bra WA{tag}_END;");
+                    b.L($"mul.lo.u32 {hh}, {oh}, {sh};");
+                    b.L($"sub.u32 {hh}, {hh}, {ph};");
+                    b.L($"add.u32 {hh}, {hh}, {aa};");
+                    b.L($"setp.ge.u32 {pc}, {hh}, {H};");
+                    b.L($"@{pc} bra WA{tag}_NEXT;");
+                    b.L($"mov.u32 {bbb}, 0;");
+                    b.Label($"WB{tag}");
+                    b.L($"setp.ge.u32 {pd}, {bbb}, {kw};");
+                    b.L($"@{pd} bra WB{tag}_END;");
+                    b.L($"mul.lo.u32 {ww}, {ow}, {sw};");
+                    b.L($"sub.u32 {ww}, {ww}, {pw};");
+                    b.L($"add.u32 {ww}, {ww}, {bbb};");
+                    b.L($"setp.ge.u32 {pd}, {ww}, {W};");
+                    b.L($"@{pd} bra WB{tag}_NEXT;");
+                    b.L($"add.u32 {cnt}, {cnt}, 1;");
+                    b.Label($"WB{tag}_NEXT");
+                    b.L($"add.u32 {bbb}, {bbb}, 1;");
+                    b.L($"bra WB{tag};");
+                    b.Label($"WB{tag}_END");
+                    b.Label($"WA{tag}_NEXT");
+                    b.L($"add.u32 {aa}, {aa}, 1;");
+                    b.L($"bra WA{tag};");
+                    b.Label($"WA{tag}_END");
                     string nf = lane.NewReg(b), share = lane.NewReg(b);
                     b.L($"cvt.rn.{lane.Op}.u32 {nf}, {cnt};");
                     b.L($"div.rn.{lane.Op} {share}, {dy}, {nf};");
@@ -505,35 +653,10 @@ internal static partial class Ptx
                 }
                 else
                 {
-                    // The window's first largest of the forward input.
-                    string hh = b.R(), ww = b.R(), pc = b.P(), pd = b.P(), bestAt = b.R(), best = lane.NewReg(b), cand = b.R();
-                    b.L($"mov.u32 {bestAt}, 0xFFFFFFFF;");
-                    b.L($"mov.{lane.Reg} {best}, {ReduceIdentity(lane, "max")};");
-                    b.L($"mov.u32 {hh}, {h0};");
-                    b.Label($"DH{tag}");
-                    b.L($"setp.ge.u32 {pc}, {hh}, {h1};");
-                    b.L($"@{pc} bra DH{tag}_END;");
-                    b.L($"mov.u32 {ww}, {w0};");
-                    b.Label($"DW{tag}");
-                    b.L($"setp.ge.u32 {pd}, {ww}, {w1};");
-                    b.L($"@{pd} bra DW{tag}_END;");
-                    b.L($"mad.lo.u32 {cand}, {ch}, {H}, {hh};");
-                    b.L($"mad.lo.u32 {cand}, {cand}, {W}, {ww};");
-                    string xv = Load2(cand), pFirst = b.P(), pGt = b.P();
-                    b.L($"setp.eq.u32 {pFirst}, {bestAt}, 0xFFFFFFFF;");
-                    b.L($"setp.gt.{lane.Op} {pGt}, {xv}, {best};");
-                    b.L($"or.pred {pGt}, {pGt}, {pFirst};");
-                    b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {best}, {xv}, {best}, {pGt};");
-                    b.L($"selp.u32 {bestAt}, {cand}, {bestAt}, {pGt};");
-                    b.L($"add.u32 {ww}, {ww}, 1;");
-                    b.L($"bra DW{tag};");
-                    b.Label($"DW{tag}_END");
-                    b.L($"add.u32 {hh}, {hh}, 1;");
-                    b.L($"bra DH{tag};");
-                    b.Label($"DH{tag}_END");
-                    string pMine = b.P();
-                    b.L($"setp.eq.u32 {pMine}, {bestAt}, {me};");
-                    b.L($"@{pMine} {lane.Add(acc, acc, dy)}");
+                    // The window's first largest of the forward input, found once for all its pixels (LayoutWindowArgmax, in aux).
+                    string chosen = Index(aux, dyIdx), pChosen = b.P();
+                    b.L($"setp.eq.u32 {pChosen}, {chosen}, {me};");
+                    b.L($"@{pChosen} {lane.Add(acc, acc, dy)}");
                 }
 
                 b.Label($"DB{tag}_NEXT");

@@ -540,6 +540,42 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
   - Measured (no pause, the same conditions as the slow runs): int8 sum:rows 0.25–0.32 → 0.053 / 0.142, sum:whole
     0.245–0.265 → 0.147 / 0.148; float16 0.403 / 0.403 (unchanged code). CPU gates green.
 
+- 6j small cells, boundary 1 (the device's cells): done, reported (uncommitted until go).
+  - Route with few targets: `OrderByTarget` for targets ≤ 256 runs the one radix pass and takes the counts and offsets
+    from its scanned digit-major table (`Ptx.RadixTableOffsets`: target i's first place is table[i · tiles], the next
+    target's minus it its count), no counting atomics. `GpuOps.TableCounts` (false: the atomics path) is the gate's:
+    `check routing` runs every route case both ways on the device (1001 into 7 added to the sized cases).
+  - `MapRow` (broadcast along rows, the device): one `rem` a word for the column, then a step with a wrap a value (a
+    `rem` a value before).
+  - P-state closures (no change): the float16 two-input formulas (exp_bwd, tanh_bwd: 0.124–0.129 ms in P1, equal to
+    add) and the 16-bit broadcasts (int16 / float16 maprow:mul 0.087 / 0.086 as the minimum of three runs, int16's
+    baseline 0.088) read slow when the card's memory clock dropped (P1 13.8 GHz, P3 7.0, P5 0.8 within one run,
+    `nvidia-smi` sampled). Device bandwidth rows are read against cells of the same run, or as the minimum of runs.
+  - Layout, a thread per value (`Ptx.LayoutPerValue`): a packed format (2–32 whole values a 32-bit word) whose output
+    has fewer words than the device's multiprocessors hold threads (`Gpu.ThreadsPerMultiprocessor`, asked of the
+    driver) takes a thread per value; the word's values are joined by `shfl.sync.bfly` over its Per lanes and stored by
+    the first; every thread runs to the shuffles (past the count: the last value's addresses, dropped).
+    `GpuOps.LayoutPerValue` (true / false / null by size) is the gate's: `check layouts` runs on the device by size (the
+    gate's shapes: per value) and by the word kernel.
+  - Max-pool backward (maxpool_bwd, adaptive_maxpool_bwd; the device): each window's first largest of the forward input
+    found once (`Ptx.LayoutWindowArgmax`, a thread per window, in the backward's lane as the scan was, into aux), the
+    backward reading each window's choice instead of scanning every window a pixel lies in (the CPU's design
+    since item 6). adaptive_maxpool_bwd was 7–41 ms on the device against 0.23 on the CPU.
+  - ctc on the device (`Ptx.Ctc` oneState, sequences of up to 256 states: a thread a state): the state's class and flags
+    in registers; the next frame's logit, log-sum-exp (and α in the backward) loaded before the frame's barrier; the
+    blank's class sum (the even states) by each warp's shuffles and the warps' sums in order; a label's by next-state
+    links (`CtcArgs.States` flags bits 2 up). The general kernel stays for longer sequences; `GpuOps.CtcOneState`
+    (false) gates it too. `CtcArgs.States` in one walk a sequence (`Class` summed every earlier sequence's label counts
+    per lookup: about 310 µs of host time a call at the bench shape, seen in an Nsight Systems trace) and one upload of
+    the classes, flags and lengths (four before). `check ctc` gained a case of 81 and 51 states (three warps of the blank
+    sum; repeated classes).
+  - Mutations (each caught, restored): the packed word without its last shuffle (`check layout strided device float16
+    DIFFERS`), the window's first largest by ≥ (`check layout adaptive_maxpool_bwd` on every type), the blank sum of the
+    first warp only (caught only by the new 81-state case), a label's sum without its links (`check ctc T11 B4 C7 grad`).
+  - Measured: see COVERAGE (route, broadcasts, formulas, int8 adaptive_maxpool, ctc's recursion). Float32 layout rows
+    whose code did not change read 1.5–1.9× in one run and as before in the next (a different row slow each time: the
+    memory clock).
+
 ## Item 5 progress
 
 - Done, reported (uncommitted until the coordinator's go). What landed:

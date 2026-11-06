@@ -452,9 +452,12 @@ internal static class Checks
         // the stable reference — many sources into few targets, into many (three radix passes, a scan over 98 blocks),
         // all into one, and descending indices (every tile's pairs reversed).
         // Under --repeat the device's cases run Stress / 20 passes (the radix place's barriers and shared counts: a race shows).
+        // On the device also with the counting atomics for few targets (TableCounts false): both ways of taking the counts.
+        foreach (bool? table in ops is null ? new bool?[] { null } : new bool?[] { null, false })
         for (int pass = 0, passes = ops is null ? 1 : Math.Max(1, Stress / 20); pass < passes && ok; pass++)
-        foreach (var (n, buckets, kind) in new[] { (1 << 20, 64, "random"), (1_000_003, 100_000, "random"), (5_000, 1, "one"), (70_001, 65_536, "descending") })
+        foreach (var (n, buckets, kind) in new[] { (1 << 20, 64, "random"), (1_000_003, 100_000, "random"), (5_000, 1, "one"), (70_001, 65_536, "descending"), (1001, 7, "random") })
         {
+            if (ops is not null) ops.TableCounts = table;
             var index = kind switch
             {
                 "one" => new int[n],
@@ -467,8 +470,10 @@ internal static class Checks
             var order = new int[n];
             using var run = new Bench.QiyasSubject().Route(ops is null ? Bench.Device.Cpu : Bench.Device.Cuda, index, buckets, counts, offsets, order)!;
             run.Run(); run.Collect();
-            if (!counts.SequenceEqual(wc) || !offsets.SequenceEqual(wo) || !order.SequenceEqual(worder)) { Console.WriteLine($"check route {n} into {buckets} ({kind}) {where,-6} DIFFERS"); ok = false; }
+            if (!counts.SequenceEqual(wc) || !offsets.SequenceEqual(wo) || !order.SequenceEqual(worder)) { Console.WriteLine($"check route {n} into {buckets} ({kind}{(table == false ? ", counting atomics" : "")}) {where,-6} DIFFERS"); ok = false; }
         }
+
+        if (ops is not null) ops.TableCounts = null;
 
         if (ok) Console.WriteLine($"check routing                {where,-6} every type: top-k, pick, sampling and the cross-entropy loss (float types) and the route as the references (also 1M into 64, 1 000 003 into 100 000, all into one, descending into 65 536)");
         return ok;
@@ -1059,6 +1064,9 @@ internal static class Checks
             (new(13, 3, 5, 4, [13, 6, 12], [5, 3, 1], [0, 1, 2, 3, 0, 1, 1, 1, 2]), false),
             (new(5, 2, 4, 0, [5, 2], [2, 2], [1, 2, 3, 3]), true),
         };
+        // Longer sequences: 81 and 51 states (the device's one-state kernel over three warps), each label class many times.
+        int[] long1 = Enumerable.Range(0, 40).Select(i => 1 + (i * 7 + i / 3) % 5).ToArray(), long2 = Enumerable.Range(0, 25).Select(i => 1 + (i * 3 + i / 4) % 5).ToArray();
+        cases.Add((new(60, 2, 6, 0, [60, 52], [40, 25], [.. long1, .. long2]), false));
         // The reference's gradient against its own loss by central differences (the formula, independently of any kernel).
         foreach (var (a, impossible) in cases)
         {
@@ -1080,9 +1088,12 @@ internal static class Checks
             if (worst > 1e-7) { Console.WriteLine($"check ctc reference T{a.T} B{a.B} C{a.C}: the gradient differs from the loss's differences by {worst:R}"); ok = false; }
         }
 
+        // The device: the one-state kernel (every case's states fit a thread each), then the general kernel.
+        foreach (bool? one in ops is null ? new bool?[] { null } : new bool?[] { null, false })
         foreach (var type in Bench.Registry.Names)
         {
             if (!Bench.Registry.IsFloat(type)) continue;
+            if (ops is not null) ops.CtcOneState = one;
             bool infinity = type is "float32" or "float64" or "float16" or "bfloat16";
             foreach (var (a, impossible) in cases)
             {
@@ -1091,7 +1102,7 @@ internal static class Checks
                 var (wantLoss, wantGrad) = a.Reference(Bench.Registry.Values(type, x, (int)a.Values));
                 double logP = wantLoss.Where(double.IsFinite).Max(Math.Abs);
                 int terms = a.T * (int)Math.Ceiling(logP + 1);
-                string name = $"ctc T{a.T} B{a.B} C{a.C}{(impossible ? " no alignment" : "")}";
+                string name = $"ctc T{a.T} B{a.B} C{a.C}{(impossible ? " no alignment" : "")}{(one == false ? " (general kernel)" : "")}";
                 int scored = impossible ? 1 : a.B;                            // the impossible case: its first sequence scored, the second checked for +∞
                 var loss = new byte[Bench.Registry.Bytes(type, a.B)];
                 Bench.Registry.WithFloat(type, new CtcRun(ops, a, x, loss, null));
@@ -1129,7 +1140,8 @@ internal static class Checks
             }
         }
 
-        if (ok) Console.WriteLine($"check ctc                    {where,-6} every float type: loss and gradient (the reference's gradient by central differences), short sequences, empty and repeated labels, another blank, no alignment, within the recursion's rounding");
+        if (ops is not null) ops.CtcOneState = null;
+        if (ok) Console.WriteLine($"check ctc                    {where,-6} every float type: loss and gradient (the reference's gradient by central differences), short and 81-state sequences, empty and repeated labels, another blank, no alignment, within the recursion's rounding");
         return ok;
     }
 
@@ -1408,8 +1420,11 @@ internal static class Checks
     {
         bool ok = true;
         string where = ops is null ? "cpu" : "device";
+        // The device: packed types by the output's size (the gate's small shapes: a thread per value), then by the word kernel.
+        foreach (bool? perValue in ops is null ? new bool?[] { null } : new bool?[] { null, false })
         foreach (var type in Bench.Registry.Names)
         {
+            if (ops is not null) ops.LayoutPerValue = perValue;
             foreach (var name in LayoutArgs.Names)
             {
                 if (!LayoutArgs.Applies(name, Bench.Registry.IsFloat(type))) continue;
@@ -1420,11 +1435,12 @@ internal static class Checks
                     Bench.Registry.With(type, new LayoutRun(ops, k));
                     // Sums round over their terms; a bilinear value is four weighted terms of the inputs' magnitude (not the result's); a pool's mean over its window.
                     int terms = name is "scatter_add_rows" or "col2im" or "maxpool_bwd" or "depthwise_conv" or "adaptive_maxpool_bwd" ? LayoutArgs.Terms(name, k.P) : name == "interpolate_bilinear" ? 4 : name is "avgpool" or "avgpool_bwd" ? k.P[3] * k.P[4] : name is "adaptive_avgpool" or "adaptive_avgpool_bwd" ? (k.P[1] / k.P[3] + 2) * (k.P[2] / k.P[4] + 2) : 0;
-                    ok &= Close(type, $"layout {name}", where, k.Output, reference, k.Count, terms);
+                    ok &= Close(type, $"layout {name}{(perValue == false ? " (word kernel)" : "")}", where, k.Output, reference, k.Count, terms);
                 }
             }
         }
 
+        if (ops is not null) ops.LayoutPerValue = null;
         if (ok) Console.WriteLine($"check layouts                {where,-6} every type: moves exact, sums and resizes within the lane's rounding");
         return ok;
     }

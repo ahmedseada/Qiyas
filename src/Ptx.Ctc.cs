@@ -20,6 +20,10 @@ internal static partial class Ptx
     /// <summary>Shared bytes of the ctc kernel for states up to cap: two state buffers with pads, the per-state terms, log P.</summary>
     public static int CtcShared(Lane lane, int cap) => (3 * cap + 5) * lane.Size;
 
+    /// <summary>Shared bytes of the one-state kernel (cap ≤ CtcThreads): CtcShared, the warps' blank partials and each
+    /// state's next state of its class.</summary>
+    public static int CtcOneShared(Lane lane, int cap) => CtcShared(lane, cap) + CtcThreads / 32 * lane.Size + cap * 4;
+
     /// <summary>Each (frame, sequence) row's log-sum-exp over the classes, a warp per row; for the gradient the row's softmax
     /// (and 0 for the rows past the sequence's frames).</summary>
     public static string CtcRows(Gpu gpu, Lane lane, bool backward, out string entry)
@@ -152,9 +156,16 @@ internal static partial class Ptx
         return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_lse, .param .u64 p_ilen, .param .u64 p_grad, .param .u32 p_t, .param .u32 p_b, .param .u32 p_c");
     }
 
-    public static string Ctc(Gpu gpu, Lane lane, int cap, bool backward, out string entry)
+    public static string Ctc(Gpu gpu, Lane lane, int cap, bool backward, out string entry) => Ctc(gpu, lane, cap, backward, false, out entry);
+
+    /// <summary>oneState (states up to cap ≤ CtcThreads: a thread per state): each state's class and flags read once into
+    /// registers, the next frame's logit, log-sum-exp (and α, backward) loaded before the frame's barrier, and in the
+    /// backward the blank's sum over the even states by the warps' shuffles (fixed order), a label class's by its states'
+    /// links (flags bits 2 up, CtcArgs.States) instead of a scan over every later state.</summary>
+    public static string Ctc(Gpu gpu, Lane lane, int cap, bool backward, bool oneState, out string entry)
     {
-        entry = $"ctc_{lane.Name}_{(backward ? "bwd" : "fwd")}_{cap}";
+        if (oneState && cap > CtcThreads) throw new NotSupportedException($"ctc: the one-state kernel takes up to {CtcThreads} states, not {cap}");
+        entry = $"ctc{(oneState ? "1" : "")}_{lane.Name}_{(backward ? "bwd" : "fwd")}_{cap}";
         int size = lane.Size, bufBytes = (cap + 2) * size, gOff = 2 * bufBytes, pOff = gOff + cap * size;
         string op = lane.Op, mem = lane.Mem, negInf = lane.Literal(double.NegativeInfinity), zero = lane.Literal(0);
         var b = new PtxBuilder();
@@ -276,6 +287,264 @@ internal static partial class Ptx
             b.L($"and.b32 {r}, {t}, 1;");
             b.L($"mad.lo.u32 {r}, {r}, {bufBytes}, {sm};");
             return r;
+        }
+
+        if (oneState)
+        {
+            int wOff = pOff + size, lOff = wOff + CtcThreads / 32 * size;
+            // This thread's state (s = tid; past S it computes on state 0's addresses and stores nothing): its class, flags,
+            // and for the backward the flags of s + 2 (the row's stride is smax + 2: zeros past S).
+            string act = b.P(), sc = b.R(), fiO = b.R(), sc1 = b.R(), sc2 = b.R();
+            b.L($"setp.lt.u32 {act}, {tid}, {S};");
+            b.L($"selp.u32 {sc}, {tid}, 0, {act};");
+            b.L($"add.u32 {fiO}, {flagRow}, {sc};");
+            b.L($"add.u32 {sc1}, {sc}, 1;");
+            b.L($"add.u32 {sc2}, {sc}, 2;");
+            string myCls = LdU(clsG, fiO), myFl = LdU(flagsG, fiO), bit = b.R(), skipA = b.P();
+            b.L($"and.b32 {bit}, {myFl}, 1;");
+            b.L($"setp.eq.u32 {skipA}, {bit}, 0;");
+
+            string XAt(string t)
+            {
+                string i = b.R();
+                b.L($"add.u32 {i}, {RowBase(t)}, {myCls};");
+                return LdG(x, i);
+            }
+
+            string AlphaAt(string t)
+            {
+                string ai = b.R();
+                b.L($"add.u32 {ai}, {alphaRow}, {t};");
+                b.L($"mad.lo.u32 {ai}, {ai}, {smax}, {sc};");
+                return ai;
+            }
+
+            // Both state buffers −∞, each state's link to the next state of its class.
+            {
+                string link = b.R(), la = b.R();
+                b.L($"shr.u32 {link}, {myFl}, 2;");
+                b.L($"mad.lo.u32 {la}, {sc}, 4, {sm};");
+                b.L($"@{act} st.shared.u32 [{la}+{lOff}], {link};");
+            }
+
+            ClearBuffers("A1");
+            {
+                string t = b.R(), pT = b.P(), xv = lane.NewReg(b), lv = lane.NewReg(b), zeroT = b.R();
+                b.L($"mov.u32 {zeroT}, 0;");
+                b.L($"mov.{op} {xv}, {XAt(zeroT)};");
+                b.L($"mov.{op} {lv}, {LseAt(zeroT)};");
+                b.L($"mov.u32 {t}, 0;");
+                b.Label("A1_T");
+                b.L($"setp.ge.u32 {pT}, {t}, {tb};");
+                b.L($"@{pT} bra A1_END;");
+                string e = Sub(xv, lv), tm1 = b.R();
+                b.L($"sub.u32 {tm1}, {t}, 1;");
+                string cur = BufBase(t), prev = BufBase(tm1), first = b.P();
+                b.L($"setp.eq.u32 {first}, {t}, 0;");
+                string p = LdS(prev, sc2), q = LdS(prev, sc1), r = LdS(prev, sc);
+                b.L($"selp.{op} {r}, {negInf}, {r}, {skipA};");
+                string v = Lse3(p, q, r);
+                b.L(lane.Add(v, v, e));
+                string v0 = lane.NewReg(b), pLow = b.P();
+                b.L($"setp.lt.u32 {pLow}, {tid}, 2;");
+                b.L($"selp.{op} {v0}, {e}, {negInf}, {pLow};");
+                b.L($"selp.{op} {v}, {v0}, {v}, {first};");
+                // The next frame's logit and log-sum-exp (the last frame's again past the end), loaded across the barrier.
+                string tn = b.R(), tl = b.R();
+                b.L($"add.u32 {tn}, {t}, 1;");
+                b.L($"sub.u32 {tl}, {tb}, 1;");
+                b.L($"min.u32 {tn}, {tn}, {tl};");
+                b.L($"mov.{op} {xv}, {XAt(tn)};");
+                b.L($"mov.{op} {lv}, {LseAt(tn)};");
+                string ca = b.R();
+                b.L($"mad.lo.u32 {ca}, {sc2}, {size}, {cur};");
+                b.L($"@{act} st.shared.{mem} [{ca}], {v};");
+                b.L($"@{act} st.global.{mem} [{Addr(alphaG, AlphaAt(t), size)}], {v};");
+                b.L("bar.sync 0;");
+                b.L($"add.u32 {t}, {t}, 1;");
+                b.L("bra A1_T;");
+                b.Label("A1_END");
+
+                // log P from the last frame's last two states (index S + 1 and S: the pad when S = 1); the loss.
+                string p0 = b.P();
+                b.L($"setp.ne.u32 {p0}, {tid}, 0;");
+                b.L($"@{p0} bra A1_LOSS_END;");
+                string tl2 = b.R();
+                b.L($"sub.u32 {tl2}, {tb}, 1;");
+                string last = BufBase(tl2), sp1 = b.R();
+                b.L($"add.u32 {sp1}, {S}, 1;");
+                string a1 = LdS(last, sp1), a2 = LdS(last, S);
+                string logP = Lse3(a1, a2, negInf), nl = lane.NewReg(b);
+                b.L($"st.shared.{mem} [{sm}+{pOff}], {logP};");
+                b.L($"neg.{op} {nl}, {logP};");
+                b.L($"st.global.{mem} [{Addr(loss, seq, size)}], {nl};");
+                b.Label("A1_LOSS_END");
+                b.L("bar.sync 0;");
+            }
+
+            if (backward)
+            {
+                string logP = lane.NewReg(b), none = b.P();
+                b.L($"ld.shared.{mem} {logP}, [{sm}+{pOff}];");
+                b.L($"setp.eq.{op} {none}, {logP}, {negInf};");
+                // No alignment: the sequence's frames' rows 0 too (the rows past its frames are the rows kernel's).
+                {
+                    string t = b.R(), pT = b.P(), end = b.R();
+                    b.L($"mov.u32 {t}, 0;");
+                    b.L($"selp.u32 {end}, {tb}, 0, {none};");
+                    b.Label("Z1_T");
+                    b.L($"setp.ge.u32 {pT}, {t}, {end};");
+                    b.L($"@{pT} bra Z1_END;");
+                    string row = RowBase(t), c = b.R(), pC = b.P(), i = b.R();
+                    b.L($"mov.u32 {c}, {tid};");
+                    b.Label("Z1_C");
+                    b.L($"setp.ge.u32 {pC}, {c}, {C};");
+                    b.L($"@{pC} bra Z1_C_END;");
+                    b.L($"add.u32 {i}, {row}, {c};");
+                    b.L($"st.global.{mem} [{Addr(grad, i, size)}], {zero};");
+                    b.L($"add.u32 {c}, {c}, {CtcThreads};");
+                    b.L("bra Z1_C;");
+                    b.Label("Z1_C_END");
+                    b.L($"add.u32 {t}, {t}, 1;");
+                    b.L("bra Z1_T;");
+                    b.Label("Z1_END");
+                }
+
+                b.L($"@{none} bra DONE;");
+                string fi2 = b.R(), skipB = b.P(), rep = b.P(), even = b.P(), bit2 = b.R(), bit3 = b.R(), lane32 = b.R(), warp = b.R();
+                b.L($"add.u32 {fi2}, {fiO}, 2;");
+                string fl2 = LdU(flagsG, fi2);
+                b.L($"and.b32 {bit2}, {fl2}, 1;");
+                b.L($"setp.eq.u32 {skipB}, {bit2}, 0;");
+                b.L($"and.b32 {bit3}, {myFl}, 2;");
+                b.L($"setp.ne.and.u32 {rep}, {bit3}, 0, {act};");
+                b.L($"and.b32 {bit3}, {tid}, 1;");
+                b.L($"setp.eq.and.u32 {even}, {bit3}, 0, {act};");
+                b.L($"and.b32 {lane32}, {tid}, 31;");
+                b.L($"shr.u32 {warp}, {tid}, 5;");
+                ClearBuffers("B1");
+                string t2 = b.R(), pDone = b.P(), tLast = b.R(), xv = lane.NewReg(b), lv = lane.NewReg(b), av = lane.NewReg(b);
+                b.L($"sub.u32 {tLast}, {tb}, 1;");
+                b.L($"mov.u32 {t2}, {tLast};");
+                b.L($"mov.{op} {xv}, {XAt(t2)};");
+                b.L($"mov.{op} {lv}, {LseAt(t2)};");
+                b.L($"mov.{op} {av}, {LdG(alphaG, AlphaAt(t2))};");
+                b.Label("B1_T");
+                b.L($"setp.lt.s32 {pDone}, {t2}, 0;");
+                b.L($"@{pDone} bra DONE;");
+                {
+                    string t = t2, row = RowBase(t), e = Sub(xv, lv), avT = lane.NewReg(b), tp1 = b.R();
+                    b.L($"mov.{op} {avT}, {av};");
+                    b.L($"add.u32 {tp1}, {t}, 1;");
+                    string cur = BufBase(t), prev = BufBase(tp1), isLast = b.P();
+                    b.L($"setp.eq.u32 {isLast}, {t}, {tLast};");
+                    string p = LdS(prev, sc), q = LdS(prev, sc1), r = LdS(prev, sc2);
+                    b.L($"selp.{op} {r}, {negInf}, {r}, {skipB};");
+                    string v = Lse3(p, q, r);
+                    b.L(lane.Add(v, v, e));
+                    string v0 = lane.NewReg(b), pHigh = b.P(), s2 = b.R();
+                    b.L($"add.u32 {s2}, {tid}, 2;");
+                    b.L($"setp.ge.u32 {pHigh}, {s2}, {S};");
+                    b.L($"selp.{op} {v0}, {e}, {negInf}, {pHigh};");
+                    b.L($"selp.{op} {v}, {v0}, {v}, {isLast};");
+                    string ca = b.R();
+                    b.L($"mad.lo.u32 {ca}, {sc}, {size}, {cur};");
+                    b.L($"@{act} st.shared.{mem} [{ca}], {v};");
+                    string g = lane.NewReg(b);
+                    b.L(lane.Add(g, avT, v));
+                    b.L($"sub.rn.{op} {g}, {g}, {e};");
+                    b.L($"sub.rn.{op} {g}, {g}, {logP};");
+                    string eg = Codec.Exp(b, lane, g), gAddr = b.R();
+                    b.L($"mad.lo.u32 {gAddr}, {sc}, {size}, {sm};");
+                    b.L($"@{act} st.shared.{mem} [{gAddr}+{gOff}], {eg};");
+                    // The blank's terms (the even states): each warp's sum by shuffles, its lane 0 into shared memory.
+                    string part = lane.NewReg(b);
+                    b.L($"selp.{op} {part}, {eg}, {zero}, {even};");
+                    for (int off = 16; off >= 1; off >>= 1)
+                    {
+                        string other = lane.NewReg(b);
+                        if (lane.Wide)
+                        {
+                            string l0 = b.R(), h0 = b.R(), l1 = b.R(), h1 = b.R();
+                            b.L($"mov.b64 {{{l0}, {h0}}}, {part};");
+                            b.L($"shfl.sync.bfly.b32 {l1}, {l0}, {off}, 0x1f, 0xffffffff;");
+                            b.L($"shfl.sync.bfly.b32 {h1}, {h0}, {off}, 0x1f, 0xffffffff;");
+                            b.L($"mov.b64 {other}, {{{l1}, {h1}}};");
+                        }
+                        else
+                        {
+                            string bits = b.R(), bits2 = b.R();
+                            b.L($"mov.b32 {bits}, {part};");
+                            b.L($"shfl.sync.bfly.b32 {bits2}, {bits}, {off}, 0x1f, 0xffffffff;");
+                            b.L($"mov.b32 {other}, {bits2};");
+                        }
+
+                        b.L(lane.Add(part, part, other));
+                    }
+
+                    string wa = b.R(), pL0 = b.P();
+                    b.L($"mad.lo.u32 {wa}, {warp}, {size}, {sm};");
+                    b.L($"setp.eq.u32 {pL0}, {lane32}, 0;");
+                    b.L($"@{pL0} st.shared.{mem} [{wa}+{wOff}], {part};");
+                    // The previous frame's logit, log-sum-exp and α (frame 0's again past the start), loaded across the barrier.
+                    string tn = b.R();
+                    b.L($"sub.u32 {tn}, {t}, 1;");
+                    b.L($"max.s32 {tn}, {tn}, 0;");
+                    b.L($"mov.{op} {xv}, {XAt(tn)};");
+                    b.L($"mov.{op} {lv}, {LseAt(tn)};");
+                    b.L($"mov.{op} {av}, {LdG(alphaG, AlphaAt(tn))};");
+                    b.L("bar.sync 0;");
+                    // Each class's first state: y − Σ of its class's terms. The blank (state 0): the warps' sums in order;
+                    // a label: its own term and its links' in state order.
+                    string sum = lane.NewReg(b), pBlank = b.P();
+                    b.L($"@!{rep} bra B1_CLS_END;");
+                    b.L($"setp.eq.u32 {pBlank}, {tid}, 0;");
+                    b.L($"@!{pBlank} bra B1_LABEL;");
+                    b.L($"ld.shared.{mem} {sum}, [{sm}+{wOff}];");
+                    for (int w = 1; w < CtcThreads / 32; w++)
+                    {
+                        string pw = lane.NewReg(b);
+                        b.L($"ld.shared.{mem} {pw}, [{sm}+{wOff + w * size}];");
+                        b.L(lane.Add(sum, sum, pw));
+                    }
+
+                    b.L("bra B1_Y;");
+                    b.Label("B1_LABEL");
+                    {
+                        string k = b.R(), pK = b.P(), ka = b.R(), gv = lane.NewReg(b);
+                        b.L($"mov.{op} {sum}, {eg};");
+                        b.L($"mad.lo.u32 {ka}, {sc}, 4, {sm};");
+                        b.L($"ld.shared.u32 {k}, [{ka}+{lOff}];");
+                        b.Label("B1_K");
+                        b.L($"setp.eq.u32 {pK}, {k}, 0;");
+                        b.L($"@{pK} bra B1_Y;");
+                        b.L($"mad.lo.u32 {ka}, {k}, {size}, {sm};");
+                        b.L($"ld.shared.{mem} {gv}, [{ka}+{gOff}];");
+                        b.L(lane.Add(sum, sum, gv));
+                        b.L($"mad.lo.u32 {ka}, {k}, 4, {sm};");
+                        b.L($"ld.shared.u32 {k}, [{ka}+{lOff}];");
+                        b.L("bra B1_K;");
+                    }
+
+                    b.Label("B1_Y");
+                    {
+                        string y = Codec.Exp(b, lane, e), ci = b.R();
+                        b.L($"sub.rn.{op} {y}, {y}, {sum};");
+                        b.L($"add.u32 {ci}, {row}, {myCls};");
+                        b.L($"st.global.{mem} [{Addr(grad, ci, size)}], {y};");
+                    }
+
+                    b.Label("B1_CLS_END");
+                    b.L("bar.sync 0;");
+                    b.L($"sub.u32 {t2}, {t2}, 1;");
+                    b.L("bra B1_T;");
+                }
+            }
+
+            b.Label("DONE");
+            b.L("ret;");
+            string pa1 = ".param .u64 p_x, .param .u64 p_lse, .param .u64 p_alpha, .param .u64 p_cls, .param .u64 p_flags, .param .u64 p_ilen, .param .u64 p_slen, .param .u64 p_loss, .param .u64 p_grad, .param .u32 p_t, .param .u32 p_b, .param .u32 p_c, .param .u32 p_smax";
+            return b.Finish(Header(gpu), entry, pa1, CtcOneShared(lane, cap));
         }
 
         // 2. α forward.

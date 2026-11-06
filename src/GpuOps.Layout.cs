@@ -5,6 +5,15 @@ namespace Qiyas;
 
 public sealed partial class GpuOps
 {
+    /// <summary>The gate's override of the per-value layout kernel for packed types: true always, false never (the word
+    /// kernel), null by the output's size.</summary>
+    internal bool? LayoutPerValue;
+
+    /// <summary>A packed type's layout takes a thread per value (Ptx.LayoutPerValue) when a thread per word would not fill
+    /// the device: fewer words than its multiprocessors hold threads.</summary>
+    private bool PerValueLayout(Fmt f, int count) =>
+        Ptx.PerValueFits(f) && (LayoutPerValue ?? (long)f.Words(count) < (long)gpu.Multiprocessors * gpu.ThreadsPerMultiprocessor);
+
     /// <summary>A layout operation (LayoutArgs.Names) from x (and the index array) into output, all on the device. Returns the lane's name.</summary>
     public string Layout<TN>(LayoutArgs k, ulong x, ulong idx, ulong output, ulong x2 = 0) where TN : struct, IQiyasNumber<TN>
     {
@@ -53,11 +62,23 @@ public sealed partial class GpuOps
                 }
             }
 
-            var fn = gpu.Cached($"layout:{k.Name}:{f.Name}:{lane.Name}", (out string e) => Ptx.Layout(gpu, f, lane, k.Name, out e));
             var args = new ulong[8 + 12];
-            args[0] = x; args[1] = x2; args[2] = idx; args[3] = aux; args[4] = output; args[5] = Gpu.U(k.Count); args[6] = Gpu.U(rows); args[7] = Gpu.U(cols);
             for (int i = 0; i < 12; i++) args[8 + i] = Gpu.U(i < k.P.Length ? k.P[i] : 0);
-            Gpu.Launch(fn, Grid(f.Words(k.Count), 256), 1, 256, 1, 0, args);
+            if (k.Name is "maxpool_bwd" or "adaptive_maxpool_bwd")
+            {
+                // Each window's first largest of the forward input, once (Ptx.LayoutWindowArgmax), into aux.
+                var (OH, OW) = k.Name == "maxpool_bwd" ? LayoutArgs.PoolOut(k.P) : (k.P[3], k.P[4]);
+                int windows = k.P[0] * OH * OW;
+                aux = gpu.Rent(Math.Max(1, windows) * 4L);
+                var argmax = gpu.Cached($"layout_argmax:{k.Name}:{f.Name}:{lane.Name}", (out string e) => Ptx.LayoutWindowArgmax(gpu, f, lane, k.Name, out e));
+                args[1] = x2; args[4] = aux; args[5] = Gpu.U(windows);
+                if (windows > 0) Gpu.Launch(argmax, Grid(windows, 256), 1, 256, 1, 0, args);
+            }
+
+            bool perValue = PerValueLayout(f, k.Count);
+            var fn = gpu.Cached($"layout:{k.Name}:{f.Name}:{lane.Name}{(perValue ? ":v" : "")}", (out string e) => Ptx.Layout(gpu, f, lane, k.Name, perValue, out e));
+            args[0] = x; args[1] = x2; args[2] = idx; args[3] = aux; args[4] = output; args[5] = Gpu.U(k.Count); args[6] = Gpu.U(rows); args[7] = Gpu.U(cols);
+            Gpu.Launch(fn, Grid(perValue ? (long)f.Words(k.Count) * f.Per : f.Words(k.Count), 256), 1, 256, 1, 0, args);
         }
         finally
         {

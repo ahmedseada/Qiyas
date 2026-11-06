@@ -47,23 +47,35 @@ public sealed record CtcArgs(int T, int B, int C, int Blank, int[] InputLengths,
 
     /// <summary>Per sequence (rows of MaxStates + 2, zeros past its states): the class of each extended state, and its
     /// flags: bit 0 where α may come from s − 2 (a label differing from the label before it), bit 1 on the first state
-    /// of each class.</summary>
+    /// of each class, bits 2 up the next state of its class (0: none).</summary>
     public (int[] Classes, int[] Flags) States()
     {
+        // One walk per sequence (its labels from a running offset): a class's states share a parity (the blank the even
+        // states, the labels the odd), so its first state is the first seen, and its next the last seen walking back.
         int stride = MaxStates + 2;
         var cls = new int[B * stride];
         var flags = new int[B * stride];
-        for (int b = 0; b < B; b++)
+        var seen = new HashSet<int>();
+        var next = new Dictionary<int, int>();
+        for (int b = 0, off = 0; b < B; off += LabelLengths[b], b++)
         {
-            int S = 2 * LabelLengths[b] + 1;
+            int S = 2 * LabelLengths[b] + 1, row = b * stride;
+            seen.Clear();
+            next.Clear();
             for (int s = 0; s < S; s++)
             {
-                int c = Class(b, s);
-                cls[b * stride + s] = c;
-                bool skip = s >= 2 && c != Blank && c != Class(b, s - 2);
-                bool first = true;
-                for (int k = s - 2; k >= 0 && first; k -= 2) first = Class(b, k) != c;
-                flags[b * stride + s] = (skip ? 1 : 0) | (first ? 2 : 0);
+                int c = (s & 1) == 0 ? Blank : Labels[off + (s >> 1)];
+                cls[row + s] = c;
+                bool skip = s >= 2 && c != Blank && c != cls[row + s - 2];
+                bool first = seen.Add(c);
+                flags[row + s] = (skip ? 1 : 0) | (first ? 2 : 0);
+            }
+
+            for (int s = S - 1; s >= 0; s--)
+            {
+                int c = cls[row + s];
+                if (next.TryGetValue(c, out int k)) flags[row + s] |= k << 2;
+                next[c] = s;
             }
         }
 

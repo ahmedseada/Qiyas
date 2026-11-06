@@ -360,11 +360,20 @@ internal static partial class Ptx
         b.L($"ld.global.{wt} {wx}, [{ax}];");
         if (f.WordBits == 32) b.L($"mov.b32 {wo}, 0;");
         b.L($"mul.lo.u32 {first}, {gid}, {f.Per};");
+        // The word's first column by one remainder, the next values' by a step that wraps at the row's end (item 6j: a
+        // remainder a value before).
+        string col = b.R(), pWrap = b.P();
+        b.L($"rem.u32 {col}, {first}, {cols};");
         for (int i = 0; i < f.Per; i++)
         {
-            string x = Codec.Unpack(b, f, wx, i, lane), idx = b.R(), col = b.R();
-            b.L($"add.u32 {idx}, {first}, {i};");
-            b.L($"rem.u32 {col}, {idx}, {cols};");
+            string x = Codec.Unpack(b, f, wx, i, lane);
+            if (i > 0)
+            {
+                b.L($"add.u32 {col}, {col}, 1;");
+                b.L($"setp.ge.u32 {pWrap}, {col}, {cols};");
+                b.L($"@{pWrap} mov.u32 {col}, 0;");
+            }
+
             string y = Codec.UnpackAt(b, f, pv, col, lane);
             string r = Formula(b, lane, op.Name, x, y, zero, zero, zero);
             Codec.Pack(b, f, r, lane, i, wo, wrap: !f.IsFloat);
