@@ -290,7 +290,28 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
   bfloat16 0.260 / 0.295 against 0.263 / 0.267 in item 4's baseline. What remains is structural: tn pays one pack of A
   more than nn (0.022, at the bandwidth); removing it means the mma kernel reading Aᵀ (ldmatrix .trans on k-major
   tiles), and every 16-bit product writes C in f32 then converts (back 0.018 of 0.26): a 16-bit epilogue in the mma
-  kernel would save that on every float16 / bfloat16 product — candidates for 6j, not done.
+  kernel would save that on every float16 / bfloat16 product — candidates for 6j, not done. The coordinator: do both in
+  6j (Aᵀ read in place by the mma kernel; the 16-bit epilogue on every float16 / bfloat16 product).
+
+- 6f (CPU recurrent): done, reported. `src/Recurrent.cs`, the own-lane path (narrow types and blocks are widened once at
+  the sequence's level, as before): `InputGates` x·Wᵀ + b of every step in one product (T·B × GH) and one MapRow;
+  `LstmForward` / `GruForward` per step only h·Uᵀ, the add and the cell (the step's gates kept for the backward when
+  asked); the sequence backwards recompute the forward once keeping every step's gates (LSTM: g; GRU: gx all, gh per
+  step), per step back only the cell's backward and dh = dg·U (GRU: dgh·U + the cell's direct part), and
+  `SequenceWeights` takes dx = dg·W, dW = dgᵀ·x, dU = dgᵀ·hPrev (`Shifted`: h0 then h of steps 0 … T − 2), db = the
+  column sums, over all T·B rows at once (no per-step weight arrays, no Map adds). The cell's backward
+  (`CellBackwardBody`) vectorized like the forward (it computed a vector sigmoid / tanh per scalar). The buffers kept per
+  thread at their exact length (`Scratch`, a slot a call site): the gates of all steps are 33 MB; fresh arrays a call
+  made the timings swing 27–51 ms with the collections. A phase profile (temporary, not kept) of lstm_seq_bwd float32
+  before the vectorizing: forward 27–34, cell backward 14–18, dh products 13–15, weights 22 ms. Gate: `check recurrent`
+  (both devices) unchanged and green; mutation (dU against hs, not the shifted states) fails at every float type.
+  Measured CPU (qiyas, against item 4's baseline): float32 lstm_seq 27.2 → 25.3, lstm_seq_bwd 150 → 69.2, gru_seq 28.9 →
+  17.9, gru_seq_bwd 109 → 57.0; float16 39.1 → 31.1, 123 → 75.4, 29.5 → 19.8, 113 → 64.2; float64 63.8 → 50.8, 259 →
+  143, 44.4 → 34.7, 231 → 112. Errors unchanged. Steps float32: lstm_step 14.9 (14.0), lstm_step_bwd 41.6 (47.3),
+  gru_step 11.0 (12.3), gru_step_bwd 35.7 (38.3) — at the product rate. float16 steps 22.9 / 62.6 / 16.9 / 47.4
+  (baseline 25.8 / 48.9 / 12.6 / 44.7): each call widens W and U to f32 (the step API takes the type's bytes) with
+  fresh arrays; the readings swing with the collections — noted, not chased. Open: the device sequence backwards keep
+  the per-step form (GRU 12.5 ms against 2.5 forward): the same restructure applies there.
 
 ## Item 5 progress
 
@@ -706,6 +727,7 @@ Each: measure against the baseline cell, change, re-measure (the full run or the
   Per step `GruStepBackward` recomputes gx, gh that the forward recompute already made, and dW, dU, db, dbh are summed by
   separate `Map add`s (CPU: fresh arrays per step). Re-measure; if it holds, keep the forward's gates (T × B × 3H each)
   and accumulate the weights' gradients in place (the products' C += form), for the LSTM sequence backward too.
+  CPU done in 6f (one product over all the steps for each weight's gradient); the device remains.
 
 ## End of item 6 — the final readiness check (the owner's addition)
 

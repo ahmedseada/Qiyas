@@ -284,7 +284,43 @@ internal static partial class Kernels
                     TN.Load(state, b * H, sl.AsSpan(0, H));
                     TN.Load(d1, b * H, d1l.AsSpan(0, H));
                     if (d2 is not null) TN.Load(d2, b * H, d2l.AsSpan(0, H));
-                    for (int j = 0; j < H; j++)
+                    // Whole vectors of the row first (the same formulas, a vector's sigmoid / tanh a vector of values), the tail
+                    // one value at a time.
+                    int w = Vector<TLane>.Count, vec = H / w * w, j0 = 0;
+                    var onev = new Vector<TLane>(one);
+                    Vector<TLane> V(TLane[] arr, int at) => new(arr.AsSpan(at));
+                    for (; j0 < vec; j0 += w)
+                    {
+                        if (a.Kind == "lstm")
+                        {
+                            var i = TL.Sigmoid(V(gl, j0)); var f = TL.Sigmoid(V(gl, H + j0)); var gg = TL.Tanh(V(gl, 2 * H + j0)); var o = TL.Sigmoid(V(gl, 3 * H + j0));
+                            var s = V(sl, j0); var d = V(d1l, j0);
+                            var cn = TL.Fma(f, s, i * gg); var tc = TL.Tanh(cn);
+                            var dcn = TL.Fma(d * o, onev - tc * tc, V(d2l, j0));
+                            (d * tc * (o * (onev - o))).CopyTo(dg.AsSpan(3 * H + j0));
+                            (dcn * gg * (i * (onev - i))).CopyTo(dg.AsSpan(j0));
+                            (dcn * s * (f * (onev - f))).CopyTo(dg.AsSpan(H + j0));
+                            (dcn * i * (onev - gg * gg)).CopyTo(dg.AsSpan(2 * H + j0));
+                            (dcn * f).CopyTo(ds.AsSpan(j0));
+                        }
+                        else
+                        {
+                            var r = TL.Sigmoid(V(gl, j0) + V(g2l, j0)); var z = TL.Sigmoid(V(gl, H + j0) + V(g2l, H + j0));
+                            var hn = V(g2l, 2 * H + j0);
+                            var n = TL.Tanh(TL.Fma(r, hn, V(gl, 2 * H + j0)));
+                            var d = V(d1l, j0);
+                            var dn = d * (onev - z); var dz = d * (V(sl, j0) - n);
+                            var dpre = dn * (onev - n * n);
+                            var dr = dpre * hn;
+                            dpre.CopyTo(dg.AsSpan(2 * H + j0));
+                            (dpre * r).CopyTo(dg2.AsSpan(2 * H + j0));
+                            var drr = dr * (r * (onev - r)); drr.CopyTo(dg.AsSpan(j0)); drr.CopyTo(dg2.AsSpan(j0));
+                            var dzz = dz * (z * (onev - z)); dzz.CopyTo(dg.AsSpan(H + j0)); dzz.CopyTo(dg2.AsSpan(H + j0));
+                            (d * z).CopyTo(ds.AsSpan(j0));
+                        }
+                    }
+
+                    for (int j = vec; j < H; j++)
                     {
                         if (a.Kind == "lstm")
                         {
@@ -433,20 +469,111 @@ internal static partial class Kernels
             return name;
         }
 
-        int xBytes = (int)TN.Bytes(bd), hBytes = (int)TN.Bytes(bh);
+        return LstmForward<TN>(a, T, x, h0, c0, w, u, bias, hOut, cOut, null);
+    }
+
+    // x · Wᵀ + b for every step at once (T·B × GH): one product over all the steps' rows, the bias added once; a step then
+    // adds only h · Uᵀ.
+    private static byte[] InputGates<TN>(CellArgs a, int T, byte[] x, byte[] w, byte[] bias) where TN : struct, IQiyasFloat<TN>
+    {
+        int GH = a.Gates * a.H, rows = T * a.B;
+        var gx = Scratch.Get(Scratch.Gx, BytesOf<TN>((long)rows * GH));
+        MatMulView<TN>(new ProductView(rows, GH, a.D, false, true), x, w, gx);
+        MapRow<TN>("add", gx, bias, gx, rows, GH);
+        return gx;
+    }
+
+    // The LSTM over the steps from the input gates of all steps at once (h, c of every step into hOut, cOut); with gates
+    // given, each step's gates (pre-activation, T × B × GH) kept for the backward.
+    private static string LstmForward<TN>(CellArgs a, int T, byte[] x, byte[] h0, byte[] c0, byte[] w, byte[] u, byte[] bias, byte[] hOut, byte[] cOut, byte[]? gates) where TN : struct, IQiyasFloat<TN>
+    {
+        int GH = a.Gates * a.H, hBytes = (int)TN.Bytes((long)a.B * a.H), gBytes = BytesOf<TN>((long)a.B * GH);
+        var gx = InputGates<TN>(a, T, x, w, bias);
         var hPrev = h0; var cPrev = c0;
+        // The step's buffers allocated once (megabytes each: a fresh array a step is a large-object allocation and its
+        // zeroing); h and c alternate between two (the step reads the previous one).
+        var g = Scratch.Get(Scratch.StepG, gBytes); var gh = Scratch.Get(Scratch.StepG2, gBytes);
+        byte[][] hb = [Scratch.Get(Scratch.H0, hBytes), Scratch.Get(Scratch.H1, hBytes)], cb = [Scratch.Get(Scratch.C0, hBytes), Scratch.Get(Scratch.C1, hBytes)];
         string lane = "";
         for (int t = 0; t < T; t++)
         {
-            var xt = new byte[xBytes]; Array.Copy(x, (long)t * xBytes, xt, 0, xBytes);
-            var ht = new byte[hBytes]; var ct = new byte[hBytes];
-            lane = LstmStep<TN>(a, xt, hPrev, cPrev, w, u, bias, ht, ct);
-            Array.Copy(ht, 0, hOut, (long)t * hBytes, hBytes);
-            Array.Copy(ct, 0, cOut, (long)t * hBytes, hBytes);
+            Buffer.BlockCopy(gx, t * gBytes, g, 0, gBytes);
+            MatMulView<TN>(new ProductView(a.B, GH, a.H, false, true), hPrev, u, gh);                // h · Uᵀ
+            Map<TN>("add", g, gh, null, g, a.B * GH, 0, 0);
+            if (gates is not null) Buffer.BlockCopy(g, 0, gates, t * gBytes, gBytes);
+            var ht = hb[t & 1]; var ct = cb[t & 1];
+            lane = LstmCell<TN>(a, g, cPrev, ht, ct);
+            Buffer.BlockCopy(ht, 0, hOut, t * hBytes, hBytes);
+            Buffer.BlockCopy(ct, 0, cOut, t * hBytes, hBytes);
             hPrev = ht; cPrev = ct;
         }
 
         return lane;
+    }
+
+    // The GRU over the steps: gx of all steps at once, a step's gh = h · Uᵀ + bh; with the arrays given, each step's gh kept
+    // (gx is returned) for the backward.
+    private static (string Lane, byte[] Gx) GruForward<TN>(CellArgs a, int T, byte[] x, byte[] h0, byte[] w, byte[] u, byte[] bias, byte[] biasH, byte[] hOut, byte[]? ghAll) where TN : struct, IQiyasFloat<TN>
+    {
+        int GH = a.Gates * a.H, hBytes = (int)TN.Bytes((long)a.B * a.H), gBytes = BytesOf<TN>((long)a.B * GH);
+        var gx = InputGates<TN>(a, T, x, w, bias);
+        var hPrev = h0;
+        var gxt = Scratch.Get(Scratch.StepG, gBytes); var gh = Scratch.Get(Scratch.StepG2, gBytes);
+        byte[][] hb = [Scratch.Get(Scratch.H0, hBytes), Scratch.Get(Scratch.H1, hBytes)];
+        string lane = "";
+        for (int t = 0; t < T; t++)
+        {
+            Buffer.BlockCopy(gx, t * gBytes, gxt, 0, gBytes);
+            MatMulView<TN>(new ProductView(a.B, GH, a.H, false, true), hPrev, u, gh);                // h · Uᵀ
+            MapRow<TN>("add", gh, biasH, gh, a.B, GH);
+            if (ghAll is not null) Buffer.BlockCopy(gh, 0, ghAll, t * gBytes, gBytes);
+            var ht = hb[t & 1];
+            lane = GruCell<TN>(a, gxt, gh, hPrev, ht);
+            Buffer.BlockCopy(ht, 0, hOut, t * hBytes, hBytes);
+            hPrev = ht;
+        }
+
+        return (lane, gx);
+    }
+
+    // The weights' gradients of all steps at once from the gates' gradients dg (T·B × GH): dx = dg · W (T·B × D),
+    // dW = dgᵀ · x, dU = dgᵀ · hPrev (hPrev: each step's input state, T·B × H), db = the column sums of dg.
+    private static void SequenceWeights<TN>(CellArgs a, int T, byte[] dg, byte[] x, byte[]? hPrev, byte[] w, byte[]? dx, byte[] dw, byte[]? du, byte[] db) where TN : struct, IQiyasFloat<TN>
+    {
+        int GH = a.Gates * a.H, rows = T * a.B;
+        if (dx is not null) MatMulView<TN>(new ProductView(rows, a.D, GH, false, false), dg, w, dx);   // dg · W
+        MatMulView<TN>(new ProductView(GH, a.D, rows, true, false), dg, x, dw);                          // dgᵀ · x
+        if (hPrev is not null && du is not null) MatMulView<TN>(new ProductView(GH, a.H, rows, true, false), dg, hPrev, du);   // dgᵀ · hPrev
+        var (sum, _) = Reduce<TN>("sum", Axis.Cols, dg, rows, GH);
+        CopyLanes<TN>(sum, db, GH);
+    }
+
+    // The sequences' buffers kept per thread at their exact length (tens of megabytes for all the steps' gates: a fresh
+    // array a call is a large-object allocation, its zeroing and the collections it brings); every one is written whole
+    // before it is read. A slot a call site.
+    private static class Scratch
+    {
+        public const int Gx = 0, StepG = 1, StepG2 = 2, H0 = 3, H1 = 4, C0 = 5, C1 = 6, Prev = 7, Hs = 8, Cs = 9, Gates = 10, Dg = 11, Dg2 = 12,
+            Dh = 13, BackG = 14, BackG2 = 15, BackDg = 16, BackDg2 = 17, PrevState = 18, Dh0 = 19, Dh1 = 20, Dc0 = 21, Dc1 = 22, DhCell = 23, Count = 24;
+
+        [ThreadStatic] private static byte[]?[]? s_slots;
+
+        public static byte[] Get(int slot, long bytes)
+        {
+            var slots = s_slots ??= new byte[Count][];
+            var array = slots[slot];
+            if (array is null || array.LongLength != bytes) slots[slot] = array = GC.AllocateUninitializedArray<byte>(checked((int)bytes));
+            return array;
+        }
+    }
+
+    // Each step's input state: h0, then h of steps 0 … T − 2 (T·B × H).
+    private static byte[] Shifted(byte[] h0, byte[] hs, int hBytes, int T)
+    {
+        var prev = Scratch.Get(Scratch.Prev, (long)T * hBytes);
+        Buffer.BlockCopy(h0, 0, prev, 0, hBytes);
+        Buffer.BlockCopy(hs, 0, prev, hBytes, (T - 1) * hBytes);
+        return prev;
     }
 
     /// <summary>A GRU over T steps: x (T × B × D), h0 → h (T × B × H).</summary>
@@ -465,19 +592,7 @@ internal static partial class Kernels
             return name;
         }
 
-        int xBytes = (int)TN.Bytes(bd), hBytes = (int)TN.Bytes(bh);
-        var hPrev = h0;
-        string lane = "";
-        for (int t = 0; t < T; t++)
-        {
-            var xt = new byte[xBytes]; Array.Copy(x, (long)t * xBytes, xt, 0, xBytes);
-            var ht = new byte[hBytes];
-            lane = GruStep<TN>(a, xt, hPrev, w, u, bias, biasH, ht);
-            Array.Copy(ht, 0, hOut, (long)t * hBytes, hBytes);
-            hPrev = ht;
-        }
-
-        return lane;
+        return GruForward<TN>(a, T, x, h0, w, u, bias, biasH, hOut, null).Lane;
     }
 
     /// <summary>The LSTM sequence's backward: from dh (T × B × H, the loss's gradient at every step) and dc at the last step:
@@ -496,36 +611,34 @@ internal static partial class Kernels
             return name;
         }
 
-        int xBytes = (int)TN.Bytes(bd), hBytes = (int)TN.Bytes(bh);
-        var hs = new byte[T][]; var cs = new byte[T][];
-        var hPrev = h0; var cPrev = c0;
-        for (int t = 0; t < T; t++)
-        {
-            var xt = new byte[xBytes]; Array.Copy(x, (long)t * xBytes, xt, 0, xBytes);
-            hs[t] = new byte[hBytes]; cs[t] = new byte[hBytes];
-            LstmStep<TN>(a, xt, hPrev, cPrev, w, u, bias, hs[t], cs[t]);
-            hPrev = hs[t]; cPrev = cs[t];
-        }
-
+        // The forward recomputed once, each step's gates kept; per step back only the cell's backward and dh = dg · U (the
+        // chain); dx, dW, dU, db over all the steps at once (SequenceWeights).
+        int GW = a.Gates * a.H, hBytes = (int)TN.Bytes(bh), gBytes = BytesOf<TN>((long)a.B * GW);
+        var hs = Scratch.Get(Scratch.Hs, (long)T * hBytes); var cs = Scratch.Get(Scratch.Cs, (long)T * hBytes);
+        var gates = Scratch.Get(Scratch.Gates, (long)T * gBytes);
+        LstmForward<TN>(a, T, x, h0, c0, w, u, bias, hs, cs, gates);
+        var dgAll = Scratch.Get(Scratch.Dg, (long)T * gBytes);
         var dhNext = new byte[hBytes]; var dcNext = (byte[])dcLast.Clone();
-        var dwSum = new byte[dw.Length]; var duSum = new byte[du.Length]; var dbSum = new byte[db.Length];
+        // The step's buffers once; dh and dc alternate between two (a step reads the next step's).
+        var dht = Scratch.Get(Scratch.Dh, hBytes); var g = Scratch.Get(Scratch.BackG, gBytes); var dg = Scratch.Get(Scratch.BackDg, gBytes); var cPrev = Scratch.Get(Scratch.PrevState, hBytes);
+        byte[][] dhb = [Scratch.Get(Scratch.Dh0, hBytes), Scratch.Get(Scratch.Dh1, hBytes)], dcb = [Scratch.Get(Scratch.Dc0, hBytes), Scratch.Get(Scratch.Dc1, hBytes)];
         string lane = "";
         for (int t = T - 1; t >= 0; t--)
         {
-            var xt = new byte[xBytes]; Array.Copy(x, (long)t * xBytes, xt, 0, xBytes);
-            var dht = new byte[hBytes]; Array.Copy(dhOut, (long)t * hBytes, dht, 0, hBytes);
+            Buffer.BlockCopy(dhOut, t * hBytes, dht, 0, hBytes);
             Map<TN>("add", dht, dhNext, null, dht, (int)bh, 0, 0);                        // the loss's gradient plus the next step's
-            var dxt = new byte[xBytes]; var dhp = new byte[hBytes]; var dcp = new byte[hBytes];
-            var dwt = new byte[dw.Length]; var dut = new byte[du.Length]; var dbt = new byte[db.Length];
-            lane = LstmStepBackward<TN>(a, xt, t == 0 ? h0 : hs[t - 1], t == 0 ? c0 : cs[t - 1], w, u, bias, dht, dcNext, dxt, dhp, dcp, dwt, dut, dbt);
-            Array.Copy(dxt, 0, dx, (long)t * xBytes, xBytes);
-            Map<TN>("add", dwSum, dwt, null, dwSum, (int)(a.Gates * a.H * (long)a.D), 0, 0);
-            Map<TN>("add", duSum, dut, null, duSum, (int)(a.Gates * a.H * (long)a.H), 0, 0);
-            Map<TN>("add", dbSum, dbt, null, dbSum, a.Gates * a.H, 0, 0);
+            Buffer.BlockCopy(gates, t * gBytes, g, 0, gBytes);
+            if (t > 0) Buffer.BlockCopy(cs, (t - 1) * hBytes, cPrev, 0, hBytes);
+            var dcp = dcb[t & 1];
+            lane = LstmCellBackward<TN>(a, g, t == 0 ? c0 : cPrev, dht, dcNext, dg, dcp);
+            Buffer.BlockCopy(dg, 0, dgAll, t * gBytes, gBytes);
+            var dhp = dhb[t & 1];
+            MatMulView<TN>(new ProductView(a.B, a.H, GW, false, false), dg, u, dhp);         // dg · U
             dhNext = dhp; dcNext = dcp;
         }
 
-        dhNext.CopyTo(dh0, 0); dcNext.CopyTo(dc0, 0); dwSum.CopyTo(dw, 0); duSum.CopyTo(du, 0); dbSum.CopyTo(db, 0);
+        SequenceWeights<TN>(a, T, dgAll, x, Shifted(h0, hs, hBytes, T), w, dx, dw, du, db);
+        dhNext.CopyTo(dh0, 0); dcNext.CopyTo(dc0, 0);
         return lane;
     }
 
@@ -545,37 +658,39 @@ internal static partial class Kernels
             return name;
         }
 
-        int xBytes = (int)TN.Bytes(bd), hBytes = (int)TN.Bytes(bh);
-        var hs = new byte[T][];
-        var hPrev = h0;
-        for (int t = 0; t < T; t++)
-        {
-            var xt = new byte[xBytes]; Array.Copy(x, (long)t * xBytes, xt, 0, xBytes);
-            hs[t] = new byte[hBytes];
-            GruStep<TN>(a, xt, hPrev, w, u, bias, biasH, hs[t]);
-            hPrev = hs[t];
-        }
-
+        // The forward recomputed once, gx (all steps) and each step's gh kept; per step back only the cell's backward and
+        // dh = dgh · U + the cell's direct part; dx, dW, db from dgx and dU, dbh from dgh over all the steps at once.
+        int GW = a.Gates * a.H, hBytes = (int)TN.Bytes(bh), gBytes = BytesOf<TN>((long)a.B * GW);
+        var hs = Scratch.Get(Scratch.Hs, (long)T * hBytes);
+        var ghAll = Scratch.Get(Scratch.Gates, (long)T * gBytes);
+        var (_, gx) = GruForward<TN>(a, T, x, h0, w, u, bias, biasH, hs, ghAll);
+        var dgxAll = Scratch.Get(Scratch.Dg, (long)T * gBytes); var dghAll = Scratch.Get(Scratch.Dg2, (long)T * gBytes);
         var dhNext = new byte[hBytes];
-        var dwSum = new byte[dw.Length]; var duSum = new byte[du.Length]; var dbSum = new byte[db.Length]; var dbhSum = new byte[dbh.Length];
+        // The step's buffers once; dh alternates between two (a step reads the next step's).
+        var dht = Scratch.Get(Scratch.Dh, hBytes); var gxt = Scratch.Get(Scratch.BackG, gBytes); var ght = Scratch.Get(Scratch.BackG2, gBytes); var hPrev = Scratch.Get(Scratch.PrevState, hBytes);
+        var dgx = Scratch.Get(Scratch.BackDg, gBytes); var dgh = Scratch.Get(Scratch.BackDg2, gBytes); var dhCell = Scratch.Get(Scratch.DhCell, hBytes);
+        byte[][] dhb = [Scratch.Get(Scratch.Dh0, hBytes), Scratch.Get(Scratch.Dh1, hBytes)];
         string lane = "";
         for (int t = T - 1; t >= 0; t--)
         {
-            var xt = new byte[xBytes]; Array.Copy(x, (long)t * xBytes, xt, 0, xBytes);
-            var dht = new byte[hBytes]; Array.Copy(dhOut, (long)t * hBytes, dht, 0, hBytes);
+            Buffer.BlockCopy(dhOut, t * hBytes, dht, 0, hBytes);
             Map<TN>("add", dht, dhNext, null, dht, (int)bh, 0, 0);                        // the loss's gradient plus the next step's
-            var dxt = new byte[xBytes]; var dhp = new byte[hBytes];
-            var dwt = new byte[dw.Length]; var dut = new byte[du.Length]; var dbt = new byte[db.Length]; var dbht = new byte[dbh.Length];
-            lane = GruStepBackward<TN>(a, xt, t == 0 ? h0 : hs[t - 1], w, u, bias, biasH, dht, dxt, dhp, dwt, dut, dbt, dbht);
-            Array.Copy(dxt, 0, dx, (long)t * xBytes, xBytes);
-            Map<TN>("add", dwSum, dwt, null, dwSum, (int)(a.Gates * a.H * (long)a.D), 0, 0);
-            Map<TN>("add", duSum, dut, null, duSum, (int)(a.Gates * a.H * (long)a.H), 0, 0);
-            Map<TN>("add", dbSum, dbt, null, dbSum, a.Gates * a.H, 0, 0);
-            Map<TN>("add", dbhSum, dbht, null, dbhSum, a.Gates * a.H, 0, 0);
+            Buffer.BlockCopy(gx, t * gBytes, gxt, 0, gBytes);
+            Buffer.BlockCopy(ghAll, t * gBytes, ght, 0, gBytes);
+            if (t > 0) Buffer.BlockCopy(hs, (t - 1) * hBytes, hPrev, 0, hBytes);
+            lane = GruCellBackward<TN>(a, gxt, ght, t == 0 ? h0 : hPrev, dht, dgx, dgh, dhCell);
+            Buffer.BlockCopy(dgx, 0, dgxAll, t * gBytes, gBytes);
+            Buffer.BlockCopy(dgh, 0, dghAll, t * gBytes, gBytes);
+            var dhp = dhb[t & 1];
+            MatMulView<TN>(new ProductView(a.B, a.H, GW, false, false), dgh, u, dhp);        // dgh · U
+            Map<TN>("add", dhp, dhCell, null, dhp, (int)bh, 0, 0);
             dhNext = dhp;
         }
 
-        dhNext.CopyTo(dh0, 0); dwSum.CopyTo(dw, 0); duSum.CopyTo(du, 0); dbSum.CopyTo(db, 0); dbhSum.CopyTo(dbh, 0);
+        var hArgs = new CellArgs("gru", a.B, a.H, a.H);
+        SequenceWeights<TN>(a, T, dgxAll, x, null, w, dx, dw, null, db);
+        SequenceWeights<TN>(hArgs, T, dghAll, Shifted(h0, hs, hBytes, T), null, u, null, du, null, dbh);
+        dhNext.CopyTo(dh0, 0);
         return lane;
     }
 
