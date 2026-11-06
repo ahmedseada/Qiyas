@@ -237,6 +237,26 @@ public sealed class QiyasSubject : IBenchSubject
         byte[]? dx, byte[]? dh0, byte[]? dc0, byte[]? dw, byte[]? du, byte[]? db) =>
         Registry.IsFloat(type) && !Registry.IsBlock(type) ? Registry.WithFloat(type, new SequenceVisitor(device, a, T, x, h0, c0, w, u, b, hOut, cOut, dx, dh0, dc0, dw, du, db)) : null;
 
+    public IBenchRun? GruSequence(Device device, string type, CellArgs a, int T, byte[] x, byte[] h0, byte[] w, byte[] u, byte[] b, byte[] bh, byte[] hOut) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new GruSequenceVisitor(device, a, T, x, h0, w, u, b, bh, hOut)) : null;
+
+    private sealed class GruSequenceVisitor(Device device, CellArgs a, int T, byte[] x, byte[] h0, byte[] w, byte[] u, byte[] b, byte[] bh, byte[] hOut) : IFloatTypeVisitor<IBenchRun?>
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float>
+        {
+            string lane = "";
+            if (device == Device.Cpu) return new BenchRun(() => lane = Kernels.GruSequence<TN>(a, T, x, h0, w, u, b, bh, hOut), lane: () => lane);
+            var ops = Devices.Ops;
+            var gpu = ops.Gpu;
+            var rented = new List<ulong>();
+            ulong Up(byte[] array) { ulong d = gpu.Rent(array.Length + 4); rented.Add(d); Gpu.Upload<byte>(array, d); return d; }
+            ulong dX = Up(x), dH0 = Up(h0), dW = Up(w), dU = Up(u), dB = Up(b), dBh = Up(bh), dHo = gpu.Rent(hOut.Length + 4);
+            rented.Add(dHo);
+            return new BenchRun(() => { lane = ops.GruSequence<TN>(a, T, dX, dH0, dW, dU, dB, dBh, dHo); Gpu.Synchronize(); },
+                () => Gpu.Download<byte>(dHo, hOut), () => { foreach (var p in rented) gpu.Return(p); }, () => lane);
+        }
+    }
+
     private sealed class SequenceVisitor(Device device, CellArgs a, int T, byte[] x, byte[] h0, byte[] c0, byte[] w, byte[] u, byte[] b, byte[] hOut, byte[] cOut,
         byte[]? dx, byte[]? dh0, byte[]? dc0, byte[]? dw, byte[]? du, byte[]? db) : IFloatTypeVisitor<IBenchRun?>
     {

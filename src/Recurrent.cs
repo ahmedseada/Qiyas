@@ -453,6 +453,18 @@ internal static partial class Kernels
     public static string GruSequence<TN>(CellArgs a, int T, byte[] x, byte[] h0, byte[] w, byte[] u, byte[] bias, byte[] biasH, byte[] hOut) where TN : struct, IQiyasFloat<TN>
     {
         long bd = (long)a.B * a.D, bh = (long)a.B * a.H;
+        if (!OwnLane<TN>())
+        {
+            // A narrower type or a block format: widened once, h kept in the float lane across the steps, narrowed once.
+            long GH = a.Gates * a.H;
+            var lh = LOut<TN>(T * bh);
+            string name = TN.Bits == 64
+                ? GruSequence<Float64>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), lh)
+                : GruSequence<Float32>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), lh);
+            FromLane<TN>(lh, hOut, T * bh);
+            return name;
+        }
+
         int xBytes = (int)TN.Bytes(bd), hBytes = (int)TN.Bytes(bh);
         var hPrev = h0;
         string lane = "";

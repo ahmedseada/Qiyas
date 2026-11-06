@@ -27,6 +27,24 @@ public sealed class RecurrentCase
         return (gx, gh);
     }
 
+    /// <summary>A GRU sequence in float64: h per step (T × B × H), the step's gates gx = x·Wᵀ + b, gh = h·Uᵀ + bh, then the cell.</summary>
+    public static double[] GruSequenceReference(CellArgs a, int T, double[] x, double[] h0, double[] w, double[] u, double[] b, double[] bh)
+    {
+        int bd = a.B * a.D, bhn = a.B * a.H;
+        var hs = new double[T * bhn];
+        var hPrev = h0;
+        for (int t = 0; t < T; t++)
+        {
+            var (gx, gh) = Gates(a, x.AsSpan(t * bd, bd).ToArray(), hPrev, w, u, b, bh);
+            var ht = new double[bhn];
+            a.GruCell(gx, gh, hPrev, ht);
+            Array.Copy(ht, 0, hs, t * bhn, bhn);
+            hPrev = ht;
+        }
+
+        return hs;
+    }
+
     /// <summary>An LSTM sequence in float64: h, c per step; and its backward from dh per step and dc at the last: dx, dh0, dc0, dW, dU, db.</summary>
     public static (double[] H, double[] C) LstmSequenceReference(CellArgs a, int T, double[] x, double[] h0, double[] c0, double[] w, double[] u, double[] b)
     {

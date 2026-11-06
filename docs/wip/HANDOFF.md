@@ -89,7 +89,7 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
   - measured (16 heads, 2048², d 128): device f32 3.79 ms (causal 2.12) from 6.1 by the composition; f16 3.82, fp8
     4.72, q8_0 3.95; f64 non-causal keeps the composition (59 vs 61), causal fused 31.7 vs 59. CPU f32 60–80 ms (causal
     33–38) from 100–148.
-- 4b: done, reported as its own boundary (uncommitted until the coordinator's go). What landed:
+- 4b: done, committed as 168059c. What landed:
   - `src/Ctc.cs`: `CtcArgs(T, B, C, Blank, InputLengths, LabelLengths, Labels)` with `Validate`, `States` (per sequence,
     rows of MaxStates + 2: the class of each extended state; flags bit 0 = α may skip from s − 2, bit 1 = the class's
     first state) and the float64 `Reference(x)` → (loss, grad); logits in, log_softmax inside.
@@ -110,6 +110,15 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
     (`--ops routing`).
   - measured (T 256, B 32, C 1024, 64 labels): device f32 0.54 / 1.18 ms (fwd / bwd), f64 2.35 / 5.25; CPU f32
     1.8 / 3.6–3.8, f16 2.4 / 4.4, f64 4.0 / 8.0. The device recursion is latency-bound (COVERAGE "Known slow").
+- 4c: done, reported as its own boundary (uncommitted until the coordinator's go). What landed:
+  - `RecurrentCase.GruSequenceReference` (the step's `Gates` and `CellArgs.GruCell` looped in float64).
+  - `Kernels.GruSequence<TN>` and `GpuOps.GruSequence<TN>`: a narrower type or a block format widened once, h kept in
+    the float lane across the steps, narrowed once (the LSTM sequence's wrapper; on the device block formats too,
+    where the GRU sequence refused them before; on the CPU narrow types rounded h to the type every step before).
+  - contract `IBenchSubject.GruSequence(...)`, `QiyasSubject.GruSequenceVisitor`; gate in `Checks.Recurrents` (3 steps
+    of 5 × 7 → 11, every float type incl. blocks); bench row `gru_seq` in Group8 (T16 B256 D512 H512).
+  - measured: device f32 2.55 ms, f16 2.77, f64 28.5, q8_0 2.70; CPU f32 71, f16 62, f64 126, q8_0 55.
+  - no GRU sequence backward (not asked for); COVERAGE says so.
 
 ## Item 4a — flash-fused attention rows
 

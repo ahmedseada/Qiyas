@@ -541,7 +541,26 @@ internal static class Checks
             ok &= Close(type, "lstm_seq_bwd db", where, db, wdb, GH, terms);
         }
 
-        if (ok) Console.WriteLine($"check recurrent              {where,-6} every float type: LSTM and GRU steps, forward and backward, and LSTM sequences, within the products' rounding");
+        // GRU sequences: 3 steps of 5 × 7 → 11 (h every step), every float type, the block formats through lane storage.
+        foreach (var type in Bench.Registry.Names)
+        {
+            if (!Bench.Registry.IsFloat(type)) continue;
+            var a = new CellArgs("gru", 5, 7, 11);
+            const int T = 3;
+            int GH = a.Gates * a.H;
+            double scale = 1 / Math.Sqrt(a.D + a.H);
+            var x = Bench.Registry.Make(type, T * a.B * a.D, 91, -1, 1); var h0 = Bench.Registry.Make(type, a.B * a.H, 92, -1, 1);
+            var w = Bench.Registry.Make(type, GH * a.D, 94, -scale, scale); var u = Bench.Registry.Make(type, GH * a.H, 95, -scale, scale);
+            var b = Bench.Registry.Make(type, GH, 96, -0.1, 0.1); var bh = Bench.Registry.Make(type, GH, 97, -0.1, 0.1);
+            double[] V(byte[] s, int n) => Bench.Registry.Values(type, s, n);
+            var wantH = Bench.RecurrentCase.GruSequenceReference(a, T, V(x, T * a.B * a.D), V(h0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH), V(bh, GH));
+            var hOut = new byte[Bench.Registry.Bytes(type, T * a.B * a.H)];
+            var dev = ops is null ? Bench.Device.Cpu : Bench.Device.Cuda;
+            using (var run = new Bench.QiyasSubject().GruSequence(dev, type, a, T, x, h0, w, u, b, bh, hOut)!) { run.Run(); run.Collect(); }
+            ok &= Close(type, "gru_seq h", where, hOut, wantH, T * a.B * a.H, T * (a.D + a.H));
+        }
+
+        if (ok) Console.WriteLine($"check recurrent              {where,-6} every float type: LSTM and GRU steps, forward and backward, LSTM sequences and their backward, GRU sequences (block formats too), within the products' rounding");
         return ok;
     }
 

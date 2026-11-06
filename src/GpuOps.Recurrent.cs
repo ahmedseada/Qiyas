@@ -275,6 +275,27 @@ public sealed partial class GpuOps
     public string GruSequence<TN>(CellArgs a, int T, ulong x, ulong h0, ulong w, ulong u, ulong bias, ulong biasH, ulong hOut) where TN : struct, IQiyasNumber<TN>
     {
         var f = Fmt.Of<TN>();
+        if (!OwnLane(f))
+        {
+            // A narrower type or a block format: widened once, h kept in the float lane across the steps, narrowed once.
+            var ln = RowLane(f);
+            var rented = new List<ulong>();
+            try
+            {
+                long bd = (long)a.B * a.D, bh = (long)a.B * a.H, GH = a.Gates * a.H;
+                ulong lh = gpu.Rent(T * bh * ln.Size);
+                rented.Add(lh);
+                ulong lx = ToLane<TN>(x, T * bd, rented), lh0 = ToLane<TN>(h0, bh, rented), lw = ToLane<TN>(w, GH * a.D, rented), lu = ToLane<TN>(u, GH * a.H, rented), lb = ToLane<TN>(bias, GH, rented), lbh = ToLane<TN>(biasH, GH, rented);
+                string name = ln.Wide ? GruSequence<Float64>(a, T, lx, lh0, lw, lu, lb, lbh, lh) : GruSequence<Float32>(a, T, lx, lh0, lw, lu, lb, lbh, lh);
+                FromLane<TN>(lh, hOut, T * bh);
+                return f.IsBlock ? $"{name} (blocks through lane storage)" : name;
+            }
+            finally
+            {
+                foreach (var p in rented) gpu.Return(p);
+            }
+        }
+
         if (f.IsBlock || ((long)a.B * a.D * f.Bits % 8 != 0) || ((long)a.B * a.H * f.Bits % 8 != 0)) throw new NotSupportedException($"{f.Name}: a sequence's steps must end on a byte");
         ulong hPrev = h0;
         string lane = "";

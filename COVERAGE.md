@@ -58,7 +58,7 @@ regression comparer and the baseline run.
 
 **Open, in the order they are taken:**
 
-1. The todo rows below (item 4, in this order: fused attention rows — done, ctc — done, the GRU sequence bench row, the block-scaled
+1. The todo rows below (item 4, in this order: fused attention rows — done, ctc — done, the GRU sequence bench row — done, the block-scaled
    tiled product, the transposition fused into the product's packing, the radix step of scatter-add, the fused direct
    convolution); the designs and the progress are in `docs/wip/HANDOFF.md`.
 2. A bump-allocated scope past the pool (buffers reserved once from the shapes; zero rents on the hot path).
@@ -239,7 +239,8 @@ sum_axis, sumsq, max, min, argmax → the reductions; transpose; gemv_nn / gemv_
 |---|---|---|---|
 | LSTM and GRU cells (h', c' from the gates), their backward (the gates' gradients) | ✓ float | ✓ float | one pass over the rows (a thread per hidden unit); sigmoid and tanh proven |
 | LSTM and GRU steps (x, h → h', c') and their backward (dx, dh, dc, dW, dU, db, dbh) | ✓ float | ✓ float | the gates by the products on views and the broadcast add, in the float lane's storage for a narrow type (the gates are sums of products); the backward by the cell backward and the products' backward |
-| LSTM sequences (T steps: h, c every step) and their backward (dx, dh0, dc0, dW, dU, db) | ✓ float | ✓ float | a loop of steps; the backward recomputes the forward and walks the steps back, the weights' gradients summed; a GRU sequence is the same loop of its step (its bench row: todo) |
+| LSTM sequences (T steps: h, c every step) and their backward (dx, dh0, dc0, dW, dU, db) | ✓ float | ✓ float | a loop of steps; the backward recomputes the forward and walks the steps back, the weights' gradients summed |
+| GRU sequences (T steps: h every step) | ✓ float | ✓ float | the loop of the GRU step; a narrower type or a block format widened once, h kept in the float lane across the steps, narrowed once (both devices, block formats included); gate: 3 steps of 5 × 7 → 11 against the step reference looped in float64, every float type; bench row `gru_seq` (16 steps of 256 × 512 → 512). A GRU sequence backward is not provided (the step's backward is: a loop of it as the LSTM sequence's is the way) |
 
 ## Quantized and block formats
 

@@ -119,6 +119,9 @@ public interface IBenchSubject
     IBenchRun? LstmSequence(Device device, string type, CellArgs a, int T, byte[] x, byte[] h0, byte[] c0, byte[] w, byte[] u, byte[] b, byte[] hOut, byte[] cOut,
         byte[]? dx, byte[]? dh0, byte[]? dc0, byte[]? dw, byte[]? du, byte[]? db) => null;
 
+    /// <summary>A GRU sequence of T steps (x: T × B × D; h0; W, U, b, bh as the step's; h out: T × B × H).</summary>
+    IBenchRun? GruSequence(Device device, string type, CellArgs a, int T, byte[] x, byte[] h0, byte[] w, byte[] u, byte[] b, byte[] bh, byte[] hOut) => null;
+
     /// <summary>A recurrent step (CellArgs: lstm or gru): h' (and c' for LSTM) from x, h (, c) and the weights W (GH × D), U (GH × H),
     /// b (GH), bh (GRU's second bias, GH); when dx is given the backward pass instead: hOut (, cOut) are then dh', dc', and the
     /// gradients go to dx, dh, dc, dw, du, db, dbh.</summary>
