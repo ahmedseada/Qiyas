@@ -2204,6 +2204,87 @@ internal static partial class Ptx
     /// stored rows (coalesced), turned in shared memory, written along the packed rows (coalesced). With conv (item 4g) B is
     /// the convolution's columns read from the image (p_x: C × H × W): B[kk][j] = x[c][oh·sh − ph + kh·dh][ow·sw − pw + kw·dw]
     /// for kk = (c, kh, kw), j = (oh, ow), 0 off the image — the implicit im2col.</summary>
+    /// <summary>The transposed packing of a 16-bit type that is its tensor kind's own (float16 → f16, bfloat16 → bf16; n
+    /// even): stored k × n, packed n × kp (zeros past k). A 64 × 64 tile a block: each warp row loads 32 words (128
+    /// bytes) of a stored row, the tile transposed through shared memory, each warp stores 32 words of a packed column
+    /// (pairs of k values); 32-bit accesses both ways, the shared reads without bank conflicts.</summary>
+    public static string PackTransposed16(Gpu gpu, Fmt f, Kind kind, out string entry)
+    {
+        entry = $"packt16_{f.Name}_{kind.Name}";
+        if (f.Bits != 16 || kind.Bits != 16) throw new ArgumentException("a 16-bit type in its own 16-bit tensor kind");
+        const int Tile = 64, Stride = 66;                                    // stride in halves: 132 bytes, a word multiple
+        var b = new PtxBuilder();
+        string tid = b.R(), col0 = b.R(), k0 = b.R(), smem = b.R();
+        b.L($"mov.u32 {tid}, %tid.x;");
+        b.L($"mov.u32 {col0}, %ctaid.x;");
+        b.L($"mul.lo.u32 {col0}, {col0}, {Tile};");
+        b.L($"mov.u32 {k0}, %ctaid.y;");
+        b.L($"mul.lo.u32 {k0}, {k0}, {Tile};");
+        b.L($"mov.u32 {smem}, smem;");
+        string src = Param64(b, "p_x"), dst = Param64(b, "p_y"), n = Param32(b, "p_n"), k = Param32(b, "p_k"), kp = Param32(b, "p_kp");
+        // Load: word wc = tid & 31 of the tile's row (columns 2wc, 2wc + 1), rows (tid >> 5) + 8i.
+        string wc = b.R(), c2 = b.R(), nn = b.R(), pCol = b.P(), r0 = b.R();
+        b.L($"and.b32 {wc}, {tid}, 31;");
+        b.L($"shl.b32 {c2}, {wc}, 1;");
+        b.L($"add.u32 {nn}, {col0}, {c2};");
+        b.L($"setp.lt.u32 {pCol}, {nn}, {n};");
+        b.L($"shr.u32 {r0}, {tid}, 5;");
+        for (int i = 0; i < Tile / 8; i++)
+        {
+            string row = b.R(), kk = b.R(), pk = b.P(), word = b.R(), off = b.RD(), addr = b.RD(), lo = b.R(), hi = b.R(), s0 = b.R();
+            b.L($"add.u32 {row}, {r0}, {8 * i};");
+            b.L($"add.u32 {kk}, {k0}, {row};");
+            b.L($"setp.lt.u32 {pk}, {kk}, {k};");
+            b.L($"and.pred {pk}, {pk}, {pCol};");
+            b.L($"mov.b32 {word}, 0;");
+            b.L($"mad.wide.u32 {off}, {kk}, {n}, {Cvt64Of(b, nn)};");
+            b.L($"shl.b64 {off}, {off}, 1;");
+            b.L($"add.u64 {addr}, {src}, {off};");
+            b.L($"@{pk} ld.global.b32 {word}, [{addr}];");
+            b.L($"and.b32 {lo}, {word}, 0xFFFF;");
+            b.L($"shr.u32 {hi}, {word}, 16;");
+            // T[c][row] at (c·Stride + row)·2: columns 2wc and 2wc + 1.
+            b.L($"mad.lo.u32 {s0}, {c2}, {Stride}, {row};");
+            b.L($"shl.b32 {s0}, {s0}, 1;");
+            b.L($"add.u32 {s0}, {s0}, {smem};");
+            b.L($"st.shared.u16 [{s0}], {lo};");
+            b.L($"st.shared.u16 [{s0}+{Stride * 2}], {hi};");
+        }
+
+        b.L("bar.sync 0;");
+        // Store: word w = tid + 256j → column w >> 5, word w & 31 (k values 2(w & 31), +1) of the tile's 64.
+        string kw0 = b.R(), wordsK = b.R();
+        b.L($"shr.u32 {kw0}, {k0}, 1;");
+        b.L($"shr.u32 {wordsK}, {kp}, 1;");
+        for (int j = 0; j < Tile * Tile / 2 / 256; j++)
+        {
+            string w = b.R(), c = b.R(), wi = b.R(), ncol = b.R(), pn = b.P(), kwi = b.R(), sAddr = b.R(), word = b.R(), wIdx = b.RD(), oAddr = b.RD();
+            b.L($"add.u32 {w}, {tid}, {j * 256};");
+            b.L($"shr.u32 {c}, {w}, 5;");
+            b.L($"and.b32 {wi}, {w}, 31;");
+            b.L($"add.u32 {ncol}, {col0}, {c};");
+            b.L($"add.u32 {kwi}, {kw0}, {wi};");
+            b.L($"setp.ge.u32 {pn}, {ncol}, {n};");
+            string pk = b.P();
+            b.L($"setp.ge.u32 {pk}, {kwi}, {wordsK};");
+            b.L($"or.pred {pn}, {pn}, {pk};");
+            b.L($"@{pn} bra STORED{j};");
+            b.L($"mad.lo.u32 {sAddr}, {c}, {Stride}, {wi};");
+            b.L($"add.u32 {sAddr}, {sAddr}, {wi};");
+            b.L($"shl.b32 {sAddr}, {sAddr}, 1;");
+            b.L($"add.u32 {sAddr}, {sAddr}, {smem};");
+            b.L($"ld.shared.b32 {word}, [{sAddr}];");
+            b.L($"mad.wide.u32 {wIdx}, {ncol}, {wordsK}, {Cvt64Of(b, kwi)};");
+            b.L($"shl.b64 {wIdx}, {wIdx}, 2;");
+            b.L($"add.u64 {oAddr}, {dst}, {wIdx};");
+            b.L($"st.global.b32 [{oAddr}], {word};");
+            b.Label($"STORED{j}");
+        }
+
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_y, .param .u32 p_n, .param .u32 p_k, .param .u32 p_kp", Tile * Stride * 2);
+    }
+
     public static string PackTransposed(Gpu gpu, Fmt f, Kind kind, out string entry, bool conv = false)
     {
         entry = conv ? $"packconv_{f.Name}_{kind.Name}" : $"packt_{f.Name}_{kind.Name}";

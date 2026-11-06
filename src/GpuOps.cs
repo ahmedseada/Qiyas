@@ -801,6 +801,14 @@ public sealed partial class GpuOps(Gpu gpu)
     {
         ulong packed = gpu.Rent((long)rows * kp * kind.Bits / 8);
         rented.Add(packed);
+        if (transposed && f.Bits == 16 && kind.Bits == 16 && f.Is(kind == Ptx.Kind.F16 ? "float16" : "bfloat16") && rows % 2 == 0)
+        {
+            // A 16-bit type in its own kind: the word-wide transposing tile.
+            var f16 = gpu.Cached($"packt16:{f.Name}:{kind.Name}", (out string e) => Ptx.PackTransposed16(gpu, f, kind, out e));
+            Gpu.Launch(f16, Grid(rows, 64), (uint)((kp + 63) / 64), 256, 1, 0, stored, packed, Gpu.U(rows), Gpu.U(k), Gpu.U(kp));
+            return packed;
+        }
+
         if (transposed)
         {
             var ft = gpu.Cached($"packt:{f.Name}:{kind.Name}", (out string e) => Ptx.PackTransposed(gpu, f, kind, out e));

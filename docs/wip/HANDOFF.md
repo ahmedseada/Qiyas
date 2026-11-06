@@ -276,6 +276,22 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
   18.1 → 13.1, float64 46.0 → 36.1, q8_0 59.8 → 14.2. Errors equal or below (q8_0 1.25e-1 → 6.42e-2, q4_k 9.02e-1 →
   5.44e-1). The device float32 and float16 rows are near the bandwidth (float32 512 MB) and the exp rate (float16).
 
+- 6e (the device Aᵀ products): done, reported. Measured now (qiyas): int32 tn / tt 0.216 / 0.274 (baseline 0.210 /
+  0.270), int4 0.102 / 0.105, batched float16 0.622, int4 0.442, int32 1.54, int64 1.63 — back within swing. The arena
+  is not the cause: with the bench's scope off (one run) float16 tn / tt read 0.295 as with it. int64 2048³ reads 0.36
+  or 0.57 ms by run in any orientation (scope on: tt 0.567, tn 0.358; scope off: nn 0.569, tn / tt 0.36): a swing of
+  the int64 product as a whole, not Aᵀ — noted, not chased. float16 / bfloat16 tn / tt: the product's phases
+  (`gpuprofile`, a temporary transA switch, not kept): nn 0.260 ms = pack B 0.020 + product 0.220 + back 0.018; tn adds
+  pack A (the transposing pack). New `Ptx.PackTransposed16` (`GpuOps.Pack`: a 16-bit type in its own kind, n even): a
+  64 × 64 tile, 32-bit loads (a warp row 128 bytes), transposed through shared memory, 32-bit stores of k pairs, the
+  shared reads conflict-free — the transposing pack 0.024–0.027 → 0.020–0.022 ms per 2048² operand (16 MB moved: at the
+  bandwidth); profile tn float16 0.296 → 0.285, bfloat16 0.334 → 0.285. Every float16 / bfloat16 device product packs B
+  through it (also padded shapes): `check products device` green. Bench rows (one run): float16 tn / tt 0.294 / 0.295,
+  bfloat16 0.260 / 0.295 against 0.263 / 0.267 in item 4's baseline. What remains is structural: tn pays one pack of A
+  more than nn (0.022, at the bandwidth); removing it means the mma kernel reading Aᵀ (ldmatrix .trans on k-major
+  tiles), and every 16-bit product writes C in f32 then converts (back 0.018 of 0.26): a 16-bit epilogue in the mma
+  kernel would save that on every float16 / bfloat16 product — candidates for 6j, not done.
+
 ## Item 5 progress
 
 - Done, reported (uncommitted until the coordinator's go). What landed:
@@ -670,6 +686,7 @@ Each: measure against the baseline cell, change, re-measure (the full run or the
   against item 4's baseline, nn / nt unchanged. The Aᵀ route packs A into a rented buffer: compare the pool and the
   arena on that path (`GpuOps.FusedConv`-style switch: the bench's scope off) once; if the arena costs it, find why
   (the packed A adjacent to B in one region, or the growth's synchronize on the first scoped calls).
+  Done in 6e (see there).
 - Item 4's full run, slower cells in code item 4 changed (not re-timed at the coordinator's order): CPU matmul
   float64 1.16×, float16 1.38×, float8_e5m2 1.41× (4e's product kernel: `Operands`, `Micro`'s cOff, the in-place
   route), CUDA matmul int4 1.15× (4e), CUDA softmax float16 1.12× (the launch-limit query, cached since). Re-time
