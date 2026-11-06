@@ -209,6 +209,37 @@ internal static partial class Kernels
 
     // A narrow float's step runs in its lane's storage: the gates are sums of products the type cannot hold between the passes.
     private static byte[] L<TN>(byte[] x, long count) where TN : struct, IQiyasFloat<TN> => ToLane<TN>(x, count);
+
+    // The weights W, U widened to the lane's storage, kept per thread for each weight array (by reference, type and count)
+    // with a copy of the bytes they came from: a call whose weights' bytes are unchanged takes the kept lanes (one
+    // vectorized compare of the type's bytes instead of a conversion and a fresh array of tens of megabytes); a changed
+    // array (a weight update in place) is converted again into the same lanes. Only read by the steps.
+    private sealed class WidenedWeights
+    {
+        public string Type = ""; public long Count; public byte[] Source = []; public byte[] Lanes = [];
+    }
+
+    [ThreadStatic] private static System.Runtime.CompilerServices.ConditionalWeakTable<byte[], WidenedWeights>? s_weights;
+
+    private static byte[] Weights<TN>(byte[] x, long count) where TN : struct, IQiyasFloat<TN>
+    {
+        int bytes = checked((int)TN.Bytes(count));
+        var table = s_weights ??= new();
+        if (!table.TryGetValue(x, out var e) || e.Type != TN.Name || e.Count != count)
+        {
+            e = new WidenedWeights { Type = TN.Name, Count = count, Source = x.AsSpan(0, bytes).ToArray(), Lanes = ToLane<TN>(x, count) };
+            table.AddOrUpdate(x, e);
+            return e.Lanes;
+        }
+
+        if (!x.AsSpan(0, bytes).SequenceEqual(e.Source))
+        {
+            ToLaneInto<TN>(x, count, e.Lanes);
+            x.AsSpan(0, bytes).CopyTo(e.Source);
+        }
+
+        return e.Lanes;
+    }
     private static byte[] LOut<TN>(long count) where TN : struct, IQiyasFloat<TN> => new byte[count * (TN.Bits == 64 ? 8 : 4)];
 
     /// <summary>An LSTM step: (h', c') from x, h, c and the weights W (4H × D), U (4H × H), b (4H).</summary>
@@ -219,8 +250,8 @@ internal static partial class Kernels
             long bh = (long)a.B * a.H;
             var lh = LOut<TN>(bh); var lc = LOut<TN>(bh);
             string lane = TN.Bits == 64
-                ? LstmStep<Float64>(a, L<TN>(x, (long)a.B * a.D), L<TN>(h, bh), L<TN>(c, bh), L<TN>(w, a.GateValues / a.B * a.D), L<TN>(u, a.GateValues / a.B * a.H), L<TN>(bias, a.Gates * a.H), lh, lc)
-                : LstmStep<Float32>(a, L<TN>(x, (long)a.B * a.D), L<TN>(h, bh), L<TN>(c, bh), L<TN>(w, a.GateValues / a.B * a.D), L<TN>(u, a.GateValues / a.B * a.H), L<TN>(bias, a.Gates * a.H), lh, lc);
+                ? LstmStep<Float64>(a, L<TN>(x, (long)a.B * a.D), L<TN>(h, bh), L<TN>(c, bh), Weights<TN>(w, a.GateValues / a.B * a.D), Weights<TN>(u, a.GateValues / a.B * a.H), L<TN>(bias, a.Gates * a.H), lh, lc)
+                : LstmStep<Float32>(a, L<TN>(x, (long)a.B * a.D), L<TN>(h, bh), L<TN>(c, bh), Weights<TN>(w, a.GateValues / a.B * a.D), Weights<TN>(u, a.GateValues / a.B * a.H), L<TN>(bias, a.Gates * a.H), lh, lc);
             FromLane<TN>(lh, hOut, bh); FromLane<TN>(lc, cOut, bh);
             return lane;
         }
@@ -409,8 +440,8 @@ internal static partial class Kernels
             long bh = (long)a.B * a.H, bd = (long)a.B * a.D, GH = a.Gates * a.H;
             var ldx = LOut<TN>(bd); var ldh = LOut<TN>(bh); var ldc = LOut<TN>(bh); var ldw = LOut<TN>(GH * a.D); var ldu = LOut<TN>(GH * a.H); var ldb = LOut<TN>(GH);
             string name = TN.Bits == 64
-                ? LstmStepBackward<Float64>(a, L<TN>(x, bd), L<TN>(h, bh), L<TN>(c, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(dhOut, bh), L<TN>(dcOut, bh), ldx, ldh, ldc, ldw, ldu, ldb)
-                : LstmStepBackward<Float32>(a, L<TN>(x, bd), L<TN>(h, bh), L<TN>(c, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(dhOut, bh), L<TN>(dcOut, bh), ldx, ldh, ldc, ldw, ldu, ldb);
+                ? LstmStepBackward<Float64>(a, L<TN>(x, bd), L<TN>(h, bh), L<TN>(c, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(dhOut, bh), L<TN>(dcOut, bh), ldx, ldh, ldc, ldw, ldu, ldb)
+                : LstmStepBackward<Float32>(a, L<TN>(x, bd), L<TN>(h, bh), L<TN>(c, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(dhOut, bh), L<TN>(dcOut, bh), ldx, ldh, ldc, ldw, ldu, ldb);
             FromLane<TN>(ldx, dx, bd); FromLane<TN>(ldh, dh, bh); FromLane<TN>(ldc, dc, bh); FromLane<TN>(ldw, dw, GH * a.D); FromLane<TN>(ldu, du, GH * a.H); FromLane<TN>(ldb, db, GH);
             return name;
         }
@@ -431,8 +462,8 @@ internal static partial class Kernels
             long bh = (long)a.B * a.H, bd = (long)a.B * a.D, GH = a.Gates * a.H;
             var ldx = LOut<TN>(bd); var ldh = LOut<TN>(bh); var ldw = LOut<TN>(GH * a.D); var ldu = LOut<TN>(GH * a.H); var ldb = LOut<TN>(GH); var ldbh = LOut<TN>(GH);
             string name = TN.Bits == 64
-                ? GruStepBackward<Float64>(a, L<TN>(x, bd), L<TN>(h, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), L<TN>(dhOut, bh), ldx, ldh, ldw, ldu, ldb, ldbh)
-                : GruStepBackward<Float32>(a, L<TN>(x, bd), L<TN>(h, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), L<TN>(dhOut, bh), ldx, ldh, ldw, ldu, ldb, ldbh);
+                ? GruStepBackward<Float64>(a, L<TN>(x, bd), L<TN>(h, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), L<TN>(dhOut, bh), ldx, ldh, ldw, ldu, ldb, ldbh)
+                : GruStepBackward<Float32>(a, L<TN>(x, bd), L<TN>(h, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), L<TN>(dhOut, bh), ldx, ldh, ldw, ldu, ldb, ldbh);
             FromLane<TN>(ldx, dx, bd); FromLane<TN>(ldh, dh, bh); FromLane<TN>(ldw, dw, GH * a.D); FromLane<TN>(ldu, du, GH * a.H); FromLane<TN>(ldb, db, GH); FromLane<TN>(ldbh, dbh, GH);
             return name;
         }
@@ -463,8 +494,8 @@ internal static partial class Kernels
             long GH = a.Gates * a.H;
             var lh = LOut<TN>(T * bh); var lc = LOut<TN>(T * bh);
             string name = TN.Bits == 64
-                ? LstmSequence<Float64>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(c0, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), lh, lc)
-                : LstmSequence<Float32>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(c0, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), lh, lc);
+                ? LstmSequence<Float64>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(c0, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), lh, lc)
+                : LstmSequence<Float32>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(c0, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), lh, lc);
             FromLane<TN>(lh, hOut, T * bh); FromLane<TN>(lc, cOut, T * bh);
             return name;
         }
@@ -586,8 +617,8 @@ internal static partial class Kernels
             long GH = a.Gates * a.H;
             var lh = LOut<TN>(T * bh);
             string name = TN.Bits == 64
-                ? GruSequence<Float64>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), lh)
-                : GruSequence<Float32>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), lh);
+                ? GruSequence<Float64>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), lh)
+                : GruSequence<Float32>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), lh);
             FromLane<TN>(lh, hOut, T * bh);
             return name;
         }
@@ -605,8 +636,8 @@ internal static partial class Kernels
             long GH = a.Gates * a.H;
             var ldx = LOut<TN>(T * bd); var ldh0 = LOut<TN>(bh); var ldc0 = LOut<TN>(bh); var ldw = LOut<TN>(GH * a.D); var ldu = LOut<TN>(GH * a.H); var ldb = LOut<TN>(GH);
             string name = TN.Bits == 64
-                ? LstmSequenceBackward<Float64>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(c0, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(dhOut, T * bh), L<TN>(dcLast, bh), ldx, ldh0, ldc0, ldw, ldu, ldb)
-                : LstmSequenceBackward<Float32>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(c0, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(dhOut, T * bh), L<TN>(dcLast, bh), ldx, ldh0, ldc0, ldw, ldu, ldb);
+                ? LstmSequenceBackward<Float64>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(c0, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(dhOut, T * bh), L<TN>(dcLast, bh), ldx, ldh0, ldc0, ldw, ldu, ldb)
+                : LstmSequenceBackward<Float32>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(c0, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(dhOut, T * bh), L<TN>(dcLast, bh), ldx, ldh0, ldc0, ldw, ldu, ldb);
             FromLane<TN>(ldx, dx, T * bd); FromLane<TN>(ldh0, dh0, bh); FromLane<TN>(ldc0, dc0, bh); FromLane<TN>(ldw, dw, GH * a.D); FromLane<TN>(ldu, du, GH * a.H); FromLane<TN>(ldb, db, GH);
             return name;
         }
@@ -652,8 +683,8 @@ internal static partial class Kernels
             long GH = a.Gates * a.H;
             var ldx = LOut<TN>(T * bd); var ldh0 = LOut<TN>(bh); var ldw = LOut<TN>(GH * a.D); var ldu = LOut<TN>(GH * a.H); var ldb = LOut<TN>(GH); var ldbh = LOut<TN>(GH);
             string name = TN.Bits == 64
-                ? GruSequenceBackward<Float64>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), L<TN>(dhOut, T * bh), ldx, ldh0, ldw, ldu, ldb, ldbh)
-                : GruSequenceBackward<Float32>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), L<TN>(dhOut, T * bh), ldx, ldh0, ldw, ldu, ldb, ldbh);
+                ? GruSequenceBackward<Float64>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), L<TN>(dhOut, T * bh), ldx, ldh0, ldw, ldu, ldb, ldbh)
+                : GruSequenceBackward<Float32>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), L<TN>(dhOut, T * bh), ldx, ldh0, ldw, ldu, ldb, ldbh);
             FromLane<TN>(ldx, dx, T * bd); FromLane<TN>(ldh0, dh0, bh); FromLane<TN>(ldw, dw, GH * a.D); FromLane<TN>(ldu, du, GH * a.H); FromLane<TN>(ldb, db, GH); FromLane<TN>(ldbh, dbh, GH);
             return name;
         }
@@ -702,8 +733,8 @@ internal static partial class Kernels
             long bh = (long)a.B * a.H, GH = a.Gates * a.H;
             var lh = LOut<TN>(bh);
             string lane = TN.Bits == 64
-                ? GruStep<Float64>(a, L<TN>(x, (long)a.B * a.D), L<TN>(h, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), lh)
-                : GruStep<Float32>(a, L<TN>(x, (long)a.B * a.D), L<TN>(h, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), lh);
+                ? GruStep<Float64>(a, L<TN>(x, (long)a.B * a.D), L<TN>(h, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), lh)
+                : GruStep<Float32>(a, L<TN>(x, (long)a.B * a.D), L<TN>(h, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), lh);
             FromLane<TN>(lh, hOut, bh);
             return lane;
         }

@@ -127,6 +127,7 @@ internal static class Checks
         ok &= Ctcs(null);
         ok &= BlockFormats(null);
         ok &= Arenas(null);
+        ok &= WeightsInPlace();
         ok &= TeamJobs();
         return ok;
     }
@@ -1486,6 +1487,49 @@ internal static class Checks
     private sealed class ArenaAttention(GpuOps ops, AttentionArgs a, ulong q, ulong k, ulong v, ulong o) : Bench.IFloatTypeVisitor<string>
     {
         public string Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float> => ops.Attention<TN>(a, q, k, v, o);
+    }
+
+    /// <summary>The CPU's narrow-type steps keep their weights widened per array (Recurrent.cs `Weights`): an LSTM and a GRU step
+    /// (float16, bfloat16), called, then called again after W and U were changed in place (the same arrays), equal bit for
+    /// bit to the step on fresh copies of the changed weights; and called a third time unchanged, equal again.</summary>
+    private static bool WeightsInPlace()
+    {
+        bool ok = true;
+        foreach (var type in new[] { "float16", "bfloat16" })
+        foreach (var kind in new[] { "lstm", "gru" })
+        {
+            var a = new CellArgs(kind, 5, 7, 11);
+            int GH = a.Gates * a.H;
+            byte[] M(int n, int seed, double lo, double hi) => Bench.Registry.Make(type, n, seed, lo, hi);
+            byte[] x = M(a.B * a.D, 91, -1, 1), h = M(a.B * a.H, 92, -1, 1), c = M(a.B * a.H, 93, -1, 1), w = M(GH * a.D, 94, -0.3, 0.3), u = M(GH * a.H, 95, -0.3, 0.3), b = M(GH, 96, -0.1, 0.1), bh = M(GH, 97, -0.1, 0.1);
+            byte[] Step(byte[] ww, byte[] uu)
+            {
+                var hOut = new byte[h.Length]; var cOut = new byte[h.Length];
+                Bench.Registry.WithFloat(type, new WeightsStep(a, x, h, c, ww, uu, b, bh, hOut, cOut));
+                return [.. hOut, .. cOut];
+            }
+
+            Step(w, u);
+            M(GH * a.D, 98, -0.3, 0.3).CopyTo(w, 0);
+            M(GH * a.H, 99, -0.3, 0.3).CopyTo(u, 0);
+            var changed = Step(w, u);
+            var fresh = Step((byte[])w.Clone(), (byte[])u.Clone());
+            var again = Step(w, u);
+            if (!changed.AsSpan().SequenceEqual(fresh) || !again.AsSpan().SequenceEqual(fresh))
+            {
+                Console.WriteLine($"check weights in place  cpu  {type} {kind}: DIFFERS from the step on fresh weights");
+                ok = false;
+            }
+        }
+
+        if (ok) Console.WriteLine("check weights in place       cpu    float16, bfloat16: LSTM and GRU steps after W and U changed in place equal the steps on fresh copies");
+        return ok;
+    }
+
+    private sealed class WeightsStep(CellArgs a, byte[] x, byte[] h, byte[] c, byte[] w, byte[] u, byte[] b, byte[] bh, byte[] hOut, byte[] cOut) : Bench.IFloatTypeVisitor<string>
+    {
+        public string Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float> =>
+            a.Kind == "lstm" ? Kernels.LstmStep<TN>(a, x, h, c, w, u, b, hOut, cOut) : Kernels.GruStep<TN>(a, x, h, w, u, b, bh, hOut);
     }
 
     // The LSTM step's h' then c' into one output (c' at cOff, a whole 256 bytes in).

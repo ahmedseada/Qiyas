@@ -313,6 +313,31 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
   fresh arrays; the readings swing with the collections — noted, not chased. Open: the device sequence backwards keep
   the per-step form (GRU 12.5 ms against 2.5 forward): the same restructure applies there.
 
+- 6f2 (the coordinator's addition: the device sequences, the float16 step swing): done, reported.
+  - Device (`src/GpuOps.Recurrent.cs`, own lane): `InputGates` (x·Wᵀ + b of all steps, one product), `LstmForward` /
+    `GruForward` (per step h·Uᵀ, the add into the kept gates' step, the cell), the backwards per step only the cell's
+    backward and dh = dg·U (dh, dc alternating between two buffers, no copies), `SequenceWeights` (dx, dW, dU, db over all
+    T·B rows; db by the column sums and the narrow) and `Shifted` (h0 then h of steps 0 … T − 2). Measured CUDA (qiyas,
+    against item 4's baseline): float32 lstm_seq 2.74 → 1.95, lstm_seq_bwd 26.0 → 6.57, gru_seq 2.54 → 1.68, gru_seq_bwd
+    12.5 → 5.51; float16 3.79 → 2.06, 14.1 → 6.40, 2.61 → 1.76, 18.6 → 5.45; float64 23.8 → 24.2, 114 → 62.2, 22.4 →
+    14.1, 98.5 → 44.3. Errors equal except float64 lstm_seq_bwd 4.44e-16 → 2.0e-15 and gru_seq_bwd 1.17e-15 → 1.33e-15:
+    the float64 product's route is measured per shape (`SlicedFaster`), and the new shapes take other routes (the gates'
+    4096 × 2048 × 512 the float64 lane, 11.9 ms against the sliced 15.0; before, 256 × 2048 × 512 a step took the sliced
+    route) — both routes within the product's proof; dx (the scored output) inherits the gates' few-ulp difference.
+    Mutation (dU against hs): `check recurrent device` fails at every float type.
+  - CPU (`src/Recurrent.cs` `Weights`): a narrow type's W and U widened once per array and kept per thread
+    (ConditionalWeakTable by reference, type and count) with a copy of their bytes; each call compares the bytes
+    (vectorized) and converts again into the same lanes when they changed (a weight update in place). New gate
+    `Checks.WeightsInPlace` (CPU, float16 and bfloat16, LSTM and GRU steps): after W and U change in place, equal bit for
+    bit to the steps on fresh copies, and again unchanged; mutation (the compare skipped) fails at all four.
+  - The float16 step swing's cause: not the conversions. The first row of a run reads ~50 ms whatever its type
+    (lstm_step bfloat16 first: 50.7; float16 second: 18.9; the order reversed: float16 50.6) and 19.2 with
+    `DOTNET_TieredCompilation=0`: the first row is timed while the JIT's tiers still run unoptimized code (TieredPGO is
+    on in Qiyas.csproj). Every family's first row in a run may read high for this; a bench-wide choice (tiered
+    compilation off for the bench, or a longer warm-up for a type's first row) is the coordinator's — not changed.
+    Measured with the cache (one run): float16 lstm_step 18.9, gru_step 12.6–14.0, lstm_step_bwd 48.8, gru_step_bwd 36.1;
+    bfloat16 17.5, 12.7, 50.9, 43.4 (baseline bfloat16 19.5, 12.4, 54.4, 45.1).
+
 ## Item 5 progress
 
 - Done, reported (uncommitted until the coordinator's go). What landed:

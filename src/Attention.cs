@@ -116,18 +116,25 @@ internal static partial class Kernels
     public static byte[] ToLane<TN>(byte[] x, long count) where TN : struct, IQiyasFloat<TN>
     {
         if (TN.Name is "float32" or "float64") return x;
-        var v = new WidenVisitor(x, count);
+        var v = new WidenVisitor(x, count, null);
         TN.Float(ref v);
         return v.Result!;
     }
 
-    private struct WidenVisitor(byte[] x, long count) : IFloatLaneVisitor
+    /// <summary>ToLane into an existing lane array of at least count lane values (a narrow type only).</summary>
+    public static void ToLaneInto<TN>(byte[] x, long count, byte[] into) where TN : struct, IQiyasFloat<TN>
+    {
+        var v = new WidenVisitor(x, count, into);
+        TN.Float(ref v);
+    }
+
+    private struct WidenVisitor(byte[] x, long count, byte[]? into) : IFloatLaneVisitor
     {
         public byte[]? Result;
 
         public void Run<TN, TLane, TL>() where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
         {
-            var result = new byte[count * Unsafe.SizeOf<TLane>()];
+            var result = into ?? new byte[count * Unsafe.SizeOf<TLane>()];
             var lanes = MemoryMarshal.Cast<byte, TLane>(result.AsSpan());
             Team.For((int)((count + 4095) / 4096), 1, count, new WidenBody<TN, TLane>(x, result, count));
             Result = result;
