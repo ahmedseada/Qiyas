@@ -70,6 +70,15 @@ internal static partial class Kernels
     /// <summary>top-k of each row: values stored as the type (rows × k), indices s32; returns the lane's name.</summary>
     public static string TopK<TN>(byte[] x, int rows, int cols, int k, byte[] values, int[] indices) where TN : struct, IQiyasNumber<TN>
     {
+        if (TN.Granularity > 8)
+        {
+            // A block format: the values in float32 storage, encoded by blocks once (a row's k values would re-encode their block row by row).
+            var lanes = new byte[(long)rows * k * 4];
+            string blockLane = TopK<Float32>(BlockLanes<TN>(x, (long)rows * cols), rows, cols, k, lanes, indices);
+            BlockStore<TN>(lanes, values, (long)rows * k);
+            return blockLane;
+        }
+
         var v = new TopKVisitor(x, rows, cols, k, values, indices);
         TN.Elementwise(ref v);
         return v.Lane;
@@ -125,6 +134,37 @@ internal static partial class Kernels
                 pool.Return(row); pool.Return(best); ArrayPool<int>.Shared.Return(bestAt);
             }
         }
+    }
+
+    // A block format's stored values as float32 storage, and float32 storage encoded into a block format (through its float lane).
+    private static byte[] BlockLanes<TN>(byte[] x, long count) where TN : struct, IQiyasNumber<TN>
+    {
+        var v = new BlockWiden(x, count);
+        TN.Elementwise(ref v);
+        return v.Result!;
+    }
+
+    private static void BlockStore<TN>(byte[] lanes, byte[] output, long count) where TN : struct, IQiyasNumber<TN>
+    {
+        var v = new BlockNarrow(lanes, output, count);
+        TN.Elementwise(ref v);
+    }
+
+    private struct BlockWiden(byte[] x, long count) : ILaneVisitor
+    {
+        public byte[]? Result;
+        public void Run<TN, TLane, TL>() where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasLane<TL, TLane>
+        {
+            var lanes = new TLane[count];
+            TN.Load(x, 0, lanes);
+            Result = System.Runtime.InteropServices.MemoryMarshal.AsBytes(lanes.AsSpan()).ToArray();
+        }
+    }
+
+    private struct BlockNarrow(byte[] lanes, byte[] output, long count) : ILaneVisitor
+    {
+        public readonly void Run<TN, TLane, TL>() where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasLane<TL, TLane> =>
+            TN.Store(System.Runtime.InteropServices.MemoryMarshal.Cast<byte, TLane>(lanes.AsSpan()).Slice(0, (int)count), output, 0);
     }
 
     /// <summary>out[r] = x[r][index[r]], stored as the type.</summary>

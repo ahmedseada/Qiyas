@@ -460,6 +460,93 @@ internal static partial class Ptx
                 return acc;
             }
 
+            case "adaptive_maxpool_bwd":
+            case "adaptive_avgpool_bwd":
+            {
+                // Output (ch, ih, iw = c), r = ch·H + ih: over the output rows and columns whose window holds the pixel.
+                bool max = name == "adaptive_maxpool_bwd";
+                string H = p[1], W = p[2], OH = p[3], OW = p[4], ih = b.R(), ch = b.R(), acc = lane.NewReg(b), oh = b.R(), ow = b.R(), h0 = b.R(), h1 = b.R(), w0 = b.R(), w1 = b.R(), t = b.R(), pa = b.P(), pb = b.P(), me = b.R();
+                b.L($"rem.u32 {ih}, {r}, {H};");
+                b.L($"div.u32 {ch}, {r}, {H};");
+                b.L($"mad.lo.u32 {me}, {ch}, {H}, {ih};");
+                b.L($"mad.lo.u32 {me}, {me}, {W}, {c};");
+                b.L($"mov.{lane.Reg} {acc}, {lane.Zero};");
+                b.L($"mov.u32 {oh}, 0;");
+                b.Label($"DA{tag}");
+                b.L($"setp.ge.u32 {pa}, {oh}, {OH};");
+                b.L($"@{pa} bra DA{tag}_END;");
+                b.L($"mul.lo.u32 {h0}, {oh}, {H};"); b.L($"div.u32 {h0}, {h0}, {OH};");
+                b.L($"add.u32 {t}, {oh}, 1;"); b.L($"mul.lo.u32 {t}, {t}, {H};"); b.L($"add.u32 {t}, {t}, {OH};"); b.L($"sub.u32 {t}, {t}, 1;"); b.L($"div.u32 {h1}, {t}, {OH};");
+                b.L($"setp.lt.u32 {pa}, {ih}, {h0};");
+                b.L($"@{pa} bra DA{tag}_NEXT;");
+                b.L($"setp.ge.u32 {pa}, {ih}, {h1};");
+                b.L($"@{pa} bra DA{tag}_NEXT;");
+                b.L($"mov.u32 {ow}, 0;");
+                b.Label($"DB{tag}");
+                b.L($"setp.ge.u32 {pb}, {ow}, {OW};");
+                b.L($"@{pb} bra DB{tag}_END;");
+                b.L($"mul.lo.u32 {w0}, {ow}, {W};"); b.L($"div.u32 {w0}, {w0}, {OW};");
+                b.L($"add.u32 {t}, {ow}, 1;"); b.L($"mul.lo.u32 {t}, {t}, {W};"); b.L($"add.u32 {t}, {t}, {OW};"); b.L($"sub.u32 {t}, {t}, 1;"); b.L($"div.u32 {w1}, {t}, {OW};");
+                b.L($"setp.lt.u32 {pb}, {c}, {w0};");
+                b.L($"@{pb} bra DB{tag}_NEXT;");
+                b.L($"setp.ge.u32 {pb}, {c}, {w1};");
+                b.L($"@{pb} bra DB{tag}_NEXT;");
+                string dyIdx = b.R();
+                b.L($"mad.lo.u32 {dyIdx}, {ch}, {OH}, {oh};");
+                b.L($"mad.lo.u32 {dyIdx}, {dyIdx}, {OW}, {ow};");
+                string dy = Load(dyIdx);
+                if (!max)
+                {
+                    string area = b.R(), af = lane.NewReg(b), share = lane.NewReg(b);
+                    b.L($"sub.u32 {area}, {h1}, {h0};"); b.L($"sub.u32 {t}, {w1}, {w0};"); b.L($"mul.lo.u32 {area}, {area}, {t};");
+                    b.L($"cvt.rn.{lane.Op}.u32 {af}, {area};");
+                    b.L($"div.rn.{lane.Op} {share}, {dy}, {af};");
+                    b.L(lane.Add(acc, acc, share));
+                }
+                else
+                {
+                    // The window's first largest of the forward input.
+                    string hh = b.R(), ww = b.R(), pc = b.P(), pd = b.P(), bestAt = b.R(), best = lane.NewReg(b), cand = b.R();
+                    b.L($"mov.u32 {bestAt}, 0xFFFFFFFF;");
+                    b.L($"mov.{lane.Reg} {best}, {ReduceIdentity(lane, "max")};");
+                    b.L($"mov.u32 {hh}, {h0};");
+                    b.Label($"DH{tag}");
+                    b.L($"setp.ge.u32 {pc}, {hh}, {h1};");
+                    b.L($"@{pc} bra DH{tag}_END;");
+                    b.L($"mov.u32 {ww}, {w0};");
+                    b.Label($"DW{tag}");
+                    b.L($"setp.ge.u32 {pd}, {ww}, {w1};");
+                    b.L($"@{pd} bra DW{tag}_END;");
+                    b.L($"mad.lo.u32 {cand}, {ch}, {H}, {hh};");
+                    b.L($"mad.lo.u32 {cand}, {cand}, {W}, {ww};");
+                    string xv = Load2(cand), pFirst = b.P(), pGt = b.P();
+                    b.L($"setp.eq.u32 {pFirst}, {bestAt}, 0xFFFFFFFF;");
+                    b.L($"setp.gt.{lane.Op} {pGt}, {xv}, {best};");
+                    b.L($"or.pred {pGt}, {pGt}, {pFirst};");
+                    b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {best}, {xv}, {best}, {pGt};");
+                    b.L($"selp.u32 {bestAt}, {cand}, {bestAt}, {pGt};");
+                    b.L($"add.u32 {ww}, {ww}, 1;");
+                    b.L($"bra DW{tag};");
+                    b.Label($"DW{tag}_END");
+                    b.L($"add.u32 {hh}, {hh}, 1;");
+                    b.L($"bra DH{tag};");
+                    b.Label($"DH{tag}_END");
+                    string pMine = b.P();
+                    b.L($"setp.eq.u32 {pMine}, {bestAt}, {me};");
+                    b.L($"@{pMine} {lane.Add(acc, acc, dy)}");
+                }
+
+                b.Label($"DB{tag}_NEXT");
+                b.L($"add.u32 {ow}, {ow}, 1;");
+                b.L($"bra DB{tag};");
+                b.Label($"DB{tag}_END");
+                b.Label($"DA{tag}_NEXT");
+                b.L($"add.u32 {oh}, {oh}, 1;");
+                b.L($"bra DA{tag};");
+                b.Label($"DA{tag}_END");
+                return acc;
+            }
+
             case "adaptive_maxpool":
             case "adaptive_avgpool":
             {

@@ -626,7 +626,7 @@ internal static partial class Kernels
             where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane> where TK : struct, IRowKernel<TLane, TL>
         {
             var body = new RowOpBody<TN, TLane, TL, TK>(op, x, x2, g, bt, s, pos, y, y2, cols, TL.From(a), TL.From(b));
-            Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)rows * cols * 4, body);
+            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)rows * cols * 4, body);
         }
     }
 

@@ -39,22 +39,23 @@ public sealed class LayoutArgs
     public int InputCount;
 
     public static readonly string[] Names = ["strided", "one_hot", "gather_rows", "gather_cols", "scatter_add_rows", "im2col", "col2im", "interpolate_nearest", "interpolate_bilinear", "shift", "pad2d",
-        "maxpool", "avgpool", "maxpool_bwd", "avgpool_bwd", "adaptive_maxpool", "adaptive_avgpool", "depthwise_conv"];
+        "maxpool", "avgpool", "maxpool_bwd", "avgpool_bwd", "adaptive_maxpool", "adaptive_avgpool", "depthwise_conv", "adaptive_maxpool_bwd", "adaptive_avgpool_bwd"];
 
     /// <summary>Whether the operation applies to the type: bilinear interpolation and the average pools compute in a float lane.</summary>
-    public static bool Applies(string name, bool floatType) => floatType || name is not ("interpolate_bilinear" or "avgpool" or "avgpool_bwd" or "adaptive_avgpool");
+    public static bool Applies(string name, bool floatType) => floatType || name is not ("interpolate_bilinear" or "avgpool" or "avgpool_bwd" or "adaptive_avgpool" or "adaptive_avgpool_bwd");
 
     /// <summary>Whether the operation sums values (its lane follows the sum rule).</summary>
-    public static bool Sums(string name) => name is "scatter_add_rows" or "col2im" or "maxpool_bwd" or "depthwise_conv";
+    public static bool Sums(string name) => name is "scatter_add_rows" or "col2im" or "maxpool_bwd" or "depthwise_conv" or "adaptive_maxpool_bwd";
 
     /// <summary>Whether the operation computes in the float lane (weighted sums of float values).</summary>
-    public static bool FloatLane(string name) => name is "interpolate_bilinear" or "avgpool" or "avgpool_bwd" or "adaptive_avgpool";
+    public static bool FloatLane(string name) => name is "interpolate_bilinear" or "avgpool" or "avgpool_bwd" or "adaptive_avgpool" or "adaptive_avgpool_bwd";
 
     /// <summary>The number of terms a summed value has (the sum rule's bound).</summary>
     public static int Terms(string name, int[] p) => name switch
     {
         "scatter_add_rows" => p[0],
         "col2im" or "maxpool_bwd" or "depthwise_conv" => p[3] * p[4],
+        "adaptive_maxpool_bwd" => (p[1] / p[3] + 2) * (p[2] / p[4] + 2),
         _ => 1,
     };
 
@@ -91,6 +92,7 @@ public sealed class LayoutArgs
             "maxpool" or "avgpool" or "depthwise_conv" => (p[0] * PoolOut(p).OH, PoolOut(p).OW),
             "maxpool_bwd" or "avgpool_bwd" => (p[0] * p[1], p[2]),
             "adaptive_maxpool" or "adaptive_avgpool" => (p[0] * p[3], p[4]),
+            "adaptive_maxpool_bwd" or "adaptive_avgpool_bwd" => (p[0] * p[1], p[2]),
             _ => throw new ArgumentException(k.Name),
         };
     }
@@ -183,6 +185,32 @@ public sealed class LayoutArgs
                     double best = double.NegativeInfinity, sum = 0;
                     for (int ih = h0; ih < h1; ih++) for (int iw = w0; iw < w1; iw++) { double v = x[(c * H + ih) * W + iw]; best = Math.Max(best, v); sum += v; }
                     y[(c * OH + oh) * OW + ow] = name == "adaptive_maxpool" ? best : sum / ((h1 - h0) * (w1 - w0));
+                }
+
+                return y;
+            }
+
+            case "adaptive_maxpool_bwd":
+            case "adaptive_avgpool_bwd":
+            {
+                // x = dy (C × OH × OW), x2 = the forward input (max): every window's gradient to its first largest, or spread over the window.
+                int C = p[0], H = p[1], W = p[2], OH = p[3], OW = p[4];
+                for (int c = 0; c < C; c++) for (int oh = 0; oh < OH; oh++) for (int ow = 0; ow < OW; ow++)
+                {
+                    var (h0, h1) = Adaptive(oh, H, OH);
+                    var (w0, w1) = Adaptive(ow, W, OW);
+                    double dy = x[(c * OH + oh) * OW + ow];
+                    if (name == "adaptive_avgpool_bwd")
+                    {
+                        double share = dy / ((h1 - h0) * (w1 - w0));
+                        for (int ih = h0; ih < h1; ih++) for (int iw = w0; iw < w1; iw++) y[(c * H + ih) * W + iw] += share;
+                        continue;
+                    }
+
+                    double best = double.NegativeInfinity;
+                    int bestAt = -1;
+                    for (int ih = h0; ih < h1; ih++) for (int iw = w0; iw < w1; iw++) { double v = x2![(c * H + ih) * W + iw]; if (bestAt < 0 || v > best) { best = v; bestAt = (c * H + ih) * W + iw; } }
+                    y[bestAt] += dy;
                 }
 
                 return y;
@@ -327,7 +355,7 @@ internal static partial class Kernels
         {
             Lane = TL.Name;
             var (rows, cols) = OutputRows(k);
-            Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)k.Count, new MoveBody<TN, TLane, TL>(k, rows, cols));
+            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)k.Count, new MoveBody<TN, TLane, TL>(k, rows, cols));
         }
     }
 
@@ -339,7 +367,7 @@ internal static partial class Kernels
         {
             Lane = TL.Name;
             var (rows, cols) = OutputRows(k);
-            Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)k.Count, new MoveBody<TN, TLane, TL>(k, rows, cols));
+            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)k.Count, new MoveBody<TN, TLane, TL>(k, rows, cols));
         }
     }
 
@@ -351,7 +379,7 @@ internal static partial class Kernels
         {
             Lane = TL.Name;
             var (rows, cols) = OutputRows(k);
-            Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)k.Count, new MoveBody<TN, TLane, TL>(k, rows, cols));
+            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)k.Count, new MoveBody<TN, TLane, TL>(k, rows, cols));
         }
 
         public void RunDot<TN, TIn, TAcc, TD>()
@@ -369,7 +397,7 @@ internal static partial class Kernels
         private static void Plain<TN, TLane, TL>(LayoutArgs k) where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasLane<TL, TLane>
         {
             var (rows, cols) = OutputRows(k);
-            Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)k.Count, new MoveBody<TN, TLane, TL>(k, rows, cols));
+            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)k.Count, new MoveBody<TN, TLane, TL>(k, rows, cols));
         }
     }
 
@@ -636,6 +664,44 @@ internal static partial class Kernels
                                 }
 
                                 o[ow] = max ? acc : TL.Mul(acc, TL.From(1.0 / ((h1 - h0) * (w1 - w0))));
+                            }
+
+                            break;
+                        }
+
+                        case "adaptive_maxpool_bwd":
+                        case "adaptive_avgpool_bwd":
+                        {
+                            // Input pixel (c, ih, iw = col): the windows holding it (an adaptive window's rows are those oh with h0(oh) ≤ ih < h1(oh)).
+                            int H = p[1], W = p[2], OH = p[3], OW = p[4];
+                            int ih = r % H, c = r / H;
+                            bool max = k.Name == "adaptive_maxpool_bwd";
+                            for (int iw = 0; iw < W; iw++)
+                            {
+                                TLane acc = TL.Zero;
+                                for (int oh = 0; oh < OH; oh++)
+                                {
+                                    var (h0, h1) = LayoutArgs.Adaptive(oh, H, OH);
+                                    if (ih < h0 || ih >= h1) continue;
+                                    for (int ow = 0; ow < OW; ow++)
+                                    {
+                                        var (w0, w1) = LayoutArgs.Adaptive(ow, W, OW);
+                                        if (iw < w0 || iw >= w1) continue;
+                                        TLane dy = Value(k.X, ((long)c * OH + oh) * OW + ow, one);
+                                        if (!max) { acc = TL.Add(acc, TL.Mul(dy, TL.From(1.0 / ((h1 - h0) * (w1 - w0))))); continue; }
+                                        long bestAt = -1;
+                                        TLane best = TL.Zero;
+                                        for (int hh = h0; hh < h1; hh++) for (int ww = w0; ww < w1; ww++)
+                                        {
+                                            TLane v = Value(k.X2!, ((long)c * H + hh) * W + ww, one);
+                                            if (bestAt < 0 || Widths.Compare(v, best) > 0) { best = v; bestAt = ((long)c * H + hh) * W + ww; }
+                                        }
+
+                                        if (bestAt == ((long)c * H + ih) * W + iw) acc = TL.Add(acc, dy);
+                                    }
+                                }
+
+                                o[iw] = acc;
                             }
 
                             break;

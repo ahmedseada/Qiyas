@@ -110,7 +110,7 @@ internal static partial class Kernels
         public void Run<TN, TLane, TL>() where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
         {
             Lane = TL.Name;
-            Team.For(a.B, Math.Max(1, a.B / (Threads * 4)), (long)a.B * a.H * 8, new CellBody<TN, TLane, TL>(a, g, g2, state, hOut, cOut));
+            Team.For(a.B, RowChunk<TN>(a.B, a.H, a.B / (Threads * 4)), (long)a.B * a.H * 8, new CellBody<TN, TLane, TL>(a, g, g2, state, hOut, cOut));
         }
     }
 
@@ -253,7 +253,7 @@ internal static partial class Kernels
         public void Run<TN, TLane, TL>() where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
         {
             Lane = TL.Name;
-            Team.For(a.B, Math.Max(1, a.B / (Threads * 4)), (long)a.B * a.H * 16, new CellBackwardBody<TN, TLane, TL>(a, g, g2, state, d1, d2, o1, o2, o3));
+            Team.For(a.B, RowChunk<TN>(a.B, a.Gates * a.H, a.B / (Threads * 4)), (long)a.B * a.H * 16, new CellBackwardBody<TN, TLane, TL>(a, g, g2, state, d1, d2, o1, o2, o3));
         }
     }
 
@@ -422,6 +422,17 @@ internal static partial class Kernels
     public static string LstmSequence<TN>(CellArgs a, int T, byte[] x, byte[] h0, byte[] c0, byte[] w, byte[] u, byte[] bias, byte[] hOut, byte[] cOut) where TN : struct, IQiyasFloat<TN>
     {
         long bd = (long)a.B * a.D, bh = (long)a.B * a.H;
+        if (!OwnLane<TN>())
+        {
+            long GH = a.Gates * a.H;
+            var lh = LOut<TN>(T * bh); var lc = LOut<TN>(T * bh);
+            string name = TN.Bits == 64
+                ? LstmSequence<Float64>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(c0, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), lh, lc)
+                : LstmSequence<Float32>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(c0, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), lh, lc);
+            FromLane<TN>(lh, hOut, T * bh); FromLane<TN>(lc, cOut, T * bh);
+            return name;
+        }
+
         int xBytes = (int)TN.Bytes(bd), hBytes = (int)TN.Bytes(bh);
         var hPrev = h0; var cPrev = c0;
         string lane = "";
@@ -462,6 +473,17 @@ internal static partial class Kernels
     public static string LstmSequenceBackward<TN>(CellArgs a, int T, byte[] x, byte[] h0, byte[] c0, byte[] w, byte[] u, byte[] bias, byte[] dhOut, byte[] dcLast, byte[] dx, byte[] dh0, byte[] dc0, byte[] dw, byte[] du, byte[] db) where TN : struct, IQiyasFloat<TN>
     {
         long bd = (long)a.B * a.D, bh = (long)a.B * a.H;
+        if (!OwnLane<TN>())
+        {
+            long GH = a.Gates * a.H;
+            var ldx = LOut<TN>(T * bd); var ldh0 = LOut<TN>(bh); var ldc0 = LOut<TN>(bh); var ldw = LOut<TN>(GH * a.D); var ldu = LOut<TN>(GH * a.H); var ldb = LOut<TN>(GH);
+            string name = TN.Bits == 64
+                ? LstmSequenceBackward<Float64>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(c0, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(dhOut, T * bh), L<TN>(dcLast, bh), ldx, ldh0, ldc0, ldw, ldu, ldb)
+                : LstmSequenceBackward<Float32>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(c0, bh), L<TN>(w, GH * a.D), L<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(dhOut, T * bh), L<TN>(dcLast, bh), ldx, ldh0, ldc0, ldw, ldu, ldb);
+            FromLane<TN>(ldx, dx, T * bd); FromLane<TN>(ldh0, dh0, bh); FromLane<TN>(ldc0, dc0, bh); FromLane<TN>(ldw, dw, GH * a.D); FromLane<TN>(ldu, du, GH * a.H); FromLane<TN>(ldb, db, GH);
+            return name;
+        }
+
         int xBytes = (int)TN.Bytes(bd), hBytes = (int)TN.Bytes(bh);
         var hs = new byte[T][]; var cs = new byte[T][];
         var hPrev = h0; var cPrev = c0;

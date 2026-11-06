@@ -113,6 +113,9 @@ internal sealed class Options
     /// <summary>With --report: print the device's facts and the lanes chosen for the run's operations before the rows.</summary>
     public bool Report;
 
+    /// <summary>--repeat N: every row measured N times over (a stress for intermittent failures; the last measurement is kept).</summary>
+    public int Repeat = 1;
+
     public static Options Parse(string[] args)
     {
         var o = new Options();
@@ -141,6 +144,7 @@ internal sealed class Options
                 case "--baseline": o.Baseline = args[++i]; break;
                 case "--shapes": o.Shapes = args[++i]; if (o.Shapes is not ("regular" or "odd")) throw new ArgumentException($"--shapes takes regular or odd, not {o.Shapes}"); break;
                 case "--report": o.Report = true; break;
+                case "--repeat": o.Repeat = int.Parse(args[++i]); break;
                 case "profile" or "gpuprofile" or "team": o.Mode = a; break;
                 default:
                     o.Devices = [.. a.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -224,7 +228,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var a = Registry.Make(type, s * s, 3, -1, 1);
             var b = Registry.Make(type, s * s, 4, -1, 1);
             var reference = References.MatMul(Registry.Values(type, a, s * s), Registry.Values(type, b, s * s), s, s, s);
-            Measure(device, "matmul", type, $"{s}x{s}x{s}", reference, (subject, c) => subject.MatMul(device, type, a, b, c, s, s, s), a.Length);
+            for (int rep = 0; rep < options.Repeat; rep++) Measure(device, "matmul", type, $"{s}x{s}x{s}", reference, (subject, c) => subject.MatMul(device, type, a, b, c, s, s, s), a.Length);
         }
 
         foreach (var op in Qiyas.Ops.All)
@@ -797,12 +801,21 @@ internal static class References
     public static double[] MapRow(string type, MapOp op, double[] x, double[] v, int rows, int cols)
     {
         var r = new double[rows * cols];
-        bool integer = !Registry.IsFloat(type);
+        bool integer = !Registry.IsFloat(type), signed = !type.StartsWith("uint", StringComparison.Ordinal) && type != "bool";
+        double m = integer ? Math.Pow(2, Registry.Bits(type)) : 0;
         for (int i = 0; i < rows; i++)
             for (int j = 0; j < cols; j++)
             {
                 double y = op.Reference(x[i * cols + j], v[j], 0, 0, 0);
-                r[i * cols + j] = integer ? Math.Truncate(y) : y;
+                if (integer)
+                {
+                    // The lanes' arithmetic is modular at the type's width (as Map's reference wraps).
+                    y = Math.Truncate(y);
+                    if (signed) { if (y >= m / 2) y -= m; else if (y < -m / 2) y += m; }
+                    else { if (y < 0) y += m; else if (y >= m) y -= m; }
+                }
+
+                r[i * cols + j] = y;
             }
 
         return r;

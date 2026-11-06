@@ -42,6 +42,16 @@ public sealed partial class GpuOps
         return d;
     }
 
+    private ulong Starts(AttentionArgs a, List<ulong> rented)
+    {
+        var starts = new int[a.Lq];
+        for (int i = 0; i < a.Lq; i++) starts[i] = a.Start(i);
+        ulong d = gpu.Rent(a.Lq * 4L);
+        rented.Add(d);
+        Gpu.Upload<int>(starts, d);
+        return d;
+    }
+
     // ---- rows of queries: the composition
 
     /// <summary>O for rows of queries; returns the lane's name.</summary>
@@ -76,17 +86,31 @@ public sealed partial class GpuOps
         var last = new int[a.Lq];
         for (int i = 0; i < a.Lq; i++) last[i] = a.Limit(i) - 1;
         Gpu.Upload<int>(last, limits);
+        ulong mask = SpanMask<TS>(a, rented);
         bool debug = Environment.GetEnvironmentVariable("QIYAS_MAP_DEBUG") == "1";
         for (int h = 0; h < a.Heads; h++)
         {
             ulong qh = q + (ulong)((long)h * a.Lq * a.D * size), kh = k + (ulong)((long)h * a.Lk * a.D * size), vh = v + (ulong)((long)h * a.Lk * a.D * size), oh = o + (ulong)((long)h * a.Lq * a.D * size);
             MatMulView<TS>(new ProductView(a.Lq, a.Lk, a.D, false, true), qh, kh, s);
             if (debug) { Gpu.Synchronize(); Console.WriteLine($"  attention head {h}: scores done"); }
-            RowOp<TS>(softmax, s, 0, 0, 0, 0, limits, s, 0, a.Lq, a.Lk, a.Scale, 1);
+            RowOp<TS>(softmax, s, mask, 0, 0, 0, limits, s, 0, a.Lq, a.Lk, a.Scale, 1);
             if (debug) { Gpu.Synchronize(); Console.WriteLine($"  attention head {h}: softmax done"); }
             MatMulView<TS>(new ProductView(a.Lq, a.D, a.Lk, false, false), s, vh, oh);
             if (debug) { Gpu.Synchronize(); Console.WriteLine($"  attention head {h}: context done"); }
         }
+    }
+
+    /// <summary>The additive mask excluding the keys below each query's span start (lane storage on the device), 0 when no span starts.</summary>
+    private ulong SpanMask<TS>(AttentionArgs a, List<ulong> rented) where TS : struct, IQiyasFloat<TS>
+    {
+        if (a.SpanStarts is null) return 0;
+        var m = new double[(long)a.Lq * a.Lk];
+        for (int i = 0; i < a.Lq; i++) for (int j = 0; j < a.Start(i); j++) m[(long)i * a.Lk + j] = -400;
+        var bytes = Bench.Registry.Encode(TS.Name, m);
+        ulong d = gpu.Rent(bytes.Length);
+        rented.Add(d);
+        Gpu.Upload<byte>(bytes, d);
+        return d;
     }
 
     // ---- decode: the fused kernel
@@ -101,9 +125,9 @@ public sealed partial class GpuOps
         var rented = new List<ulong>();
         try
         {
-            ulong limits = Limits(a, rented);
+            ulong limits = Limits(a, rented), starts = Starts(a, rented);
             var fn = gpu.Cached($"attention_decode:{f.Name}:{dCap}", (out string e) => Ptx.AttentionDecode(gpu, f, lane, dCap, out e));
-            Gpu.Launch(fn, (uint)(a.Heads * a.Lq), 1, Ptx.DecodeThreads, 1, 0, q, k, v, o, limits, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), lane.Wide ? Gpu.D(a.Scale) : Gpu.F((float)a.Scale));
+            Gpu.Launch(fn, (uint)(a.Heads * a.Lq), 1, Ptx.DecodeThreads, 1, 0, q, k, v, o, limits, starts, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), lane.Wide ? Gpu.D(a.Scale) : Gpu.F((float)a.Scale));
             return lane.Name;
         }
         finally
@@ -148,6 +172,7 @@ public sealed partial class GpuOps
         var last = new int[a.Lq];
         for (int i = 0; i < a.Lq; i++) last[i] = a.Limit(i) - 1;
         Gpu.Upload<int>(last, limits);
+        ulong mask = SpanMask<TS>(a, rented);
         var softmax = RowOps.Find("scale_mask_softmax");
         var softmaxBwd = RowOps.Find("softmax_bwd");
         var scale = Qiyas.Ops.Find("scale");
@@ -156,7 +181,7 @@ public sealed partial class GpuOps
             long qo = (long)h * a.Lq * a.D * size, ko = (long)h * a.Lk * a.D * size;
             ulong qh = q + (ulong)qo, kh = k + (ulong)ko, vh = v + (ulong)ko, doh = dO + (ulong)qo, dqh = dq + (ulong)qo, dkh = dk + (ulong)ko, dvh = dv + (ulong)ko;
             MatMulView<TS>(new ProductView(a.Lq, a.Lk, a.D, false, true), qh, kh, p);
-            RowOp<TS>(softmax, p, 0, 0, 0, 0, limits, p, 0, a.Lq, a.Lk, a.Scale, 1);
+            RowOp<TS>(softmax, p, mask, 0, 0, 0, limits, p, 0, a.Lq, a.Lk, a.Scale, 1);
             MatMulView<TS>(new ProductView(a.Lk, a.D, a.Lq, true, false), p, doh, dvh);            // dV = Pᵀ·dO
             MatMulView<TS>(new ProductView(a.Lq, a.Lk, a.D, false, true), doh, vh, dp);             // dP = dO·Vᵀ
             RowOp<TS>(softmaxBwd, p, dp, 0, 0, 0, 0, dp, 0, a.Lq, a.Lk, 0, 0);                      // dS = P·(dP − Σ P·dP)

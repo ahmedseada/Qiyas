@@ -19,7 +19,7 @@ internal static partial class Ptx
         string tid = b.R(), bid = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");
-        string q = Param64(b, "p_q"), k = Param64(b, "p_k"), v = Param64(b, "p_v"), o = Param64(b, "p_o"), lim = Param64(b, "p_lim");
+        string q = Param64(b, "p_q"), k = Param64(b, "p_k"), v = Param64(b, "p_v"), o = Param64(b, "p_o"), lim = Param64(b, "p_lim"), starts = Param64(b, "p_start");
         string lq = Param32(b, "p_lq"), lk = Param32(b, "p_lk"), d = Param32(b, "p_d");
         string scale = lane.NewReg(b);
         b.L($"ld.param.{lane.Op} {scale}, [p_scale];");
@@ -31,6 +31,11 @@ internal static partial class Ptx
         b.L($"add.u64 {la}, {lim}, {la};");
         b.L($"ld.global.s32 {limit}, [{la}];");
         b.L($"min.u32 {limit}, {limit}, {lk};");
+        string start = b.R(), sa = b.RD();
+        b.L($"mul.wide.u32 {sa}, {i}, 4;");
+        b.L($"add.u64 {sa}, {starts}, {sa};");
+        b.L($"ld.global.s32 {start}, [{sa}];");
+        b.L($"min.u32 {start}, {start}, {limit};");
         b.L($"mad.lo.u32 {qBase}, {bid}, {d}, 0;");                       // (h·lq + i)·d = bid·d
         b.L($"mul.lo.u32 {kBase}, {h}, {lk};");
         b.L($"mul.lo.u32 {kBase}, {kBase}, {d};");
@@ -64,7 +69,7 @@ internal static partial class Ptx
         var acc = new string[PerThread];
         for (int a = 0; a < PerThread; a++) { acc[a] = lane.NewReg(b); b.L($"mov.{lane.Reg} {acc[a]}, {lane.Zero};"); }
         string chunk = b.R(), pDone = b.P();
-        b.L($"mov.u32 {chunk}, 0;");
+        b.L($"mov.u32 {chunk}, {start};");
         b.Label("CHUNK");
         b.L($"setp.ge.u32 {pDone}, {chunk}, {limit};");
         b.L($"@{pDone} bra CHUNK_END;");
@@ -185,7 +190,7 @@ internal static partial class Ptx
 
         b.L("ret;");
         string pa = lane.Wide ? "f64" : "f32";
-        return b.Finish(Header(gpu), entry, $".param .u64 p_q, .param .u64 p_k, .param .u64 p_v, .param .u64 p_o, .param .u64 p_lim, .param .u32 p_lq, .param .u32 p_lk, .param .u32 p_d, .param .{pa} p_scale", DecodeShared(lane, dCap));
+        return b.Finish(Header(gpu), entry, $".param .u64 p_q, .param .u64 p_k, .param .u64 p_v, .param .u64 p_o, .param .u64 p_lim, .param .u64 p_start, .param .u32 p_lq, .param .u32 p_lk, .param .u32 p_d, .param .{pa} p_scale", DecodeShared(lane, dCap));
     }
 
     // ---------------------------------------------------------------- lane storage: widen a format to its float lane's storage, and back

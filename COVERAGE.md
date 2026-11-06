@@ -141,7 +141,7 @@ sum_axis, sumsq, max, min, argmax → the reductions; transpose; gemv_nn / gemv_
 | decode: a few queries over a long cache | ✓ float | ✓ float | the device's fused kernel: a block per query, keys in chunks, the softmax online, K and V read once; the CPU per query in the lane |
 | backward: dQ, dK, dV | ✓ float | ✓ float | the composition: P recomputed, dV = Pᵀ·dO, dP = dO·Vᵀ, dS = softmax_bwd, dQ = scale·dS·K, dK = scale·dSᵀ·Q |
 | fused rows (flash: tiles of keys through the tensor lanes without the scores in memory) | todo | todo | the composition keeps Lq × Lk scores per head in lane storage |
-| spans as a key range per query | ✓ (span from 0) | ✓ | a start offset per query: todo |
+| spans as a key range per query: [start, limit) | ✓ | ✓ | the limit by scale_mask_softmax's position, the start by an additive mask row (the composition) or the decode kernel's first chunk |
 
 ## Convolution and pooling
 
@@ -152,7 +152,7 @@ sum_axis, sumsq, max, min, argmax → the reductions; transpose; gemv_nn / gemv_
 | depthwise convolution | ✓ sum | ✓ sum | a layout operation: a gather with the channel's weights |
 | maxpool, avgpool (strides, pads: a window's count excludes the pads), their backward passes | ✓ own / ✓ float | ✓ own / ✓ float | layout operations; maxpool backward recomputes each window's first largest (deterministic) |
 | adaptive max / average pools | ✓ own / ✓ float | ✓ own / ✓ float | windows [⌊i·n/o⌋, ⌈(i + 1)·n/o⌉) |
-| pool backward of the adaptive pools | todo | todo | |
+| adaptive max / average pool backward | ✓ sum / ✓ float | ✓ sum / ✓ float | layout operations: each input pixel gathers the windows holding it |
 
 ## Optimizers
 
@@ -174,7 +174,7 @@ sum_axis, sumsq, max, min, argmax → the reductions; transpose; gemv_nn / gemv_
 | operation | CPU | CUDA | note |
 |---|---|---|---|
 | Q8_0, Q4_0, Q4_K, Q6_K as types (Load decodes blocks into the f32 lane, Store encodes blocks) | ✓ | ✓ decode; encode Q8_0, Q4_0 | the GGUF layouts; every operation above runs on them (the device's value-wise stores through float32 storage and a block encode) |
-| products with a block-format operand | ✓ sum | ✓ sum | through the f32 lane (the values decoded); the block-scaled integer dot products (the format's own fast path) are todo |
+| products with a block-format operand | ✓ sum | ✓ sum | matmul through the f32 lane (the values decoded); gemv on Q8_0 / Q4_0 by the block-scaled integer dot (32-term s8 dots per block, the block scales' product in f32: the format's own fast path, `s8dp blocks`); the same for the tiled product: todo |
 
 ## Masks
 

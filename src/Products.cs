@@ -45,7 +45,7 @@ public sealed record ProductView(int M, int N, int K, bool TransA, bool TransB, 
 
 internal static partial class Kernels
 {
-    private static int BytesOf<TN>(long values) where TN : struct, IQiyasNumber<TN> => (int)((values * TN.Bits + 7) / 8);
+    private static int BytesOf<TN>(long values) where TN : struct, IQiyasNumber<TN> => (int)TN.Bytes(values);
 
     /// <summary>C = op(A)·op(B) over the view's batches on the CPU; returns the product's lane.</summary>
     public static string MatMulView<TN>(ProductView v, byte[] a, byte[] b, byte[] c) where TN : struct, IQiyasNumber<TN>

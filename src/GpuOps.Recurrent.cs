@@ -216,6 +216,26 @@ public sealed partial class GpuOps
     public string LstmSequence<TN>(CellArgs a, int T, ulong x, ulong h0, ulong c0, ulong w, ulong u, ulong bias, ulong hOut, ulong cOut) where TN : struct, IQiyasNumber<TN>
     {
         var f = Fmt.Of<TN>();
+        if (!OwnLane(f) && !f.IsBlock)
+        {
+            var ln = RowLane(f);
+            var rented = new List<ulong>();
+            try
+            {
+                long bd = (long)a.B * a.D, bh = (long)a.B * a.H, GH = a.Gates * a.H;
+                ulong lh = gpu.Rent(T * bh * ln.Size), lc = gpu.Rent(T * bh * ln.Size);
+                rented.Add(lh); rented.Add(lc);
+                ulong lx = ToLane<TN>(x, T * bd, rented), lh0 = ToLane<TN>(h0, bh, rented), lc0 = ToLane<TN>(c0, bh, rented), lw = ToLane<TN>(w, GH * a.D, rented), lu = ToLane<TN>(u, GH * a.H, rented), lb = ToLane<TN>(bias, GH, rented);
+                string name = ln.Wide ? LstmSequence<Float64>(a, T, lx, lh0, lc0, lw, lu, lb, lh, lc) : LstmSequence<Float32>(a, T, lx, lh0, lc0, lw, lu, lb, lh, lc);
+                FromLane<TN>(lh, hOut, T * bh); FromLane<TN>(lc, cOut, T * bh);
+                return name;
+            }
+            finally
+            {
+                foreach (var p in rented) gpu.Return(p);
+            }
+        }
+
         long xBytes = f.Words((long)a.B * a.D) * (f.WordBits / 8), hBytes = f.Words((long)a.B * a.H) * (f.WordBits / 8);
         if (f.IsBlock || ((long)a.B * a.D * f.Bits % 8 != 0) || ((long)a.B * a.H * f.Bits % 8 != 0)) throw new NotSupportedException($"{f.Name}: a sequence's steps must end on a byte");
         ulong hPrev = h0, cPrev = c0;
@@ -252,6 +272,26 @@ public sealed partial class GpuOps
     public string LstmSequenceBackward<TN>(CellArgs a, int T, ulong x, ulong h0, ulong c0, ulong w, ulong u, ulong bias, ulong dhOut, ulong dcLast, ulong dx, ulong dh0, ulong dc0, ulong dw, ulong du, ulong db) where TN : struct, IQiyasNumber<TN>
     {
         var f = Fmt.Of<TN>();
+        if (!OwnLane(f) && !f.IsBlock)
+        {
+            var ln = RowLane(f);
+            var rented2 = new List<ulong>();
+            try
+            {
+                long bd = (long)a.B * a.D, bh = (long)a.B * a.H, GH = a.Gates * a.H;
+                ulong R2(long n) { ulong p = gpu.Rent(n * ln.Size); rented2.Add(p); return p; }
+                ulong ldx = R2(T * bd), ldh0 = R2(bh), ldc0 = R2(bh), ldw = R2(GH * a.D), ldu = R2(GH * a.H), ldb = R2(GH);
+                ulong lx = ToLane<TN>(x, T * bd, rented2), lh0 = ToLane<TN>(h0, bh, rented2), lc0 = ToLane<TN>(c0, bh, rented2), lw = ToLane<TN>(w, GH * a.D, rented2), lu = ToLane<TN>(u, GH * a.H, rented2), lb = ToLane<TN>(bias, GH, rented2), ldho = ToLane<TN>(dhOut, T * bh, rented2), ldcl = ToLane<TN>(dcLast, bh, rented2);
+                string name = ln.Wide ? LstmSequenceBackward<Float64>(a, T, lx, lh0, lc0, lw, lu, lb, ldho, ldcl, ldx, ldh0, ldc0, ldw, ldu, ldb) : LstmSequenceBackward<Float32>(a, T, lx, lh0, lc0, lw, lu, lb, ldho, ldcl, ldx, ldh0, ldc0, ldw, ldu, ldb);
+                FromLane<TN>(ldx, dx, T * bd); FromLane<TN>(ldh0, dh0, bh); FromLane<TN>(ldc0, dc0, bh); FromLane<TN>(ldw, dw, GH * a.D); FromLane<TN>(ldu, du, GH * a.H); FromLane<TN>(ldb, db, GH);
+                return name;
+            }
+            finally
+            {
+                foreach (var p in rented2) gpu.Return(p);
+            }
+        }
+
         if (f.IsBlock || ((long)a.B * a.D * f.Bits % 8 != 0) || ((long)a.B * a.H * f.Bits % 8 != 0)) throw new NotSupportedException($"{f.Name}: a sequence's steps must end on a byte");
         long xStep = (long)a.B * a.D * f.Bits / 8, hStep = (long)a.B * a.H * f.Bits / 8;
         long dwBytes = f.Words((long)a.Gates * a.H * a.D) * (f.WordBits / 8), duBytes = f.Words((long)a.Gates * a.H * a.H) * (f.WordBits / 8), dbBytes = f.Words(a.Gates * a.H) * (f.WordBits / 8);

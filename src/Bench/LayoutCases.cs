@@ -20,7 +20,7 @@ public static class LayoutCases
     /// <summary>The second input's values: the forward input of a maxpool backward, the weights of a depthwise convolution.</summary>
     public static int SecondCount(LayoutArgs k) => k.Name switch
     {
-        "maxpool_bwd" or "avgpool_bwd" => k.P[0] * k.P[1] * k.P[2],
+        "maxpool_bwd" or "avgpool_bwd" or "adaptive_maxpool_bwd" or "adaptive_avgpool_bwd" => k.P[0] * k.P[1] * k.P[2],
         "depthwise_conv" => k.P[0] * k.P[3] * k.P[4],
         _ => 0,
     };
@@ -39,7 +39,7 @@ public static class LayoutCases
         "shift" => $"{k.P[0]}x{k.P[1]} by {k.P[2]}",
         "pad2d" => $"{k.P[0]}x{k.P[1]} to {k.P[2]}",
         "maxpool" or "avgpool" or "maxpool_bwd" or "avgpool_bwd" or "depthwise_conv" => $"{k.P[0]}x{k.P[1]}x{k.P[2]} k{k.P[3]}x{k.P[4]} s{k.P[5]} p{k.P[7]}",
-        "adaptive_maxpool" or "adaptive_avgpool" => $"{k.P[0]}x{k.P[1]}x{k.P[2]} to {k.P[3]}x{k.P[4]}",
+        "adaptive_maxpool" or "adaptive_avgpool" or "adaptive_maxpool_bwd" or "adaptive_avgpool_bwd" => $"{k.P[0]}x{k.P[1]}x{k.P[2]} to {k.P[3]}x{k.P[4]}",
         _ => "",
     };
 
@@ -118,6 +118,11 @@ public static class LayoutCases
                 yield return Make(name, type, 3 * 7 * 9, null, [3, 7, 9, 5, 4], 3 * 5 * 4, 94);
                 yield return Make(name, type, 2 * 5 * 5, null, [2, 5, 5, 7, 3], 2 * 7 * 3, 95);
                 break;
+            case "adaptive_maxpool_bwd":
+            case "adaptive_avgpool_bwd":
+                yield return Make(name, type, 3 * 5 * 4, null, [3, 7, 9, 5, 4], 3 * 7 * 9, 97, 3 * 7 * 9);
+                yield return Make(name, type, 2 * 7 * 3, null, [2, 5, 5, 7, 3], 2 * 5 * 5, 98, 2 * 5 * 5);
+                break;
             case "depthwise_conv":
             {
                 int[][] shapes = [[3, 7, 9, 3, 3, 1, 1, 1, 1, 1, 1], [2, 11, 5, 3, 2, 2, 1, 1, 0, 2, 1]];
@@ -146,6 +151,7 @@ public static class LayoutCases
         "maxpool" or "avgpool" => Make(name, type, 64 * 256 * 256, null, [64, 256, 256, 2, 2, 2, 2, 0, 0], PoolCount([64, 256, 256, 2, 2, 2, 2, 0, 0]), 92),
         "maxpool_bwd" or "avgpool_bwd" => Make(name, type, PoolCount([64, 256, 256, 2, 2, 2, 2, 0, 0]), null, [64, 256, 256, 2, 2, 2, 2, 0, 0], 64 * 256 * 256, 93, 64 * 256 * 256),
         "adaptive_maxpool" or "adaptive_avgpool" => Make(name, type, 64 * 256 * 256, null, [64, 256, 256, 7, 7], 64 * 7 * 7, 94),
+        "adaptive_maxpool_bwd" or "adaptive_avgpool_bwd" => Make(name, type, 64 * 7 * 7, null, [64, 256, 256, 7, 7], 64 * 256 * 256, 97, 64 * 256 * 256),
         "depthwise_conv" => Make(name, type, 64 * 256 * 256, null, [64, 256, 256, 3, 3, 1, 1, 1, 1, 1, 1], PoolCount([64, 256, 256, 3, 3, 1, 1, 1, 1, 1, 1]), 96, 64 * 9),
         _ => throw new ArgumentException(name),
     };

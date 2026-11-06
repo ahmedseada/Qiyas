@@ -224,6 +224,13 @@ public sealed partial class GpuOps(Gpu gpu)
     public string Gemv<TN>(ulong a, ulong x, ulong y, int rows, int cols, bool transposed) where TN : struct, IQiyasNumber<TN>
     {
         var f = Fmt.Of<TN>();
+        if (f.Name is "q8_0" or "q4_0" && !transposed && cols % 32 == 0)
+        {
+            ulong yBlocks = gpu.Rent(rows * 4L);
+            try { string blockLane = GemvBlocks<TN>(a, x, yBlocks, rows, cols); Back(f, Lane.F32, yBlocks, y, rows); return blockLane; }
+            finally { gpu.Return(yBlocks); }
+        }
+
         if (f.IsBlock)
         {
             var r = new List<ulong>();

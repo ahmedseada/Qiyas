@@ -307,18 +307,19 @@ internal static class Packed
         else
         {
             // 1-bit values: 8 a byte, the first in the low bit (a whole byte at a time, the last partial byte kept beyond the values).
+            // Values held to 0 or 1 (as the head values are), not their low bit.
             int whole = rest.Length / 8;
             for (int i = 0; i < whole; i++)
             {
                 int v = 0;
-                for (int t = 0; t < 8; t++) v |= (rest[i * 8 + t] & 1) << t;
+                for (int t = 0; t < 8; t++) v |= (int)Math.Clamp(signed ? (sbyte)rest[i * 8 + t] : rest[i * 8 + t], low, high) << t;
                 dst[i] = (byte)v;
             }
 
             for (int i = whole * 8; i < rest.Length; i++)
             {
                 int t = i % 8;
-                dst[whole] = (byte)((dst[whole] & ~(1 << t)) | (rest[i] & 1) << t);
+                dst[whole] = (byte)((dst[whole] & ~(1 << t)) | (int)Math.Clamp(signed ? (sbyte)rest[i] : rest[i], low, high) << t);
             }
         }
     }

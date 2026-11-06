@@ -19,13 +19,16 @@ using System.Runtime.InteropServices;
 namespace Qiyas;
 
 /// <summary>Q (heads × Lq × d), K and V (heads × Lk × d), O (heads × Lq × d); the scale; causal or spans per query.</summary>
-public sealed record AttentionArgs(int Heads, int Lq, int Lk, int D, double Scale, bool Causal, int[]? Spans = null)
+public sealed record AttentionArgs(int Heads, int Lq, int Lk, int D, double Scale, bool Causal, int[]? Spans = null, int[]? SpanStarts = null)
 {
     public long QValues => (long)Heads * Lq * D;
     public long KValues => (long)Heads * Lk * D;
 
-    /// <summary>The keys query i sees: [0, Limit(i)).</summary>
+    /// <summary>The keys query i sees: [Start(i), Limit(i)).</summary>
     public int Limit(int i) => Spans is not null ? Math.Min(Lk, Spans[i]) : Causal ? Math.Min(Lk, i + (Lk - Lq) + 1) : Lk;
+
+    /// <summary>The first key query i sees (0 unless span starts are given).</summary>
+    public int Start(int i) => SpanStarts is null ? 0 : Math.Clamp(SpanStarts[i], 0, Lk);
 
     /// <summary>The float64 reference of O, and of P when asked (heads × Lq × Lk).</summary>
     public double[] Reference(double[] q, double[] k, double[] v, double[]? p = null)
@@ -33,10 +36,10 @@ public sealed record AttentionArgs(int Heads, int Lq, int Lk, int D, double Scal
         var o = new double[QValues];
         Parallel.For(0, Heads * Lq, hi =>
         {
-            int h = hi / Lq, i = hi % Lq, limit = Limit(i);
+            int h = hi / Lq, i = hi % Lq, limit = Limit(i), start = Start(i);
             var s = new double[Lk];
             double m = double.NegativeInfinity;
-            for (int j = 0; j < limit; j++)
+            for (int j = start; j < limit; j++)
             {
                 double dot = 0;
                 for (int t = 0; t < D; t++) dot += q[((long)h * Lq + i) * D + t] * k[((long)h * Lk + j) * D + t];
@@ -45,14 +48,15 @@ public sealed record AttentionArgs(int Heads, int Lq, int Lk, int D, double Scal
             }
 
             double sum = 0;
-            for (int j = 0; j < limit; j++) sum += s[j] = Math.Exp(s[j] - m);
-            for (int j = 0; j < limit; j++) s[j] = sum > 0 ? s[j] / sum : 0;
+            for (int j = start; j < limit; j++) sum += s[j] = Math.Exp(s[j] - m);
+            for (int j = start; j < limit; j++) s[j] = sum > 0 ? s[j] / sum : 0;
+            for (int j = 0; j < Math.Min(start, Lk); j++) s[j] = 0;
             for (int j = limit; j < Lk; j++) s[j] = 0;
             if (p is not null) Array.Copy(s, 0, p, ((long)h * Lq + i) * Lk, Lk);
             for (int t = 0; t < D; t++)
             {
                 double acc = 0;
-                for (int j = 0; j < limit; j++) acc += s[j] * v[((long)h * Lk + j) * D + t];
+                for (int j = start; j < limit; j++) acc += s[j] * v[((long)h * Lk + j) * D + t];
                 o[((long)h * Lq + i) * D + t] = acc;
             }
         });
@@ -195,6 +199,7 @@ internal static partial class Kernels
         var limits = new int[a.Lq];
         for (int i = 0; i < a.Lq; i++) limits[i] = a.Limit(i) - 1;
         var softmax = RowOps.Find("scale_mask_softmax");
+        var mask = SpanMask<TS>(a);
         for (int h = 0; h < a.Heads; h++)
         {
             long qOff = (long)h * a.Lq * a.D, kOff = (long)h * a.Lk * a.D;
@@ -203,13 +208,22 @@ internal static partial class Kernels
             var sk = Slice(k, kOff * size, (long)a.Lk * a.D * size);
             var sv = Slice(v, kOff * size, (long)a.Lk * a.D * size);
             MatMulView<TS>(new ProductView(a.Lq, a.Lk, a.D, false, true), sq, sk, s);
-            RowOp<TS>(softmax, s, null, null, null, null, limits, s, null, a.Lq, a.Lk, a.Scale, 1);
+            RowOp<TS>(softmax, s, mask, null, null, null, limits, s, null, a.Lq, a.Lk, a.Scale, 1);
             var so = new byte[(long)a.Lq * a.D * size];
             MatMulView<TS>(new ProductView(a.Lq, a.D, a.Lk, false, false), s, sv, so);
             Array.Copy(so, 0, lo, qOff * size, so.Length);
         }
 
         narrow?.Invoke(lo);
+    }
+
+    /// <summary>The additive mask (Lq × Lk, lane storage) excluding the keys below each query's span start; null when no span starts.</summary>
+    private static byte[]? SpanMask<TS>(AttentionArgs a) where TS : struct, IQiyasFloat<TS>
+    {
+        if (a.SpanStarts is null) return null;
+        var m = new double[(long)a.Lq * a.Lk];
+        for (int i = 0; i < a.Lq; i++) for (int j = 0; j < a.Start(i); j++) m[(long)i * a.Lk + j] = -400;
+        return Bench.Registry.Encode(TS.Name, m);
     }
 
     private static byte[] Slice(byte[] x, long offset, long length)
@@ -254,7 +268,7 @@ internal static partial class Kernels
             var sv = Slice(v, kOff * size, (long)a.Lk * a.D * size);
             var sdo = Slice(dO, qOff * size, a.Lq * a.D * size);
             MatMulView<TS>(new ProductView(a.Lq, a.Lk, a.D, false, true), sq, sk, p);
-            RowOp<TS>(softmax, p, null, null, null, null, limits, p, null, a.Lq, a.Lk, a.Scale, 1);
+            RowOp<TS>(softmax, p, SpanMask<TS>(a), null, null, null, limits, p, null, a.Lq, a.Lk, a.Scale, 1);
             var hdv = new byte[(long)a.Lk * a.D * size];
             MatMulView<TS>(new ProductView(a.Lk, a.D, a.Lq, true, false), p, sdo, hdv);            // dV = Pᵀ·dO
             MatMulView<TS>(new ProductView(a.Lq, a.Lk, a.D, false, true), sdo, sv, dp);             // dP = dO·Vᵀ
@@ -289,7 +303,7 @@ internal static partial class Kernels
         public void Run<TN, TLane, TL>() where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
         {
             Lane = TL.Name;
-            Team.For(a.Heads * a.Lq, 1, a.KValues * 2, new DecodeBody<TN, TLane, TL>(a, q, k, v, o));
+            Team.For(a.Heads * a.Lq, RowChunk<TN>(a.Heads * a.Lq, a.D, 1), a.KValues * 2, new DecodeBody<TN, TLane, TL>(a, q, k, v, o));
         }
     }
 
@@ -308,20 +322,20 @@ internal static partial class Kernels
                 TLane scale = TL.From(a.Scale);
                 for (int hi = first; hi < last; hi++)
                 {
-                    int h = hi / a.Lq, i = hi % a.Lq, limit = a.Limit(i);
+                    int h = hi / a.Lq, i = hi % a.Lq, limit = a.Limit(i), start = Math.Min(a.Start(i), limit);
                     long qi = ((long)h * a.Lq + i) * a.D, kBase = (long)h * a.Lk * a.D;
                     TN.Load(q, (int)qi, qr.AsSpan(0, a.D));
                     TLane m = TL.NegativeInfinity;
-                    for (int j = 0; j < limit; j++)
+                    for (int j = start; j < limit; j++)
                     {
                         TN.Load(k, (int)(kBase + (long)j * a.D), kr.AsSpan(0, a.D));
                         s[j] = TL.Mul(RowMath<TLane, TL>.Dot(qr.AsSpan(0, a.D), kr.AsSpan(0, a.D)), scale);
                         m = TL.Max(m, s[j]);
                     }
 
-                    TLane sum = limit == 0 ? TL.Zero : RowMath<TLane, TL>.ExpSum(s.AsSpan(0, limit), m, s.AsSpan(0, limit));
+                    TLane sum = limit <= start ? TL.Zero : RowMath<TLane, TL>.ExpSum(s.AsSpan(start, limit - start), m, s.AsSpan(start, limit - start));
                     acc.AsSpan(0, a.D).Clear();
-                    for (int j = 0; j < limit; j++)
+                    for (int j = start; j < limit; j++)
                     {
                         TN.Load(v, (int)(kBase + (long)j * a.D), kr.AsSpan(0, a.D));
                         var pj = new Vector<TLane>(s[j]);
@@ -330,7 +344,7 @@ internal static partial class Kernels
                         for (; t < a.D; t++) acc[t] = TL.Fma(kr[t], s[j], acc[t]);
                     }
 
-                    TLane inv = limit == 0 ? TL.Zero : TL.Div(TL.From(1), sum);
+                    TLane inv = limit <= start ? TL.Zero : TL.Div(TL.From(1), sum);
                     RowMath<TLane, TL>.Scale(acc.AsSpan(0, a.D), TL.Zero, inv, acc.AsSpan(0, a.D));
                     TN.Store(acc.AsSpan(0, a.D), o, (int)qi);
                 }

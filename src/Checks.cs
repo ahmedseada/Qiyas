@@ -136,6 +136,7 @@ internal static class Checks
     {
         bool ok = true;
         string where = ops is null ? "cpu" : "device";
+        if (ops is null) ok &= BlockSpecifications();
         var random = new Random(99);
         foreach (var type in Bench.Registry.Names)
         {
@@ -188,6 +189,100 @@ internal static class Checks
         }
 
         if (ok) Console.WriteLine($"check block formats          {where,-6} Q8_0, Q4_0, Q4_K, Q6_K: round trips within the block's step; the device's codecs as the CPU's");
+        return ok;
+    }
+
+    /// <summary>The codecs against the formats' specifications (GGUF): blocks written by hand, their values by the specified formulas.</summary>
+    private static bool BlockSpecifications()
+    {
+        bool ok = true;
+        static void Half(float v, Span<byte> s, int at) => BitConverter.TryWriteBytes(s.Slice(at, 2), (Half)v);
+        var v = new float[256];
+        // Q8_0: d = 0.5, q_i = i − 16 → value_i = 0.5·(i − 16); byte 2 + i holds q_i.
+        {
+            var block = new byte[34];
+            Half(0.5f, block, 0);
+            for (int i = 0; i < 32; i++) block[2 + i] = (byte)(sbyte)(i - 16);
+            Blocks.DecodeQ8_0(block, v);
+            for (int i = 0; i < 32; i++) if (v[i] != 0.5f * (i - 16)) { ok = false; Console.WriteLine($"check block q8_0 spec: value {i} = {v[i]}, expected {0.5f * (i - 16)}"); break; }
+            var back = new byte[34];
+            Blocks.EncodeQ8_0(v.AsSpan(0, 32), back);
+            float dEnc = (float)BitConverter.ToHalf(back.AsSpan(0, 2));
+            Blocks.DecodeQ8_0(back, v);
+            for (int i = 0; i < 32; i++) if (Math.Abs(v[i] - 0.5f * (i - 16)) > 0.5f * dEnc + 1e-6f) { ok = false; Console.WriteLine($"check block q8_0 spec: round trip value {i} = {v[i]} (scale {dEnc})"); break; }
+        }
+
+        // Q4_0: d = 0.25; byte 2 + j holds value j in its low nibble and value j + 16 in its high nibble; value = d·(q − 8).
+        {
+            var block = new byte[18];
+            Half(0.25f, block, 0);
+            for (int j = 0; j < 16; j++) block[2 + j] = (byte)(j | ((15 - j) << 4));
+            Blocks.DecodeQ4_0(block, v);
+            for (int j = 0; j < 16; j++)
+            {
+                if (v[j] != 0.25f * (j - 8) || v[j + 16] != 0.25f * (15 - j - 8)) { ok = false; Console.WriteLine($"check block q4_0 spec: values {j}, {j + 16} = {v[j]}, {v[j + 16]}"); break; }
+            }
+        }
+
+        // Q4_K: d = 1, dmin = 0.5; sub-block scales 1..8 and mins 0..7 in the 6-bit layout; nibbles: sub-block j's value i = (i + j) & 15
+        // (low nibbles for even j, high for odd, over the pair's 32 bytes); value = d·scale_j·q − dmin·min_j.
+        {
+            var block = new byte[144];
+            Half(1f, block, 0); Half(0.5f, block, 2);
+            var sc = block.AsSpan(4, 12);
+            int[] ls = [1, 2, 3, 4, 5, 6, 7, 8], lm = [0, 1, 2, 3, 4, 5, 6, 7];
+            for (int j = 0; j < 8; j++)
+            {
+                if (j < 4) { sc[j] = (byte)ls[j]; sc[j + 4] = (byte)lm[j]; }
+                else { sc[j + 4] = (byte)((ls[j] & 0xF) | ((lm[j] & 0xF) << 4)); sc[j - 4] |= (byte)((ls[j] >> 4) << 6); sc[j] |= (byte)((lm[j] >> 4) << 6); }
+            }
+
+            var qs = block.AsSpan(16, 128);
+            for (int j = 0; j < 8; j++) for (int i = 0; i < 32; i++)
+            {
+                int q = (i + j) & 15, at = j / 2 * 32 + i;
+                if (j % 2 == 0) qs[at] = (byte)((qs[at] & 0xF0) | q); else qs[at] = (byte)((qs[at] & 0x0F) | q << 4);
+            }
+
+            Blocks.DecodeQ4_K(block, v);
+            for (int j = 0; j < 8 && ok; j++) for (int i = 0; i < 32; i++)
+            {
+                float want = 1f * ls[j] * ((i + j) & 15) - 0.5f * lm[j];
+                if (v[j * 32 + i] != want) { ok = false; Console.WriteLine($"check block q4_k spec: sub-block {j} value {i} = {v[j * 32 + i]}, expected {want}"); break; }
+            }
+        }
+
+        // Q6_K: d = 0.125; scales_j = j − 8 (int8); value i of sub-block j (16 values) = d·scale_j·(q − 32) with q = (i·3 + j) & 63 laid into ql / qh.
+        {
+            var block = new byte[210];
+            Half(0.125f, block, 208);
+            var sc = block.AsSpan(192, 16);
+            for (int j = 0; j < 16; j++) sc[j] = (byte)(sbyte)(j - 8);
+            var q = new int[256];
+            for (int j = 0; j < 16; j++) for (int i = 0; i < 16; i++) q[j * 16 + i] = (i * 3 + j) & 63;
+            var ql = block.AsSpan(0, 128);
+            var qh = block.AsSpan(128, 64);
+            for (int half = 0; half < 2; half++)
+            {
+                int lBase = half * 64, hBase = half * 32, vBase = half * 128;
+                for (int l = 0; l < 32; l++)
+                {
+                    int q1 = q[vBase + l], q2 = q[vBase + l + 32], q3 = q[vBase + l + 64], q4 = q[vBase + l + 96];
+                    ql[lBase + l] = (byte)((q1 & 0xF) | ((q3 & 0xF) << 4));
+                    ql[lBase + l + 32] = (byte)((q2 & 0xF) | ((q4 & 0xF) << 4));
+                    qh[hBase + l] = (byte)(((q1 >> 4) & 3) | (((q2 >> 4) & 3) << 2) | (((q3 >> 4) & 3) << 4) | (((q4 >> 4) & 3) << 6));
+                }
+            }
+
+            Blocks.DecodeQ6_K(block, v);
+            for (int j = 0; j < 16 && ok; j++) for (int i = 0; i < 16; i++)
+            {
+                float want = 0.125f * (j - 8) * (((i * 3 + j) & 63) - 32);
+                if (v[j * 16 + i] != want) { ok = false; Console.WriteLine($"check block q6_k spec: sub-block {j} value {i} = {v[j * 16 + i]}, expected {want}"); break; }
+            }
+        }
+
+        if (ok) Console.WriteLine("check block specifications   cpu    Q8_0, Q4_0, Q4_K, Q6_K blocks laid out by hand decode by the formats' formulas");
         return ok;
     }
 
@@ -535,6 +630,8 @@ internal static class Checks
             {
                 (new(2, 37, 53, 24, 0.2, false), false), (new(2, 37, 53, 24, 0.2, true), false), (new(2, 37, 53, 17, 0.2, false), false),
                 (new(2, 37, 53, 24, 0.2, false, Enumerable.Range(0, 37).Select(i => i * 3 % 60).ToArray()), false),
+                (new(2, 37, 53, 24, 0.2, false, Enumerable.Range(0, 37).Select(i => 20 + i % 30).ToArray(), Enumerable.Range(0, 37).Select(i => i % 25).ToArray()), false),
+                (new(2, 3, 1001, 24, 0.2, false, null, [5, 300, 900]), true),
                 (new(2, 3, 1001, 24, 0.2, false), true), (new(2, 5, 1001, 17, 0.2, true), true),
             };
             foreach (var (a, decode) in cases)
@@ -703,7 +800,7 @@ internal static class Checks
                     var reference = LayoutArgs.Reference(name, Bench.Registry.Values(type, k.X, k.InputCount), k.Index, k.P, k.Count, k.X2 is null ? null : Bench.Registry.Values(type, k.X2, Bench.LayoutCases.SecondCount(k)));
                     Bench.Registry.With(type, new LayoutRun(ops, k));
                     // Sums round over their terms; a bilinear value is four weighted terms of the inputs' magnitude (not the result's); a pool's mean over its window.
-                    int terms = name is "scatter_add_rows" or "col2im" or "maxpool_bwd" or "depthwise_conv" ? LayoutArgs.Terms(name, k.P) : name == "interpolate_bilinear" ? 4 : name is "avgpool" or "avgpool_bwd" ? k.P[3] * k.P[4] : name == "adaptive_avgpool" ? (k.P[1] / k.P[3] + 2) * (k.P[2] / k.P[4] + 2) : 0;
+                    int terms = name is "scatter_add_rows" or "col2im" or "maxpool_bwd" or "depthwise_conv" or "adaptive_maxpool_bwd" ? LayoutArgs.Terms(name, k.P) : name == "interpolate_bilinear" ? 4 : name is "avgpool" or "avgpool_bwd" ? k.P[3] * k.P[4] : name is "adaptive_avgpool" or "adaptive_avgpool_bwd" ? (k.P[1] / k.P[3] + 2) * (k.P[2] / k.P[4] + 2) : 0;
                     ok &= Close(type, $"layout {name}", where, k.Output, reference, k.Count, terms);
                 }
             }
@@ -920,12 +1017,28 @@ internal static class Checks
         for (int i = 0; i < n; i++)
         {
             double want = expected[i], v = got[i];
-            if (mant == 0) { if (v != want) worst = Math.Max(worst, Math.Abs(v - want)); continue; }
+            bool debug = Environment.GetEnvironmentVariable("QIYAS_MAP_DEBUG") == "1";
+            if (mant == 0)
+            {
+                if (v != want)
+                {
+                    if (debug && worst == 0) Console.WriteLine($"  {what} {type} [{i}] got {v:R} want {want:R} ref {reference[i]:R}");
+                    worst = Math.Max(worst, Math.Abs(v - want));
+                }
+
+                continue;
+            }
+
             if (blockMax is not null)
             {
                 double bstep = (blockMax[i / blockValues] == 0 ? 1 : blockMax[i / blockValues]) * Math.Pow(2, -mant);
                 double btol = 2 * bstep + 4 * Math.Abs(reference[i]) * Math.Pow(2, -laneMant);
-                if (Math.Abs(v - want) > btol) worst = Math.Max(worst, Math.Abs(v - want) / bstep);
+                if (Math.Abs(v - want) > btol)
+                {
+                    if (debug && worst == 0) Console.WriteLine($"  {what} {type} [{i}] got {v:R} want {want:R} ref {reference[i]:R} block max {blockMax[i / blockValues]:R}");
+                    worst = Math.Max(worst, Math.Abs(v - want) / bstep);
+                }
+
                 continue;
             }
 

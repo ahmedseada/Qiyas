@@ -20,6 +20,18 @@ internal static partial class Kernels
 
     private static int Threads => Team.Size;
 
+    /// <summary>Rows a task takes when tasks write whole rows of `cols` values of TN: about `wanted`, rounded up to a count
+    /// whose row span is whole storage units (a packed byte, a block), so two tasks never write one unit.</summary>
+    internal static int RowChunk<TN>(int rows, int cols, int wanted) where TN : struct, IQiyasNumber<TN>
+    {
+        int g = TN.Granularity;
+        if (g <= 1 || cols % g == 0) return Math.Max(1, wanted);
+        int unit = g / Gcd(g, cols);                                       // rows per whole unit boundary
+        return Math.Max(unit, (Math.Max(1, wanted) + unit - 1) / unit * unit);
+    }
+
+    private static int Gcd(int a, int b) { while (b != 0) (a, b) = (b, a % b); return a; }
+
     /// <summary>When set (profile runs only), MatMul adds each phase's milliseconds: load, pack, product, store.</summary>
     public static double[]? Phases;
 
@@ -437,7 +449,7 @@ internal static partial class Kernels
             int wantRows = Math.Max(1, Threads * 6 / colTiles);
             int tileRows = Math.Max(R, (m + wantRows - 1) / wantRows + R - 1) / R * R;
             int rowTiles = (m + tileRows - 1) / tileRows;
-            bool storeTiles = cl is not null && nRows;
+            bool storeTiles = cl is not null && nRows && strip % TN.Granularity == 0 && n % TN.Granularity == 0;
             Team.For(rowTiles * colTiles, 1, (long)m * n * k,
                 new ProductBody<TN, TIn, TAcc, TL>(a, al, packed, cLanes, c, storeTiles, m, n, k, kg, tileRows, tileStrips, rowTiles));
             t0 = Mark(t0, 2);
