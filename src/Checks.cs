@@ -1328,6 +1328,41 @@ internal static class Checks
         }
     }
 
+    // ---------------------------------------------------------------- whole sums of float types on the device
+
+    /// <summary>The device's whole sum and sum of squares of a narrow float type over 2^20 + 3 values: within one f32 lane step
+    /// of the exact sum (the chunks' compensated sums joined in float64, rounded once). The plain f32 lane drifts past it.</summary>
+    private static bool WholeSums(GpuOps ops)
+    {
+        bool ok = true;
+        const int rows = 1, cols = (1 << 20) + 3;
+        foreach (var type in new[] { "float32", "float16", "bfloat16", "q8_0" })
+        {
+            var x = Bench.Registry.Make(type, cols, 41, -1, 1);
+            var v = Bench.Registry.Values(type, x, cols);
+            foreach (var op in new[] { "sum", "sumsq" })
+            {
+                double exact = 0, c = 0;
+                foreach (double t in v)
+                {
+                    // Neumaier's sum in float64: exact to far below the f32 step for these terms.
+                    double term = op == "sumsq" ? t * t : t, s = exact + term;
+                    c += Math.Abs(exact) >= Math.Abs(term) ? (exact - s) + term : (term - s) + exact;
+                    exact = s;
+                }
+
+                exact += c;
+                var (got, lane) = Bench.Registry.With(type, new ReduceRun(ops, op, Axis.Whole, x, rows, cols));
+                double value = Bench.LaneValues.Decode(lane, got, 1)[0];
+                double step = Math.Pow(2, Math.Floor(Math.Log2(Math.Abs(exact))) - 23);
+                if (Math.Abs(value - exact) > step) { Console.WriteLine($"check whole {op} {type} device: {value:R} against {exact:R} ({Math.Abs(value - exact) / step:0.##} f32 steps, lane {lane})"); ok = false; }
+            }
+        }
+
+        if (ok) Console.WriteLine("check whole sums             device float32, float16, bfloat16, q8_0: sum and sum of squares of 2^20 + 3 values within one f32 step of the exact sum");
+        return ok;
+    }
+
     // ---------------------------------------------------------------- the buffer arena and the product's workspace
 
     /// <summary>The device: a transposed product, attention and an LSTM step (float16, float32), each called once outside a scope
@@ -1983,6 +2018,7 @@ internal static class Checks
         ok &= Ctcs(ops);
         ok &= BlockFormats(ops);
         ok &= Arenas(ops);
+        ok &= WholeSums(ops);
         return ok;
     }
 

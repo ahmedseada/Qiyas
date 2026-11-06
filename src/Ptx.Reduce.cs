@@ -30,9 +30,12 @@ internal static partial class Ptx
 
     /// <summary>out[row] = op over x[row·cols + first .. ] for `count` values (a block per row; rows = %ctaid.x); the
     /// block's chunk when p_chunk > 0: row r covers values [r·chunk, min(n, (r+1)·chunk)) of one long row.</summary>
-    public static string ReduceRows(Gpu gpu, Fmt f, Lane lane, string op, bool squares, out string entry)
+    /// <param name="compensated">A float sum's chunk pass (lane f32): each thread's running sum compensated (Kahan: the
+    /// rounding lost by every add kept and taken back), the threads' sums joined in float64 and stored as f64 partials.</param>
+    public static string ReduceRows(Gpu gpu, Fmt f, Lane lane, string op, bool squares, out string entry, bool compensated = false)
     {
-        entry = $"reduce_rows_{op}{(squares ? "sq" : "")}_{f.Name}_{lane.Name}";
+        entry = $"reduce_rows_{op}{(squares ? "sq" : "")}_{f.Name}_{lane.Name}{(compensated ? "_kahan" : "")}";
+        if (compensated && (lane.Name != "f32" || op != "sum")) throw new ArgumentException("the compensated pass is a float sum in the f32 lane");
         var b = new PtxBuilder();
         string tid = b.R(), row = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
@@ -50,7 +53,9 @@ internal static partial class Ptx
         b.L($"selp.u32 {start}, {cs}, {start}, {pChunk};");
         b.L($"selp.u32 {count}, {cc}, {count}, {pChunk};");
         string acc = lane.NewReg(b), i = b.R(), pEnd = b.P();
+        string comp = compensated ? b.F() : "", ky = compensated ? b.F() : "", kt = compensated ? b.F() : "";
         b.L($"mov.{lane.Reg} {acc}, {Identity(lane, op)};");
+        if (compensated) b.L($"mov.f32 {comp}, 0f00000000;");
         b.L($"mov.u32 {i}, {tid};");
         b.Label("LOOP");
         b.L($"setp.ge.u32 {pEnd}, {i}, {count};");
@@ -58,12 +63,34 @@ internal static partial class Ptx
         string idx = b.R();
         b.L($"add.u32 {idx}, {start}, {i};");
         string v = Codec.UnpackAt(b, f, src, idx, lane);
-        if (squares) b.L(lane.Fma(acc, v, v, acc));
+        if (compensated)
+        {
+            // y = term − c; t = acc + y; c = (t − acc) − y; acc = t (each step rounded as written: no contraction).
+            if (squares) b.L($"mul.rn.f32 {ky}, {v}, {v};");
+            else b.L($"mov.f32 {ky}, {v};");
+            b.L($"sub.rn.f32 {ky}, {ky}, {comp};");
+            b.L($"add.rn.f32 {kt}, {acc}, {ky};");
+            b.L($"sub.rn.f32 {comp}, {kt}, {acc};");
+            b.L($"sub.rn.f32 {comp}, {comp}, {ky};");
+            b.L($"mov.f32 {acc}, {kt};");
+        }
+        else if (squares) b.L(lane.Fma(acc, v, v, acc));
         else b.L(Combine(lane, op, acc, acc, v));
         b.L($"add.u32 {i}, {i}, {ReduceThreads};");
         b.L("bra LOOP;");
         b.Label("DONE");
         _ = end;
+        if (compensated)
+        {
+            // The thread's sum in float64: acc − c, then the block's sum in float64, stored as an f64 partial.
+            string wideAcc = b.FD(), wideComp = b.FD();
+            b.L($"cvt.f64.f32 {wideAcc}, {acc};");
+            b.L($"cvt.f64.f32 {wideComp}, {comp};");
+            b.L($"sub.rn.f64 {wideAcc}, {wideAcc}, {wideComp};");
+            acc = wideAcc;
+            lane = Lane.F64;
+        }
+
         string total = BlockReduce(b, lane, tid, acc, op == "max" ? "max" : op == "min" ? "min" : "add", ReduceThreads);
         string p0 = b.P(), oAddr = b.RD();
         b.L($"setp.ne.u32 {p0}, {tid}, 0;");

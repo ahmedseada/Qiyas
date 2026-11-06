@@ -145,7 +145,7 @@ and measured against the baseline when it is.
 | CPU | attention rows | 60–80 ms float32 (causal 33–38) for 16 heads of 2048² at d = 128 by the fused rows, from 100–148 by the composition (since item 4a) |
 | CUDA | attention backward by the composition | 4.0 ms for 8 heads of 1024² |
 | CUDA | int8 adaptive_maxpool | 0.265 ms against float32 0.079 (per-value unpacking of 4 values a word in the window loop) |
-| CPU | top-k per row | 113 ms float32, 305 int8 for top-8 of 4096 × 32768: k passes over the row (a partial sort is the step) |
+| CPU | top-k per row — done (item 6) | was 113 ms float32, 305 int8 (k passes over the row); now one pass keeping the k largest in order (the same values and indices: the comparison is a total order): float16 81 → 7.3–7.8 ms, int8 313 → 26; block formats widened by the team (q8_0 278 → 62) |
 | CUDA | ctc's recursion | 0.54 ms forward, 1.18 backward (float32; T 256, B 32, C 1024, 64 labels), of which the rows kernel is a small part: a block per sequence (32 of the device's blocks) and a barrier per frame, each step waiting on global loads of the state's class, flags and emission; the emissions computed beforehand and the next frame's loads issued before the barrier are the step |
 | CPU | ctc | 1.8 ms forward, 3.6–3.8 backward (float32, the same shape): a task per sequence (32 sequences on 24 threads, the recursion serial within one); moving the rows' work into a pass over all rows measured slower (single-value loads of the emissions), so it was not kept |
 | CPU | LSTM / GRU sequences | gru_seq 65–71 ms, lstm_seq 83 ms float32 (16 steps of 256 × 512 → 512, about 13 GFLOP of products) where the CPU's float32 product rate implies 15–20 ms: per step the gate products, the cell and the copies go through separate passes and allocations |
@@ -282,7 +282,7 @@ sum_axis, sumsq, max, min, argmax → the reductions; transpose; gemv_nn / gemv_
 
 | operation | CPU | CUDA | note |
 |---|---|---|---|
-| top-k per row (values as the type, indices s32; largest first, ties by the lower index) | ✓ own | ✓ own | k passes of the row's argmax (k ≤ 256 on the device; a partial sort is the step for large k); the CPU's row tasks chunked on whole storage units of the k values (bool, the packed integers), the device's block formats through lane storage |
+| top-k per row (values as the type, indices s32; largest first, ties by the lower index) | ✓ own | ✓ own | the CPU: one pass keeping the k largest in order (a value enters when strictly larger than the k-th; ties keep the lower index); the device: k passes of the row's argmax (k ≤ 256); the CPU's row tasks chunked on whole storage units of the k values (bool, the packed integers), the device's block formats through lane storage |
 | pick per row (x[r][index[r]]) | ✓ own | ✓ own | |
 | sampling per row (the first column whose running sum reaches u·Σ) | ✓ float | ✓ float | chunk sums, their prefix, the least crossing |
 | route: counts, offsets, the sources ordered by bucket | ✓ | ✓ | the scatter-add's ordering (deterministic): on the device the radix sort above — 1M into 64 buckets 0.27 ms (216.7 by the quadratic ranks before item 4f), 1M into 65 536 0.19 (`route_wide`). Gate: also 1M into 64, 1 000 003 into 100 000, all into one, descending into 65 536, each equal to the stable reference |

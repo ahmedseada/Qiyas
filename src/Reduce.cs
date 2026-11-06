@@ -35,7 +35,8 @@ internal static partial class Kernels
             return (cmp.Result!, op == "argmax" ? "s32 index" : cmp.Lane);
         }
 
-        var (lo, hi) = TN.Range(x, rows * cols);
+        // A float type's sum lane does not depend on the values: its range is not read (a block format's decodes every block).
+        var (lo, hi) = TN.IsFloat ? (0, 0) : TN.Range(x, rows * cols);
         long terms = axis switch { Axis.Whole => (long)rows * cols, Axis.Rows => cols, _ => rows };
         var bounds = op == "sumsq" ? new Bounds(lo, hi, lo, hi, terms) : new Bounds(lo, hi, 1, 1, terms);
         var sum = new SumVisitor(op == "sumsq", axis, x, rows, cols);
@@ -678,8 +679,8 @@ internal static partial class Kernels
             return blockLane;
         }
 
-        var (aLo, aHi) = TN.Range(a, rows * cols);
-        var (xLo, xHi) = TN.Range(x, transposed ? rows : cols);
+        var (aLo, aHi) = TN.IsFloat ? (0, 0) : TN.Range(a, rows * cols);                 // a float type's lane does not depend on them
+        var (xLo, xHi) = TN.IsFloat ? (0, 0) : TN.Range(x, transposed ? rows : cols);
         var bounds = new Bounds(aLo, aHi, xLo, xHi, transposed ? rows : cols);
         var visitor = new GemvVisitor(a, x, y, rows, cols, transposed);
         TN.Sum(ref visitor, in bounds);

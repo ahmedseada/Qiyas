@@ -109,21 +109,20 @@ internal static partial class Kernels
                 for (int r = first; r < last; r++)
                 {
                     TN.Load(x, r * cols, row.AsSpan(0, cols));
-                    // k passes of the row's argmax over the values not yet taken (k is small against cols; a partial sort is the step for large k).
+                    // One pass keeping the k largest in order (larger first, an equal value after the earlier ones): a value
+                    // enters only when strictly larger than the k-th, then moves past every kept value it is strictly larger
+                    // than. The comparison is a total order, so this is the k passes of first-largest exactly.
                     int taken = 0;
-                    for (int i = 0; i < k; i++)
+                    for (int c = 0; c < cols; c++)
                     {
-                        int at = -1;
-                        for (int c = 0; c < cols; c++)
-                        {
-                            bool skip = false;
-                            for (int t = 0; t < taken; t++) if (bestAt[t] == c) { skip = true; break; }
-                            if (skip) continue;
-                            if (at < 0 || Widths.Compare(row[c], row[at]) > 0) at = c;
-                        }
-
-                        bestAt[taken] = at; best[taken] = at < 0 ? TL.Zero : row[at]; taken++;
+                        TLane v = row[c];
+                        if (taken == k && Widths.Compare(v, best[k - 1]) <= 0) continue;
+                        int j = taken < k ? taken++ : k - 1;
+                        while (j > 0 && Widths.Compare(v, best[j - 1]) > 0) { best[j] = best[j - 1]; bestAt[j] = bestAt[j - 1]; j--; }
+                        best[j] = v; bestAt[j] = c;
                     }
+
+                    for (int i = taken; i < k; i++) { best[i] = TL.Zero; bestAt[i] = -1; }          // k past the row: as the passes left them
 
                     TN.Store(best.AsSpan(0, k), values, r * k);
                     Array.Copy(bestAt, 0, indices, r * k, k);
@@ -155,10 +154,18 @@ internal static partial class Kernels
         public byte[]? Result;
         public void Run<TN, TLane, TL>() where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasLane<TL, TLane>
         {
-            var lanes = new TLane[count];
-            TN.Load(x, 0, lanes);
-            Result = System.Runtime.InteropServices.MemoryMarshal.AsBytes(lanes.AsSpan()).ToArray();
+            // Decoded by the team straight into the result's bytes (one decode per block, no copy).
+            var bytes = new byte[count * System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>()];
+            int n = (int)count, unit = Math.Max(256, TN.Granularity);
+            Team.For(n, Math.Max(4096, n / (Threads * 2)) / unit * unit + unit, n, new TopKWidenBody<TN, TLane>(x, bytes));
+            Result = bytes;
         }
+    }
+
+    private readonly struct TopKWidenBody<TN, TLane>(byte[] x, byte[] lanes) : Team.IBody where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged
+    {
+        public void Run(int first, int last) =>
+            TN.Load(x, first, System.Runtime.InteropServices.MemoryMarshal.Cast<byte, TLane>(lanes.AsSpan()).Slice(first, last - first));
     }
 
     private struct BlockNarrow(byte[] lanes, byte[] output, long count) : ILaneVisitor

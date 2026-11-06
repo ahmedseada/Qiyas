@@ -64,8 +64,8 @@ internal static partial class Kernels
         if (FusedConv != false && ConvInPlace<TN>(a))
         {
             // The columns' values are the image's and 0 (padding): the image's range, with 0, bounds them.
-            var (wLo, wHi) = TN.Range(w, (int)a.WValues);
-            var (xLo, xHi) = TN.Range(x, (int)a.XValues);
+            var (wLo, wHi) = TN.IsFloat ? (0, 0) : TN.Range(w, (int)a.WValues);              // a float type's lane does not depend on them
+            var (xLo, xHi) = TN.IsFloat ? (0, 0) : TN.Range(x, (int)a.XValues);
             var product = new MatMulVisitor(w, x, y, a.OC, a.Cols, a.Rows) { Where = new Operands(ImageB: a) };
             TN.Sum(ref product, new Bounds(wLo, wHi, Math.Min(xLo, 0), Math.Max(xHi, 0), a.Rows));
             return product.Lane;

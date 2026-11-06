@@ -76,8 +76,8 @@ internal static partial class Kernels
         for (int i = 0; i < v.Batch; i++)
         {
             int ao = (int)(i * v.StrideAOrDefault), bo = (int)(i * v.StrideBOrDefault), co = (int)(i * v.StrideCOrDefault);
-            var (aLo, aHi) = TN.Range(a.AsSpan((int)TN.Bytes(ao)), v.M * v.K);
-            var (bLo, bHi) = TN.Range(b.AsSpan((int)TN.Bytes(bo)), v.K * v.N);
+            var (aLo, aHi) = TN.IsFloat ? (0, 0) : TN.Range(a.AsSpan((int)TN.Bytes(ao)), v.M * v.K);     // a float type's lane does not depend on them
+            var (bLo, bHi) = TN.IsFloat ? (0, 0) : TN.Range(b.AsSpan((int)TN.Bytes(bo)), v.K * v.N);
             var product = new MatMulVisitor(a, b, c, v.M, v.N, v.K) { Where = new Operands(ao, v.TransA, bo, v.TransB, co) };
             TN.Sum(ref product, new Bounds(aLo, aHi, bLo, bHi, v.K));
             lane = product.Lane;
@@ -102,8 +102,8 @@ internal static partial class Kernels
                 Layout<TN>(new LayoutArgs { Name = "strided", X = b, P = v.ViewB(i), Output = cb, Count = v.K * v.N, InputCount = (int)v.ValuesB });
             }
 
-            var (aLo, aHi) = TN.Range(ca, v.M * v.K);
-            var (bLo, bHi) = TN.Range(cb, v.K * v.N);
+            var (aLo, aHi) = TN.IsFloat ? (0, 0) : TN.Range(ca, v.M * v.K);
+            var (bLo, bHi) = TN.IsFloat ? (0, 0) : TN.Range(cb, v.K * v.N);
             var product = new MatMulVisitor(ca, cb, cc, v.M, v.N, v.K);
             TN.Sum(ref product, new Bounds(aLo, aHi, bLo, bHi, v.K));
             lane = product.Lane;

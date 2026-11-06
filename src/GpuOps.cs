@@ -100,6 +100,29 @@ public sealed partial class GpuOps(Gpu gpu)
         long terms = axis switch { Axis.Whole => total, Axis.Rows => cols, _ => rows };
         var bounds = op == "sumsq" ? new Bounds(lo, hi, lo, hi, terms) : new Bounds(lo, hi, 1, 1, terms);
         var lane = SumLane(f, in bounds);
+        if (axis == Axis.Whole && f.IsFloat && !lane.Wide)
+        {
+            // A narrow float type's whole sum: each thread's running sum in the f32 lane compensated (Kahan), the threads'
+            // and the chunks' sums joined in float64, the result rounded once to the f32 lane — the f32 lane's speed, and the
+            // rounding of millions of terms no longer growing with them.
+            int n = rows * cols, blocks = WholeBlocks(n), chunk = WholeChunk(n);
+            var kahan = gpu.Cached($"reduce_rows:sum:{op == "sumsq"}:{f.Name}:f32:kahan", (out string e) => Ptx.ReduceRows(gpu, f, Lane.F32, "sum", op == "sumsq", out e, compensated: true));
+            var join = gpu.Cached($"reduce_rows:sum:False:{Ptx.LaneFormat(Lane.F64).Name}:f64", (out string e) => Ptx.ReduceRows(gpu, Ptx.LaneFormat(Lane.F64), Lane.F64, "sum", false, out e));
+            ulong partials = gpu.Rent((long)blocks * 8), wide = gpu.Rent(8);
+            try
+            {
+                Gpu.Launch(kahan, (uint)blocks, 1, Ptx.ReduceThreads, 1, 0, x, partials, Gpu.U(n), Gpu.U(chunk));
+                Gpu.Launch(join, 1, 1, Ptx.ReduceThreads, 1, 0, partials, wide, Gpu.U(blocks), Gpu.U(0));
+                Back(Ptx.LaneFormat(Lane.F32), Lane.F64, wide, output, 1);
+            }
+            finally
+            {
+                gpu.Return(partials); gpu.Return(wide);
+            }
+
+            return lane.Name;
+        }
+
         if (axis == Axis.Whole)
         {
             // The chunk pass needs only its own terms' bound: a narrower lane there (s32 for 8-bit values over a few thousand

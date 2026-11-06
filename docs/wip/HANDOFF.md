@@ -225,6 +225,22 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
   block each store, and the bench reuses its output buffer, so the stale values kept depend on the repetition count —
   a bench property of partial-block outputs, not the kernel.
 
+- 6b (top-k, whole sums, ranges): done, reported. CPU `TopKBody`: one pass keeping the k largest in order (enters when
+  strictly larger than the k-th, moves past every kept value it is strictly larger than: the k passes' result exactly,
+  `Widths.Compare` being a total order); the block-format widening by the team (`TopKWidenBody`, no 512 MB copy). CPU:
+  a float type's range no longer read before a sum whose lane does not depend on it — `Kernels.Reduce`, `Gemv`, the view
+  products (both routes), the fused conv (a block format's range decoded every block serially). Device: a narrow float
+  type's whole sum (`GpuOps.Reduce`, Axis.Whole): `Ptx.ReduceRows(…, compensated: true)` — each thread's running sum in
+  f32 with Kahan's compensation, acc − c widened to f64, the block's sum in f64 to f64 partials; the partials summed in
+  f64 by the f64 kernel; rounded once to the f32 lane by `Back`. Gate `Checks.WholeSums` (device): float32, float16,
+  bfloat16, q8_0, sum and sumsq of 2^20 + 3 values within one f32 step of a Neumaier float64 sum; mutation (compensation
+  off): float32 sum 1.19 steps, fails. Measured (against item 4's baseline): CUDA sum:whole err float32 5.98e-4 → 4.87e-5
+  (lib 1.95e-4), float8_e5m2 3.66e-4 → 0 (lib 6.1e-5), q8_0 3.2e-4 → 1.53e-5; time float32 0.093 → 0.097 ms, float16
+  0.025 → 0.032, q8_0 0.033 → 0.040, q4_k 0.065 → 0.073 (the compensation's cost). CPU: topk_rows float16 81 → 7.3–7.8,
+  int8 313 → 26, q8_0 278 → 62, q4_k → 23.6; sum:whole q8_0 56 → 0.67, q4_k 57 → 0.65; gemv q4_k 226 → 2.4, gemv_t q4_k
+  232 → 10.9; matmul_nt q4_k 9.4 → 2.5; conv q8_0 7.8 → 4.6. Untouched cells read slower in the same run (CPU sum:whole
+  int8 0.104 → 0.22, CUDA topk_rows q4_k 5.5 → 7.3): swing.
+
 ## Item 5 progress
 
 - Done, reported (uncommitted until the coordinator's go). What landed:
