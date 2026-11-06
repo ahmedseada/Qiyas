@@ -59,7 +59,7 @@ regression comparer and the baseline run.
 **Open, in the order they are taken:**
 
 1. The todo rows below (item 4, in this order: fused attention rows — done, ctc — done, the GRU sequence bench row — done, the block-scaled
-   tiled product, the transposition fused into the product's packing, the radix step of scatter-add, the fused direct
+   tiled product — done, the transposition fused into the product's packing, the radix step of scatter-add, the fused direct
    convolution); the designs and the progress are in `docs/wip/HANDOFF.md`.
 2. A bump-allocated scope past the pool (buffers reserved once from the shapes; zero rents on the hot path).
 3. The known-slow list.
@@ -131,6 +131,7 @@ and measured against the baseline when it is.
 | CPU | top-k per row | 113 ms float32, 305 int8 for top-8 of 4096 × 32768: k passes over the row (a partial sort is the step) |
 | CUDA | ctc's recursion | 0.54 ms forward, 1.18 backward (float32; T 256, B 32, C 1024, 64 labels), of which the rows kernel is a small part: a block per sequence (32 of the device's blocks) and a barrier per frame, each step waiting on global loads of the state's class, flags and emission; the emissions computed beforehand and the next frame's loads issued before the barrier are the step |
 | CPU | ctc | 1.8 ms forward, 3.6–3.8 backward (float32, the same shape): a task per sequence (32 sequences on 24 threads, the recursion serial within one); moving the rows' work into a pass over all rows measured slower (single-value loads of the emissions), so it was not kept |
+| CPU | LSTM / GRU sequences | gru_seq 65–71 ms, lstm_seq 83 ms float32 (16 steps of 256 × 512 → 512, about 13 GFLOP of products) where the CPU's float32 product rate implies 15–20 ms: per step the gate products, the cell and the copies go through separate passes and allocations |
 | CPU | LSTM / GRU steps | 20–31 ms forward, 56–84 backward at B = D = H = 1024: the products dominate (four gates, two operands); a fused gates product is the step |
 
 ## Element-wise (map)
@@ -209,7 +210,7 @@ sum_axis, sumsq, max, min, argmax → the reductions; transpose; gemv_nn / gemv_
 
 | operation | CPU | CUDA | note |
 |---|---|---|---|
-| rows of queries: O = softmax(scale·Q·Kᵀ, causal or spans)·V per head | ✓ float | ✓ float | the fused rows or the composition, whichever the device measures faster at the shape and type (once; both warmed, then timed in alternating rounds, the minimum of each; the decision in `--report`); the composition for d > 128. The composition: Qiyas's own operations in lane storage (a narrow type widened once, O narrowed once): the view product, scale_mask_softmax with the key limit per row, the view product |
+| rows of queries: O = softmax(scale·Q·Kᵀ, causal or spans)·V per head | ✓ float | ✓ float | the fused rows or the composition, whichever the device measures faster at the shape and type (once, by `Measure.Faster`: both warmed, then alternating rounds of several calls, the minimum of each, on until both settle and the runtime compiles nothing; the decision in `--report`); the composition for d > 128. The composition: Qiyas's own operations in lane storage (a narrow type widened once, O narrowed once): the view product, scale_mask_softmax with the key limit per row, the view product |
 | decode: a few queries over a long cache | ✓ float | ✓ float | the device's fused kernel: a block per query, keys in chunks, the softmax online, K and V read once; the CPU per query in the lane |
 | backward: dQ, dK, dV | ✓ float | ✓ float | the composition: P recomputed, dV = Pᵀ·dO, dP = dO·Vᵀ, dS = softmax_bwd, dQ = scale·dS·K, dK = scale·dSᵀ·Q |
 | fused rows (flash: tiles of keys without the scores in memory), d ≤ 128 | ✓ float | ✓ float | the softmax online (running max and sum, the context rescaled when the max rises); block formats through lane storage. CPU: tasks of 16 query rows, keys in tiles of 64 laid transposed for vector scores, row pairs in registers. CUDA: a block of 256 threads per (head, 32 query rows; 16 in f64), keys in tiles of 32 (16) through shared memory with 16-byte loads, group reductions by shuffles, causal and span tiles skipped per block; FMA lane (the tensor lanes inside: the known-slow step). Gate: the composition's cases plus d 17 / 64 / 128, causal, spans with starts, rows that see no key; bench rows `attention_fused`, `attention_fused_causal` |
@@ -247,7 +248,7 @@ sum_axis, sumsq, max, min, argmax → the reductions; transpose; gemv_nn / gemv_
 | operation | CPU | CUDA | note |
 |---|---|---|---|
 | Q8_0, Q4_0, Q4_K, Q6_K as types (Load decodes blocks into the f32 lane, Store encodes blocks) | ✓ | ✓ | the GGUF layouts, the codecs proven against blocks laid out by hand; every operation above runs on them (the device's value-wise stores through float32 storage and a block encode) |
-| products with a block-format operand | ✓ sum | ✓ sum | matmul through the f32 lane on both devices (a block's values, an f16 scale times an integer, are exact in f32 and not in the f16 tensor lane); gemv on Q8_0 / Q4_0 by the block-scaled integer dot (32-term s8 dots per block, the block scales' product in f32: the format's own fast path, `s8dp blocks`); the same for the tiled product: todo |
+| products with a block-format operand | ✓ sum | ✓ sum | matmul through the f32 lane on both devices (a block's values, an f16 scale times an integer, are exact in f32 and not in the f16 tensor lane); gemv on Q8_0 / Q4_0 by the block-scaled integer dot (32-term s8 dots per block, the block scales' product in f32: the format's own fast path, `s8dp blocks`); the tiled product C = A·Bᵀ of two Q8_0 / Q4_0 operands (k in whole blocks, the weights-times-activations layout) by the same block-scaled dot where measured faster than the decoded route (once per shape and format by `Measure.Faster`, the decision in `--report`): CPU the s8 dot lane in 4 × 2 register tiles (`s8dp blocks`), the device the s8 tensor instruction at k = 32, one per block (`s8 mma blocks`, four k-blocks staged a time by coalesced 16-bit loads); a plain A·B keeps the decoded route (B's blocks run along n), and Q4_K / Q6_K keep it too (sub-block scales and Q4_K's min term). The device gemv's block path read its values by 32-bit loads that a 34- or 18-byte block leaves 2-byte aligned (every other block faulted; no gate reached it: the reductions' gate has 1001 columns): now by 16-bit halves, and gated at 37 × 64. Gate: A·Bᵀ at 37 × 29 × 64 and × 320, the block product forced, both devices; bench row `matmul_blocks` |
 
 ## Masks
 

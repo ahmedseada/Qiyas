@@ -965,7 +965,55 @@ internal static class Checks
 
         if (ops is not null) { ops.FourBit = null; ops.K32 = null; }
         if (ops is not null) ok &= TensorConfigs(ops);
+        ok &= BlockProducts(ops, where);
         if (ok) Console.WriteLine($"check products               {where,-6} every type at 37 x 29 x 53, transposed, batched, and the backward pair{(ops is null ? "" : ", under every tensor kind")}: within the product's rounding");
+        return ok;
+    }
+
+    /// <summary>The block-scaled products where the device has them: A·Bᵀ of two Q8_0 / Q4_0 operands at 37 × 29 with k = 64
+    /// and 320 (whole blocks), the block product forced, against the double-double reference of the stored values; gemv's
+    /// block path at 37 rows of 64 (the reductions' gate has 1001 columns, never a whole number of blocks).</summary>
+    private static bool BlockProducts(GpuOps? ops, string where)
+    {
+        bool available = ops is null ? Kernels.BlockProductAvailable : ops.BlockProductAvailable;
+        if (!available)
+        {
+            Console.WriteLine($"check block products         {where,-6} not available here (the {(ops is null ? "s8 dot lane" : "s8 tensor instruction at k = 32")}): the decoded route stands");
+            return true;
+        }
+
+        bool ok = true;
+        const int M = 37, N = 29;
+        if (ops is null) Kernels.BlockProducts = true; else ops.BlockProducts = true;
+        try
+        {
+            foreach (var type in new[] { "q8_0", "q4_0" })
+            {
+                foreach (int K in new[] { 64, 320 })
+                {
+                    var v = new ProductView(M, N, K, false, true);
+                    var a = Bench.Registry.Make(type, M * K, 34, -1, 1);
+                    var b = Bench.Registry.Make(type, N * K, 35, -1, 1);
+                    var c = new byte[Bench.Registry.Bytes(type, M * N)];
+                    var want = v.Reference(Bench.Registry.Values(type, a, M * K), Bench.Registry.Values(type, b, N * K));
+                    Bench.Registry.With(type, new ProductRun(ops, v, a, b, c, null, null));
+                    ok &= Close(type, $"product Bᵀ blocks k{K}", where, c, want, M * N, K);
+                }
+
+                var ga = Bench.Registry.Make(type, M * 64, 44, -1, 1);
+                var gx = Bench.Registry.Make(type, 64, 45, -1, 1);
+                var gy = new byte[Bench.Registry.Bytes(type, M)];
+                var gwant = References.Gemv(Bench.Registry.Values(type, ga, M * 64), Bench.Registry.Values(type, gx, 64), M, 64, false);
+                Bench.Registry.With(type, new GemvRun(ops, ga, gx, gy, M, 64, false));
+                ok &= Close(type, "gemv blocks k64", where, gy, gwant, M, 64);
+            }
+        }
+        finally
+        {
+            if (ops is null) Kernels.BlockProducts = null; else ops.BlockProducts = null;
+        }
+
+        if (ok) Console.WriteLine($"check block products         {where,-6} Q8_0, Q4_0: A·Bᵀ at 37 × 29 × 64 and × 320, the block-scaled product forced, and gemv at 37 × 64: within the product's rounding");
         return ok;
     }
 

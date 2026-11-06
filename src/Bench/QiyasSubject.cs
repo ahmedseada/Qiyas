@@ -237,6 +237,25 @@ public sealed class QiyasSubject : IBenchSubject
         byte[]? dx, byte[]? dh0, byte[]? dc0, byte[]? dw, byte[]? du, byte[]? db) =>
         Registry.IsFloat(type) && !Registry.IsBlock(type) ? Registry.WithFloat(type, new SequenceVisitor(device, a, T, x, h0, c0, w, u, b, hOut, cOut, dx, dh0, dc0, dw, du, db)) : null;
 
+    public IBenchRun? MatMulBlocks(Device device, string type, int m, int n, int k, byte[] a, byte[] b, byte[] c) =>
+        type is "q8_0" or "q4_0" && k % 32 == 0 && (device == Device.Cpu ? Kernels.BlockProductAvailable : Devices.Ops.BlockProductAvailable)
+            ? Registry.With(type, new MatMulBlocksVisitor(device, new ProductView(m, n, k, false, true), a, b, c)) : null;
+
+    private sealed class MatMulBlocksVisitor(Device device, ProductView v, byte[] a, byte[] b, byte[] c) : ITypeVisitor<IBenchRun?>
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IQiyasNumber<TN, float>
+        {
+            string lane = "";
+            if (device == Device.Cpu) return new BenchRun(() => lane = Kernels.MatMulViewBlocks<TN>(v, a, b, c), lane: () => lane);
+            var ops = Devices.Ops;
+            var gpu = ops.Gpu;
+            ulong dA = gpu.Rent(a.Length), dB = gpu.Rent(b.Length), dC = gpu.Rent(c.Length);
+            Gpu.Upload<byte>(a, dA); Gpu.Upload<byte>(b, dB);
+            return new BenchRun(() => { lane = ops.MatMulViewBlocks<TN>(v, dA, dB, dC); Gpu.Synchronize(); },
+                () => Gpu.Download<byte>(dC, c), () => { gpu.Return(dA); gpu.Return(dB); gpu.Return(dC); }, () => lane);
+        }
+    }
+
     public IBenchRun? GruSequence(Device device, string type, CellArgs a, int T, byte[] x, byte[] h0, byte[] w, byte[] u, byte[] b, byte[] bh, byte[] hOut) =>
         Registry.IsFloat(type) ? Registry.WithFloat(type, new GruSequenceVisitor(device, a, T, x, h0, w, u, b, bh, hOut)) : null;
 

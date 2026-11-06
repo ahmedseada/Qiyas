@@ -45,6 +45,9 @@ script to a file and run `python script.py .` from the repository root.
   forces every kind (`GpuOps.FourBit`, `GpuOps.K32`) so all are checked regardless.
 - The thread team (`src/Team.cs`): a job is closed when its last chunk completes; keep it so (the int4 product fault).
 - `References.MatMul` (Program.cs) is double-double: an exact lane reads 0; a float64 lane shows ~1e-13 at 2048³.
+- Measured choices (one path or another, per shape) go through `Measure.Faster` (`src/Measure.cs`) on both devices,
+  and the bodies of both paths carry AggressiveOptimization: a single timed call each, or a body still in the runtime's
+  first tier, chose the 20× slower path (the block product at 4d).
 - The open intermittent (COVERAGE.md State, item 4 there): `matmul_bwd dB device` unsigned types wrong by 138 steps,
   seen once, not reproduced in 150 gate passes. If it shows again, `QIYAS_MAP_DEBUG=1` on the run captures the values.
 
@@ -118,7 +121,43 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
   - contract `IBenchSubject.GruSequence(...)`, `QiyasSubject.GruSequenceVisitor`; gate in `Checks.Recurrents` (3 steps
     of 5 × 7 → 11, every float type incl. blocks); bench row `gru_seq` in Group8 (T16 B256 D512 H512).
   - measured: device f32 2.55 ms, f16 2.77, f64 28.5, q8_0 2.70; CPU f32 71, f16 62, f64 126, q8_0 55.
-  - no GRU sequence backward (not asked for); COVERAGE says so.
+  - no GRU sequence backward (not asked for); COVERAGE says so. Committed as bb5ab2c.
+- 4d: done, reported as its own boundary (uncommitted until the coordinator's go). What landed (design in "4d as built"):
+  - `src/MatMulBlocks.cs`: CPU `Kernels.MatMulBlocks` (A and B unpacked once to int8 rows and per-4-byte scales, tasks
+    of 4 rows, 4 × 2 tiles of float vectors, `S8Dot.Fma` per vector), `MatMulViewBlocks` (C encoded by blocks on the
+    team: `BlocksStore` over `NarrowBody`; the serial `CopyLanes` took 15 of 18 ms); device `Ptx.MatMulBlocks`
+    (128 threads per 64 × 64, m16n8k32 s8 per block per 16 × 8 tile, 4 k-blocks staged a time: element i of the tile's
+    64 × 4·halves 16-bit loads to thread i % 128, so a row's contiguous blocks are read by consecutive lanes;
+    the per-halfword staging before that took 3.2 / 1.4 ms) and `GpuOps.MatMulBlocks<TN>` / `MatMulViewBlocks<TN>`.
+  - `MatMulView` on both devices: `BlockView` (A·Bᵀ, batch 1, Q8_0/Q4_0, k % 32 = 0, the lane available) then
+    `UseBlocks` (measured once per shape and format; override `BlockProducts` for the gate); the old body is
+    `MatMulViewRoute`.
+  - fixed on the way: the device gemv's block path (`Ptx.GemvBlocks`) loaded 32-bit words from 2-byte-aligned blocks
+    (misaligned address on every other block); now two 16-bit halves. Its first gate at a whole number of blocks.
+  - gate `Checks.BlockProducts` (from `Products`): q8_0, q4_0 A·Bᵀ at 37 × 29 × 64 and × 320 forced, gemv at 37 × 64,
+    both devices; a mutation of the device scales fails it by 6–9 steps.
+  - contract `IBenchSubject.MatMulBlocks(device, type, m, n, k, a, b, c)`; bench row `matmul_blocks` in Group4b.
+  - measured: device 2048³ q8_0 0.54 ms, q4_0 0.37 (matmul_nt by the decoded route 3.8 / 0.89); CPU 1024³ q8_0 2.8,
+    q4_0 2.7–3.0 (decoded 19 / 17). 4h (Idrak in every family's lib column) was cancelled by the owner.
+  - fixed before the go (the coordinator's run chose the decoded route on the CPU for q8_0: block-scaled 66 ms against
+    a steady 2.8): the cause was the runtime's first compilation tier, not memory (no collections in those calls). Q8_0's
+    first block calls ran 68, 68, 54, then 10, 3.4 ms as the optimized body arrived; Q4_0, measured next on the same
+    body, ran 2.8 from the first round; the decoded route was already optimized by earlier work. Fixed both ways:
+    the cost (`MatMulBlocksBody.Run`, `UnpackRowsBody.Run` compiled at the final tier from the first call,
+    AggressiveOptimization, as the hot kernels already are) and the measurement (`src/Measure.cs`, `Measure.Faster`:
+    rounds of ≥ 2 ms of calls, alternating, at least 3, on until neither minimum improves by 2 % and the runtime
+    compiles nothing for 3 rounds in a row, at most 24). All four measured choices use it: block product and attention,
+    CPU and device (CPU attention at the gates' shapes flipped between fused rows and composition run to run before).
+    Proof: `cuda,cpu --report --subjects qiyas --types q8_0,q4_0 --ops matmul_nt,matmul_blocks` 3 times, block-scaled
+    chosen for both formats on both devices every time, matmul_nt on the lane of matmul_blocks. One A/B (both orders)
+    of the attribute: the steady CPU block row 3.5–3.65 ms with it, 3.15–3.18 without; profile-guided optimization off
+    left the build without it unchanged, so the gap is within this laptop's swing or a real ~10 % — re-check at item 4's
+    full run.
+- 5 pieces left in item 4 after 4d: 4e, 4f, 4g, then the GRU sequence backward (below), then item 4's full run.
+- GRU sequence backward (the owner's addition; after 4g): dx, dh0, dW, dU, db of the GRU sequence, on both devices, built
+  the way the LSTM sequence backward is (float64 reference looped over the steps, gate in `Checks.Recurrents` on every
+  float type incl. blocks, contract method, bench row `gru_seq_bwd` in Group8). "A complete core cannot leave it out."
+  When it lands, COVERAGE's GRU sequences row stops saying the backward is not provided.
 
 ## Item 4a — flash-fused attention rows
 
@@ -213,6 +252,35 @@ activation quantization (an option, default off: the plain product stays exact a
 block types with the option on, against the reference with B quantized. Bench row `matmul_blocks` (q8_0, q4_0;
 2048³ cuda / 1024³ cpu). Q4_K/Q6_K: their sub-block scales make the same scheme work per 32 values (Q4_K's scale × min
 term needs the column sums of B per block: Σ dB·sum(qB)); do Q8_0/Q4_0 first, K formats if time allows, and say which.
+
+### 4d as built (supersedes the draft above; written before building)
+
+The COVERAGE todo is gemv's semantics carried to the tiled product: both operands in the same block format, the blocks
+along k, the integer dots exact, the block scales applied in f32 — no activation quantization and no option. That is
+C = A·Bᵀ (`ProductView` with TransB, batch 1): A (M × K) and B (N × K) both Q8_0 or both Q4_0, K a multiple of 32 —
+the weights-times-activations layout (a linear layer's W stored N × K). A plain A·B cannot take it: B's blocks run along
+N, and re-blocking along k would re-quantize. Q4_K / Q6_K are not taken (sub-block scales and Q4_K's min term need B's
+per-block sums): say so in COVERAGE.
+
+C_ij = Σ_blocks dA_ib · dB_jb · (Σ_32 qA·qB), the result in float32 lanes, encoded to the type by blocks (as gemv).
+- CPU `Kernels.MatMulBlocks(format, a, b, float[] c, m, n, k)` (`src/BlockProducts.cs`): A's and B's blocks unpacked
+  once into int8 rows (Q4_0: q − 8) and per-4-byte expanded scales (K/4 floats a row: the scale of the block each int
+  lane of an s8 dot covers, so any vector width works). Tasks of 4 rows; a 4 × 4 register tile of Vector<float>
+  accumulators; per vector of k: `S8Dot.Fma` (the s8 dot lane), converted to float, times sA·sB, added. Offered only
+  where the runtime reports the s8 dot lane (else the f32 route stays). Lane `s8dp blocks`.
+- device `Ptx.MatMulBlocks` / `GpuOps.MatMulBlocks<TN>`: the s8 tensor kind with k = 32 (`mma.m16n8k32.s8`, one
+  instruction per block) where the JIT accepts it, else the f32 route. A block of 128 threads (4 warps) per 64 × 64 of
+  C, a warp 32 × 32 (2 × 4 tiles); per k-block A's and B's 64 blocks staged into shared memory by 16-bit loads (a
+  34-byte Q8_0 block is 2-byte aligned only; Q4_0's nibbles expanded to int8 − 8 on the way), rows 48 bytes apart (no
+  bank conflicts for the fragment loads), the scales in f32 beside them; fragments by 32-bit shared loads in the
+  m16n8k32 layout; each tile's s32 result converted and added as acc += c·(sA_row·sB_col). Lane `s8 mma blocks`.
+- `MatMulView` on both devices takes it for that view and those formats when measured faster than the f32 route
+  (once per shape and format, both warmed, alternating rounds; the decision noted, as attention's).
+- gate (`Checks.Products`): q8_0 and q4_0 at 37 × 29 with K = 64 and 320, the block path forced on both devices,
+  against the double-double reference of the stored values; the device gemv's block path at K = 64 too (its gate so
+  far had 1001 columns, never a whole number of blocks).
+- contract `IBenchSubject.MatMulBlocks(device, type, m, n, k, a, b, c)`; bench row `matmul_blocks` (q8_0, q4_0;
+  C = A·Bᵀ at 2048³ on the device, 1024³ on the CPU) in Group4b beside `matmul_nt`.
 
 ## Item 4e — the transposition fused into the product's packing
 
@@ -312,3 +380,12 @@ Each: measure against the baseline cell, change, re-measure (the full run or the
   rows (`src/Layout.cs` `MoveBody`); a partial sort (a per-row heap of k) for top-k in `src/Routing.cs` `TopKBody`.
 - When a cell lands: update its Known-slow row with the new measurement (or remove the row and say so in the item
   report); README Results regenerated from the full run that includes it.
+- CPU recurrent sequences (the coordinator's observation at 4c): gru_seq 65–71 ms, lstm_seq 83 ms against ~15–20 ms
+  implied by the f32 product rate (COVERAGE Known slow).
+
+## End of item 6 — the final readiness check (the owner's addition)
+
+The goal: Qiyas ready to replace Idrak's kernels entirely once items 4–6 are done. After item 6's full run, compare
+the list of Idrak's operation names against COVERAGE.md, reading names only and never design (the standing rule:
+nothing of Lib's code or design enters the repository). Report every operation an application would need that Qiyas
+lacks, with what it would take; nothing is added without the coordinator's go.

@@ -5,8 +5,16 @@ namespace Qiyas;
 
 public sealed partial class GpuOps
 {
-    /// <summary>C = op(A)·op(B) over the view's batches; returns the product's lane.</summary>
+    /// <summary>C = op(A)·op(B) over the view's batches; returns the product's lane. A·Bᵀ of two Q8_0 / Q4_0 operands with k
+    /// in whole blocks takes the block-scaled product where it measures faster (MatMulBlocks.cs).</summary>
     public string MatMulView<TN>(ProductView v, ulong a, ulong b, ulong c) where TN : struct, IQiyasNumber<TN>
+    {
+        if (BlockView<TN>(v) && UseBlocks<TN>(v, a, b, c)) return MatMulViewBlocks<TN>(v, a, b, c);
+        return MatMulViewRoute<TN>(v, a, b, c);
+    }
+
+    /// <summary>C = op(A)·op(B) by the strided copies and the product kernel.</summary>
+    private string MatMulViewRoute<TN>(ProductView v, ulong a, ulong b, ulong c) where TN : struct, IQiyasNumber<TN>
     {
         var f = Fmt.Of<TN>();
         string lane = "";

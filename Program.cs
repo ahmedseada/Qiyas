@@ -104,7 +104,7 @@ internal sealed class Options
     ];
     public static readonly string[] Group3 = [.. RowOps.All.Select(o => "row:" + o.Name), "norm_params_bwd:rms", "norm_params_bwd:layer"];
     public static readonly string[] Group4 = [.. LayoutArgs.Names.Select(n => "layout:" + n)];
-    public static readonly string[] Group4b = ["matmul_nt", "matmul_tn", "matmul_tt", "matmul_batched", "matmul_bwd"];
+    public static readonly string[] Group4b = ["matmul_nt", "matmul_tn", "matmul_tt", "matmul_batched", "matmul_bwd", "matmul_blocks"];
     public static readonly string[] Group5 = ["attention", "attention_causal", "attention_fused", "attention_fused_causal", "attention_decode", "attention_bwd"];
     public static readonly string[] Group7 = [.. OptimizerArgs.Names.Select(n => "optimizer:" + n)];
     public static readonly string[] Group6 = ["conv", "conv_bwd"];
@@ -616,6 +616,18 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
     private void ProductRow(Device device, string type, string name)
     {
         int s = MatSize(device), s4 = s / 4;
+        if (name == "matmul_blocks")
+        {
+            // A·Bᵀ of two Q8_0 / Q4_0 operands by the block-scaled product alone (matmul_nt takes it where measured faster).
+            if (type is not ("q8_0" or "q4_0")) return;
+            var blockView = new ProductView(s, s, s, false, true);
+            var ba = Registry.Make(type, s * s, 31, -1, 1);
+            var bb = Registry.Make(type, s * s, 32, -1, 1);
+            var bwant = blockView.Reference(Registry.Values(type, ba, s * s), Registry.Values(type, bb, s * s));
+            Measure(device, name, type, $"{s}x{s}x{s} Bᵀ", bwant, (subject, c) => subject.MatMulBlocks(device, type, s, s, s, ba, bb, c), (int)Registry.Bytes(type, s * s));
+            return;
+        }
+
         if (name == "matmul_bwd")
         {
             var a = Registry.Make(type, s * s, 31, -1, 1);

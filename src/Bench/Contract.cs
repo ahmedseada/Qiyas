@@ -119,6 +119,9 @@ public interface IBenchSubject
     IBenchRun? LstmSequence(Device device, string type, CellArgs a, int T, byte[] x, byte[] h0, byte[] c0, byte[] w, byte[] u, byte[] b, byte[] hOut, byte[] cOut,
         byte[]? dx, byte[]? dh0, byte[]? dc0, byte[]? dw, byte[]? du, byte[]? db) => null;
 
+    /// <summary>C = A·Bᵀ (A m × k, B n × k, C m × n) by the block-scaled product of two Q8_0 / Q4_0 operands (k in whole blocks).</summary>
+    IBenchRun? MatMulBlocks(Device device, string type, int m, int n, int k, byte[] a, byte[] b, byte[] c) => null;
+
     /// <summary>A GRU sequence of T steps (x: T × B × D; h0; W, U, b, bh as the step's; h out: T × B × H).</summary>
     IBenchRun? GruSequence(Device device, string type, CellArgs a, int T, byte[] x, byte[] h0, byte[] w, byte[] u, byte[] b, byte[] bh, byte[] hOut) => null;
 

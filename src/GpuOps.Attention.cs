@@ -67,25 +67,9 @@ public sealed partial class GpuOps
         string key = $"{f.Name}:{a.Heads}x{a.Lq}x{a.Lk}x{a.D}:{a.Causal}:{a.Spans is not null}:{a.SpanStarts is not null}";
         if (!_fusedFaster.TryGetValue(key, out bool fused))
         {
-            double Time(Action run)
-            {
-                long t0 = Stopwatch.GetTimestamp();
-                run();
-                Gpu.Synchronize();
-                return Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
-            }
-
-            // Both warmed, then timed in alternating rounds, the minimum of each kept: a device still raising its clocks
-            // (the first timings of a run) slows both alike instead of the one timed first.
-            AttentionRows<TN>(a, q, k, v, o);
-            AttentionComposed<TN>(a, q, k, v, o);
-            Gpu.Synchronize();
-            double tf = double.MaxValue, tc = double.MaxValue;
-            for (int round = 0; round < 3; round++)
-            {
-                tf = Math.Min(tf, Time(() => AttentionRows<TN>(a, q, k, v, o)));
-                tc = Math.Min(tc, Time(() => AttentionComposed<TN>(a, q, k, v, o)));
-            }
+            // As Measure.Faster settles it: a device still raising its clocks (the first timings of a run) keeps the
+            // alternating rounds going instead of deciding against the path timed first.
+            var (tf, tc) = Measure.Faster(() => AttentionRows<TN>(a, q, k, v, o), () => AttentionComposed<TN>(a, q, k, v, o), Gpu.Synchronize);
 
             fused = _fusedFaster[key] = tf <= tc;
             Note($"attention {key}: fused rows {tf:0.000} ms, composition {tc:0.000} ms: {(fused ? "fused rows" : "composition")}");

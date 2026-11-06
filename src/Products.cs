@@ -47,8 +47,16 @@ internal static partial class Kernels
 {
     private static int BytesOf<TN>(long values) where TN : struct, IQiyasNumber<TN> => (int)TN.Bytes(values);
 
-    /// <summary>C = op(A)·op(B) over the view's batches on the CPU; returns the product's lane.</summary>
+    /// <summary>C = op(A)·op(B) over the view's batches on the CPU; returns the product's lane. A·Bᵀ of two Q8_0 / Q4_0
+    /// operands with k in whole blocks takes the block-scaled product where it measures faster (MatMulBlocks.cs).</summary>
     public static string MatMulView<TN>(ProductView v, byte[] a, byte[] b, byte[] c) where TN : struct, IQiyasNumber<TN>
+    {
+        if (BlockView<TN>(v) && UseBlocks<TN>(v, a, b, c)) return MatMulViewBlocks<TN>(v, a, b, c);
+        return MatMulViewRoute<TN>(v, a, b, c);
+    }
+
+    /// <summary>C = op(A)·op(B) by the strided copies and the product kernel.</summary>
+    private static string MatMulViewRoute<TN>(ProductView v, byte[] a, byte[] b, byte[] c) where TN : struct, IQiyasNumber<TN>
     {
         string lane = "";
         bool direct = v.Batch == 1 && !v.TransA && !v.TransB;

@@ -102,14 +102,23 @@ internal static partial class Ptx
         b.L($"cvt.f32.f16 {da}, {ha};");
         b.L($"cvt.f32.f16 {dx}, {hx};");
         b.L($"mov.u32 {dot}, 0;");
+        // A block is 2-byte aligned only (34 or 18 bytes): a 4-byte group of its values is read as two halves.
+        void Word(string w, string addr, int offset)
+        {
+            string lo = b.H(), hi = b.H();
+            b.L($"ld.global.u16 {lo}, [{addr}+{offset}];");
+            b.L($"ld.global.u16 {hi}, [{addr}+{offset + 2}];");
+            b.L($"mov.b32 {w}, {{{lo}, {hi}}};");
+        }
+
         if (f.Is("q8_0"))
         {
             // 32 int8 at +2: eight 4-byte groups.
             for (int g = 0; g < 8; g++)
             {
                 string wa = b.R(), wx = b.R();
-                b.L($"ld.global.b32 {wa}, [{aAddr}+{2 + g * 4}];");
-                b.L($"ld.global.b32 {wx}, [{xAddr}+{2 + g * 4}];");
+                Word(wa, aAddr, 2 + g * 4);
+                Word(wx, xAddr, 2 + g * 4);
                 if (dp4a) b.L($"dp4a.s32.s32 {dot}, {wa}, {wx}, {dot};");
                 else
                 {
@@ -129,8 +138,8 @@ internal static partial class Ptx
             for (int g = 0; g < 4; g++)
             {
                 string wa = b.R(), wx = b.R();
-                b.L($"ld.global.b32 {wa}, [{aAddr}+{2 + g * 4}];");
-                b.L($"ld.global.b32 {wx}, [{xAddr}+{2 + g * 4}];");
+                Word(wa, aAddr, 2 + g * 4);
+                Word(wx, xAddr, 2 + g * 4);
                 for (int i = 0; i < 8; i++)
                 {
                     string qa = b.R(), qx = b.R();

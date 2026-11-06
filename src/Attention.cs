@@ -194,24 +194,9 @@ internal static partial class Kernels
         {
             if (!s_fusedFaster.TryGetValue(key, out fused))
             {
-                double Time(Func<string> run)
-                {
-                    long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-                    run();
-                    return System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
-                }
-
-                // Both warmed, then timed in alternating rounds, the minimum of each kept (a processor raising its clocks
-                // slows both alike instead of the one timed first).
-                AttentionRows<TN>(a, q, k, v, o);
-                AttentionComposed<TN>(a, q, k, v, o);
-                double tf = double.MaxValue, tc = double.MaxValue;
-                for (int round = 0; round < 2; round++)
-                {
-                    tf = Math.Min(tf, Time(() => AttentionRows<TN>(a, q, k, v, o)));
-                    tc = Math.Min(tc, Time(() => AttentionComposed<TN>(a, q, k, v, o)));
-                }
-
+                // As Measure.Faster settles it: rounds of several calls (a short run's timer grain and team wake-up
+                // averaged out), alternating, on until both minimums settle.
+                var (tf, tc) = Measure.Faster(() => AttentionRows<TN>(a, q, k, v, o), () => AttentionComposed<TN>(a, q, k, v, o));
                 fused = s_fusedFaster[key] = tf <= tc;
                 Note($"attention {key}: fused rows {tf:0.000} ms, composition {tc:0.000} ms: {(fused ? "fused rows" : "composition")}");
             }

@@ -18,7 +18,8 @@ does best for it, chosen per operation from the data itself. No type is fixed an
   reference written from the format's definition, the dot lanes against scalar sums, exp against the runtime's, and
   the device's conversions against the CPU's; then every operation of every family runs over every type it applies to
   on both devices, on small odd shapes, against float64 references (`src/Checks.cs`); the block codecs against blocks
-  laid out by hand from the formats' specifications; the products on the device under every tensor kind the device
+  laid out by hand from the formats' specifications; the block-scaled products of Q8_0 / Q4_0 (A·Bᵀ and gemv, k in whole
+  blocks) forced on both devices; the products on the device under every tensor kind the device
   accepts (the measured choice, then the 4-bit kinds and the 32-deep 8-bit instruction forced on and off), and under
   every tensor-kernel configuration the device can run with every kind choice (k = 53 and 300, every integer and
   narrow-float type); attention rows by both the composition and the fused rows (causal, spans with starts, head
@@ -61,7 +62,8 @@ its backward, weight_norm, rope, scale_mask_softmax, add_rms_norm, add_layer_nor
 4096 × 4096, float types); `layout` adds the layout operations (`layout:<name>` for each of `LayoutArgs.Names`: strided,
 one_hot, gather_rows, gather_cols, scatter_add_rows, im2col, col2im, interpolate_nearest, interpolate_bilinear, shift).
 `products` adds the products on views (`matmul_nt`, `matmul_tn`, `matmul_tt` at 4096³, `matmul_batched`: 16 × 1024³,
-`matmul_bwd`: dA and dB at 4096³); `attention` adds `attention`, `attention_causal` (16 heads, 2048 × 2048, d = 128),
+`matmul_bwd`: dA and dB at 4096³, `matmul_blocks`: A·Bᵀ of two Q8_0 / Q4_0 operands by the block-scaled product alone);
+`attention` adds `attention`, `attention_causal` (16 heads, 2048 × 2048, d = 128),
 `attention_fused`, `attention_fused_causal` (the same shapes, the fused rows alone, for comparing with the measured
 choice), `attention_decode` (32 heads, one query over 4096 keys) and `attention_bwd` (8 heads of 1024). The decisions
 taken from measurements during a run (attention's fused-or-composed choice per shape and type, among others) are printed
@@ -109,6 +111,7 @@ checkout (files listed in `.gitignore`); a clone runs the other subjects.
 | `src/Numbers.cs` | the contract: `IQiyasNumber<TSelf>`, lanes, dot lanes, the visitors; exp on vectors |
 | `src/Types.cs` | the seventeen stored types and their lane rules |
 | `src/Blocks.cs`, `src/Ptx.Blocks.cs`, `src/BlockProducts.cs` | the block formats Q8_0, Q4_0, Q4_K, Q6_K and bool: the codecs (CPU and device encoders, a thread per block), the block-scaled integer gemv |
+| `src/MatMulBlocks.cs` | the block-scaled tiled product A·Bᵀ of Q8_0 / Q4_0 on the CPU (the s8 dot lane) and the device (the s8 tensor instruction at k = 32), and its measured choice against the decoded route |
 | `src/Report.cs` | `--report`: the facts and measured decisions of each device, the pool's rent/return cost |
 | `docs/wip/` | the regression comparer (`compare.py`), the baseline run it compares against (`baseline.md`), the README Results generator (`readme_results.py`) |
 | `src/Convert.cs` | every load and store on vectors; `Widths`, any lane to any lane |
@@ -214,7 +217,7 @@ allows.
 ## Open
 
 What the gates have not confirmed, or is not done, is in `COVERAGE.md` ("State" for the order, **todo** in the rows):
-the block-scaled tiled product, the transposition fused into the product's packing, the
+the transposition fused into the product's packing, the
 radix step of scatter-add, a fused direct convolution, a bump-allocated scope past the buffer pool, and the known-slow
 cells (among them the tensor lanes inside the fused attention kernel, which runs in the FMA lane). The README claims nothing beyond what the gates and the regression
 comparison have confirmed.
