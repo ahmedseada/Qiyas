@@ -1190,6 +1190,10 @@ internal static class Checks
             ops.SplitSlices = 5;
             ok &= ProductsWith(ops, where, 37, 29, 1100, " [split-k 5]");
             ops.SplitSlices = null;
+            // As on a device that refuses the staged kernel (asynchronous copies): the 32-bit lanes on the register-tiled one.
+            ops.Staged = false;
+            ok &= ProductsWith(ops, where, 37, 29, 53, " [no staged kernel]");
+            ops.Staged = null;
         }
 
         if (ops is not null) ok &= Epilogues(ops);

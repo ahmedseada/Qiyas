@@ -487,6 +487,36 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
     from a 16-bit kind by shared memory alone; a device refusing the tensor PTX does, by `Accepts`). Mutation (the
     tensor route ignoring the limit) fails at 8 cells: the d = 120 / 128 shapes of the four kinds.
 
+- 6j sweep (the coordinator: every device kernel past 48 KB of shared memory or on an instruction an older device may
+  lack, and its guard). One gap found and fixed (the staged product); the rest were guarded.
+
+  | kernel | needs | guard |
+  |---|---|---|
+  | `GemmMma` (tensor products of every kind, the f64x sliced route, the block-free conv route) | mma, ldmatrix, cp.async; up to 99 KB dynamic | `Usable` / `MmaShape`: a configuration only when its shared ≤ `SharedOptIn` and `gpu.Accepts`; a kind with none is not used (`MmaSupported`: the plain lanes) |
+  | `Gemm2` staged 32-bit lane product, split-k | cp.async; 36.9 / 55.3 KB | `Gemm2Stages`: shared ≤ `SharedOptIn` and `Accepts` — but 2 stages were kept when neither was taken (a device without cp.async: every f32 product would throw). Fixed: 0 → the register-tiled `Gemm`; `GpuOps.Staged` (false: as such a device) and the gate's products at 37 × 29 × 53 "[no staged kernel]" (mutation: the register-tiled launch short by 4 of k fails at 45 cells, all under that tag). Before this, no gate reached the 32-bit lanes' register-tiled kernel (every padded shape is the staged kernel's) |
+  | `GemmDot` (dp4a products, the conv route) | dp4a | `Dp4aSupported` (`Accepts`) in `ProductLane` |
+  | `GemvBlocks` Q8_0 dot | dp4a | `Dp4aSupported(true)` |
+  | `MatMulBlocks` (s8 mma blocks) | mma s8 k32 | `BlockProductAvailable` = the s8k32 tensor kind accepted (the same instruction) |
+  | `AttentionRowsMma` | mma, ldmatrix, cp.async, cvt f16x2 / bf16x2; 34.8 KB | 6j: `Accepts` and shared ≤ the limit, else the FMA rows |
+  | `AttentionBackRowsMma` / `AttentionBackKeysMma` | the same; 34.8 / 70.9 KB | 6j: `MmaBackwardUsable`, else the FMA fused backward |
+  | `AttentionBackRows` / `AttentionBackKeys` (FMA) | 68.7–76.7 KB dynamic at d = 128 | 6j: `FusedBackwardFits`, else the composition |
+  | radix sort (`RadixPlace`), rows, ctc, routing, reductions | vote.sync, shfl.sync, 32-bit integer atomics | none needed: every device a current driver runs (sm_50 on) has them |
+  | every other kernel | static shared ≤ 48 KB | the PTX limit itself (a larger static declaration would not build anywhere) |
+
+  The 8-bit floats' and bfloat16's conversions are integer code (`Codec`), not the sm_89 / sm_80 cvt forms, outside the
+  tensor attention kernels (which ask `Accepts`).
+
+- 6j part 4 (max / min along rows, CPU): done, reported (uncommitted until go).
+  - `Reduce.Extreme` (`wantIndex`, default true): max and min along rows (`RowCompareBody`) and whole (`PartCompareBody`
+    for max / min; argmax keeps the search) skip the second pass that found the first position holding the extreme (a
+    scalar scan of half a row on average, per row). The vector loop in four chains by `Vector.LoadUnsafe`, joined lane by
+    lane: each lane the extreme of the same positions as the one chain was, so the value is the same whenever the lane's
+    Max / Min are associative and commutative: integers exact; floats IEEE maximum / minimum in .NET 9 on (`dotnet fsi`
+    on the runtime: max(−0, +0) = max(+0, −0) = +0, min = −0 either way, NaN either way).
+  - Gate: `check reductions` (every type at 37 × 1001 as the references) green. Measured: see COVERAGE (the max / min row).
+  - Seen, not this piece's: CPU sum:rows / sum:whole int8 0.103 / 0.104 → 0.29 / 0.25 and float16 0.399 / 0.401 → 0.59 /
+    0.60 in both runs here (item 4's baseline; 6b called int8's 0.22 swing): for 6k's re-measure.
+
 ## Item 5 progress
 
 - Done, reported (uncommitted until the coordinator's go). What landed:

@@ -668,10 +668,10 @@ public sealed partial class GpuOps(Gpu gpu)
             ulong lb = direct ? b : Lanes(f, lane, b, (long)k * n, rented);
             ulong lcl = direct ? c : gpu.Rent((long)m * n * lane.Size);
             if (!direct) rented.Add(lcl);
-            if (!lane.Wide && k % 4 == 0 && n % 4 == 0)
+            // The staged kernel where the device builds it (cp.async), its pipeline depth measured once per lane; 0: none.
+            int stages = Staged != false && !lane.Wide && k % 4 == 0 && n % 4 == 0 ? Gemm2Stages(lane, la, lb, lcl, m, n, k) : 0;
+            if (stages > 0)
             {
-                // The staged kernel: its pipeline depth measured on the device once per lane.
-                int stages = Gemm2Stages(lane, la, lb, lcl, m, n, k);
                 int slices = SplitK(m, n, k, out int sliceBlocks);
                 if (slices > 1)
                 {
@@ -709,6 +709,9 @@ public sealed partial class GpuOps(Gpu gpu)
             foreach (var p in rented) gpu.Return(p);
         }
     }
+
+    /// <summary>The gate's override: false takes the register-tiled kernel as on a device that refuses the staged one.</summary>
+    internal bool? Staged;
 
     /// <summary>The gate's override of split-k's slice count (null: SplitK's rule).</summary>
     public int? SplitSlices;
@@ -888,7 +891,7 @@ public sealed partial class GpuOps(Gpu gpu)
     private int Gemm2Stages(Lane lane, ulong la, ulong lb, ulong lc, int m, int n, int k)
     {
         if (_gemm2Stages.TryGetValue(lane.Name, out int known)) return known;
-        int best = 2;
+        int best = 0;                                                    // no depth the device takes: the register-tiled kernel
         double bestMs = double.MaxValue;
         var report = new List<string>();
         foreach (int stages in new[] { 2, 3 })
@@ -909,7 +912,8 @@ public sealed partial class GpuOps(Gpu gpu)
             if (ms < bestMs) (bestMs, best) = (ms, stages);
         }
 
-        Console.WriteLine($"device measured {lane.Name} staged product at {m}x{n}x{k}: {string.Join(", ", report)}: {best} stages kept");
+        Console.WriteLine(best > 0 ? $"device measured {lane.Name} staged product at {m}x{n}x{k}: {string.Join(", ", report)}: {best} stages kept"
+            : $"device takes no staged {lane.Name} product (its shared memory or asynchronous copies): the register-tiled kernel");
         return _gemm2Stages[lane.Name] = best;
     }
 

@@ -391,7 +391,7 @@ internal static partial class Kernels
                 parts = (c + span - 1) / span;
                 var values = new byte[parts * Unsafe.SizeOf<TLane>()];
                 var indices = new byte[parts * 4];
-                Team.For(parts, 1, (long)c, new PartCompareBody<TN, TLane, TL>(x, values, indices, c, span, max));
+                Team.For(parts, 1, (long)c, new PartCompareBody<TN, TLane, TL>(x, values, indices, c, span, max, op == "argmax"));
                 var pv = MemoryMarshal.Cast<byte, TLane>(values.AsSpan());
                 var pi = MemoryMarshal.Cast<byte, int>(indices.AsSpan());
                 int bestPart = 0;
@@ -419,8 +419,10 @@ internal static partial class Kernels
         }
     }
 
+    // The extreme of x[first, first + n) and the first position holding it; wantIndex false (item 6j: max / min, whose
+    // result is the value): no second pass for the position (index 0 when there is a value, −1 when n is 0).
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static TLane Extreme<TN, TLane, TL>(byte[] x, int first, int n, bool max, Span<TLane> scratch, out int index)
+    private static TLane Extreme<TN, TLane, TL>(byte[] x, int first, int n, bool max, Span<TLane> scratch, out int index, bool wantIndex = true)
         where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasLane<TL, TLane>
     {
         int w = Vector<TLane>.Count;
@@ -441,8 +443,27 @@ internal static partial class Kernels
             int i = 0;
             if (len >= w)
             {
-                var acc = new Vector<TLane>(s);
-                for (i = w; i + w <= len; i += w) { var v = new Vector<TLane>(s[i..]); acc = max ? TL.Max(acc, v) : TL.Min(acc, v); }
+                // Four chains of vectors (item 6j), joined lane by lane: each lane still the extreme of the same positions
+                // (the lane's Max / Min associative and commutative: IEEE maximum / minimum, integers exact).
+                ref TLane rs = ref MemoryMarshal.GetReference(s);
+                var acc = Vector.LoadUnsafe(ref rs);
+                i = w;
+                if (len >= 4 * w)
+                {
+                    Vector<TLane> a1 = Vector.LoadUnsafe(ref rs, (nuint)w), a2 = Vector.LoadUnsafe(ref rs, (nuint)(2 * w)), a3 = Vector.LoadUnsafe(ref rs, (nuint)(3 * w));
+                    for (i = 4 * w; i + 4 * w <= len; i += 4 * w)
+                    {
+                        nuint at2 = (nuint)i;
+                        var v0 = Vector.LoadUnsafe(ref rs, at2); var v1 = Vector.LoadUnsafe(ref rs, at2 + (nuint)w);
+                        var v2 = Vector.LoadUnsafe(ref rs, at2 + (nuint)(2 * w)); var v3 = Vector.LoadUnsafe(ref rs, at2 + (nuint)(3 * w));
+                        if (max) { acc = TL.Max(acc, v0); a1 = TL.Max(a1, v1); a2 = TL.Max(a2, v2); a3 = TL.Max(a3, v3); }
+                        else { acc = TL.Min(acc, v0); a1 = TL.Min(a1, v1); a2 = TL.Min(a2, v2); a3 = TL.Min(a3, v3); }
+                    }
+
+                    acc = max ? TL.Max(TL.Max(acc, a1), TL.Max(a2, a3)) : TL.Min(TL.Min(acc, a1), TL.Min(a2, a3));
+                }
+
+                for (; i + w <= len; i += w) { var v = Vector.LoadUnsafe(ref rs, (nuint)i); acc = max ? TL.Max(acc, v) : TL.Min(acc, v); }
                 TLane e = acc[0];
                 for (int l = 1; l < w; l++) e = max ? (Widths.Compare(acc[l], e) > 0 ? acc[l] : e) : (Widths.Compare(acc[l], e) < 0 ? acc[l] : e);
                 if (!have || (max ? Widths.Compare(e, best) > 0 : Widths.Compare(e, best) < 0)) { best = e; have = true; }
@@ -457,6 +478,7 @@ internal static partial class Kernels
         }
 
         // The first position holding the extreme.
+        if (have && !wantIndex) { index = 0; return best; }
         if (have)
         {
             if (TN.Direct)
@@ -477,7 +499,7 @@ internal static partial class Kernels
         return best;
     }
 
-    private struct PartCompareBody<TN, TLane, TL>(byte[] x, byte[] values, byte[] indices, int n, int span, bool max) : Team.IBody
+    private struct PartCompareBody<TN, TLane, TL>(byte[] x, byte[] values, byte[] indices, int n, int span, bool max, bool wantIndex = true) : Team.IBody
         where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasLane<TL, TLane>
     {
         public readonly void Run(int first, int last)
@@ -489,7 +511,7 @@ internal static partial class Kernels
             {
                 int start = p * span, len = Math.Min(span, n - start);
                 if (len <= 0) { pi[p] = -1; continue; }
-                pv[p] = Extreme<TN, TLane, TL>(x, start, len, max, scratch, out int index);
+                pv[p] = Extreme<TN, TLane, TL>(x, start, len, max, scratch, out int index, wantIndex);
                 pi[p] = index < 0 ? -1 : start + index;
             }
         }
@@ -502,7 +524,7 @@ internal static partial class Kernels
         {
             var o = MemoryMarshal.Cast<byte, TLane>(result.AsSpan());
             Span<TLane> scratch = stackalloc TLane[4096];
-            for (int r = first; r < last; r++) o[r] = Extreme<TN, TLane, TL>(x, r * cols, cols, max, scratch, out _);
+            for (int r = first; r < last; r++) o[r] = Extreme<TN, TLane, TL>(x, r * cols, cols, max, scratch, out _, wantIndex: false);
         }
     }
 
