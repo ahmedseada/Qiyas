@@ -517,6 +517,27 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
   - Seen, not this piece's: CPU sum:rows / sum:whole int8 0.103 / 0.104 → 0.29 / 0.25 and float16 0.399 / 0.401 → 0.59 /
     0.60 in both runs here (item 4's baseline; 6b called int8's 0.22 swing): for 6k's re-measure.
 
+- 6j part 5 (the CPU sum cells the coordinator asked to bisect): the cause is the machine's power state, not a change;
+  two real costs removed on the way (uncommitted until go).
+  - Bisect (temporary worktrees, removed; one run per cell, then A/B): int8 sum:rows / whole read 0.08–0.10 at 57f9ff0,
+    81dac8e and 634882e, 0.20–0.33 at 64e29a9, 49bb2ea, 110392e — but 634882e also read 0.27 in an alternating A/B, and
+    110392e read 0.10 once. float16 sum read 0.40 at main in two of three runs (0.60–0.70 the third): bimodal, no change.
+    No sum code changed between 634882e and 64e29a9; the bench's settle rule reverted (main): still 0.20–0.29; a full
+    collection after the gates: still slow. A probe (temporary) split the int8 sum's 0.21: the integer range read 0.178,
+    the sum 0.03–0.13. A 30 s pause after the gates (temporary): sum:rows 0.069 / 0.082 against 0.237 / 0.251 without,
+    sum:whole (timed after sum:rows' own runs) 0.20 either way. The CPU (Core Ultra 9 285, 65 W, 8 P + 16 E cores, 36 MB
+    L3) spends its boost budget on the gates' ~20 s of every core; the L3-bound cells then run at the sustained clocks.
+    Item 6's gates grew (6g's erf and convolution-backward checks), so the first timed cells now meet that state more
+    often. The baseline's cells were timed deep in the full run, after lighter rows. A cool-down before the timed rows
+    would be the bench's change, not done (the coordinator's call).
+  - `Reduce.Reduce`: an integer sum reads its range only where it can change the lane (`RangeMatters`: the lane the
+    type's own bounds take against the lane all-zero values take; equal: every range takes it, the sum exact in it).
+    Rows of 4096 int8 values no longer read the 16 MB range per call (whole sums of 16M values still do: there the
+    type's bounds pass the 32-bit dot lane). `Cvt.RangeOf`: two chains of unchecked loads. Results unchanged (integers
+    exact; the read is skipped only where its lane is the type bounds' lane).
+  - Measured (no pause, the same conditions as the slow runs): int8 sum:rows 0.25–0.32 → 0.053 / 0.142, sum:whole
+    0.245–0.265 → 0.147 / 0.148; float16 0.403 / 0.403 (unchanged code). CPU gates green.
+
 ## Item 5 progress
 
 - Done, reported (uncommitted until the coordinator's go). What landed:

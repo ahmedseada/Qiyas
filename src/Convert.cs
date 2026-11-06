@@ -704,10 +704,28 @@ internal static class Cvt
         long lo = long.MaxValue, hi = long.MinValue;
         if (s.Length >= w)
         {
-            Vector<T> mn = new(s), mx = mn;
-            for (i = w; i + w <= s.Length; i += w)
+            // Two chains each of minimum and maximum by unchecked loads (item 6j), joined lane by lane (integers: exact).
+            ref T r = ref MemoryMarshal.GetReference(s);
+            Vector<T> mn = Vector.LoadUnsafe(ref r), mx = mn;
+            i = w;
+            if (s.Length >= 2 * w)
             {
-                var v = new Vector<T>(s[i..]);
+                Vector<T> mn1 = Vector.LoadUnsafe(ref r, (nuint)w), mx1 = mn1;
+                for (i = 2 * w; i + 2 * w <= s.Length; i += 2 * w)
+                {
+                    var v0 = Vector.LoadUnsafe(ref r, (nuint)i);
+                    var v1 = Vector.LoadUnsafe(ref r, (nuint)(i + w));
+                    mn = Vector.Min(mn, v0); mx = Vector.Max(mx, v0);
+                    mn1 = Vector.Min(mn1, v1); mx1 = Vector.Max(mx1, v1);
+                }
+
+                mn = Vector.Min(mn, mn1);
+                mx = Vector.Max(mx, mx1);
+            }
+
+            for (; i + w <= s.Length; i += w)
+            {
+                var v = Vector.LoadUnsafe(ref r, (nuint)i);
                 mn = Vector.Min(mn, v);
                 mx = Vector.Max(mx, v);
             }

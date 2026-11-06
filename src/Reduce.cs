@@ -36,12 +36,38 @@ internal static partial class Kernels
         }
 
         // A float type's sum lane does not depend on the values: its range is not read (a block format's decodes every block).
-        var (lo, hi) = TN.IsFloat ? (0, 0) : TN.Range(x, rows * cols);
+        // An integer type's range is read only where it can change the lane (item 6j): where the type's own bounds take
+        // the lane the narrowest values would, every range takes it, and the sum is exact in it either way.
         long terms = axis switch { Axis.Whole => (long)rows * cols, Axis.Rows => cols, _ => rows };
+        var (lo, hi) = TN.IsFloat ? (0, 0) : !RangeMatters<TN>(op == "sumsq", terms) ? (TN.Min, TN.Max) : TN.Range(x, rows * cols);
         var bounds = op == "sumsq" ? new Bounds(lo, hi, lo, hi, terms) : new Bounds(lo, hi, 1, 1, terms);
         var sum = new SumVisitor(op == "sumsq", axis, x, rows, cols);
         TN.Sum(ref sum, in bounds);
         return (sum.Result!, sum.Lane);
+    }
+
+    // Whether an integer sum's lane can depend on the values' range: the lane the type's own bounds take against the lane
+    // the narrowest values (all 0) take.
+    private static bool RangeMatters<TN>(bool squares, long terms) where TN : struct, IQiyasNumber<TN>
+    {
+        var wide = squares ? new Bounds(TN.Min, TN.Max, TN.Min, TN.Max, terms) : new Bounds(TN.Min, TN.Max, 1, 1, terms);
+        var narrow = squares ? new Bounds(0, 0, 0, 0, terms) : new Bounds(0, 0, 1, 1, terms);
+        var a = new LaneProbe();
+        TN.Sum(ref a, in wide);
+        var b = new LaneProbe();
+        TN.Sum(ref b, in narrow);
+        return a.Lane != b.Lane;
+    }
+
+    // The lane a sum's bounds take, nothing run.
+    private struct LaneProbe : ISumVisitor
+    {
+        public string Lane;
+
+        public void Run<TN, TLane, TL>() where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasLane<TL, TLane> => Lane = TL.Name;
+
+        public void RunDot<TN, TIn, TAcc, TD>()
+            where TN : struct, IQiyasNumber<TN, TIn>, IQiyasNumber<TN, TAcc> where TIn : unmanaged where TAcc : unmanaged where TD : struct, IQiyasDotLane<TD, TIn, TAcc> => Lane = TD.Name;
     }
 
     private struct SumVisitor(bool squares, Axis axis, byte[] x, int rows, int cols) : ISumVisitor
