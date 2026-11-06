@@ -30,6 +30,17 @@ internal static partial class Kernels
         sb.AppendLine($"  dot lanes: s8 {(S8Dot.IsSupported ? "yes" : "no")}, u8 {(U8Dot.IsSupported ? "yes" : "no")}, s16 {(S16Dot.IsSupported ? "yes" : "no")}, u16 {(U16Dot.IsSupported ? "yes" : "no")} (the runtime's report; a lane not supported is not used)");
         sb.AppendLine("  lane rules: own (element-wise), float (f32 for narrow floats, f64 for float64), sum (dot lanes → f32 ≤ 2^24 → s32/u32 → f64 ≤ 2^53 → s64/u64, by the bounds measured on the data)");
         sb.AppendLine("  block formats: Q8_0, Q4_0, Q4_K, Q6_K read a value at a time, written a block at a time; bool at 1 bit");
+        // The product's workspace (src/Workspace.cs): a float16 product with Aᵀ stored, twice; the second call's counts.
+        {
+            var v = new ProductView(96, 80, 72, true, false);
+            byte[] a = new byte[96 * 72 * 2], b = new byte[72 * 80 * 2], c = new byte[96 * 80 * 2];
+            MatMulView<Float16>(v, a, b, c);
+            var (r0, g0, p0) = Workspace.Counts;
+            MatMulView<Float16>(v, a, b, c);
+            var (r1, g1, p1) = Workspace.Counts;
+            sb.AppendLine($"  buffers: the product's packed B, loaded A / B, C lanes and A panels from a per-thread workspace grown to the largest shape seen; a float16 product's second call: {r1 - r0} workspace rents, {g1 - g0} allocations, {p1 - p0} pool fallbacks");
+        }
+
         lock (s_decisions) foreach (var d in s_decisions) sb.AppendLine($"  measured: {d}");
         return sb.ToString();
     }
@@ -60,12 +71,30 @@ public sealed partial class GpuOps
         sb.AppendLine("  lane rules: own (element-wise), float (f32 / f64), sum (tensor or dot kinds for 8-bit-ranged inputs → f32 ≤ 2^24 → s32/u32 → s64/u64; 16/32-bit integer sums by the type's range)");
         sb.AppendLine("  row kernels: a block per row, rows in registers up to 16 words a thread of 1024, longer rows in segments; rows not ending on a word value by value");
         foreach (var d in _decisions) sb.AppendLine($"  measured: {d}");
-        // The buffer pool is the arena: a size-keyed free list, so after a shape's first call no driver allocation happens; its cost per rent/return pair, measured.
+        // Buffers: outside a scope the size-keyed pool, inside one the arena (src/Arena.cs); a rent/return pair of each, measured,
+        // and a transposed float16 product's second call in a scope.
         ulong warm = gpu.Rent(1 << 20); gpu.Return(warm);
         long start = System.Diagnostics.Stopwatch.GetTimestamp();
         for (int i = 0; i < 10000; i++) { ulong p = gpu.Rent(1 << 20); gpu.Return(p); }
         double ns = System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds * 1e6 / 10000;
-        sb.AppendLine($"  buffers: a size-keyed pool; a rent/return pair after a shape's first call costs {ns:0} ns and no driver call (the arena)");
+        double arenaNs;
+        using (Scope())
+        {
+            ulong w = gpu.Rent(1 << 20); gpu.Return(w);
+            start = System.Diagnostics.Stopwatch.GetTimestamp();
+            for (int i = 0; i < 10000; i++) { ulong p = gpu.Rent(1 << 20); gpu.Return(p); }
+            arenaNs = System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds * 1e6 / 10000;
+        }
+
+        var view = new ProductView(256, 256, 256, true, false);
+        ulong da = gpu.Rent(256 * 256 * 2), db = gpu.Rent(256 * 256 * 2), dc = gpu.Rent(256 * 256 * 2);
+        Gpu.Clear(da, 256 * 256 * 2); Gpu.Clear(db, 256 * 256 * 2);
+        using (Scope()) MatMulView<Float16>(view, da, db, dc);
+        var before = gpu.Counts;
+        using (Scope()) MatMulView<Float16>(view, da, db, dc);
+        var after = gpu.Counts;
+        gpu.Return(da); gpu.Return(db); gpu.Return(dc);
+        sb.AppendLine($"  buffers: outside a scope a size-keyed pool (a rent/return pair {ns:0} ns), inside a scope the arena, one region bumped and released from the top (a pair {arenaNs:0} ns); a transposed float16 256³ product's second call in a scope: {after.ArenaRents - before.ArenaRents} arena rents, {after.PoolRents - before.PoolRents} pool rents, {after.DriverAllocations - before.DriverAllocations} driver allocations (region {gpu.ArenaCapacity >> 20} MB)");
         return sb.ToString();
     }
 }

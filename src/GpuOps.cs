@@ -891,6 +891,10 @@ public sealed partial class GpuOps(Gpu gpu)
 
     private static Lane RowLane(Fmt f) => f.Bits == 64 ? Lane.F64 : Lane.F32;
 
+    /// <summary>An arena scope on this device (src/Arena.cs): the operations called until it is disposed take their buffers
+    /// from one region, bumped and released from the top.</summary>
+    public Gpu.ArenaScope Scope() => gpu.Scope();
+
     // A row's block: enough threads (128 to 1024) that each holds about four words; the words per thread (a row in
     // registers up to 16; longer rows take the three-pass kernels).
     private static (int Threads, int WordsPerThread) RowShape(Fmt f, int cols)

@@ -75,7 +75,7 @@ internal static unsafe partial class Driver
 }
 
 /// <summary>One CUDA device: its facts, its compiled kernels and its memory.</summary>
-public sealed unsafe class Gpu : IDisposable
+public sealed unsafe partial class Gpu : IDisposable
 {
     private readonly Dictionary<string, IntPtr> _modules = [];
     private readonly Dictionary<(IntPtr, string), IntPtr> _functions = [];
@@ -212,17 +212,28 @@ public sealed unsafe class Gpu : IDisposable
         return sb.ToString();
     }
 
-    /// <summary>Device memory of at least <paramref name="bytes"/>, from the free-list when a buffer of that size was released before.</summary>
-    public ulong Rent(long bytes)
+    /// <summary>Device memory of at least <paramref name="bytes"/>: inside a scope from the arena (src/Arena.cs), else from the
+    /// free-list when a buffer of that size was released before.</summary>
+    public ulong Rent(long bytes) => _depth > 0 ? ArenaRent(bytes) : PoolRent(bytes);
+
+    public void Return(ulong pointer)
+    {
+        if (ArenaReturn(pointer)) return;
+        PoolReturn(pointer);
+    }
+
+    private ulong PoolRent(long bytes)
     {
         long size = Math.Max(256, (bytes + 255) / 256 * 256);
+        _poolRents++;
         if (_free.TryGetValue(size, out var stack) && stack.Count > 0) return stack.Pop();
         Driver.Check(Driver.cuMemAlloc(out ulong pointer, (nuint)size), "cuMemAlloc");
+        _driverAllocations++;
         _sizes[pointer] = size;
         return pointer;
     }
 
-    public void Return(ulong pointer)
+    private void PoolReturn(ulong pointer)
     {
         long size = _sizes[pointer];
         if (!_free.TryGetValue(size, out var stack)) _free[size] = stack = new Stack<ulong>();
@@ -284,5 +295,6 @@ public sealed unsafe class Gpu : IDisposable
     {
         foreach (var module in _modules.Values) Driver.cuModuleUnload(module);
         foreach (var pointer in _sizes.Keys) Driver.cuMemFree(pointer);
+        if (_region != 0) Driver.cuMemFree(_region);
     }
 }

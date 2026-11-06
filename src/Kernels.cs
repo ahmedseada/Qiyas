@@ -319,11 +319,11 @@ internal static partial class Kernels
             // The tile's A panel: every 6-row block of this panel of k packed first (it stays in L2), then each B strip
             // (L1-resident) swept over all the blocks.
             int blocksPerTile = (tileRows + R - 1) / R;
-            var panel = ArrayPool<TAcc>.Shared.Rent(blocksPerTile * kcg0 * R);
+            var panel = Workspace<TAcc>.Rent(Workspace.Panel, blocksPerTile * kcg0 * R);
             Span<TIn> rowsIn = stackalloc TIn[KC * R];
             Span<TAcc> spill = stackalloc TAcc[R * strip];
             ReadOnlySpan<TIn> direct = Lanes.Direct<TN, TIn>() ? MemoryMarshal.Cast<byte, TIn>(a.AsSpan()) : aLanes;
-            TIn[]? kRows = transA && direct.IsEmpty ? ArrayPool<TIn>.Shared.Rent(KC * tileRows) : null;
+            TIn[]? kRows = transA && direct.IsEmpty ? Workspace<TIn>.Rent(Workspace.KRows, KC * tileRows) : null;
             for (int t = first; t < last; t++)
             {
                 int r0 = t % rowTiles * tileRows, r1 = Math.Min(m, r0 + tileRows);
@@ -390,8 +390,8 @@ internal static partial class Kernels
                 }
             }
 
-            ArrayPool<TAcc>.Shared.Return(panel);
-            if (kRows is not null) ArrayPool<TIn>.Shared.Return(kRows);
+            Workspace<TAcc>.Return(Workspace.Panel, panel);
+            if (kRows is not null) Workspace<TIn>.Return(Workspace.KRows, kRows);
         }
     }
 
@@ -567,19 +567,19 @@ internal static partial class Kernels
         TIn[]? al = null, bl = null;
         TAcc[]? cl = null;
         long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-        var packed = accPool.Rent(strips * strip * kg);
+        var packed = Workspace<TAcc>.Rent(Workspace.Packed, strips * strip * kg);
         try
         {
             // Rows that do not start on whole bytes: that matrix loaded whole first.
             if (!aRows)
             {
-                al = inPool.Rent(m * k);
+                al = Workspace<TIn>.Rent(Workspace.ALanes, m * k);
                 Team.For(m * k, Math.Max(4096, m * k / (Threads * 2)) / 64 * 64, m * k, new LoadBody<TN, TIn>(a, al));
             }
 
             if (!nRows && o.ImageB is null)
             {
-                bl = inPool.Rent(k * n);
+                bl = Workspace<TIn>.Rent(Workspace.BLanes, k * n);
                 Team.For(k * n, Math.Max(4096, k * n / (Threads * 2)) / 64 * 64, k * n, new LoadBody<TN, TIn>(b, bl));
             }
 
@@ -588,7 +588,7 @@ internal static partial class Kernels
             t0 = Mark(t0, 1);
 
             // C in lanes (the stored bytes themselves when they are lanes).
-            cl = cDirect ? null : accPool.Rent(m * n);
+            cl = cDirect ? null : Workspace<TAcc>.Rent(Workspace.CLanes, m * n);
             var cLanes = cl ?? Unsafe.As<TAcc[]>(c);
 
             // Tiles of C: about six per thread (cores of unequal speed balance through the shared counter), rows in whole blocks, columns in whole strips.
@@ -612,10 +612,10 @@ internal static partial class Kernels
         }
         finally
         {
-            accPool.Return(packed);
-            if (al is not null) inPool.Return(al);
-            if (bl is not null) inPool.Return(bl);
-            if (cl is not null) accPool.Return(cl);
+            Workspace<TAcc>.Return(Workspace.Packed, packed);
+            if (al is not null) Workspace<TIn>.Return(Workspace.ALanes, al);
+            if (bl is not null) Workspace<TIn>.Return(Workspace.BLanes, bl);
+            if (cl is not null) Workspace<TAcc>.Return(Workspace.CLanes, cl);
         }
     }
 

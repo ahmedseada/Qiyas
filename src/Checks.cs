@@ -126,6 +126,7 @@ internal static class Checks
         ok &= Routings(null);
         ok &= Ctcs(null);
         ok &= BlockFormats(null);
+        ok &= Arenas(null);
         ok &= TeamJobs();
         return ok;
     }
@@ -1327,6 +1328,134 @@ internal static class Checks
         }
     }
 
+    // ---------------------------------------------------------------- the buffer arena and the product's workspace
+
+    /// <summary>The device: a transposed product, attention and an LSTM step (float16, float32), each called once outside a scope
+    /// (the pool) and then in scopes: from the second scoped call no pool rent, no driver allocation, no rent past the region,
+    /// nothing left unreturned or returned late, and the results equal to the pool's bit for bit. The CPU: the product and the
+    /// LSTM step reach a call with no workspace allocation and no pool fallback within a few calls, the results unchanged.</summary>
+    public static bool Arenas(GpuOps? ops)
+    {
+        bool ok = true;
+        string where = ops is null ? "cpu" : "device";
+        foreach (var type in new[] { "float16", "float32" })
+        {
+            var cases = new List<(string Name, byte[][] Inputs, int OutBytes, Func<ulong[], ulong, string>? Device, Action<byte[][], byte[]>? Cpu)>();
+            {
+                var v = new ProductView(192, 160, 300, true, false);
+                var a = Bench.Registry.Make(type, 300 * 192, 71, -1, 1); var b = Bench.Registry.Make(type, 300 * 160, 72, -1, 1);
+                int outBytes = (int)Bench.Registry.Bytes(type, 192 * 160);
+                cases.Add(("matmul_tn", [a, b], outBytes,
+                    (d, o) => Bench.Registry.WithFloat(type, new ArenaProduct(ops, v, d[0], d[1], o, null, null, null)),
+                    (x, o) => Bench.Registry.WithFloat(type, new ArenaProduct(null, v, 0, 0, 0, x[0], x[1], o))));
+            }
+
+            if (ops is not null)
+            {
+                var at = new AttentionArgs(2, 37, 53, 24, 0.2, true);
+                var q = Bench.Registry.Make(type, (int)at.QValues, 73, -1, 1); var k = Bench.Registry.Make(type, (int)at.KValues, 74, -1, 1); var vv = Bench.Registry.Make(type, (int)at.KValues, 75, -1, 1);
+                cases.Add(("attention", [q, k, vv], (int)Bench.Registry.Bytes(type, at.QValues),
+                    (d, o) => Bench.Registry.WithFloat(type, new ArenaAttention(ops, at, d[0], d[1], d[2], o)), null));
+            }
+
+            {
+                var ca = new CellArgs("lstm", 5, 7, 11);
+                int GH = ca.Gates * ca.H;
+                byte[] M(int n, int seed, double lo, double hi) => Bench.Registry.Make(type, n, seed, lo, hi);
+                byte[][] ins = [M(ca.B * ca.D, 81, -1, 1), M(ca.B * ca.H, 82, -1, 1), M(ca.B * ca.H, 83, -1, 1), M(GH * ca.D, 84, -0.3, 0.3), M(GH * ca.H, 85, -0.3, 0.3), M(GH, 86, -0.1, 0.1)];
+                int hBytes = (int)Bench.Registry.Bytes(type, ca.B * ca.H), cOff = (hBytes + 255) / 256 * 256;
+                cases.Add(("lstm_step", ins, cOff + hBytes,
+                    (d, o) => Bench.Registry.WithFloat(type, new ArenaLstm(ops, ca, d, o, hBytes, cOff, null, null)),
+                    (x, o) => Bench.Registry.WithFloat(type, new ArenaLstm(null, ca, null, 0, hBytes, cOff, x, o))));
+            }
+
+            foreach (var (name, inputs, outBytes, device, cpu) in cases)
+            {
+                if (ops is null)
+                {
+                    var first = new byte[outBytes];
+                    cpu!(inputs, first);
+                    bool steady = false;
+                    for (int call = 0; call < 8 && !steady; call++)
+                    {
+                        var again = new byte[outBytes];
+                        var (_, g0, p0) = Workspace.Counts;
+                        cpu(inputs, again);
+                        var (_, g1, p1) = Workspace.Counts;
+                        steady = g1 == g0 && p1 == p0;
+                        if (!again.AsSpan().SequenceEqual(first)) { Console.WriteLine($"check arena {name} {type} cpu: call {call + 2} differs from the first"); ok = false; break; }
+                    }
+
+                    if (!steady) { Console.WriteLine($"check arena {name} {type} cpu: still allocating after 8 calls"); ok = false; }
+                    continue;
+                }
+
+                var gpu = ops.Gpu;
+                var d = inputs.Select(x => { ulong p = gpu.Rent(x.Length); Qiyas.Gpu.Upload<byte>(x, p); return p; }).ToArray();
+                ulong dout = gpu.Rent(outBytes);
+                try
+                {
+                    var pooled = new byte[outBytes];
+                    Qiyas.Gpu.Clear(dout, outBytes);
+                    device!(d, dout);
+                    Qiyas.Gpu.Synchronize();
+                    Qiyas.Gpu.Download<byte>(dout, pooled);
+                    for (int call = 0; call < 3; call++)
+                    {
+                        Qiyas.Gpu.Clear(dout, outBytes);
+                        var c0 = gpu.Counts;
+                        using (ops.Scope()) device(d, dout);
+                        var c1 = gpu.Counts;
+                        var got = new byte[outBytes];
+                        Qiyas.Gpu.Synchronize();
+                        Qiyas.Gpu.Download<byte>(dout, got);
+                        if (!got.AsSpan().SequenceEqual(pooled)) { Console.WriteLine($"check arena {name} {type} device: scoped call {call + 1} differs from the pool's"); ok = false; }
+                        if (c1.Leaks != c0.Leaks || c1.Strays != c0.Strays) { Console.WriteLine($"check arena {name} {type} device: scoped call {call + 1} left {c1.Leaks - c0.Leaks} buffers unreturned, {c1.Strays - c0.Strays} returned late"); ok = false; }
+                        var (high, peak) = gpu.LastScope;
+                        if (call >= 1 && high != peak) { Console.WriteLine($"check arena {name} {type} device: scoped call {call + 1} reached {high} bytes of the region for {peak} alive at once (returned buffers not released)"); ok = false; }
+                        if (call >= 1 && (c1.PoolRents != c0.PoolRents || c1.DriverAllocations != c0.DriverAllocations || c1.Overflows != c0.Overflows || c1.ArenaRents == c0.ArenaRents))
+                        {
+                            Console.WriteLine($"check arena {name} {type} device: scoped call {call + 1}: {c1.ArenaRents - c0.ArenaRents} arena rents, {c1.PoolRents - c0.PoolRents} pool rents, {c1.DriverAllocations - c0.DriverAllocations} driver allocations, {c1.Overflows - c0.Overflows} past the region");
+                            ok = false;
+                        }
+                    }
+                }
+                finally
+                {
+                    foreach (var p in d) gpu.Return(p);
+                    gpu.Return(dout);
+                }
+            }
+        }
+
+        if (ok) Console.WriteLine($"check arena                  {where,-6} float16, float32: {(ops is null ? "the product and the LSTM step reach calls with no workspace allocation, the results unchanged" : "a transposed product, attention, an LSTM step: from the second scoped call no pool rent, no driver allocation, nothing past the region or unreturned, the region's high-water mark the peak alive at once, the results the pool's bit for bit")}");
+        return ok;
+    }
+
+    private sealed class ArenaProduct(GpuOps? ops, ProductView v, ulong da, ulong db, ulong dc, byte[]? a, byte[]? b, byte[]? c) : Bench.IFloatTypeVisitor<string>
+    {
+        public string Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float> =>
+            ops is null ? Kernels.MatMulView<TN>(v, a!, b!, c!) : ops.MatMulView<TN>(v, da, db, dc);
+    }
+
+    private sealed class ArenaAttention(GpuOps ops, AttentionArgs a, ulong q, ulong k, ulong v, ulong o) : Bench.IFloatTypeVisitor<string>
+    {
+        public string Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float> => ops.Attention<TN>(a, q, k, v, o);
+    }
+
+    // The LSTM step's h' then c' into one output (c' at cOff, a whole 256 bytes in).
+    private sealed class ArenaLstm(GpuOps? ops, CellArgs a, ulong[]? d, ulong o, int hBytes, int cOff, byte[][]? x, byte[]? output) : Bench.IFloatTypeVisitor<string>
+    {
+        public string Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float>
+        {
+            if (ops is not null) return ops.LstmStep<TN>(a, d![0], d[1], d[2], d[3], d[4], d[5], o, o + (ulong)cOff);
+            byte[] h = new byte[hBytes], c = new byte[hBytes];
+            string lane = Kernels.LstmStep<TN>(a, x![0], x[1], x[2], x[3], x[4], x[5], h, c);
+            h.CopyTo(output!, 0); c.CopyTo(output!, cOff);
+            return lane;
+        }
+    }
+
     // ---------------------------------------------------------------- the row operations on odd shapes
 
     /// <summary>Every float type, three shapes (37 × 1001; 5 × 64, a short row; 3 × 17, rows not ending on a word for the
@@ -1853,6 +1982,7 @@ internal static class Checks
         ok &= Routings(ops);
         ok &= Ctcs(ops);
         ok &= BlockFormats(ops);
+        ok &= Arenas(ops);
         return ok;
     }
 

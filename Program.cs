@@ -467,7 +467,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var output = new int[reference.Length];
             using var run = prepare(subject, output);
             if (run is null) { cells.Add(null); continue; }
-            double ms = Time(run.Run);
+            double ms = Time(Scoped(device, subject, run));
             run.Collect();
             double worst = extra?.Invoke() ?? 0;
             for (int i = 0; i < reference.Length; i++) worst = Math.Max(worst, Math.Abs((double)output[i] - reference[i]));
@@ -722,7 +722,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var output = new byte[count * 8];
             using var run = prepare(subject, output);
             if (run is null) { cells.Add(null); continue; }
-            double ms = Time(run.Run);
+            double ms = Time(Scoped(device, subject, run));
             run.Collect();
             var got = LaneValues.Decode(run.Lane, output, count);
             double worst = 0;
@@ -754,7 +754,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var output = new byte[outputBytes];
             using var run = prepare(subject, output);
             if (run is null) { cells.Add(null); continue; }
-            double ms = Time(run.Run);
+            double ms = Time(Scoped(device, subject, run));
             run.Collect();
             cells.Add(new Cell(subject.Name, run.Lane, ms, Err(type, output, reference)));
         }
@@ -776,6 +776,11 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
 
         return worst;
     }
+
+    // Qiyas on the device: each timed call inside one arena scope (src/Arena.cs), so its buffers come from one region with no
+    // pool lookup; the buffers prepared outside the call stay the pool's.
+    private static Action Scoped(Device device, IBenchSubject subject, IBenchRun run) =>
+        device == Device.Cuda && subject is QiyasSubject ? () => { using var scope = Devices.Ops.Scope(); run.Run(); } : run.Run;
 
     // Median wall time (ms) after one warm-up: at least 7 runs and 300 ms of them (at most 201 runs; past 3 runs, at
     // most 3 s), so a millisecond operation is timed over hundreds of runs and none by a handful.

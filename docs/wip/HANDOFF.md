@@ -68,15 +68,18 @@ Do not overuse bench runs: run one only when it is needed, and as small as the q
    README Results tables and becomes `docs/wip/baseline.md`. Never after a piece inside an item (4b, the GRU row, the
    tiled product, ...): a piece gets only the gates plus its own family's rows (rule 1).
 5. No bench to check a doc or a script change.
-6. The full runs at the end of items 5 and 6 (the coordinator, after item 4's run took over 92 minutes against a
-   one-hour limit): every family with the qiyas and lib columns, the number column on the core ops only, under 40
-   minutes in total. The CLI cannot split columns per family, so two invocations if needed, e.g.
-   `cuda,cpu --report --subjects qiyas,lib --ops all` and `cuda,cpu --report --subjects number` (core ops), the two
-   results files merged into the one baseline. Measure before launching: time a slice (one float, one integer and one
-   block type per device, `--ops all`) and scale it by the type count; if the estimate exceeds 40 minutes, say what
-   to cut and ask before running. Note: number implements the core ops only (src/Bench/NumberSubject.cs), so the run's
-   length is qiyas and lib across the families; item 4's run had CUDA about 45 minutes (the map family's formulas on
-   every type are most of the rows).
+6. The full runs at the end of items 5 and 6 (the coordinator, after item 4's `--ops all` run took 92 minutes: the
+   length came from the map family's formulas across all 21 types, not the number column). They time:
+   - the families the item changed, at every type;
+   - every other family at a fixed representative set of types: float32, float16, float64, int8, int4, q4_k;
+   - the map family with a fixed handful of formulas: add, mul, exp, gelu, erf and one backward (e.g. gelu_bwd).
+   Columns: qiyas and lib everywhere they have rows, number on the core ops only (it implements nothing else). The CLI
+   takes one `--types` and one `--ops` per invocation, so this is several invocations, their results merged into the
+   one baseline. Estimate the length from the baseline's per-row times (plus a per-row overhead for inputs, references
+   and the repeated timing) and send the estimate to the coordinator before launching; the ceiling is 40 minutes, aim
+   well under. Every bench runs on the owner's PC: anything over 5 minutes is estimated first, over 15 minutes asked
+   first; gate-only runs (`cuda --subjects qiyas --types float32 --ops add`, ~30 s, every gate) are preferred, and no
+   polling waiters or monitors.
 
 ## Item 4 progress (update as it moves)
 
@@ -202,6 +205,38 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
     5.98e-4 vs 1.95e-4, float8_e5m2 3.66e-4 vs 6.1e-5; sum:rows float16, bfloat16 up to 1.3×). The README now says so;
     item 6 below.
 - Item 4: done (closed by the coordinator with the stopped run). Next: item 5, the arena, on the coordinator's go.
+- Item 4 committed as c936dca.
+
+## Item 5 progress
+
+- Done, reported (uncommitted until the coordinator's go). What landed:
+  - `src/Arena.cs` (Gpu is partial now): `Gpu.Scope()` / `GpuOps.Scope()`; inside a scope `Rent` bumps in one region and
+    `Return` releases from the top (a buffer returned below the top waits until everything above it is); a rent past the
+    region comes from the pool for that call, and the outermost scope's end grows the region (synchronize, free, allocate,
+    rounded to 1 MB) to the call's peak computed as if every rent had been bumped, so the next call fits. Counts:
+    `Gpu.Counts` (arena rents, pool rents, driver allocations, overflows, leaks, strays), `Gpu.LastScope` (high-water
+    mark, peak alive). The pool (`PoolRent` / `PoolReturn`) is the old Rent / Return, unchanged, for rents outside scopes.
+  - the bench (`Program.Scoped`): every timed Qiyas call on the device inside one scope; the buffers prepared outside
+    stay the pool's.
+  - `src/Workspace.cs`: `Workspace<T>.Rent(slot, n)` / `Return` — per-thread, per-type arrays grown with a quarter's
+    headroom; a slot busy on the thread falls back to ArrayPool. `Kernels.MatMul`'s packed, al, bl, cl and
+    `ProductBody`'s panel and kRows use it.
+  - `--report`: pool pair 653 ns, arena pair 14 ns; a transposed float16 256³ product's second scoped call 3 arena
+    rents, 0 pool rents, 0 driver allocations (region 2 MB); CPU: a float16 product's second call 34 workspace rents, 0
+    allocations, 0 pool fallbacks.
+  - gate `Checks.Arenas` (both devices, float16 / float32): device — a transposed product, attention, an LSTM step,
+    once from the pool then three scoped calls: equal bit for bit, no leak or stray, and from the second scoped call no
+    pool rent, driver allocation or overflow and high-water mark == peak alive; CPU — the product and the LSTM step
+    reach a call with no workspace allocation or pool fallback within 8 calls, results unchanged. Mutations: the
+    workspace never freeing its slot (CPU: 4 failures), the bump never moving (device: results differ), the top never
+    released (device: lstm_step high-water 668160 for 337920 alive).
+  - timing (the coordinator's one run: `cuda,cpu --subjects qiyas --ops add,matmul,softmax,rms_norm,products`, 217 s)
+    against item 4's baseline: geomean new/base CUDA 0.997 (176 cells: 15 faster, 21 slower), CPU 1.009 (158: 41
+    faster, 42 slower); untouched cells moved as much (CPU add float16 1.41, CUDA add uint64 1.92): swing. One device
+    cluster is consistent: the products with Aᵀ (tn / tt) float16 1.11–1.14, bfloat16 1.10–1.14, int32 / uint32 1.17–1.30,
+    int64 / uint64 tt 1.59, batched int4 / int2 1.39–1.45, while nn / nt did not move: a Known slow row and item 6 below.
+    The sub-ms device cells expected to gain a few µs read softmax float16 0.084 → 0.075, bfloat16 0.082 → 0.077,
+    rms_norm bfloat16 0.081 → 0.075.
 - 4g: done, committed as d9939ff. What landed:
   - CPU: `Kernels.Operands.ImageB` (a ConvArgs): `PackBody` builds each row of the columns from the image
     (`ImageRow`: row p = (c, kh, kw), an image row read in place or loaded once, stride 1 by a contiguous copy with the
@@ -561,6 +596,11 @@ Each: measure against the baseline cell, change, re-measure (the full run or the
 - CPU recurrent sequences (the coordinator's observation at 4c): gru_seq 65–71 ms, lstm_seq 83 ms against ~15–20 ms
   implied by the f32 product rate (COVERAGE Known slow). The GRU sequence backward piece's runs read CPU gru_seq float32
   at 20.7 and 22.1 ms (after 4e's in-place products): re-measure lstm_seq too; the row may be done.
+- Device products with Aᵀ after item 5's arena (one run, no A/B at the coordinator's order): tn / tt float16
+  1.11–1.14×, bfloat16 1.10–1.14×, int32 / uint32 1.17–1.30×, int64 / uint64 tt 1.59×, batched int4 / int2 1.39–1.45×
+  against item 4's baseline, nn / nt unchanged. The Aᵀ route packs A into a rented buffer: compare the pool and the
+  arena on that path (`GpuOps.FusedConv`-style switch: the bench's scope off) once; if the arena costs it, find why
+  (the packed A adjacent to B in one region, or the growth's synchronize on the first scoped calls).
 - Item 4's full run, slower cells in code item 4 changed (not re-timed at the coordinator's order): CPU matmul
   float64 1.16×, float16 1.38×, float8_e5m2 1.41× (4e's product kernel: `Operands`, `Micro`'s cOff, the in-place
   route), CUDA matmul int4 1.15× (4e), CUDA softmax float16 1.12× (the launch-limit query, cached since). Re-time

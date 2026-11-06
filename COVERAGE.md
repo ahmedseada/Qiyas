@@ -33,9 +33,19 @@ Every bench row has a shape option (`--shapes odd`: the nearest primes below the
 report option (`--report`: the device's and the CPU's facts and the lanes chosen, measured — nothing assumed about a
 vendor, a vector width or a capability; a kind the JIT refuses falls back to the plain lanes).
 
-Device buffers come from a size-keyed pool: after a shape's first call no driver allocation happens; `--report` measures
-the cost of a rent/return pair (tens of nanoseconds). That pool is the arena the plan asked for; a bump-allocated scope
-per operation would save the remaining lookup and is the step past it.
+Device buffers: inside an arena scope (`GpuOps.Scope()`, src/Arena.cs; the bench opens one around every timed Qiyas call
+on the device) every rent bumps a pointer in one region and a return releases from the top (a buffer returned below the
+top once everything above it is), so a call's buffers are a stack in one allocation: no pool lookup, no driver call. A
+rent past the region comes from the pool for that call, and the scope's end grows the region to the call's peak (never
+inside a call), so the next call of the same shapes bumps everything. Outside a scope the size-keyed pool serves as
+before. `--report` measures a rent/return pair (pool 653 ns, arena 14 ns on this machine) and a transposed float16 256³
+product's second call in a scope (0 pool rents, 0 driver allocations). Gate (`Checks.Arenas`): a transposed product,
+attention and an LSTM step in float16 and float32: from the second scoped call no pool rent, no driver allocation,
+nothing past the region, unreturned or returned late, the region's high-water mark equal to the peak alive at once, and
+the results the pool's bit for bit. The CPU product's packed B, loaded A / B, C lanes, A panels and transposed k-rows come
+from a per-thread workspace (src/Workspace.cs) grown to the largest shape seen (a slot in use on the thread falls back to
+ArrayPool); the gate requires the product and the LSTM step to reach calls with no workspace allocation, results
+unchanged.
 
 ## State (2026-11-06, branch `coverage-wip`)
 
@@ -61,7 +71,8 @@ regression comparer and the baseline run.
 1. The todo rows below (item 4, in this order: fused attention rows — done, ctc — done, the GRU sequence bench row — done, the block-scaled
    tiled product — done, the transposition fused into the product's packing — done, the radix step of scatter-add — done, the fused direct
    convolution — done); the designs and the progress are in `docs/wip/HANDOFF.md`.
-2. A bump-allocated scope past the pool (buffers reserved once from the shapes; zero rents on the hot path).
+2. A bump-allocated scope past the pool (buffers reserved once from the shapes; zero rents on the hot path) — done
+   (item 5: the device arena and the CPU product workspace, above).
 3. The known-slow list.
 
 **Settled — the device products intermittent** (`matmul_bwd dB device uint64 / uint32 / uint16 DIFFERS by 138 steps`,
@@ -139,6 +150,7 @@ and measured against the baseline when it is.
 | CPU | ctc | 1.8 ms forward, 3.6–3.8 backward (float32, the same shape): a task per sequence (32 sequences on 24 threads, the recursion serial within one); moving the rows' work into a pass over all rows measured slower (single-value loads of the emissions), so it was not kept |
 | CPU | LSTM / GRU sequences | gru_seq 65–71 ms, lstm_seq 83 ms float32 (16 steps of 256 × 512 → 512, about 13 GFLOP of products) where the CPU's float32 product rate implies 15–20 ms: per step the gate products, the cell and the copies go through separate passes and allocations |
 | CUDA, CPU | GRU sequence backward | 4.5–6× the forward on both devices (16 steps of 256 × 512 → 512, float32: device 12.4–15.8 ms against 2.55–2.76, CPU 102–114 against 21–22) where the products imply about 4×: the step's backward recomputes the gates the forward's recompute already made, and each step's dW, dU, db, dbh are summed by separate adds (on the CPU into fresh arrays). To re-measure in item 6; keeping the recomputed gates and accumulating into the sums in place are the steps |
+| CUDA | products with Aᵀ after the arena (item 5) | tn / tt float16 1.11–1.14×, bfloat16 1.10–1.14×, int32 / uint32 1.17–1.30×, int64 / uint64 tt 1.59×, batched int4 / int2 1.39–1.45× against item 4's baseline in one run, nn / nt unchanged. To compare pool and arena on that path in item 6 |
 | CPU, CUDA | item 4's full run: slower cells in changed code | CPU matmul float64 1.16×, float16 1.38×, float8_e5m2 1.41×, CUDA matmul int4 1.15× against item 4a's baseline (4e changed the product kernels); CUDA softmax float16 1.12× (the launch-limit query, cached since). Not re-timed: item 6 re-times each once, both orders |
 | CUDA | the cross_entropy bench row | 46 ms float16, 95 float32 (4096 × 32768) against 18–23 on the CPU: the row composes three subject runs through host arrays (the contract has no device-resident chaining), so the device timing is the upload of logp (512 MB float32) and the downloads. To measure in item 6 as a device-resident composition (or a fused loss row) |
 | CPU | LSTM / GRU steps | 20–31 ms forward, 56–84 backward at B = D = H = 1024: the products dominate (four gates, two operands); a fused gates product is the step |

@@ -52,7 +52,9 @@ failed intermittently (the block transpose; 20 by default): a stress for schedul
 `--shapes odd` runs every row at the nearest primes below its regular sizes (4093 × 4091 instead of 4096², 16M − 5,
 …) so no dimension ends on a tile, a word or a block: the padded, value-wise and segmented paths are what is timed.
 `--report` prints, after the gates, the facts the run's kernels were chosen by (the team and vector widths, the dot
-lanes the runtime reports, the tensor kinds the JIT accepted, the sliced-float64 proof and every measured decision).
+lanes the runtime reports, the tensor kinds the JIT accepted, the sliced-float64 proof and every measured decision),
+and the buffers: the pool's and the arena's rent/return cost and a product's second call in an arena scope (its pool
+rents and driver allocations), the CPU product workspace's the same.
 
 `--ops map` adds a row per element-wise formula (`map:<name>`, 16M values); `reduce` adds the reductions (`sum:whole`,
 `sum:rows`, `sum:cols`, `sumsq:rows`, `max:whole`, `max:rows`, `max:cols`, `min:rows`, `argmax:rows`), the row-vector
@@ -113,7 +115,9 @@ checkout (files listed in `.gitignore`); a clone runs the other subjects.
 | `src/Types.cs` | the seventeen stored types and their lane rules |
 | `src/Blocks.cs`, `src/Ptx.Blocks.cs`, `src/BlockProducts.cs` | the block formats Q8_0, Q4_0, Q4_K, Q6_K and bool: the codecs (CPU and device encoders, a thread per block), the block-scaled integer gemv |
 | `src/MatMulBlocks.cs` | the block-scaled tiled product A·Bᵀ of Q8_0 / Q4_0 on the CPU (the s8 dot lane) and the device (the s8 tensor instruction at k = 32), and its measured choice against the decoded route |
-| `src/Report.cs` | `--report`: the facts and measured decisions of each device, the pool's rent/return cost |
+| `src/Report.cs` | `--report`: the facts and measured decisions of each device, the buffers' costs and steady state |
+| `src/Arena.cs` | the device's buffer arena: a scope's buffers bumped in one region, released from the top, the region grown between calls |
+| `src/Workspace.cs` | the CPU product's per-thread workspace (packed B, loaded A / B, C lanes, A panels) |
 | `docs/wip/` | the regression comparer (`compare.py`), the baseline run it compares against (`baseline.md`), the README Results generator (`readme_results.py`) |
 | `src/Convert.cs` | every load and store on vectors; `Widths`, any lane to any lane |
 | `src/Kernels.cs` | the CPU kernels: add, product (GotoBLAS-shaped, dot lanes in groups), softmax, rms_norm |
@@ -241,6 +245,6 @@ names the measured cells that are correct but below what the device allows.
 ## Open
 
 What the gates have not confirmed, or is not done, is in `COVERAGE.md` ("State" for the order, **todo** in the rows):
-a bump-allocated scope past the buffer pool, and the known-slow
+the known-slow
 cells (among them the tensor lanes inside the fused attention kernel, which runs in the FMA lane). The README claims nothing beyond what the gates and the regression
 comparison have confirmed.
