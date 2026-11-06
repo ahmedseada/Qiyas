@@ -22,7 +22,9 @@ does best for it, chosen per operation from the data itself. No type is fixed an
   accepts (the measured choice, then the 4-bit kinds and the 32-deep 8-bit instruction forced on and off), and under
   every tensor-kernel configuration the device can run with every kind choice (k = 53 and 300, every integer and
   narrow-float type); attention rows by both the composition and the fused rows (causal, spans with starts, head
-  dimensions up to 128, rows that see no key); the thread
+  dimensions up to 128, rows that see no key); ctc's loss and gradient (the float64 reference's gradient checked
+  against its own loss by central differences; short sequences, empty and repeated labels, another blank, a sequence
+  no alignment fits); the thread
   team under 20 000 jobs of alternating chunk counts (every chunk within its job, every index once). The float64
   reference of every product is accumulated in double-double, so an exact lane reads 0. The bench refuses to time while
   any gate fails.
@@ -32,7 +34,8 @@ does best for it, chosen per operation from the data itself. No type is fixed an
   and indexing (strided copies, one-hot, gathers, scatter-add, im2col/col2im, interpolation, shift, pad, the pools and
   their backward, depthwise convolution); products on views (transposed, batched) and the matmul backward; attention
   (rows by the composition or the fused rows, whichever is measured faster; causal, spans, decode, backward); convolution forward and backward; the optimizer steps; LSTM and GRU cells,
-  steps and sequences with their backward passes; top-k, pick, sampling, routing; and the block formats and bool
+  steps and sequences with their backward passes; top-k, pick, sampling, routing, cross-entropy and ctc (loss and
+  gradient); and the block formats and bool
   through all of it. What is still open is listed in COVERAGE.md's "State" and marked **todo** in its rows.
 
 ## The bench
@@ -69,7 +72,8 @@ named in the lane column); `conv` adds `conv` and `conv_bwd` (a 64 × 128 × 128
 pools and the depthwise convolution are layout operations (`layout:maxpool`, `layout:avgpool`, their `_bwd`,
 `layout:adaptive_maxpool`, `layout:adaptive_avgpool`, `layout:depthwise_conv`); `recurrent` adds `lstm_step`, `gru_step`
 and their `_bwd` (a batch of 1024, input 1024, hidden 1024), `lstm_seq` and `lstm_seq_bwd` (16 steps of 256 × 512 → 512); `routing` adds `topk_rows`, `pick_rows`, `sample_rows`
-(4096 rows of 32768), `route` (1M indices into 64 buckets) and `cross_entropy` (the loss by log_softmax, pick, neg).
+(4096 rows of 32768), `route` (1M indices into 64 buckets), `cross_entropy` (the loss by log_softmax, pick, neg), and
+`ctc`, `ctc_bwd` (256 frames of 32 sequences over 1024 classes, 64 labels each; the loss scored, then the gradient).
 `COVERAGE.md` lists every operation with its lane rule on each device. The block formats and bool run through every
 family: a block format's lane is float32, read a value at a time anywhere (both devices decode by index) and written a
 block at a time (the CPU re-encodes the blocks a store touches, tasks never sharing a block; the device computes
@@ -112,6 +116,7 @@ checkout (files listed in `.gitignore`); a clone runs the other subjects.
 | `src/Map.cs`, `src/Ptx.Map.cs` | the element-wise family: the catalogue of formulas (with float64 references), the CPU kernel, the device kernel |
 | `src/Rows.cs`, `src/Ptx.Rows.cs`, `src/GpuOps.Rows.cs`, `src/Bench/RowInputs.cs` | the row family: the catalogue (references, error scales), the CPU kernels, the device kernels, the inputs and tolerance shared by the checks and the bench |
 | `src/Routing.cs`, `src/Ptx.Routing.cs`, `src/GpuOps.Routing.cs` | top-k, pick, sampling, the route; cross-entropy's backward is a row operation |
+| `src/Ctc.cs`, `src/Ptx.Ctc.cs`, `src/GpuOps.Ctc.cs` | ctc: the arguments and the float64 reference, the CPU kernel, the device kernels (rows, then a block per sequence) |
 | `src/Recurrent.cs`, `src/Ptx.Recurrent.cs`, `src/GpuOps.Recurrent.cs`, `src/Bench/RecurrentCases.cs` | LSTM and GRU cells and steps, forward and backward |
 | `src/Conv.cs`, `src/GpuOps.Conv.cs` | convolution forward and backward as im2col / product / col2im compositions |
 | `src/Optimizers.cs`, `src/Ptx.Optimizers.cs`, `src/GpuOps.Optimizers.cs` | optimizer steps: sgd with momentum, adam, adamw |
@@ -209,7 +214,7 @@ allows.
 ## Open
 
 What the gates have not confirmed, or is not done, is in `COVERAGE.md` ("State" for the order, **todo** in the rows):
-ctc, a GRU sequence bench row, the block-scaled tiled product, the transposition fused into the product's packing, the
+a GRU sequence bench row, the block-scaled tiled product, the transposition fused into the product's packing, the
 radix step of scatter-add, a fused direct convolution, a bump-allocated scope past the buffer pool, and the known-slow
 cells (among them the tensor lanes inside the fused attention kernel, which runs in the FMA lane). The README claims nothing beyond what the gates and the regression
 comparison have confirmed.

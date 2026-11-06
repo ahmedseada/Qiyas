@@ -109,7 +109,7 @@ internal sealed class Options
     public static readonly string[] Group7 = [.. OptimizerArgs.Names.Select(n => "optimizer:" + n)];
     public static readonly string[] Group6 = ["conv", "conv_bwd"];
     public static readonly string[] Group8 = ["lstm_step", "gru_step", "lstm_step_bwd", "gru_step_bwd", "lstm_seq", "lstm_seq_bwd"];
-    public static readonly string[] Group9 = ["topk_rows", "pick_rows", "sample_rows", "route", "cross_entropy"];
+    public static readonly string[] Group9 = ["topk_rows", "pick_rows", "sample_rows", "route", "cross_entropy", "ctc", "ctc_bwd"];
     public List<string>? Subjects;
     public string? Baseline;
 
@@ -392,6 +392,28 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
                 var counts = new int[buckets];
                 var offsets = new int[buckets + 1];
                 MeasureIndices(device, name, "s32", $"{n} into {buckets}", wantOrder, (s, order) => s.Route(device, index, buckets, counts, offsets, order), extra: () => counts.SequenceEqual(wantCounts) && offsets.SequenceEqual(wantOffsets) ? 0 : 1);
+                return;
+            }
+
+            case "ctc":
+            case "ctc_bwd":
+            {
+                // ctc over 256 frames of 32 sequences, 1024 classes (blank 0), 64 labels each, the sequences 256, 248, 240,
+                // 232 frames in turn: the loss scored (ctc), the gradient scored (ctc_bwd, the loss computed with it).
+                if (!Registry.IsFloat(type)) return;
+                int T = Prime(256), B = Prime(32), C = Prime(1024), L = Prime(64);
+                var labelRandom = new Random(98);
+                var a = new CtcArgs(T, B, C, 0, [.. Enumerable.Range(0, B).Select(b => T - b % 4 * 8)], [.. Enumerable.Repeat(L, B)], [.. Enumerable.Range(0, B * L).Select(_ => 1 + labelRandom.Next(C - 1))]);
+                var x = Registry.Make(type, (int)a.Values, 99, -4, 4);
+                var (wantLoss, wantGrad) = a.Reference(Registry.Values(type, x, (int)a.Values));
+                string shape = $"T{T} B{B} C{C} L{L}";
+                if (name == "ctc") Measure(device, name, type, shape, wantLoss, (s, o) => s.Ctc(device, type, a, x, o, null), (int)Registry.Bytes(type, B));
+                else
+                {
+                    var loss = new byte[Registry.Bytes(type, B)];
+                    Measure(device, name, type, shape, wantGrad, (s, o) => s.Ctc(device, type, a, x, loss, o), (int)Registry.Bytes(type, a.Values));
+                }
+
                 return;
             }
 

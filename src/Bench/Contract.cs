@@ -104,6 +104,10 @@ public interface IBenchSubject
     /// <summary>output[r] = x[r][index[r]] as the type.</summary>
     IBenchRun? Pick(Device device, string type, byte[] x, int rows, int cols, int[] index, byte[] output) => null;
 
+    /// <summary>The ctc loss per sequence (B values as the type) from logits (T × B × C, CtcArgs); with grad given, the
+    /// gradient with respect to the logits too (T × B × C as the type).</summary>
+    IBenchRun? Ctc(Device device, string type, CtcArgs a, byte[] logits, byte[] loss, byte[]? grad) => null;
+
     /// <summary>picks[r] = the first column whose running sum of row r reaches u[r] · Σ row (u as the type, one per row).</summary>
     IBenchRun? Sample(Device device, string type, byte[] x, int rows, int cols, byte[] u, int[] picks) => null;
 

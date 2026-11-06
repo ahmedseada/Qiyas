@@ -124,6 +124,7 @@ internal static class Checks
         ok &= Convs(null);
         ok &= Recurrents(null);
         ok &= Routings(null);
+        ok &= Ctcs(null);
         ok &= BlockFormats(null);
         ok &= TeamJobs();
         return ok;
@@ -809,6 +810,114 @@ internal static class Checks
             }
 
             gpu.Return(dQ); gpu.Return(dK); gpu.Return(dV); gpu.Return(dO);
+            return true;
+        }
+    }
+
+    // ---------------------------------------------------------------- ctc
+
+    /// <summary>Every float type: the ctc loss (forward alone and with the gradient) and the gradient against the float64
+    /// reference on odd shapes: sequences shorter than T, an empty label, a label repeated next to itself (the blank
+    /// between them is required) and apart, a blank other than class 0. The recursion runs 2T steps over log values up to
+    /// |log P|, so the tolerance takes T · |log P| lane steps. A sequence no alignment fits (types with an infinity): loss
+    /// +∞, gradient 0. The gradient of each frame sums to 0 (float32, float64).</summary>
+    public static bool Ctcs(GpuOps? ops)
+    {
+        bool ok = true;
+        string where = ops is null ? "cpu" : "device";
+        var cases = new List<(CtcArgs A, bool Impossible)>
+        {
+            (new(11, 4, 7, 0, [11, 9, 11, 7], [3, 4, 0, 3], [1, 2, 3, 2, 2, 4, 5, 3, 1, 3]), false),
+            (new(13, 3, 5, 4, [13, 6, 12], [5, 3, 1], [0, 1, 2, 3, 0, 1, 1, 1, 2]), false),
+            (new(5, 2, 4, 0, [5, 2], [2, 2], [1, 2, 3, 3]), true),
+        };
+        // The reference's gradient against its own loss by central differences (the formula, independently of any kernel).
+        foreach (var (a, impossible) in cases)
+        {
+            if (impossible) continue;
+            var x = Bench.Registry.Values("float64", Bench.Registry.Make("float64", (int)a.Values, 61, -2, 2), (int)a.Values);
+            var (_, g) = a.Reference(x);
+            double worst = 0;
+            for (long i = 0; i < a.Values; i++)
+            {
+                int bb = (int)(i / a.C % a.B);
+                const double h = 1e-5;
+                double keep = x[i];
+                x[i] = keep + h; double up = a.Reference(x).Loss[bb];
+                x[i] = keep - h; double down = a.Reference(x).Loss[bb];
+                x[i] = keep;
+                worst = Math.Max(worst, Math.Abs((up - down) / (2 * h) - g[i]));
+            }
+
+            if (worst > 1e-7) { Console.WriteLine($"check ctc reference T{a.T} B{a.B} C{a.C}: the gradient differs from the loss's differences by {worst:R}"); ok = false; }
+        }
+
+        foreach (var type in Bench.Registry.Names)
+        {
+            if (!Bench.Registry.IsFloat(type)) continue;
+            bool infinity = type is "float32" or "float64" or "float16" or "bfloat16";
+            foreach (var (a, impossible) in cases)
+            {
+                if (impossible && !infinity) continue;
+                var x = Bench.Registry.Make(type, (int)a.Values, 61, -2, 2);
+                var (wantLoss, wantGrad) = a.Reference(Bench.Registry.Values(type, x, (int)a.Values));
+                double logP = wantLoss.Where(double.IsFinite).Max(Math.Abs);
+                int terms = a.T * (int)Math.Ceiling(logP + 1);
+                string name = $"ctc T{a.T} B{a.B} C{a.C}{(impossible ? " no alignment" : "")}";
+                int scored = impossible ? 1 : a.B;                            // the impossible case: its first sequence scored, the second checked for +∞
+                var loss = new byte[Bench.Registry.Bytes(type, a.B)];
+                Bench.Registry.WithFloat(type, new CtcRun(ops, a, x, loss, null));
+                ok &= Close(type, name + " loss", where, loss, wantLoss, scored, terms);
+                var loss2 = new byte[loss.Length];
+                var grad = new byte[Bench.Registry.Bytes(type, a.Values)];
+                Bench.Registry.WithFloat(type, new CtcRun(ops, a, x, loss2, grad));
+                ok &= Close(type, name + " loss (bwd)", where, loss2, wantLoss, scored, terms);
+                ok &= Close(type, name + " grad", where, grad, wantGrad, (int)a.Values, terms);
+                if (impossible)
+                {
+                    foreach (var l in new[] { loss, loss2 })
+                    {
+                        double got = Bench.Registry.Values(type, l, a.B)[1];
+                        if (!double.IsPositiveInfinity(got)) { Console.WriteLine($"check ctc no alignment {where,-6} {type,-12} loss {got:R}, not +∞"); ok = false; }
+                    }
+                }
+
+                if (type is "float32" or "float64")
+                {
+                    var g = Bench.Registry.Values(type, grad, (int)a.Values);
+                    double eps = type == "float64" ? Math.Pow(2, -52) : Math.Pow(2, -23), worst = 0;
+                    for (int t = 0; t < a.T; t++)
+                    {
+                        for (int bb = 0; bb < a.B; bb++)
+                        {
+                            double sum = 0;
+                            for (int c = 0; c < a.C; c++) sum += g[((long)t * a.B + bb) * a.C + c];
+                            worst = Math.Max(worst, Math.Abs(sum));
+                        }
+                    }
+
+                    if (worst > 4 * (a.C + terms) * eps) { Console.WriteLine($"check ctc grad sum {where,-6} {type,-12} a frame's gradient sums to {worst:R}, not 0"); ok = false; }
+                }
+            }
+        }
+
+        if (ok) Console.WriteLine($"check ctc                    {where,-6} every float type: loss and gradient (the reference's gradient by central differences), short sequences, empty and repeated labels, another blank, no alignment, within the recursion's rounding");
+        return ok;
+    }
+
+    private sealed class CtcRun(GpuOps? ops, CtcArgs a, byte[] x, byte[] loss, byte[]? grad) : Bench.IFloatTypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float>
+        {
+            if (ops is null) { Kernels.Ctc<TN>(a, x, loss, grad); return true; }
+            var gpu = ops.Gpu;
+            ulong dx = gpu.Rent(x.Length), dl = gpu.Rent(loss.Length), dg = grad is null ? 0 : gpu.Rent(grad.Length);
+            Qiyas.Gpu.Upload<byte>(x, dx);
+            ops.Ctc<TN>(a, dx, dl, dg);
+            Qiyas.Gpu.Synchronize();
+            Qiyas.Gpu.Download<byte>(dl, loss);
+            if (grad is not null) { Qiyas.Gpu.Download<byte>(dg, grad); gpu.Return(dg); }
+            gpu.Return(dx); gpu.Return(dl);
             return true;
         }
     }
@@ -1509,6 +1618,7 @@ internal static class Checks
         ok &= Convs(ops);
         ok &= Recurrents(ops);
         ok &= Routings(ops);
+        ok &= Ctcs(ops);
         ok &= BlockFormats(ops);
         return ok;
     }

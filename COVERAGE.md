@@ -58,7 +58,7 @@ regression comparer and the baseline run.
 
 **Open, in the order they are taken:**
 
-1. The todo rows below (item 4, in this order: fused attention rows — done, ctc, the GRU sequence bench row, the block-scaled
+1. The todo rows below (item 4, in this order: fused attention rows — done, ctc — done, the GRU sequence bench row, the block-scaled
    tiled product, the transposition fused into the product's packing, the radix step of scatter-add, the fused direct
    convolution); the designs and the progress are in `docs/wip/HANDOFF.md`.
 2. A bump-allocated scope past the pool (buffers reserved once from the shapes; zero rents on the hot path).
@@ -129,6 +129,8 @@ and measured against the baseline when it is.
 | CUDA | attention backward by the composition | 4.0 ms for 8 heads of 1024² |
 | CUDA | int8 adaptive_maxpool | 0.265 ms against float32 0.079 (per-value unpacking of 4 values a word in the window loop) |
 | CPU | top-k per row | 113 ms float32, 305 int8 for top-8 of 4096 × 32768: k passes over the row (a partial sort is the step) |
+| CUDA | ctc's recursion | 0.54 ms forward, 1.18 backward (float32; T 256, B 32, C 1024, 64 labels), of which the rows kernel is a small part: a block per sequence (32 of the device's blocks) and a barrier per frame, each step waiting on global loads of the state's class, flags and emission; the emissions computed beforehand and the next frame's loads issued before the barrier are the step |
+| CPU | ctc | 1.8 ms forward, 3.6–3.8 backward (float32, the same shape): a task per sequence (32 sequences on 24 threads, the recursion serial within one); moving the rows' work into a pass over all rows measured slower (single-value loads of the emissions), so it was not kept |
 | CPU | LSTM / GRU steps | 20–31 ms forward, 56–84 backward at B = D = H = 1024: the products dominate (four gates, two operands); a fused gates product is the step |
 
 ## Element-wise (map)
@@ -262,4 +264,4 @@ sum_axis, sumsq, max, min, argmax → the reductions; transpose; gemv_nn / gemv_
 | route: counts, offsets, the sources ordered by bucket | ✓ | ✓ | the scatter-add's ordering kernels (deterministic; quadratic in the source count on the device: a radix step for millions) |
 | cross-entropy rows: the loss (log_softmax → pick → neg), its backward (softmax − one_hot, a row operation) | ✓ float | ✓ float | |
 | expert products (a product per bucket over the routed rows) | ✓ | ✓ | gather_rows by the order, the batched product on views, scatter-add rows back: the composition |
-| ctc | todo | todo | |
+| ctc: the loss per sequence and its gradient with respect to the logits (T × B × C; log_softmax inside; per sequence its frames and labels, any blank class) | ✓ float | ✓ float | log-space α/β recursions over the 2L + 1 extended states; the gradient y − Σ exp(α + β − log y − log P) per class; a sequence no alignment fits: loss +∞, gradient 0. CPU: a task per sequence, the states a vector at a time (the lane's exp and log), float32/float64 rows in place, narrower floats a row at a time in the task, block formats through float32 storage. CUDA: a warp per (frame, sequence) row for the log-sum-exp and the softmax row, then a block per sequence: the states over its threads, a barrier per frame, each class's states summed by the class's first state (no atomics). Gate: the reference's gradient against its own loss by central differences; odd shapes with short sequences, empty and repeated labels, a blank other than 0, no alignment; the gradient of each frame sums to 0. float8_e4m3 cannot hold a loss past 448 (the bench row's ≈ 1800 store as NaN, its error column ∞); its gradient row is within the type |

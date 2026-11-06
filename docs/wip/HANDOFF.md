@@ -16,7 +16,7 @@ Release build 0 errors — then stop editing and wait for "go".
 |---|---|
 | Build | `dotnet build -c Release` (from `D:\Projects\Qiyas`); `sh guard.sh` before every build. A build fails while a bench process holds the dll. |
 | Full run (both devices' gates, then the core rows of every type) | `dotnet bin/Release/net10.0/Qiyas.dll cuda,cpu --report` (~25 min; writes `results-qiyas-cuda-cpu.md`). `cuda` alone also runs the CPU gates first. |
-| Regression gate | `python docs/wip/compare.py docs/wip/baseline.md results-qiyas-cuda-cpu.md` — prints every cell with base/new ms, ratio, lanes, errors; flags `SLOWER` (> 5 %) and `ERR UP`; "new row" for rows the baseline lacks. `baseline.md` is the full `cuda,cpu --report` run of item 4a (128 rows: the core rows of every type incl. the block formats and bool; committed with 4a). An earlier commit (c68ef15) held a matmul re-timing run there by mistake; the 12:38 run of item 3 survives only as the README Results tables, which `python docs/wip/compare_readme.py README.md results-qiyas-cuda-cpu.md <an older full run for the error column>` compares against cell by cell. Some CPU cells of the 4a run caught this laptop's slow level; re-time before calling a cell slower. Re-time a flagged cell several times before calling it swing: this laptop's sub-2 ms cells move ±20–40 % run to run; an A/B against a build of the baseline commit (`git worktree add <dir> c73a251`, build it, run both dlls back to back) separates code from machine state. |
+| Regression gate | per item (from 4c on): the gates plus only the rows of the family the item changed, qiyas only (e.g. `dotnet bin/Release/net10.0/Qiyas.dll cuda,cpu --subjects qiyas --ops recurrent` for the GRU row; every gate runs at startup), then `python docs/wip/compare.py docs/wip/baseline.md results-qiyas-cuda-cpu.md` — compare.py finds each subject's columns by the header's names, so a qiyas-only file compares with the full baseline; the full `cuda,cpu --report` run with every column only at the end of each whole item (after item 4, after item 5, after item 6; never after a piece inside an item): the README Results tables are regenerated from it (`docs/wip/readme_results.py`) and it becomes `docs/wip/baseline.md`. compare.py prints every cell with base/new ms, ratio, lanes, errors; flags `SLOWER` (> 5 %) and `ERR UP`; "new row" for rows the baseline lacks. `baseline.md` is the full `cuda,cpu --report` run of item 4a (128 rows: the core rows of every type incl. the block formats and bool; committed with 4a). An earlier commit (c68ef15) held a matmul re-timing run there by mistake; the 12:38 run of item 3 survives only as the README Results tables, which `python docs/wip/compare_readme.py README.md results-qiyas-cuda-cpu.md <an older full run for the error column>` compares against cell by cell. Some CPU cells of the 4a run caught this laptop's slow level; re-time before calling a cell slower. Re-time a flagged cell several times before calling it swing: this laptop's sub-2 ms cells move ±20–40 % run to run; an A/B against a build of the baseline commit (`git worktree add <dir> c73a251`, build it, run both dlls back to back) separates code from machine state. |
 | README Results tables | `python docs/wip/readme_results.py results-qiyas-cuda-cpu.md > tables.md` — the two tables (lib / number / qiyas / ×). The script sets stdout to UTF-8; redirect to a file and splice (the Bash console's code page mangles — × ³ otherwise). |
 | Gate-only quick runs | `Qiyas.dll cpu --types int8 --ops add` (every CPU gate, one row); `Qiyas.dll cuda --types float32 --ops add` (every gate on both devices). `--types` only limits the bench rows; the gates always cover every type. |
 | Stress | `--repeat N`: repeats the matmul rows N times and raises `Checks.Stress` (default 20) to N: the block-format transpose is repeated `Stress` times in Group2, the team gate runs `Stress × 500` jobs, the device products gate runs `Stress / 20` passes under every tensor kind. Used: `cpu --types q6_k,q4_k,q4_0,q8_0 --ops reduce --repeat 100` (the transpose race), `cpu --types int4 --ops matmul --repeat 30` ×5 (the team race), `cuda --types uint16 --ops matmul --repeat 600` (30 passes of the device products gate). |
@@ -48,13 +48,28 @@ script to a file and run `python script.py .` from the repository root.
 - The open intermittent (COVERAGE.md State, item 4 there): `matmul_bwd dB device` unsigned types wrong by 138 steps,
   seen once, not reproduced in 150 gate passes. If it shows again, `QIYAS_MAP_DEBUG=1` on the run captures the values.
 
+## Bench runs (the owner's rules, from item 4b on)
+
+Do not overuse bench runs: run one only when it is needed, and as small as the question allows.
+
+1. Per item: the gates (they all run at startup) plus only the rows of the family the item changed, qiyas only, e.g.
+   `--subjects qiyas --ops recurrent` for the GRU row.
+2. A/B or re-timing only for a slower cell whose code the item changed: at most once per cell, both orders in a single
+   comparison. A slower cell in code the item did not touch is machine swing by definition: list it, no A/B.
+3. Stress (`--repeat`) only when the item touches scheduling, chunking, shared buffers or a race-prone path.
+4. One full run with every column at the end of each whole item: once after item 4 (all seven todos gone, no todo
+   left in COVERAGE.md), once after item 5 (the arena), once after item 6 (the known-slow list). Each regenerates the
+   README Results tables and becomes `docs/wip/baseline.md`. Never after a piece inside an item (4b, the GRU row, the
+   tiled product, ...): a piece gets only the gates plus its own family's rows (rule 1).
+5. No bench to check a doc or a script change.
+
 ## Item 4 progress (update as it moves)
 
 Item 4 = every remaining **todo** in COVERAGE.md gone: 4a fused attention rows, 4b ctc, then 4c the GRU sequence bench
 row, 4d the block-scaled tiled product, 4e the transposition fused into the product's packing, 4f the radix step of
 scatter-add, 4g the fused direct convolution. Each may be reported as its own boundary.
 
-- 4a: done, reported as its own boundary (uncommitted until the coordinator's go). What landed:
+- 4a: done, committed as c35fd15 (the full run of 4a is docs/wip/baseline.md). What landed:
   - device kernel `Ptx.AttentionRows` (`src/Ptx.AttentionRows.cs`): a block of 256 threads per (head, Br query rows),
     Br = Bc = 32 in f32 and 16 in f64 (`Ptx.AttentionTile`), dCap ∈ {32, 64, 128}; K and V tiles through one shared
     buffer (`AttentionRowsShared`), 16-byte shared loads, group max/sum by `shfl.sync.bfly`, P through shared memory;
@@ -74,6 +89,27 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
   - measured (16 heads, 2048², d 128): device f32 3.79 ms (causal 2.12) from 6.1 by the composition; f16 3.82, fp8
     4.72, q8_0 3.95; f64 non-causal keeps the composition (59 vs 61), causal fused 31.7 vs 59. CPU f32 60–80 ms (causal
     33–38) from 100–148.
+- 4b: done, reported as its own boundary (uncommitted until the coordinator's go). What landed:
+  - `src/Ctc.cs`: `CtcArgs(T, B, C, Blank, InputLengths, LabelLengths, Labels)` with `Validate`, `States` (per sequence,
+    rows of MaxStates + 2: the class of each extended state; flags bit 0 = α may skip from s − 2, bit 1 = the class's
+    first state) and the float64 `Reference(x)` → (loss, grad); logits in, log_softmax inside.
+  - CPU `Kernels.Ctc<TN>`: a task per sequence (`CtcBody<TS, TLane, TL>`), the states a vector at a time with the
+    lane's exp/log; float32/float64 rows in place, narrower floats loaded a row at a time in the task (`TS.Load`), block
+    formats through float32 storage (`ToLane`/`FromLane`). Tried and dropped: the rows' lse and softmax as a pass over
+    all T × B rows (slower: the emissions became single-value loads).
+  - device `GpuOps.Ctc<TN>` (`src/GpuOps.Ctc.cs`) on lane storage: `Ptx.CtcRows` (a warp per row: lse, and for the
+    gradient the softmax row, 0 past the frames), then `Ptx.Ctc` (a block per sequence, 256 threads over the states,
+    α in two shared buffers with 2 front pads, α of every frame in global scratch, thread 0 takes log P; backward: β in
+    the same buffers with pads after S, per frame the states' terms into shared memory and each class's first state
+    writes y − Σ; no atomics). Shared bytes `CtcShared(lane, cap)`, cap = MaxStates rounded to 64; refuses past 48 KB.
+  - gate `Checks.Ctcs` (both devices, every float type): the reference's gradient by central differences; T11 B4 C7
+    (short sequences, an empty label, an adjacent and a non-adjacent repeat), T13 B3 C5 with blank 4, T5 B2 C4 with a
+    sequence no alignment fits (types with an infinity: loss +∞, gradient 0); per-frame gradient sums to 0 (f32/f64).
+    A mutation (the skip rule off) fails it on both devices by millions of steps.
+  - contract `IBenchSubject.Ctc(device, type, args, logits, loss, grad)`; bench rows `ctc`, `ctc_bwd` in Group9
+    (`--ops routing`).
+  - measured (T 256, B 32, C 1024, 64 labels): device f32 0.54 / 1.18 ms (fwd / bwd), f64 2.35 / 5.25; CPU f32
+    1.8 / 3.6–3.8, f16 2.4 / 4.4, f64 4.0 / 8.0. The device recursion is latency-bound (COVERAGE "Known slow").
 
 ## Item 4a — flash-fused attention rows
 

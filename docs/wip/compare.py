@@ -2,19 +2,18 @@ import sys, re
 base, new = sys.argv[1], sys.argv[2]
 
 def parse(path):
+    # Each subject's columns (ms, x, lane, err) are found by the header's names ("qiyas ms", ...), so a run of some
+    # subjects only (--subjects qiyas) compares with a run of all of them.
     rows = {}
+    at = None
     for line in open(path, encoding='utf-8'):
-        if not line.startswith('| c'): continue
         cells = [c.strip() for c in line.strip().strip('|').split('|')]
-        device, op, typ, shape = cells[:4]
-        rest = cells[4:]
-        # columns per subject: ms, x, lane, err (subjects lib, number, qiyas in order)
-        subj = {}
-        names = ['lib', 'number', 'qiyas']
-        for i, name in enumerate(names):
-            ms, x, lane, err = rest[4 * i: 4 * i + 4]
-            subj[name] = (ms, x, lane, err)
-        rows[(device, op, typ)] = subj
+        if line.startswith('| device'):
+            at = {c[:-3]: i for i, c in enumerate(cells) if c.endswith(' ms')}
+            continue
+        if not line.startswith('| c') or at is None: continue
+        device, op, typ = cells[:3]
+        rows[(device, op, typ)] = {name: tuple(cells[i:i + 4]) for name, i in at.items()}
     return rows
 
 b, n = parse(base), parse(new)

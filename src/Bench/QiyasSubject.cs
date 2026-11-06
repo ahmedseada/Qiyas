@@ -149,6 +149,25 @@ public sealed class QiyasSubject : IBenchSubject
     public IBenchRun? Pick(Device device, string type, byte[] x, int rows, int cols, int[] index, byte[] output) =>
         Registry.With(type, new PickVisitor(device, x, rows, cols, index, output));
 
+    public IBenchRun? Ctc(Device device, string type, CtcArgs a, byte[] logits, byte[] loss, byte[]? grad) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new CtcVisitor(device, a, logits, loss, grad)) : null;
+
+    private sealed class CtcVisitor(Device device, CtcArgs a, byte[] x, byte[] loss, byte[]? grad) : IFloatTypeVisitor<IBenchRun?>
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float>
+        {
+            string lane = "";
+            if (device == Device.Cpu) return new BenchRun(() => lane = Kernels.Ctc<TN>(a, x, loss, grad), lane: () => lane);
+            var ops = Devices.Ops;
+            var gpu = ops.Gpu;
+            ulong dx = gpu.Rent(x.Length), dl = gpu.Rent(loss.Length), dg = grad is null ? 0 : gpu.Rent(grad.Length);
+            Gpu.Upload<byte>(x, dx);
+            return new BenchRun(() => { lane = ops.Ctc<TN>(a, dx, dl, dg); Gpu.Synchronize(); },
+                () => { Gpu.Download<byte>(dl, loss); if (grad is not null) Gpu.Download<byte>(dg, grad); },
+                () => { gpu.Return(dx); gpu.Return(dl); if (dg != 0) gpu.Return(dg); }, () => lane);
+        }
+    }
+
     public IBenchRun? Sample(Device device, string type, byte[] x, int rows, int cols, byte[] u, int[] picks) =>
         Registry.IsFloat(type) ? Registry.WithFloat(type, new SampleVisitor(device, x, rows, cols, u, picks)) : null;
 
