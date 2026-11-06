@@ -100,7 +100,1084 @@ internal static class Checks
         // exp on vectors against the runtime's scalar exp, in units of the last place.
         ok &= Exp32(random);
         ok &= Exp64(random);
+        ok &= Function32("log f32", Funcs.Log, Math.Log, 1e-30, 1e30, 2, random, logScale: true);
+        ok &= Function64("log f64", Funcs.Log, Math.Log, 1e-300, 1e300, 2, random, logScale: true);
+        ok &= Function32("sin f32", Funcs.Sin, Math.Sin, -1000, 1000, 2, random);
+        ok &= Function64("sin f64", Funcs.Sin, Math.Sin, -1000, 1000, 2, random);
+        ok &= Function32("cos f32", Funcs.Cos, Math.Cos, -1000, 1000, 2, random);
+        ok &= Function64("cos f64", Funcs.Cos, Math.Cos, -1000, 1000, 2, random);
+        ok &= Function32("expm1 f32", Funcs.Expm1, Funcs.Expm1Reference, -1, 1, 2, random);
+        ok &= Function64("expm1 f64", Funcs.Expm1, Funcs.Expm1Reference, -1, 1, 2, random);
+        ok &= Function32("tanh f32", Funcs.Tanh, Math.Tanh, -10, 10, 3, random);
+        ok &= Function64("tanh f64", Funcs.Tanh, Math.Tanh, -10, 10, 3, random);
+        ok &= Function32("sigmoid f32", Funcs.Sigmoid, x => 1 / (1 + Math.Exp(-x)), -20, 20, 3, random);
+        ok &= Function64("sigmoid f64", Funcs.Sigmoid, x => 1 / (1 + Math.Exp(-x)), -20, 20, 3, random);
+        ok &= Function32("erf f32", Funcs.Erf, Funcs.ErfReference, -5, 5, 4, random);
+        ok &= Function64("erf f64", Funcs.Erf, Funcs.ErfReference, -6, 6, 4, random);
+        ok &= Maps(null);
+        ok &= Group2(null);
+        ok &= Rows(null);
+        ok &= Layouts(null);
+        ok &= Products(null);
+        ok &= Attentions(null);
+        ok &= Optimizers(null);
+        ok &= Convs(null);
+        ok &= Recurrents(null);
+        ok &= Routings(null);
+        ok &= BlockFormats(null);
         return ok;
+    }
+
+    // ---------------------------------------------------------------- the block formats
+
+    /// <summary>Q8_0, Q4_0, Q4_K, Q6_K: 1001 values (not whole blocks) encoded and decoded on the CPU within the block's step;
+    /// the device's decode bit for bit against the CPU's; the device's encode (Q8_0, Q4_0) byte for byte against the CPU's.</summary>
+    public static bool BlockFormats(GpuOps? ops)
+    {
+        bool ok = true;
+        string where = ops is null ? "cpu" : "device";
+        var random = new Random(99);
+        foreach (var type in Bench.Registry.Names)
+        {
+            if (!Bench.Registry.IsBlock(type)) continue;
+            const int n = 1001;
+            var values = new double[n];
+            for (int i = 0; i < n; i++) values[i] = (random.NextDouble() * 8 - 4) * (i % 7 == 0 ? 0.01 : 1);
+            var stored = Bench.Registry.Encode(type, values);
+            var back = Bench.Registry.Values(type, stored, n);
+            int mant = Bench.Registry.Mantissa(type), blockValues = type is "q8_0" or "q4_0" ? 32 : 256;
+            double worst = 0;
+            for (int i = 0; i < n; i++)
+            {
+                double bmax = 0;
+                for (int j = i / blockValues * blockValues; j < Math.Min(n, i / blockValues * blockValues + blockValues); j++) bmax = Math.Max(bmax, Math.Abs(values[j]));
+                double step = bmax * Math.Pow(2, -mant) + 1e-30;
+                worst = Math.Max(worst, Math.Abs(back[i] - values[i]) / step);
+            }
+
+            if (worst > 1.5) { Console.WriteLine($"check block {type,-6} round trip   cpu    DIFFERS by {worst:0.##} block steps"); ok = false; }
+            if (ops is null) continue;
+            var gpu = ops.Gpu;
+            // The device decodes every value as the CPU does (its Widen kernel), and encodes Q8_0 / Q4_0 as the CPU does.
+            ulong d = gpu.Rent(stored.Length), lanes = gpu.Rent(n * 4L);
+            Qiyas.Gpu.Upload<byte>(stored, d);
+            var lane = new float[n];
+            Bench.Registry.WithFloat(type, new WidenRun(ops, d, lanes, n));
+            Qiyas.Gpu.Synchronize();
+            Qiyas.Gpu.Download<float>(lanes, lane);
+            int bad = 0;
+            for (int i = 0; i < n; i++) if (lane[i] != (float)back[i]) bad++;
+            if (bad > 0) { Console.WriteLine($"check block {type,-6} decode       device DIFFERS at {bad} values"); ok = false; }
+            if (type is "q8_0" or "q4_0")
+            {
+                var f32 = new float[n];
+                for (int i = 0; i < n; i++) f32[i] = (float)values[i];
+                ulong src = gpu.Rent(n * 4L), enc = gpu.Rent(stored.Length);
+                Qiyas.Gpu.Upload<float>(f32, src);
+                Bench.Registry.WithFloat(type, new NarrowRun(ops, src, enc, n));
+                Qiyas.Gpu.Synchronize();
+                var encoded = new byte[stored.Length];
+                Qiyas.Gpu.Download<byte>(enc, encoded);
+                int diff = 0;
+                for (int i = 0; i < stored.Length; i++) if (encoded[i] != stored[i]) diff++;
+                if (diff > 0) { Console.WriteLine($"check block {type,-6} encode       device DIFFERS at {diff} bytes"); ok = false; }
+                gpu.Return(src); gpu.Return(enc);
+            }
+
+            gpu.Return(d); gpu.Return(lanes);
+        }
+
+        if (ok) Console.WriteLine($"check block formats          {where,-6} Q8_0, Q4_0, Q4_K, Q6_K: round trips within the block's step; the device's codecs as the CPU's");
+        return ok;
+    }
+
+    private sealed class WidenRun(GpuOps ops, ulong stored, ulong lanes, int n) : Bench.IFloatTypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float> { ops.ToLanes<TN>(Lane.F32, stored, lanes, n); return true; }
+    }
+
+    private sealed class NarrowRun(GpuOps ops, ulong lanes, ulong stored, int n) : Bench.IFloatTypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float> { ops.FromLanes<TN>(Lane.F32, lanes, stored, n); return true; }
+    }
+
+    // ---------------------------------------------------------------- routing, sampling and the loss on odd shapes
+
+    /// <summary>Every type: top-k (k = 5 of 1001, ties included) exact; pick exact; sampling (float types) exact against
+    /// the float64 draw except where the lane's rounding of the running sum crosses the threshold (allowed: the next
+    /// column); the route of 1001 indices into 7 buckets exact.</summary>
+    public static bool Routings(GpuOps? ops)
+    {
+        bool ok = true;
+        string where = ops is null ? "cpu" : "device";
+        const int rows = 37, cols = 1001, k = 5;
+        var random = new Random(98);
+        foreach (var type in Bench.Registry.Names)
+        {
+            var x = Bench.Registry.Make(type, rows * cols, 95, -4, 4);
+            var xv = Bench.Registry.Values(type, x, rows * cols);
+            var (wantV, wantI) = Routing.TopKReference(xv, rows, cols, k);
+            var values = new byte[Bench.Registry.Bytes(type, rows * k)];
+            var indices = new int[rows * k];
+            Bench.Registry.With(type, new TopKRun(ops, x, rows, cols, k, values, indices, null, null, null, null));
+            // Ties (the narrow types have many): the values must match exactly; the indices where the values are distinct.
+            ok &= Close(type, "topk values", where, values, wantV, rows * k);
+            int bad = 0;
+            for (int i = 0; i < rows * k; i++) if (indices[i] != wantI[i] && xv[i / k * cols + indices[i]] != wantV[i]) bad++;
+            if (bad > 0) { Console.WriteLine($"check topk indices  {where,-6} {type,-12} DIFFERS at {bad} places"); ok = false; }
+            var index = Enumerable.Range(0, rows).Select(_ => random.Next(cols)).ToArray();
+            var picked = new byte[Bench.Registry.Bytes(type, rows)];
+            Bench.Registry.With(type, new TopKRun(ops, x, rows, cols, 0, null, null, index, picked, null, null));
+            ok &= Close(type, "pick", where, picked, Routing.PickReference(xv, rows, cols, index), rows);
+            if (Bench.Registry.IsFloat(type))
+            {
+                var w = Bench.Registry.Make(type, rows * cols, 95, 0, 1);
+                var u = Bench.Registry.Make(type, rows, 96, 0, 1);
+                var wantS = Routing.SampleReference(Bench.Registry.Values(type, w, rows * cols), rows, cols, Bench.Registry.Values(type, u, rows));
+                var picks = new int[rows];
+                Bench.Registry.WithFloat(type, new SampleRun(ops, w, rows, cols, u, picks));
+                int off = 0;
+                for (int r = 0; r < rows; r++) if (Math.Abs(picks[r] - wantS[r]) > 1) off++;
+                if (off > 0) { Console.WriteLine($"check sample        {where,-6} {type,-12} DIFFERS at {off} rows by more than one column"); ok = false; }
+            }
+        }
+
+        {
+            var index = Enumerable.Range(0, 1001).Select(_ => random.Next(7)).ToArray();
+            var (wc, wo, worder) = Routing.RouteReference(index, 7);
+            var counts = new int[7];
+            var offsets = new int[8];
+            var order = new int[1001];
+            var subject = new Bench.QiyasSubject();
+            using var run = subject.Route(ops is null ? Bench.Device.Cpu : Bench.Device.Cuda, index, 7, counts, offsets, order)!;
+            run.Run(); run.Collect();
+            if (!counts.SequenceEqual(wc) || !offsets.SequenceEqual(wo) || !order.SequenceEqual(worder)) { Console.WriteLine($"check route         {where,-6} DIFFERS"); ok = false; }
+        }
+
+        if (ok) Console.WriteLine($"check routing                {where,-6} every type: top-k, pick, sampling (float types) and the route as the references");
+        return ok;
+    }
+
+    private sealed class TopKRun(GpuOps? ops, byte[] x, int rows, int cols, int k, byte[]? values, int[]? indices, int[]? index, byte[]? picked, object? u1, object? u2) : Bench.ITypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasNumber<TN, float>
+        {
+            var subject = new Bench.QiyasSubject();
+            var device = ops is null ? Bench.Device.Cpu : Bench.Device.Cuda;
+            using var run = values is not null ? subject.TopK(device, TN.Name, x, rows, cols, k, values, indices!)! : subject.Pick(device, TN.Name, x, rows, cols, index!, picked!)!;
+            run.Run(); run.Collect();
+            return true;
+        }
+    }
+
+    private sealed class SampleRun(GpuOps? ops, byte[] x, int rows, int cols, byte[] u, int[] picks) : Bench.IFloatTypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float>
+        {
+            var subject = new Bench.QiyasSubject();
+            using var run = subject.Sample(ops is null ? Bench.Device.Cpu : Bench.Device.Cuda, TN.Name, x, rows, cols, u, picks)!;
+            run.Run(); run.Collect();
+            return true;
+        }
+    }
+
+    // ---------------------------------------------------------------- recurrent steps on odd shapes
+
+    /// <summary>Every float type: LSTM and GRU steps over 37 rows (input 29, hidden 53) and 5 rows (input 7, hidden 11), forward
+    /// (h', c') and backward (dx, dh, dc, dW, dU, db, dbh) against float64 within the products' rounding.</summary>
+    public static bool Recurrents(GpuOps? ops)
+    {
+        bool ok = true;
+        string where = ops is null ? "cpu" : "device";
+        foreach (var type in Bench.Registry.Names)
+        {
+            if (!Bench.Registry.IsFloat(type)) continue;
+            foreach (var kind in new[] { "lstm", "gru" })
+            {
+                foreach (var (B, D, H) in new[] { (37, 29, 53), (5, 7, 11) })
+                {
+                    var a = new CellArgs(kind, B, D, H);
+                    foreach (bool backward in new[] { false, true })
+                    {
+                        var k = Bench.RecurrentCase.Make(a, type, backward);
+                        int GH = a.Gates * H;
+                        if (!backward)
+                        {
+                            var hOut = new byte[k.H.Length];
+                            Bench.Registry.WithFloat(type, new RecurrentRun(ops, a, k, hOut, null));
+                            ok &= Close(type, $"{kind}_step h", where, hOut, k.WantH, B * H, D + H);
+                            if (k.COut is not null) ok &= Close(type, $"{kind}_step c", where, k.COut, k.WantC!, B * H, D + H);
+                            continue;
+                        }
+
+                        var dx = new byte[k.X.Length];
+                        Bench.Registry.WithFloat(type, new RecurrentRun(ops, a, k, dx, null));
+                        ok &= Close(type, $"{kind}_step_bwd dx", where, dx, k.WantDx!, B * D, 4 * (D + H + GH));
+                        ok &= Close(type, $"{kind}_step_bwd dh", where, k.Dh!, k.WantDh!, B * H, 4 * (D + H + GH));
+                        if (k.Dc is not null) ok &= Close(type, $"{kind}_step_bwd dc", where, k.Dc, k.WantDc!, B * H, 4 * (D + H));
+                        ok &= Close(type, $"{kind}_step_bwd dw", where, k.Dw!, k.WantDw!, GH * D, 4 * (D + H + B));
+                        ok &= Close(type, $"{kind}_step_bwd du", where, k.Du!, k.WantDu!, GH * H, 4 * (D + H + B));
+                        ok &= Close(type, $"{kind}_step_bwd db", where, k.Db!, k.WantDb!, GH, 4 * (D + H + B));
+                        if (k.Dbh is not null) ok &= Close(type, $"{kind}_step_bwd dbh", where, k.Dbh, k.WantDbh!, GH, 4 * (D + H + B));
+                    }
+                }
+            }
+        }
+
+        // Sequences: 3 steps of 5 × 7 → 11, forward (h, c every step) and backward (dx, dh0, dc0, dW, dU, db), for the plain float types.
+        foreach (var type in Bench.Registry.Names)
+        {
+            if (!Bench.Registry.IsFloat(type) || Bench.Registry.IsBlock(type)) continue;
+            var a = new CellArgs("lstm", 5, 7, 11);
+            const int T = 3;
+            int GH = a.Gates * a.H;
+            double scale = 1 / Math.Sqrt(a.D + a.H);
+            var x = Bench.Registry.Make(type, T * a.B * a.D, 81, -1, 1); var h0 = Bench.Registry.Make(type, a.B * a.H, 82, -1, 1); var c0 = Bench.Registry.Make(type, a.B * a.H, 83, -1, 1);
+            var w = Bench.Registry.Make(type, GH * a.D, 84, -scale, scale); var u = Bench.Registry.Make(type, GH * a.H, 85, -scale, scale); var b = Bench.Registry.Make(type, GH, 86, -0.1, 0.1);
+            double[] V(byte[] s, int n) => Bench.Registry.Values(type, s, n);
+            var (wantH, wantC) = Bench.RecurrentCase.LstmSequenceReference(a, T, V(x, T * a.B * a.D), V(h0, a.B * a.H), V(c0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH));
+            var hOut = new byte[Bench.Registry.Bytes(type, T * a.B * a.H)]; var cOut = new byte[hOut.Length];
+            var subject = new Bench.QiyasSubject();
+            var dev = ops is null ? Bench.Device.Cpu : Bench.Device.Cuda;
+            using (var run = subject.LstmSequence(dev, type, a, T, x, h0, c0, w, u, b, hOut, cOut, null, null, null, null, null, null)!) { run.Run(); run.Collect(); }
+            ok &= Close(type, "lstm_seq h", where, hOut, wantH, T * a.B * a.H, T * (a.D + a.H));
+            ok &= Close(type, "lstm_seq c", where, cOut, wantC, T * a.B * a.H, T * (a.D + a.H));
+            var dhOut = Bench.Registry.Make(type, T * a.B * a.H, 88, -1, 1); var dcLast = Bench.Registry.Make(type, a.B * a.H, 89, -1, 1);
+            var (wdx, wdh0, wdc0, wdw, wdu, wdb) = Bench.RecurrentCase.LstmSequenceBackwardReference(a, T, V(x, T * a.B * a.D), V(h0, a.B * a.H), V(c0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH), V(dhOut, T * a.B * a.H), V(dcLast, a.B * a.H));
+            var dx = new byte[x.Length]; var dh0 = new byte[h0.Length]; var dc0 = new byte[c0.Length]; var dw = new byte[w.Length]; var du = new byte[u.Length]; var db = new byte[b.Length];
+            using (var run = subject.LstmSequence(dev, type, a, T, x, h0, c0, w, u, b, dhOut, dcLast, dx, dh0, dc0, dw, du, db)!) { run.Run(); run.Collect(); }
+            int terms = 8 * T * (a.D + a.H + GH + a.B);
+            ok &= Close(type, "lstm_seq_bwd dx", where, dx, wdx, T * a.B * a.D, terms);
+            ok &= Close(type, "lstm_seq_bwd dh0", where, dh0, wdh0, a.B * a.H, terms);
+            ok &= Close(type, "lstm_seq_bwd dc0", where, dc0, wdc0, a.B * a.H, terms);
+            ok &= Close(type, "lstm_seq_bwd dw", where, dw, wdw, GH * a.D, terms);
+            ok &= Close(type, "lstm_seq_bwd du", where, du, wdu, GH * a.H, terms);
+            ok &= Close(type, "lstm_seq_bwd db", where, db, wdb, GH, terms);
+        }
+
+        if (ok) Console.WriteLine($"check recurrent              {where,-6} every float type: LSTM and GRU steps, forward and backward, and LSTM sequences, within the products' rounding");
+        return ok;
+    }
+
+    private sealed class RecurrentRun(GpuOps? ops, CellArgs a, Bench.RecurrentCase k, byte[] output, byte[]? unused) : Bench.IFloatTypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float>
+        {
+            bool lstm = a.Kind == "lstm", backward = k.DhOut is not null;
+            var subject = new Bench.QiyasSubject();
+            using var run = subject.Recurrent(ops is null ? Bench.Device.Cpu : Bench.Device.Cuda, TN.Name, a, k.X, k.H, k.C, k.W, k.U, k.Bias, k.BiasH,
+                backward ? k.DhOut! : output, backward ? k.DcOut : k.COut, backward ? output : null, k.Dh, k.Dc, k.Dw, k.Du, k.Db, k.Dbh)!;
+            run.Run();
+            run.Collect();
+            return true;
+        }
+    }
+
+    // ---------------------------------------------------------------- convolution on odd shapes
+
+    /// <summary>Every type: a 3 × 7 × 9 image by 5 filters of 3 × 2 at stride 2 × 1, pad 1, dilation 1; and 2 × 5 × 5 by 3 of 3 × 3
+    /// dilated 2; forward and the backward pair against float64 within the products' rounding.</summary>
+    public static bool Convs(GpuOps? ops)
+    {
+        bool ok = true;
+        string where = ops is null ? "cpu" : "device";
+        foreach (var type in Bench.Registry.Names)
+        {
+            foreach (var a in new[] { new ConvArgs(3, 7, 9, 5, 3, 2, 2, 1, 1, 1), new ConvArgs(2, 5, 5, 3, 3, 3, 1, 1, 1, 1, 2, 2) })
+            {
+                var x = Bench.Registry.Make(type, (int)a.XValues, 61, -1, 1);
+                var w = Bench.Registry.Make(type, (int)a.WValues, 62, -1, 1);
+                var y = new byte[Bench.Registry.Bytes(type, a.YValues)];
+                var want = a.Reference(Bench.Registry.Values(type, x, (int)a.XValues), Bench.Registry.Values(type, w, (int)a.WValues));
+                Bench.Registry.With(type, new ConvRun(ops, a, x, w, y, null, null));
+                ok &= Close(type, $"conv {a.Kh}x{a.Kw} s{a.Sh}", where, y, want, (int)a.YValues, a.Rows);
+                if (!Bench.Registry.IsFloat(type)) continue;                 // the backward needs the float lane's storage
+                var dy = Bench.Registry.Make(type, (int)a.YValues, 63, -1, 1);
+                var (wantX, wantW) = a.ReferenceBackward(Bench.Registry.Values(type, x, (int)a.XValues), Bench.Registry.Values(type, w, (int)a.WValues), Bench.Registry.Values(type, dy, (int)a.YValues));
+                var dx = new byte[x.Length];
+                var dw = new byte[w.Length];
+                Bench.Registry.WithFloat(type, new ConvBackwardRun(ops, a, x, w, dy, dx, dw));
+                ok &= Close(type, $"conv_bwd dx {a.Kh}x{a.Kw}", where, dx, wantX, (int)a.XValues, a.OC * a.Kh * a.Kw);
+                ok &= Close(type, $"conv_bwd dw {a.Kh}x{a.Kw}", where, dw, wantW, (int)a.WValues, a.Cols);
+            }
+        }
+
+        if (ok) Console.WriteLine($"check convolution            {where,-6} every type: forward and the backward pair within the products' rounding");
+        return ok;
+    }
+
+    private sealed class ConvRun(GpuOps? ops, ConvArgs a, byte[] x, byte[] w, byte[] y, byte[]? dx, byte[]? dw) : Bench.ITypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasNumber<TN, float>
+        {
+            if (ops is null) { Kernels.Conv<TN>(a, x, w, y); return true; }
+            var gpu = ops.Gpu;
+            ulong dX = gpu.Rent(x.Length), dW = gpu.Rent(w.Length), dY = gpu.Rent(y.Length);
+            Qiyas.Gpu.Upload<byte>(x, dX); Qiyas.Gpu.Upload<byte>(w, dW);
+            ops.Conv<TN>(a, dX, dW, dY);
+            Qiyas.Gpu.Synchronize();
+            Qiyas.Gpu.Download<byte>(dY, y);
+            gpu.Return(dX); gpu.Return(dW); gpu.Return(dY);
+            return true;
+        }
+    }
+
+    private sealed class ConvBackwardRun(GpuOps? ops, ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dx, byte[] dw) : Bench.IFloatTypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float>
+        {
+            if (ops is null) { Kernels.ConvBackward<TN>(a, x, w, dy, dx, dw); return true; }
+            var gpu = ops.Gpu;
+            ulong dX = gpu.Rent(x.Length), dW = gpu.Rent(w.Length), dY = gpu.Rent(dy.Length), gx = gpu.Rent(dx.Length), gw = gpu.Rent(dw.Length);
+            Qiyas.Gpu.Upload<byte>(x, dX); Qiyas.Gpu.Upload<byte>(w, dW); Qiyas.Gpu.Upload<byte>(dy, dY);
+            ops.ConvBackward<TN>(a, dX, dW, dY, gx, gw);
+            Qiyas.Gpu.Synchronize();
+            Qiyas.Gpu.Download<byte>(gx, dx); Qiyas.Gpu.Download<byte>(gw, dw);
+            gpu.Return(dX); gpu.Return(dW); gpu.Return(dY); gpu.Return(gx); gpu.Return(gw);
+            return true;
+        }
+    }
+
+    // ---------------------------------------------------------------- optimizer steps on odd sizes
+
+    /// <summary>Every float type, 1001 and 37 values, each step at step counts 1 and 7: p against float64 within the lane's
+    /// rounding of the update (several operations: 16 lane ulps of the update's magnitude), m and v within 4 lane ulps.</summary>
+    public static bool Optimizers(GpuOps? ops)
+    {
+        bool ok = true;
+        string where = ops is null ? "cpu" : "device";
+        foreach (var type in Bench.Registry.Names)
+        {
+            if (!Bench.Registry.IsFloat(type)) continue;
+            int size = type == "float64" ? 8 : 4;
+            foreach (var name in OptimizerArgs.Names)
+            {
+                foreach (var (n, step) in new[] { (1001, 1), (37, 7) })
+                {
+                    var a = new OptimizerArgs(name, 0.01, 0.9, 0.999, 1e-8, 0.01, step);
+                    var p = Bench.Registry.Make(type, n, 71, -1, 1);
+                    var g = Bench.Registry.Make(type, n, 72, -1, 1);
+                    var random = new Random(73);
+                    var mv = new double[n];
+                    var vv = a.Moments > 1 ? new double[n] : null;
+                    for (int i = 0; i < n; i++) { mv[i] = random.NextDouble() - 0.5; if (vv is not null) vv[i] = random.NextDouble(); }
+                    var m = Lanes(size, mv);
+                    var v = vv is null ? null : Lanes(size, vv);
+                    var want = Bench.Registry.Values(type, p, n);
+                    var wantM = (double[])mv.Clone();
+                    var wantV = vv is null ? null : (double[])vv.Clone();
+                    a.Reference(want, Bench.Registry.Values(type, g, n), wantM, wantV);
+                    Bench.Registry.WithFloat(type, new OptimizerRun(ops, a, p, g, m, v, n));
+                    ok &= Close(type, $"optimizer {name} t{step}", where, p, want, n, 16);
+                    ok &= LanesClose(type, $"optimizer {name} m t{step}", where, m, wantM, size);
+                    if (v is not null) ok &= LanesClose(type, $"optimizer {name} v t{step}", where, v, wantV!, size);
+                }
+            }
+        }
+
+        if (ok) Console.WriteLine($"check optimizers             {where,-6} every float type at 1001 and 37 values: p, m, v within the lane's rounding");
+        return ok;
+    }
+
+    private static byte[] Lanes(int size, double[] values)
+    {
+        var bytes = new byte[values.Length * size];
+        if (size == 8) System.Runtime.InteropServices.MemoryMarshal.Cast<double, byte>(values.AsSpan()).CopyTo(bytes);
+        else for (int i = 0; i < values.Length; i++) BitConverter.TryWriteBytes(bytes.AsSpan(i * 4), (float)values[i]);
+        return bytes;
+    }
+
+    private static bool LanesClose(string type, string what, string where, byte[] lanes, double[] want, int size)
+    {
+        double eps = size == 8 ? Math.Pow(2, -52) : Math.Pow(2, -23), worst = 0;
+        for (int i = 0; i < want.Length; i++)
+        {
+            double got = size == 8 ? BitConverter.ToDouble(lanes, i * 8) : BitConverter.ToSingle(lanes, i * 4);
+            double tol = 4 * eps * (Math.Abs(want[i]) + 1);
+            if (Math.Abs(got - want[i]) > tol) worst = Math.Max(worst, Math.Abs(got - want[i]) / tol);
+        }
+
+        if (worst > 0) Console.WriteLine($"check {what,-28} {where,-6} {type,-12} DIFFERS by {worst:0.##} tolerances");
+        return worst == 0;
+    }
+
+    private sealed class OptimizerRun(GpuOps? ops, OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) : Bench.IFloatTypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float>
+        {
+            if (ops is null) { Kernels.Optimizer<TN>(a, p, g, m, v, n); return true; }
+            var gpu = ops.Gpu;
+            ulong dp = gpu.Rent(p.Length), dg = gpu.Rent(g.Length), dm = gpu.Rent(m.Length), dv = v is null ? 0 : gpu.Rent(v.Length);
+            Qiyas.Gpu.Upload<byte>(p, dp); Qiyas.Gpu.Upload<byte>(g, dg); Qiyas.Gpu.Upload<byte>(m, dm);
+            if (v is not null) Qiyas.Gpu.Upload<byte>(v, dv);
+            ops.Optimizer<TN>(a, dp, dg, dm, dv, n);
+            Qiyas.Gpu.Synchronize();
+            Qiyas.Gpu.Download<byte>(dp, p); Qiyas.Gpu.Download<byte>(dm, m);
+            if (v is not null) Qiyas.Gpu.Download<byte>(dv, v);
+            gpu.Return(dp); gpu.Return(dg); gpu.Return(dm);
+            if (v is not null) gpu.Return(dv);
+            return true;
+        }
+    }
+
+    // ---------------------------------------------------------------- attention on odd shapes
+
+    /// <summary>Every float type: 2 heads, 37 queries over 53 keys at d = 24 and d = 17 (plain, causal, spans), decode
+    /// (3 queries over 1001 keys), and the backward pass, against float64 within the lane's rounding over the keys.</summary>
+    public static bool Attentions(GpuOps? ops)
+    {
+        bool ok = true;
+        string where = ops is null ? "cpu" : "device";
+        foreach (var type in Bench.Registry.Names)
+        {
+            if (!Bench.Registry.IsFloat(type)) continue;
+            var cases = new List<(AttentionArgs A, bool Decode)>
+            {
+                (new(2, 37, 53, 24, 0.2, false), false), (new(2, 37, 53, 24, 0.2, true), false), (new(2, 37, 53, 17, 0.2, false), false),
+                (new(2, 37, 53, 24, 0.2, false, Enumerable.Range(0, 37).Select(i => i * 3 % 60).ToArray()), false),
+                (new(2, 3, 1001, 24, 0.2, false), true), (new(2, 5, 1001, 17, 0.2, true), true),
+            };
+            foreach (var (a, decode) in cases)
+            {
+                var q = Bench.Registry.Make(type, (int)a.QValues, 41, -1, 1);
+                var k = Bench.Registry.Make(type, (int)a.KValues, 42, -1, 1);
+                var v = Bench.Registry.Make(type, (int)a.KValues, 43, -1, 1);
+                var o = new byte[q.Length];
+                var want = a.Reference(Bench.Registry.Values(type, q, (int)a.QValues), Bench.Registry.Values(type, k, (int)a.KValues), Bench.Registry.Values(type, v, (int)a.KValues));
+                Bench.Registry.WithFloat(type, new AttentionRun(ops, a, q, k, v, o, decode, null, null, null));
+                ok &= Close(type, $"attention{(decode ? " decode" : "")}{(a.Causal ? " causal" : "")}{(a.Spans is not null ? " spans" : "")} d{a.D}", where, o, want, (int)a.QValues, a.Lk + a.D);
+            }
+
+            {
+                var a = new AttentionArgs(2, 37, 53, 24, 0.2, true);
+                var q = Bench.Registry.Make(type, (int)a.QValues, 41, -1, 1);
+                var k = Bench.Registry.Make(type, (int)a.KValues, 42, -1, 1);
+                var v = Bench.Registry.Make(type, (int)a.KValues, 43, -1, 1);
+                var dO = Bench.Registry.Make(type, (int)a.QValues, 44, -1, 1);
+                var (wq, wk, wv) = a.ReferenceBackward(Bench.Registry.Values(type, q, (int)a.QValues), Bench.Registry.Values(type, k, (int)a.KValues), Bench.Registry.Values(type, v, (int)a.KValues), Bench.Registry.Values(type, dO, (int)a.QValues));
+                var dq = new byte[q.Length];
+                var dk = new byte[k.Length];
+                var dv = new byte[v.Length];
+                Bench.Registry.WithFloat(type, new AttentionRun(ops, a, q, k, v, dO, false, dq, dk, dv));
+                ok &= Close(type, "attention_bwd dQ", where, dq, wq, (int)a.QValues, 2 * (a.Lk + a.D));
+                ok &= Close(type, "attention_bwd dK", where, dk, wk, (int)a.KValues, 2 * (a.Lq + a.D));
+                ok &= Close(type, "attention_bwd dV", where, dv, wv, (int)a.KValues, a.Lq + a.D);
+            }
+        }
+
+        if (ok) Console.WriteLine($"check attention              {where,-6} every float type: rows, causal, spans, decode and the backward pass within the lane's rounding");
+        return ok;
+    }
+
+    private sealed class AttentionRun(GpuOps? ops, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o, bool decode, byte[]? dq, byte[]? dk, byte[]? dv) : Bench.IFloatTypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float>
+        {
+            bool backward = dq is not null;
+            if (ops is null)
+            {
+                if (backward) Kernels.AttentionBackward<TN>(a, q, k, v, o, dq!, dk!, dv!);
+                else if (decode) Kernels.AttentionDecode<TN>(a, q, k, v, o);
+                else Kernels.Attention<TN>(a, q, k, v, o);
+                return true;
+            }
+
+            var gpu = ops.Gpu;
+            ulong dQ = gpu.Rent(q.Length), dK = gpu.Rent(k.Length), dV = gpu.Rent(v.Length), dO = gpu.Rent(o.Length);
+            Qiyas.Gpu.Upload<byte>(q, dQ); Qiyas.Gpu.Upload<byte>(k, dK); Qiyas.Gpu.Upload<byte>(v, dV);
+            if (backward)
+            {
+                Qiyas.Gpu.Upload<byte>(o, dO);
+                ulong gq = gpu.Rent(dq!.Length), gk = gpu.Rent(dk!.Length), gv = gpu.Rent(dv!.Length);
+                ops.AttentionBackward<TN>(a, dQ, dK, dV, dO, gq, gk, gv);
+                Qiyas.Gpu.Synchronize();
+                Qiyas.Gpu.Download<byte>(gq, dq); Qiyas.Gpu.Download<byte>(gk, dk); Qiyas.Gpu.Download<byte>(gv, dv);
+                gpu.Return(gq); gpu.Return(gk); gpu.Return(gv);
+            }
+            else
+            {
+                if (decode) ops.AttentionDecode<TN>(a, dQ, dK, dV, dO); else ops.Attention<TN>(a, dQ, dK, dV, dO);
+                Qiyas.Gpu.Synchronize();
+                Qiyas.Gpu.Download<byte>(dO, o);
+            }
+
+            gpu.Return(dQ); gpu.Return(dK); gpu.Return(dV); gpu.Return(dO);
+            return true;
+        }
+    }
+
+    // ---------------------------------------------------------------- products on views and the matmul backward on odd shapes
+
+    /// <summary>Every type: 37 × 29 × 53 with each transposition, three batches of it at contiguous strides, and the
+    /// backward pair, against float64 within the product's rounding over k terms.</summary>
+    public static bool Products(GpuOps? ops)
+    {
+        bool ok = true;
+        string where = ops is null ? "cpu" : "device";
+        const int M = 37, N = 29, K = 53;
+        foreach (var type in Bench.Registry.Names)
+        {
+            var views = new List<ProductView>();
+            foreach (bool ta in new[] { false, true }) foreach (bool tb in new[] { false, true }) views.Add(new ProductView(M, N, K, ta, tb));
+            views.Add(new ProductView(M, N, K, false, true, 3, M * K, N * K, M * N));
+            views.Add(new ProductView(M, N, K, true, false, 3, M * K, 0, M * N));
+            foreach (var v in views)
+            {
+                var a = Bench.Registry.Make(type, (int)v.ValuesA, 34, -1, 1);
+                var b = Bench.Registry.Make(type, (int)v.ValuesB, 35, -1, 1);
+                var c = new byte[Bench.Registry.Bytes(type, v.ValuesC)];
+                var want = v.Reference(Bench.Registry.Values(type, a, (int)v.ValuesA), Bench.Registry.Values(type, b, (int)v.ValuesB));
+                Bench.Registry.With(type, new ProductRun(ops, v, a, b, c, null, null));
+                ok &= Close(type, $"product{(v.TransA ? " Aᵀ" : "")}{(v.TransB ? " Bᵀ" : "")}{(v.Batch > 1 ? $" x{v.Batch}" : "")}", where, c, want, (int)v.ValuesC, K);
+            }
+
+            {
+                var a = Bench.Registry.Make(type, M * K, 34, -1, 1);
+                var b = Bench.Registry.Make(type, K * N, 35, -1, 1);
+                var dc = Bench.Registry.Make(type, M * N, 36, -1, 1);
+                var da = new byte[Bench.Registry.Bytes(type, M * K)];
+                var db = new byte[Bench.Registry.Bytes(type, K * N)];
+                var wantA = new ProductView(M, K, N, false, true).Reference(Bench.Registry.Values(type, dc, M * N), Bench.Registry.Values(type, b, K * N));
+                var wantB = new ProductView(K, N, M, true, false).Reference(Bench.Registry.Values(type, a, M * K), Bench.Registry.Values(type, dc, M * N));
+                Bench.Registry.With(type, new ProductRun(ops, new ProductView(M, N, K, false, false), a, b, dc, da, db));
+                ok &= Close(type, "matmul_bwd dA", where, da, wantA, M * K, N);
+                ok &= Close(type, "matmul_bwd dB", where, db, wantB, K * N, M);
+            }
+        }
+
+        if (ok) Console.WriteLine($"check products               {where,-6} every type at 37 x 29 x 53, transposed, batched, and the backward pair: within the product's rounding");
+        return ok;
+    }
+
+    private sealed class ProductRun(GpuOps? ops, ProductView v, byte[] a, byte[] b, byte[] c, byte[]? da, byte[]? db) : Bench.ITypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasNumber<TN, float>
+        {
+            bool backward = da is not null;
+            if (ops is null)
+            {
+                if (backward) Kernels.MatMulBackward<TN>(a, b, c, da!, db!, v.M, v.N, v.K); else Kernels.MatMulView<TN>(v, a, b, c);
+                return true;
+            }
+
+            var gpu = ops.Gpu;
+            ulong dA = gpu.Rent(a.Length), dB = gpu.Rent(b.Length), dC = gpu.Rent(c.Length);
+            Qiyas.Gpu.Upload<byte>(a, dA); Qiyas.Gpu.Upload<byte>(b, dB);
+            if (backward)
+            {
+                Qiyas.Gpu.Upload<byte>(c, dC);
+                ulong dDa = gpu.Rent(da!.Length), dDb = gpu.Rent(db!.Length);
+                ops.MatMulBackward<TN>(dA, dB, dC, dDa, dDb, v.M, v.N, v.K);
+                Qiyas.Gpu.Synchronize();
+                Qiyas.Gpu.Download<byte>(dDa, da); Qiyas.Gpu.Download<byte>(dDb, db);
+                gpu.Return(dDa); gpu.Return(dDb);
+            }
+            else
+            {
+                ops.MatMulView<TN>(v, dA, dB, dC);
+                Qiyas.Gpu.Synchronize();
+                Qiyas.Gpu.Download<byte>(dC, c);
+            }
+
+            gpu.Return(dA); gpu.Return(dB); gpu.Return(dC);
+            return true;
+        }
+    }
+
+    // ---------------------------------------------------------------- layout and indexing on odd shapes
+
+    /// <summary>Every type, every layout operation on small odd shapes (LayoutCases.Gate): exact for the moves (the value
+    /// moves as stored), the sums within the lane's rounding over their terms, bilinear within 4 lane ulps.</summary>
+    public static bool Layouts(GpuOps? ops)
+    {
+        bool ok = true;
+        string where = ops is null ? "cpu" : "device";
+        foreach (var type in Bench.Registry.Names)
+        {
+            foreach (var name in LayoutArgs.Names)
+            {
+                if (!LayoutArgs.Applies(name, Bench.Registry.IsFloat(type))) continue;
+                foreach (var k in Bench.LayoutCases.Gate(name, type))
+                {
+                    if (Environment.GetEnvironmentVariable("QIYAS_MAP_DEBUG") == "1") Console.WriteLine($"  layout {name} {type} {Bench.LayoutCases.Shape(k)} ({where})");
+                    var reference = LayoutArgs.Reference(name, Bench.Registry.Values(type, k.X, k.InputCount), k.Index, k.P, k.Count, k.X2 is null ? null : Bench.Registry.Values(type, k.X2, Bench.LayoutCases.SecondCount(k)));
+                    Bench.Registry.With(type, new LayoutRun(ops, k));
+                    // Sums round over their terms; a bilinear value is four weighted terms of the inputs' magnitude (not the result's); a pool's mean over its window.
+                    int terms = name is "scatter_add_rows" or "col2im" or "maxpool_bwd" or "depthwise_conv" ? LayoutArgs.Terms(name, k.P) : name == "interpolate_bilinear" ? 4 : name is "avgpool" or "avgpool_bwd" ? k.P[3] * k.P[4] : name == "adaptive_avgpool" ? (k.P[1] / k.P[3] + 2) * (k.P[2] / k.P[4] + 2) : 0;
+                    ok &= Close(type, $"layout {name}", where, k.Output, reference, k.Count, terms);
+                }
+            }
+        }
+
+        if (ok) Console.WriteLine($"check layouts                {where,-6} every type: moves exact, sums and resizes within the lane's rounding");
+        return ok;
+    }
+
+    private sealed class LayoutRun(GpuOps? ops, LayoutArgs k) : Bench.ITypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasNumber<TN, float>
+        {
+            if (ops is null) { Kernels.Layout<TN>(k); return true; }
+            var gpu = ops.Gpu;
+            ulong dx = gpu.Rent(k.X.Length), dout = gpu.Rent(k.Output.Length), didx = k.Index is null ? 0 : gpu.Rent(k.Index.Length * 4L), dx2 = k.X2 is null ? 0 : gpu.Rent(k.X2.Length);
+            Qiyas.Gpu.Upload<byte>(k.X, dx);
+            if (k.Index is not null) Qiyas.Gpu.Upload<int>(k.Index, didx);
+            if (k.X2 is not null) Qiyas.Gpu.Upload<byte>(k.X2, dx2);
+            ops.Layout<TN>(k, dx, didx, dout, dx2);
+            Qiyas.Gpu.Synchronize();
+            Qiyas.Gpu.Download<byte>(dout, k.Output);
+            gpu.Return(dx); gpu.Return(dout);
+            if (didx != 0) gpu.Return(didx);
+            if (dx2 != 0) gpu.Return(dx2);
+            return true;
+        }
+    }
+
+    // ---------------------------------------------------------------- the row operations on odd shapes
+
+    /// <summary>Every float type, three shapes (37 × 1001; 5 × 64, a short row; 3 × 17, rows not ending on a word for the
+    /// narrow floats): every row operation against float64 within the type's step plus the operation's ulps of its error
+    /// scale; the parameter backward (both statistics) against float64 within its scale.</summary>
+    public static bool Rows(GpuOps? ops)
+    {
+        bool ok = true;
+        string where = ops is null ? "cpu" : "device";
+        foreach (var type in Bench.Registry.Names)
+        {
+            if (!Bench.Registry.IsFloat(type) || Bench.Registry.IsBlock(type)) continue;
+            foreach (var (rows, cols) in new[] { (37, 1001), (5, 64), (3, 17), (3, 20011) })
+            {
+                foreach (var op in RowOps.All)
+                {
+                    var k = Bench.RowCase.Make(op, type, rows, cols, positions: true);
+                    var y = new byte[k.X.Length];
+                    var y2 = op.SecondOut ? new byte[k.X.Length] : null;
+                    Bench.Registry.WithFloat(type, new RowOpRun(ops, op, k, y, y2));
+                    double worst = Math.Max(k.Worst(y), y2 is null ? 0 : k.Worst(y2, second: true));
+                    if (worst > 0) { Console.WriteLine($"check row {op.Name,-18} {where,-6} {type,-12} DIFFERS by {worst:0.##} steps ({rows} x {cols})"); ok = false; }
+                }
+
+                foreach (bool centered in new[] { false, true })
+                {
+                    var x = Bench.Registry.Make(type, rows * cols, 51, -4, 4);
+                    var dy = Bench.Registry.Make(type, rows * cols, 52, -1, 1);
+                    var dgamma = new double[cols];
+                    var dbeta = new double[cols];
+                    double scale = RowOps.NormParamsReference(Bench.Registry.Values(type, x, rows * cols), Bench.Registry.Values(type, dy, rows * cols), rows, cols, 1e-5, centered, dgamma, dbeta);
+                    var (got, lane) = Bench.Registry.WithFloat(type, new NormParamsRun(ops, x, dy, rows, cols, centered));
+                    var g = Bench.LaneValues.Decode(lane, got, 2 * cols);
+                    // The row statistic sums cols terms: its rounding, times the row's values, reaches every column sum.
+                    double eps = lane == "f64" ? Math.Pow(2, -52) : Math.Pow(2, -23), tol = eps * scale * (8 + cols), worst = 0;
+                    for (int i = 0; i < 2 * cols; i++) { double want = i < cols ? dgamma[i] : dbeta[i - cols]; if (Math.Abs(g[i] - want) > tol) worst = Math.Max(worst, Math.Abs(g[i] - want) / tol); }
+                    if (worst > 0) { Console.WriteLine($"check norm_params_bwd:{(centered ? "layer" : "rms"),-6} {where,-6} {type,-12} DIFFERS by {worst:0.##} tolerances ({rows} x {cols}, lane {lane})"); ok = false; }
+                }
+            }
+        }
+
+        if (ok) Console.WriteLine($"check rows                   {where,-6} every float type at 37 x 1001, 5 x 64, 3 x 17: within the lane's rounding of the references");
+        return ok;
+    }
+
+    private sealed class RowOpRun(GpuOps? ops, RowOp op, Bench.RowCase k, byte[] y, byte[]? y2) : Bench.IFloatTypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float>
+        {
+            if (ops is null) { Kernels.RowOp<TN>(op, k.X, k.X2, k.G, k.Bt, k.S, k.Pos, y, y2, k.Rows, k.Cols, op.A, op.B); return true; }
+            var gpu = ops.Gpu;
+            var rented = new List<ulong>();
+            ulong Up(byte[]? a) { if (a is null) return 0; ulong d = gpu.Rent(a.Length); rented.Add(d); Qiyas.Gpu.Upload<byte>(a, d); return d; }
+            ulong dx = Up(k.X), dx2 = Up(k.X2), dg = Up(k.G), dbt = Up(k.Bt), ds = Up(k.S), dpos = 0;
+            if (k.Pos is not null) { dpos = gpu.Rent(k.Pos.Length * 4L); rented.Add(dpos); Qiyas.Gpu.Upload<int>(k.Pos, dpos); }
+            ulong dy = gpu.Rent(y.Length), dy2 = y2 is null ? 0 : gpu.Rent(y2.Length);
+            rented.Add(dy);
+            if (dy2 != 0) rented.Add(dy2);
+            ops.RowOp<TN>(op, dx, dx2, dg, dbt, ds, dpos, dy, dy2, k.Rows, k.Cols, op.A, op.B);
+            Qiyas.Gpu.Synchronize();
+            Qiyas.Gpu.Download<byte>(dy, y);
+            if (y2 is not null) Qiyas.Gpu.Download<byte>(dy2, y2);
+            foreach (var p in rented) gpu.Return(p);
+            return true;
+        }
+    }
+
+    private sealed class NormParamsRun(GpuOps? ops, byte[] x, byte[] dy, int rows, int cols, bool centered) : Bench.IFloatTypeVisitor<(byte[], string)>
+    {
+        public (byte[], string) Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float>
+        {
+            int size = TN.Bits == 64 ? 8 : 4;
+            var dgamma = new byte[cols * size];
+            var dbeta = new byte[cols * size];
+            string lane;
+            if (ops is null) lane = Kernels.NormParamsBwd<TN>(x, dy, dgamma, dbeta, rows, cols, 1e-5, centered);
+            else
+            {
+                var gpu = ops.Gpu;
+                ulong dx = gpu.Rent(x.Length), ddy = gpu.Rent(dy.Length), dg = gpu.Rent(dgamma.Length), db = gpu.Rent(dbeta.Length);
+                Qiyas.Gpu.Upload<byte>(x, dx); Qiyas.Gpu.Upload<byte>(dy, ddy);
+                lane = ops.NormParamsBwd<TN>(dx, ddy, dg, db, rows, cols, 1e-5, centered);
+                Qiyas.Gpu.Synchronize();
+                Qiyas.Gpu.Download<byte>(dg, dgamma); Qiyas.Gpu.Download<byte>(db, dbeta);
+                gpu.Return(dx); gpu.Return(ddy); gpu.Return(dg); gpu.Return(db);
+            }
+
+            var output = new byte[2 * cols * size];
+            dgamma.CopyTo(output, 0);
+            dbeta.CopyTo(output, cols * size);
+            return (output, lane);
+        }
+    }
+
+    // ---------------------------------------------------------------- reductions, broadcasts, transposes, matrix · vector on odd shapes
+
+    /// <summary>Every type, 37 × 1001 (rows and columns that end on no word for the packed types): reductions against float64
+    /// sums (exact in the lane by the rule: integer results must match exactly, float ones within the lane's rounding),
+    /// broadcasts and transposes against the type's rounding, gemv against float64 within the type's step.</summary>
+    public static bool Group2(GpuOps? ops)
+    {
+        bool ok = true;
+        string where = ops is null ? "cpu" : "device";
+        const int R = 37, C = 1001;
+        foreach (var type in Bench.Registry.Names)
+        {
+            var data = Bench.Registry.Make(type, R * C, 41, -1, 1);
+            var values = Bench.Registry.Values(type, data, R * C);
+            bool integer = !Bench.Registry.IsFloat(type);
+            // Whole reductions also over a long odd length (97 × 4099: more parts than the team, parts not ending on a word).
+            const int LR = 97, LC = 4099;
+            var longData = Bench.Registry.Make(type, LR * LC, 44, -1, 1);
+            var longValues = Bench.Registry.Values(type, longData, LR * LC);
+            foreach (string op in new[] { "sum", "sumsq", "max", "min", "argmax" })
+            {
+                foreach (var (axis, r, c, d, vals) in new[] { (Axis.Whole, R, C, data, values), (Axis.Rows, R, C, data, values), (Axis.Cols, R, C, data, values), (Axis.Whole, LR, LC, longData, longValues) })
+                {
+
+                    int count = axis == Axis.Whole ? 1 : axis == Axis.Rows ? r : c;
+                    var want = References.Reduce(op, axis, vals, r, c);
+                    var (got, lane) = Bench.Registry.With(type, new ReduceRun(ops, op, axis, d, r, c));
+                    var g = Bench.LaneValues.Decode(lane, got, count);
+                    double worst = 0;
+                    int terms = axis == Axis.Whole ? r * c : axis == Axis.Rows ? c : r;
+                    for (int i = 0; i < count; i++)
+                    {
+                        // A float sum differs from the float64 reference by the lane's rounding over its terms (any order).
+                        double eps = lane == "f32" ? 5.97e-8 : 1.12e-16;
+                        double tol = integer || op is "max" or "min" or "argmax" ? 0 : (Math.Abs(want[i]) + 1) * eps * terms;
+                        if (Math.Abs(g[i] - want[i]) > tol) worst = Math.Max(worst, Math.Abs(g[i] - want[i]));
+                    }
+
+                    if (worst > 0) { Console.WriteLine($"check {op}:{axis.ToString().ToLowerInvariant(),-6} {where,-6} {type,-12} DIFFERS by {worst:0.###e+0} (lane {lane}, {r} x {c})"); ok = false; }
+                }
+            }
+
+            // Broadcasts (two formulas), transpose, gemv both ways.
+            foreach (var opName in new[] { "add", "mul" })
+            {
+                var op = Qiyas.Ops.Find(opName);
+                var v = Bench.Registry.Make(type, C, 42, -1, 1);
+                var want = References.MapRow(type, op, values, Bench.Registry.Values(type, v, C), R, C);
+                var output = new byte[data.Length];
+                Bench.Registry.With(type, new MapRowRun(ops, op, data, v, output, R, C));
+                ok &= Close(type, $"maprow:{opName}", where, output, want, R * C);
+            }
+
+            {
+                var output = new byte[data.Length];
+                Bench.Registry.With(type, new TransposeRun(ops, data, output, R, C));
+                ok &= Close(type, "transpose", where, output, References.Transpose(values, R, C), R * C);
+            }
+
+            foreach (bool t in new[] { false, true })
+            {
+                var x = Bench.Registry.Make(type, t ? R : C, 43, -1, 1);
+                var want = References.Gemv(values, Bench.Registry.Values(type, x, t ? R : C), R, C, t);
+                var y = new byte[Bench.Registry.Bytes(type, t ? C : R)];
+                Bench.Registry.With(type, new GemvRun(ops, data, x, y, R, C, t));
+                ok &= Close(type, t ? "gemv_t" : "gemv", where, y, want, t ? C : R, terms: t ? R : C);
+            }
+        }
+
+        if (ok) Console.WriteLine($"check reductions, broadcasts, transposes, gemv {where,-6} every type at 37 × 1001: as the references");
+        return ok;
+    }
+
+    // Stored output against a float64 reference rounded as the type rounds: integers exact, floats within one step of the type plus lane ulps.
+    private static bool Close(string type, string what, string where, byte[] output, double[] reference, int n, int terms = 0)
+    {
+        var expected = Bench.Registry.Values(type, Bench.Registry.Encode(type, reference), n);
+        var got = Bench.Registry.Values(type, output, n);
+        int mant = Bench.Registry.Mantissa(type), laneMant = type == "float64" ? 52 : 23;
+        int blockValues = type switch { "q8_0" or "q4_0" => 32, "q4_k" or "q6_k" => 256, _ => 0 };
+        double[]? blockMax = null;
+        if (blockValues > 0)
+        {
+            // A block format's step is set by its block's largest value: the tolerance is the block's, and a block whose values
+            // were produced one rounding apart may take the next scale: two steps.
+            blockMax = new double[(n + blockValues - 1) / blockValues];
+            for (int i = 0; i < n; i++) blockMax[i / blockValues] = Math.Max(blockMax[i / blockValues], Math.Abs(reference[i]));
+        }
+
+        double worst = 0;
+        for (int i = 0; i < n; i++)
+        {
+            double want = expected[i], v = got[i];
+            if (mant == 0) { if (v != want) worst = Math.Max(worst, Math.Abs(v - want)); continue; }
+            if (blockMax is not null)
+            {
+                double bstep = (blockMax[i / blockValues] == 0 ? 1 : blockMax[i / blockValues]) * Math.Pow(2, -mant);
+                double btol = 2 * bstep + 4 * Math.Abs(reference[i]) * Math.Pow(2, -laneMant);
+                if (Math.Abs(v - want) > btol) worst = Math.Max(worst, Math.Abs(v - want) / bstep);
+                continue;
+            }
+
+            double scale = reference[i] == 0 ? 1 : Math.Pow(2, Math.Floor(Math.Log2(Math.Abs(reference[i]))));
+            // A matrix · vector result is a sum of `terms` products of magnitude at most 1 in the lane: its rounding is the sum's, not the result's.
+            double tol = Math.Max(scale * Math.Pow(2, -mant), Bench.Registry.MinStep(type)) + 4 * scale * Math.Pow(2, -laneMant) + terms * Math.Pow(2, -laneMant) * 4;
+            if (Math.Abs(v - want) > tol)
+            {
+                if (Environment.GetEnvironmentVariable("QIYAS_MAP_DEBUG") == "1" && worst == 0) Console.WriteLine($"  {what} {type} [{i}] got {v:R} want {want:R} ref {reference[i]:R}");
+                worst = Math.Max(worst, Math.Abs(v - want) / (scale * Math.Pow(2, -mant)));
+            }
+        }
+
+        if (worst > 0) Console.WriteLine($"check {what,-12} {where,-6} {type,-12} DIFFERS by {worst:0.##} steps");
+        return worst == 0;
+    }
+
+    private sealed class ReduceRun(GpuOps? ops, string op, Axis axis, byte[] x, int rows, int cols) : Bench.ITypeVisitor<(byte[], string)>
+    {
+        public (byte[], string) Visit<TN>() where TN : struct, IQiyasNumber<TN, float>
+        {
+            if (ops is null) return Kernels.Reduce<TN>(op, axis, x, rows, cols);
+            var gpu = ops.Gpu;
+            int count = axis == Axis.Whole ? 1 : axis == Axis.Rows ? rows : cols;
+            ulong dx = gpu.Rent(x.Length), dout = gpu.Rent(count * 8L);
+            Qiyas.Gpu.Upload<byte>(x, dx);
+            string lane = ops.Reduce<TN>(op, axis, dx, rows, cols, dout);
+            Qiyas.Gpu.Synchronize();
+            var output = new byte[count * 8];
+            Qiyas.Gpu.Download<byte>(dout, output);
+            gpu.Return(dx); gpu.Return(dout);
+            return (output, lane);
+        }
+    }
+
+    private sealed class MapRowRun(GpuOps? ops, MapOp op, byte[] x, byte[] v, byte[] output, int rows, int cols) : Bench.ITypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasNumber<TN, float>
+        {
+            if (ops is null) { Kernels.MapRow<TN>(op.Name, x, v, output, rows, cols); return true; }
+            var gpu = ops.Gpu;
+            ulong dx = gpu.Rent(x.Length), dv = gpu.Rent(v.Length), dout = gpu.Rent(output.Length);
+            Qiyas.Gpu.Upload<byte>(x, dx); Qiyas.Gpu.Upload<byte>(v, dv);
+            ops.MapRow<TN>(op, dx, dv, dout, rows, cols);
+            Qiyas.Gpu.Synchronize();
+            Qiyas.Gpu.Download<byte>(dout, output);
+            gpu.Return(dx); gpu.Return(dv); gpu.Return(dout);
+            return true;
+        }
+    }
+
+    private sealed class TransposeRun(GpuOps? ops, byte[] x, byte[] output, int rows, int cols) : Bench.ITypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasNumber<TN, float>
+        {
+            if (ops is null) { Kernels.Transpose<TN>(x, output, rows, cols); return true; }
+            var gpu = ops.Gpu;
+            ulong dx = gpu.Rent(x.Length), dout = gpu.Rent(output.Length);
+            Qiyas.Gpu.Upload<byte>(x, dx);
+            Qiyas.Gpu.Clear(dout, output.Length);
+            ops.Transpose<TN>(dx, dout, rows, cols);
+            Qiyas.Gpu.Synchronize();
+            Qiyas.Gpu.Download<byte>(dout, output);
+            gpu.Return(dx); gpu.Return(dout);
+            return true;
+        }
+    }
+
+    private sealed class GemvRun(GpuOps? ops, byte[] a, byte[] x, byte[] y, int rows, int cols, bool transposed) : Bench.ITypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasNumber<TN, float>
+        {
+            if (ops is null) { Kernels.Gemv<TN>(a, x, y, rows, cols, transposed); return true; }
+            var gpu = ops.Gpu;
+            ulong da = gpu.Rent(a.Length), dx = gpu.Rent(x.Length), dy = gpu.Rent(y.Length);
+            Qiyas.Gpu.Upload<byte>(a, da); Qiyas.Gpu.Upload<byte>(x, dx);
+            ops.Gemv<TN>(da, dx, dy, rows, cols, transposed);
+            Qiyas.Gpu.Synchronize();
+            Qiyas.Gpu.Download<byte>(dy, y);
+            gpu.Return(da); gpu.Return(dx); gpu.Return(dy);
+            return true;
+        }
+    }
+
+    // ---------------------------------------------------------------- functions on vectors against scalar references, in ulps
+
+    private static bool Function32(string name, Func<Vector<float>, Vector<float>> f, Func<double, double> reference, double low, double high, double maxUlp, Random random, bool logScale = false)
+    {
+        int w = Vector<float>.Count, worstAt = 0;
+        double worst = 0;
+        var x = new float[w * 2048];
+        for (int i = 0; i < x.Length; i++) x[i] = (float)(logScale ? Math.Exp(Math.Log(low) + (Math.Log(high) - Math.Log(low)) * random.NextDouble()) : low + (high - low) * random.NextDouble());
+        for (int i = 0; i < x.Length; i += w)
+        {
+            var y = f(new Vector<float>(x.AsSpan(i)));
+            for (int l = 0; l < w; l++)
+            {
+                double want = reference(x[i + l]);
+                float wantF = (float)want;
+                double ulp = Math.Abs(MathF.BitIncrement(Math.Abs(wantF)) - Math.Abs(wantF));
+                double err = wantF == 0 ? Math.Abs(y[l]) / float.Epsilon : Math.Abs(y[l] - want) / ulp;
+                if (err > worst) { worst = err; worstAt = i + l; }
+            }
+        }
+
+        Console.WriteLine($"check {name + " (ulps)",-36} {x.Length,9} values: worst {worst:0.00} ulp at x = {x[worstAt]:R}{(worst <= maxUlp ? "" : "  TOO FAR")}");
+        return worst <= maxUlp;
+    }
+
+    private static bool Function64(string name, Func<Vector<double>, Vector<double>> f, Func<double, double> reference, double low, double high, double maxUlp, Random random, bool logScale = false)
+    {
+        int w = Vector<double>.Count, worstAt = 0;
+        double worst = 0;
+        var x = new double[w * 2048];
+        for (int i = 0; i < x.Length; i++) x[i] = logScale ? Math.Exp(Math.Log(low) + (Math.Log(high) - Math.Log(low)) * random.NextDouble()) : low + (high - low) * random.NextDouble();
+        for (int i = 0; i < x.Length; i += w)
+        {
+            var y = f(new Vector<double>(x.AsSpan(i)));
+            for (int l = 0; l < w; l++)
+            {
+                double want = reference(x[i + l]);
+                double ulp = Math.BitIncrement(Math.Abs(want)) - Math.Abs(want);
+                double err = want == 0 ? Math.Abs(y[l]) / double.Epsilon : Math.Abs(y[l] - want) / ulp;
+                if (err > worst) { worst = err; worstAt = i + l; }
+            }
+        }
+
+        Console.WriteLine($"check {name + " (ulps)",-36} {x.Length,9} values: worst {worst:0.00} ulp at x = {x[worstAt]:R}{(worst <= maxUlp ? "" : "  TOO FAR")}");
+        return worst <= maxUlp;
+    }
+
+    // ---------------------------------------------------------------- every element-wise formula on every type it applies to
+
+    /// <summary>Each formula over 1001 values of each of its types, on the CPU (ops null) or the device, against the float64
+    /// reference rounded as the type rounds: integer types exact; float types within one step of the type plus a few ulps of
+    /// the lane (the transcendental functions' own error).</summary>
+    public static bool Maps(GpuOps? ops)
+    {
+        const int N = 1001;
+        bool ok = true;
+        string where = ops is null ? "cpu" : "device";
+        foreach (var op in Ops.All)
+        {
+            double worst = 0;
+            string worstType = "";
+            bool failed = false;
+            foreach (var type in Bench.Registry.Names)
+            {
+                if (Bench.Registry.IsBlock(type)) continue;                    // measured by the block formats' gate (block steps)
+                if (type == "bool" && op.Name == "div") continue;              // bool: a divisor of 0 is half its values: no division (n/a)
+                if (op.FloatOnly && !Bench.Registry.IsFloat(type)) continue;
+                byte[]? x = op.Inputs >= 1 ? Bench.Registry.Make(type, N, 31, op.XRange.Low, op.XRange.High) : null;
+                byte[]? y = op.Inputs >= 2 ? Bench.Registry.Make(type, N, 32, op.YRange.Low, op.YRange.High) : null;
+                byte[]? z = op.Inputs >= 3 ? Bench.Registry.Make(type, N, 33, op.YRange.Low, op.YRange.High) : null;
+                var output = new byte[Bench.Registry.Bytes(type, N)];
+                var reference = References.Map(type, op, x, y, z, N, wrap: false);
+                if (ops is null) Bench.Registry.With(type, new CpuMap(op, x, y, z, output, N));
+                else Bench.Registry.With(type, new DeviceMap(ops, op, x, y, z, output, N));
+                int mant = Bench.Registry.Mantissa(type);
+                int laneMant = type == "float64" ? 52 : 23;
+                if (mant == 0)
+                {
+                    // Integers: exact, modulo 2^bits, compared in 128-bit integers (64-bit values read straight from the bytes).
+                    int bits = Bench.Registry.Bits(type);
+                    bool signed = type.StartsWith("int", StringComparison.Ordinal);
+                    var got64 = bits == 64 ? (signed ? MemoryMarshal.Cast<byte, long>(output).ToArray().Select(v => (Int128)v).ToArray() : MemoryMarshal.Cast<byte, ulong>(output).ToArray().Select(v => (Int128)v).ToArray()) : null;
+                    var gotValues = got64 ?? Bench.Registry.Values(type, output, N).Select(v => (Int128)v).ToArray();
+                    Int128 m = Int128.One << bits;
+                    for (int i = 0; i < N; i++)
+                    {
+                        Int128 want = (Int128)reference[i];
+                        want = ((want % m) + m) % m;
+                        if (signed && want >= m / 2) want -= m;
+                        if (gotValues[i] != want && worst == 0) { worst = (double)(gotValues[i] - want); worstType = type; }
+                    }
+
+                    continue;
+                }
+
+                var expected = Bench.Registry.Values(type, Bench.Registry.Encode(type, reference), N);
+                var got = Bench.Registry.Values(type, output, N);
+                for (int i = 0; i < N; i++)
+                {
+                    double e, want = expected[i], v = got[i];
+                    if (double.IsNaN(want) || double.IsInfinity(want)) { e = (double.IsNaN(v) && double.IsNaN(want)) || v == want ? 0 : double.PositiveInfinity; }
+                    else
+                    {
+                        double scale = Math.Abs(reference[i]) == 0 ? 1 : Math.Pow(2, Math.Floor(Math.Log2(Math.Abs(reference[i]))));
+                        double stepType = scale * Math.Pow(2, -mant), stepLane = scale * Math.Pow(2, -laneMant);
+                        double tol = stepType + op.Ulps * stepLane;
+                        e = Math.Abs(v - want) <= tol ? 0 : Math.Abs(v - want) / stepType;
+                    }
+
+                    if (e > worst)
+                    {
+                        worst = e; worstType = type;
+                        if (Environment.GetEnvironmentVariable("QIYAS_MAP_DEBUG") == "1") Console.WriteLine($"  {op.Name} {type} [{i}] x {(x is null ? 0 : Bench.Registry.Values(type, x, N)[i]):R} got {v:R} want {want:R} ref {reference[i]:R}: {e:0.##} steps");
+                    }
+                }
+
+                if (worst > 0 && !failed) failed = true;
+            }
+
+            Console.WriteLine($"check map {op.Name,-18} {where,-6} {(worst == 0 ? "every type exact to its step" : $"DIFFERS by {worst:0.##} steps in {worstType}")}");
+            ok &= worst == 0;
+        }
+
+        return ok;
+    }
+
+    private sealed class CpuMap(MapOp op, byte[]? x, byte[]? y, byte[]? z, byte[] output, int n) : Bench.ITypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasNumber<TN, float>
+        {
+            if (Bench.Registry.IsFloat(TN.Name)) Bench.Registry.WithFloat(TN.Name, new CpuFloatMap(op, x, y, z, output, n));
+            else Kernels.Map<TN>(op.Name, x, y, z, output, n, op.A, op.B);
+            return true;
+        }
+    }
+
+    private sealed class CpuFloatMap(MapOp op, byte[]? x, byte[]? y, byte[]? z, byte[] output, int n) : Bench.IFloatTypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float>
+        {
+            Kernels.MapFloat<TN>(op.Name, x, y, z, output, n, op.A, op.B);
+            return true;
+        }
+    }
+
+    private sealed class DeviceMap(GpuOps ops, MapOp op, byte[]? x, byte[]? y, byte[]? z, byte[] output, int n) : Bench.ITypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasNumber<TN, float>
+        {
+            var gpu = ops.Gpu;
+            var rented = new List<ulong>();
+            ulong Up(byte[]? array)
+            {
+                if (array is null) return 0;
+                ulong d = gpu.Rent(array.Length);
+                rented.Add(d);
+                Qiyas.Gpu.Upload<byte>(array, d);
+                return d;
+            }
+
+            ulong dx = Up(x), dy = Up(y), dz = Up(z), dout = gpu.Rent(output.Length);
+            rented.Add(dout);
+            ops.Map<TN>(op, dx, dy, dz, dout, n, op.A, op.B);
+            Qiyas.Gpu.Synchronize();
+            Qiyas.Gpu.Download<byte>(dout, output);
+            foreach (var p in rented) gpu.Return(p);
+            return true;
+        }
     }
 
     // ---------------------------------------------------------------- the device's conversions against the CPU's, bit for bit
@@ -132,6 +1209,17 @@ internal static class Checks
         ok &= Device<Int64, double>(ops, Lane.F64);
         ok &= Device<Int16, double>(ops, Lane.F64);
         ok &= Sliced(ops);
+        ok &= Maps(ops);
+        ok &= Group2(ops);
+        ok &= Rows(ops);
+        ok &= Layouts(ops);
+        ok &= Products(ops);
+        ok &= Attentions(ops);
+        ok &= Optimizers(ops);
+        ok &= Convs(ops);
+        ok &= Recurrents(ops);
+        ok &= Routings(ops);
+        ok &= BlockFormats(ops);
         return ok;
     }
 
@@ -208,7 +1296,7 @@ internal static class Checks
     {
         const int N = 1 << 16;
         var random = new Random(11);
-        var stored = new byte[((long)N * TN.Bits + 7) / 8];
+        var stored = new byte[TN.Bytes(N)];
         random.NextBytes(stored);
         var gpu = ops.Gpu;
         ulong dStored = gpu.Rent(stored.Length), dLanes = gpu.Rent((long)N * lane.Size);

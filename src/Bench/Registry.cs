@@ -25,16 +25,25 @@ public static class Registry
         "float64", "float32", "float16", "bfloat16", "float8_e4m3", "float8_e5m2",
         "int64", "int32", "int16", "int8", "int4", "int2",
         "uint64", "uint32", "uint16", "uint8", "uint2",
+        "q8_0", "q4_0", "q4_k", "q6_k", "bool",
     ];
 
-    public static bool IsFloat(string name) => name.StartsWith("float", StringComparison.Ordinal) || name.StartsWith("bfloat", StringComparison.Ordinal);
+    /// <summary>The block formats (float values in blocks with shared scales): their lane is float32.</summary>
+    public static bool IsBlock(string name) => name.StartsWith("q", StringComparison.Ordinal);
 
-    /// <summary>Types whose values read exactly into float64 lanes (all but the 16- and 8-bit floats, which read into float32).</summary>
+    public static bool IsFloat(string name) => name.StartsWith("float", StringComparison.Ordinal) || name.StartsWith("bfloat", StringComparison.Ordinal) || IsBlock(name);
+
+    /// <summary>Types whose values read exactly into float64 lanes (all but the 16- and 8-bit floats and the block formats, which read into float32).</summary>
     public static bool HasDoubleLane(string name) => !IsFloat(name) || name is "float64" or "float32";
 
     public static int Bits(string name) => With(name, new BitsVisitor());
 
-    public static long Bytes(string name, long values) => (values * Bits(name) + 7) / 8;
+    public static long Bytes(string name, long values) => With(name, new BytesVisitor(values));
+
+    private sealed class BytesVisitor(long values) : ITypeVisitor<long>
+    {
+        public long Visit<TN>() where TN : struct, IQiyasNumber<TN, float> => TN.Bytes(values);
+    }
 
     public static T With<T>(string name, ITypeVisitor<T> v) => name switch
     {
@@ -55,6 +64,11 @@ public static class Registry
         "uint16" => v.Visit<UInt16>(),
         "uint8" => v.Visit<UInt8>(),
         "uint2" => v.Visit<UInt2>(),
+        "q8_0" => v.Visit<Q8_0>(),
+        "q4_0" => v.Visit<Q4_0>(),
+        "q4_k" => v.Visit<Q4_K>(),
+        "q6_k" => v.Visit<Q6_K>(),
+        "bool" => v.Visit<Bool>(),
         _ => throw new ArgumentException($"no stored type named {name}"),
     };
 
@@ -66,6 +80,10 @@ public static class Registry
         "bfloat16" => v.Visit<BFloat16>(),
         "float8_e4m3" => v.Visit<Float8E4M3>(),
         "float8_e5m2" => v.Visit<Float8E5M2>(),
+        "q8_0" => v.Visit<Q8_0>(),
+        "q4_0" => v.Visit<Q4_0>(),
+        "q4_k" => v.Visit<Q4_K>(),
+        "q6_k" => v.Visit<Q6_K>(),
         _ => throw new ArgumentException($"{name} is not a float type"),
     };
 
@@ -84,12 +102,53 @@ public static class Registry
         "uint16" => v.Visit<UInt16>(),
         "uint8" => v.Visit<UInt8>(),
         "uint2" => v.Visit<UInt2>(),
+        "bool" => v.Visit<Bool>(),
         _ => throw new ArgumentException($"{name} has no float64 lane"),
     };
 
     /// <summary>Stored values as float64, exact for every type (through the float64 lane, or the float32 one for the small floats).</summary>
     public static double[] Values(string name, byte[] stored, int count) =>
         HasDoubleLane(name) ? WithDouble(name, new ValuesViaDouble(stored, count)) : With(name, new ValuesViaFloat(stored, count));
+
+    /// <summary>Values stored by the type (rounded as the type rounds, held to its range), through its float64 lane or its float32 one.</summary>
+    public static byte[] Encode(string name, double[] values) =>
+        HasDoubleLane(name) ? WithDouble(name, new EncodeViaDouble(values)) : With(name, new EncodeViaFloat(values));
+
+    private sealed class EncodeViaDouble(double[] values) : IDoubleTypeVisitor<byte[]>
+    {
+        public byte[] Visit<TN>() where TN : struct, IQiyasNumber<TN, float>, IQiyasNumber<TN, double>
+        {
+            var bytes = new byte[TN.Bytes(values.Length)];
+            TN.Store(values, bytes, 0);
+            return bytes;
+        }
+    }
+
+    private sealed class EncodeViaFloat(double[] values) : ITypeVisitor<byte[]>
+    {
+        public byte[] Visit<TN>() where TN : struct, IQiyasNumber<TN, float>
+        {
+            var f = new float[values.Length];
+            for (int i = 0; i < f.Length; i++) f[i] = (float)values[i];
+            var bytes = new byte[TN.Bytes(values.Length)];
+            TN.Store(f, bytes, 0);
+            return bytes;
+        }
+    }
+
+    /// <summary>The type's smallest step (its subnormals'): float64 2^−1074, float32 2^−149, float16 2^−24, bfloat16 2^−133, float8 e4m3 2^−9, e5m2 2^−16.</summary>
+    public static double MinStep(string name) => name switch
+    {
+        "float64" => Math.Pow(2, -1074), "float32" => Math.Pow(2, -149), "float16" => Math.Pow(2, -24), "bfloat16" => Math.Pow(2, -133),
+        "float8_e4m3" => Math.Pow(2, -9), "float8_e5m2" => Math.Pow(2, -16), _ => 0,
+    };
+
+    /// <summary>Bits of significand the type keeps (its rounding step), for tolerances.</summary>
+    public static int Mantissa(string name) => name switch
+    {
+        "float64" => 52, "float32" => 23, "float16" => 10, "bfloat16" => 7, "float8_e4m3" => 3, "float8_e5m2" => 2,
+        "q8_0" => 6, "q4_0" => 2, "q4_k" => 2, "q6_k" => 4, _ => 0,
+    };
 
     /// <summary>count values stored by the type: floats uniform in [low, high] (as float32 values, so every type stores them
     /// exactly or by its own rounding), integers uniform over the small range the bench uses.</summary>
@@ -127,9 +186,10 @@ public static class Registry
         public byte[] Visit<TN>() where TN : struct, IQiyasNumber<TN, float>
         {
             var random = new Random(seed);
-            var bytes = new byte[((long)count * TN.Bits + 7) / 8];
+            var bytes = new byte[TN.Bytes(count)];
             bool signed = TN.Min < 0;
-            (double lo, double hi) = TN.IsFloat ? (low, high) : TN.Bits == 2 ? (signed ? (-1, 0) : (0, 1)) : signed ? (-2, 2) : (0, 3);
+            // Integer types: small values; a positive lower bound asks for values from 1 (divisors, logarithms).
+            (double lo, double hi) = TN.IsFloat ? (low, high) : TN.Bits == 2 ? (signed ? (low > 0 ? (1, 1) : (-1, 0)) : (low > 0 ? (1, 1) : (0, 1))) : signed ? (low > 0 ? (1, 2) : (-2, 2)) : (low > 0 ? (1, 3) : (0, 3));
             var f = new float[count];
             for (int i = 0; i < count; i++) f[i] = TN.IsFloat ? (float)(lo + (hi - lo) * random.NextDouble()) : random.Next((int)lo, (int)hi + 1);
             TN.Store(f, bytes, 0);

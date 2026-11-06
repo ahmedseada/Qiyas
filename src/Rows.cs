@@ -1,0 +1,796 @@
+// Row operations ("rows"): one formula over each row of a rows × cols array whose result needs the row's statistics
+// (a max, a sum, a sum of squares, a dot product): the normalizations and their backward passes, log-softmax and the
+// softmax backward passes, weight normalization, rotary embedding, scaled and masked softmax, the fused residual-add +
+// normalization. Written once over <TN, TLane, TL> in the type's float lane (f32 for every float narrower than 32 bits,
+// f64 for float64): the stored type is what is read and written, the row is computed in the lane.
+//
+// An operation takes a row of x, optionally a second row (x2: dy, the residual, an additive mask), per-column vectors
+// (g: gamma / weight, bt: beta / bias), a per-row scalar (s: weight_norm's g), per-row positions (rope), two scalars
+// (a, b) and writes a row of y and optionally a second row (y2: the fused add's sum). The catalogue (RowOps.All) names
+// each, gives its float64 reference and its error scale for the gate.
+//
+// The backward passes of the parameters (dgamma, dbeta) are column sums with the rows' statistics: NormParamsBwd.
+using System.Buffers;
+using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+
+namespace Qiyas;
+
+/// <summary>The float64 reference over one row; returns the row's error scale (the magnitude the lane's rounding acts on).</summary>
+public delegate double RowReference(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2);
+
+/// <summary>What the bench and the checks need to know about a row operation.</summary>
+public sealed record RowOp(string Name, bool Second, bool Gamma, bool Beta, bool RowScalar, bool Positions, bool SecondOut, double A, double B, RowReference Reference, string Note = "", int Ulps = 8)
+{
+    public (double Low, double High) XRange { get; init; } = (-4, 4);
+
+    /// <summary>The second row's values: dy in (−1, 1), a residual in (−4, 4); the mask is a pattern (see Mask).</summary>
+    public (double Low, double High) SecondRange { get; init; } = (-1, 1);
+
+    /// <summary>The second row is an additive mask: 0 keeps a value, −400 excludes it (exp underflows to 0 in f32; within
+    /// every float type's range, 448 being the smallest of the maxima); a pattern over (row, column).</summary>
+    public bool Mask => Name == "scale_mask_softmax";
+
+    public static double MaskValue(int row, int col) => (row * 7 + col) % 3 == 0 ? -400 : 0;
+}
+
+public static class RowOps
+{
+    private const double Eps = 1e-5;
+
+    public static readonly RowOp[] All =
+    [
+        new("log_softmax", false, false, false, false, false, false, 0, 0, LogSoftmax),
+        new("softmax_bwd", true, false, false, false, false, false, 0, 0, SoftmaxBwd, "(y, dy) → dx = y·(dy − Σ y·dy)") { XRange = (0, 1) },
+        new("log_softmax_bwd", true, false, false, false, false, false, 0, 0, LogSoftmaxBwd, "(log y, dy) → dx = dy − exp(log y)·Σ dy") { XRange = (-8, 0) },
+        new("rms_norm_affine", false, true, false, false, false, false, Eps, 0, RmsNormAffine, "y = x·g / √(mean x² + a)"),
+        new("rms_norm_bwd", true, true, false, false, false, false, Eps, 0, RmsNormBwd, "(x, dy, g) → dx; x̂ = x·rstd: dx = rstd·(g·dy − x̂·mean(g·dy·x̂))"),
+        new("layer_norm", false, true, true, false, false, false, Eps, 0, LayerNorm, "y = (x − μ)·g / √(var + a) + bt"),
+        new("layer_norm_bwd", true, true, false, false, false, false, Eps, 0, LayerNormBwd, "(x, dy, g) → dx = rstd·(g·dy − mean(g·dy) − x̂·mean(g·dy·x̂))"),
+        new("weight_norm", false, false, false, true, false, false, 1e-12, 0, WeightNorm, "y = x·s / √(Σ x² + a), s the row's scalar"),
+        new("rope", false, false, false, false, true, false, 10000, 0, Rope, "pairs (i, i + cols/2) rotated by pos·a^(−2i/cols); an odd row's last value kept", Ulps: 64),
+        new("scale_mask_softmax", true, false, false, false, false, false, 0.125, 1, ScaleMaskSoftmax, "softmax(a·x + mask); b ≠ 0: columns past the row's position excluded (causal; the position is the row's index, or the one given: a key span)"),
+        new("add_rms_norm", true, true, false, false, false, true, Eps, 0, AddRmsNorm, "h = x + x2 (written to y2); y = rms_norm_affine(h)") { SecondRange = (-4, 4) },
+        new("add_layer_norm", true, true, true, false, false, true, Eps, 0, AddLayerNorm, "h = x + x2 (written to y2); y = layer_norm(h)") { SecondRange = (-4, 4) },
+        new("cross_entropy_bwd", false, false, false, false, true, false, 0, 0, CrossEntropyBwd, "softmax(x) − one_hot(the row's position: the target class); the loss is −log_softmax(x) picked at the target (pick_rows)"),
+    ];
+
+    public static RowOp Find(string name) => Array.Find(All, o => o.Name == name) ?? throw new ArgumentException($"unknown row operation {name}");
+
+    private static double MaxAbs(ReadOnlySpan<double> v) { double m = 0; foreach (var t in v) m = Math.Max(m, Math.Abs(t)); return m; }
+
+    private static double LogSoftmax(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)
+    {
+        double m = double.NegativeInfinity, sum = 0;
+        foreach (var v in x) m = Math.Max(m, v);
+        foreach (var v in x) sum += Math.Exp(v - m);
+        double ls = m + Math.Log(sum);
+        for (int i = 0; i < x.Length; i++) y[i] = x[i] - ls;
+        return MaxAbs(x) + Math.Abs(ls);
+    }
+
+    private static double SoftmaxBwd(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)
+    {
+        double d = 0;
+        for (int i = 0; i < x.Length; i++) d += x[i] * x2[i];
+        for (int i = 0; i < x.Length; i++) y[i] = x[i] * (x2[i] - d);
+        return MaxAbs(x2) * (1 + MaxAbs(x) * x.Length);
+    }
+
+    private static double LogSoftmaxBwd(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)
+    {
+        double sd = 0, abs = 0;
+        foreach (var v in x2) { sd += v; abs += Math.Abs(v); }
+        for (int i = 0; i < x.Length; i++) y[i] = x2[i] - Math.Exp(x[i]) * sd;
+        return abs + MaxAbs(x2);
+    }
+
+    private static double Rstd(ReadOnlySpan<double> x, double mean, double eps)
+    {
+        double v = 0;
+        foreach (var t in x) v += (t - mean) * (t - mean);
+        return 1 / Math.Sqrt(v / x.Length + eps);
+    }
+
+    private static double RmsNormAffine(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)
+    {
+        double rstd = Rstd(x, 0, a);
+        for (int i = 0; i < x.Length; i++) y[i] = x[i] * rstd * g[i];
+        return MaxAbs(y) * Math.Sqrt(x.Length);
+    }
+
+    private static double RmsNormBwd(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)
+    {
+        double rstd = Rstd(x, 0, a), t = 0;
+        for (int i = 0; i < x.Length; i++) t += g[i] * x2[i] * x[i] * rstd;
+        double m = t / x.Length;
+        for (int i = 0; i < x.Length; i++) y[i] = rstd * (g[i] * x2[i] - x[i] * rstd * m);
+        return rstd * MaxAbs(g) * MaxAbs(x2) * (1 + MaxAbs(x) * rstd * MaxAbs(x) * rstd) * Math.Sqrt(x.Length);
+    }
+
+    private static double LayerNorm(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)
+    {
+        double mu = 0;
+        foreach (var t in x) mu += t;
+        mu /= x.Length;
+        double rstd = Rstd(x, mu, a);
+        for (int i = 0; i < x.Length; i++) y[i] = (x[i] - mu) * rstd * g[i] + bt[i];
+        return (MaxAbs(y) + MaxAbs(bt)) * Math.Sqrt(x.Length);
+    }
+
+    private static double LayerNormBwd(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)
+    {
+        double mu = 0;
+        foreach (var t in x) mu += t;
+        mu /= x.Length;
+        double rstd = Rstd(x, mu, a), m1 = 0, m2 = 0, xh = 0;
+        for (int i = 0; i < x.Length; i++) { double h = (x[i] - mu) * rstd; m1 += g[i] * x2[i]; m2 += g[i] * x2[i] * h; xh = Math.Max(xh, Math.Abs(h)); }
+        m1 /= x.Length; m2 /= x.Length;
+        for (int i = 0; i < x.Length; i++) y[i] = rstd * (g[i] * x2[i] - m1 - (x[i] - mu) * rstd * m2);
+        return rstd * MaxAbs(g) * MaxAbs(x2) * (2 + xh * xh) * Math.Sqrt(x.Length);
+    }
+
+    private static double WeightNorm(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)
+    {
+        double ss = 0;
+        foreach (var t in x) ss += t * t;
+        double k = s / Math.Sqrt(ss + a);
+        for (int i = 0; i < x.Length; i++) y[i] = x[i] * k;
+        return MaxAbs(y) * Math.Sqrt(x.Length);
+    }
+
+    private static double Rope(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)
+    {
+        int n = x.Length, half = n / 2;
+        for (int i = 0; i < half; i++)
+        {
+            double theta = pos * Math.Exp(-2.0 * i / n * Math.Log(a)), c = Math.Cos(theta), sn = Math.Sin(theta);
+            y[i] = x[i] * c - x[i + half] * sn;
+            y[i + half] = x[i] * sn + x[i + half] * c;
+        }
+
+        if (n % 2 == 1) y[n - 1] = x[n - 1];
+        return MaxAbs(x) * (1 + 2 * Math.Abs(pos));
+    }
+
+    private static double ScaleMaskSoftmax(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)
+    {
+        int n = x.Length;
+        double m = double.NegativeInfinity;
+        for (int i = 0; i < n; i++)
+        {
+            double z = b != 0 && i > pos ? double.NegativeInfinity : a * x[i] + (x2.IsEmpty ? 0 : x2[i]);
+            y[i] = z;
+            m = Math.Max(m, z);
+        }
+
+        double sum = 0;
+        for (int i = 0; i < n; i++) sum += y[i] = double.IsNegativeInfinity(y[i]) ? 0 : Math.Exp(y[i] - m);
+        for (int i = 0; i < n; i++) y[i] = sum > 0 ? y[i] / sum : 0;
+        return 1 + Math.Abs(a) * MaxAbs(x);
+    }
+
+    private static double CrossEntropyBwd(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)
+    {
+        double m = double.NegativeInfinity, sum = 0;
+        foreach (var v in x) m = Math.Max(m, v);
+        for (int i = 0; i < x.Length; i++) sum += y[i] = Math.Exp(x[i] - m);
+        for (int i = 0; i < x.Length; i++) y[i] = y[i] / sum - (i == pos ? 1 : 0);
+        return 1 + MaxAbs(x);
+    }
+
+    private static double AddRmsNorm(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)
+    {
+        for (int i = 0; i < x.Length; i++) y2[i] = x[i] + x2[i];
+        return RmsNormAffine(y2, default, g, bt, s, pos, row, a, b, y, default) + MaxAbs(y2);
+    }
+
+    private static double AddLayerNorm(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)
+    {
+        for (int i = 0; i < x.Length; i++) y2[i] = x[i] + x2[i];
+        return LayerNorm(y2, default, g, bt, s, pos, row, a, b, y, default) + MaxAbs(y2);
+    }
+
+    /// <summary>dgamma[c] = Σ_r dy·x̂, dbeta[c] = Σ_r dy with x̂ = (x − μ_r)·rstd_r (centered) or x·rstd_r; returns the error scale.</summary>
+    public static double NormParamsReference(double[] x, double[] dy, int rows, int cols, double eps, bool centered, double[] dgamma, double[] dbeta)
+    {
+        double scale = 0;
+        for (int r = 0; r < rows; r++)
+        {
+            var xr = x.AsSpan(r * cols, cols);
+            double mu = 0;
+            if (centered) { foreach (var t in xr) mu += t; mu /= cols; }
+            double rstd = Rstd(xr, mu, eps);
+            for (int c = 0; c < cols; c++)
+            {
+                double h = (xr[c] - mu) * rstd, d = dy[r * cols + c];
+                dgamma[c] += d * h;
+                dbeta[c] += d;
+                scale = Math.Max(scale, Math.Abs(d) * (1 + Math.Abs(h)));
+            }
+        }
+
+        return scale * rows;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------- the CPU kernels
+
+/// <summary>A row operation over lane spans: x, the second row, gamma, beta (empty when the operation has none), the
+/// row's scalar, position and index, the two scalars, and the outputs (y2 empty when the operation has none).</summary>
+public interface IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+{
+    static abstract void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2);
+}
+
+/// <summary>Row statistics and element-wise passes on lane vectors.</summary>
+internal static class RowMath<TLane, TL> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+{
+    private static int W => Vector<TLane>.Count;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector<TLane> At(ref TLane r, int i) => Vector.LoadUnsafe(ref r, (nuint)i);
+
+    public static TLane Max(ReadOnlySpan<TLane> x)
+    {
+        int w = W, vec = x.Length / w * w;
+        ref TLane rx = ref MemoryMarshal.GetReference(x);
+        TLane max = TL.NegativeInfinity;
+        if (vec > 0)
+        {
+            Vector<TLane> m0 = new(max), m1 = m0;
+            int i = 0;
+            for (; i + 2 * w <= vec; i += 2 * w) { m0 = Vector.Max(m0, At(ref rx, i)); m1 = Vector.Max(m1, At(ref rx, i + w)); }
+            for (; i < vec; i += w) m0 = Vector.Max(m0, At(ref rx, i));
+            m0 = Vector.Max(m0, m1);
+            for (int l = 0; l < w; l++) max = TL.Max(max, m0[l]);
+        }
+
+        for (int i = vec; i < x.Length; i++) max = TL.Max(max, x[i]);
+        return max;
+    }
+
+    public static TLane Sum(ReadOnlySpan<TLane> x)
+    {
+        int w = W, vec = x.Length / w * w;
+        ref TLane rx = ref MemoryMarshal.GetReference(x);
+        Vector<TLane> s0 = Vector<TLane>.Zero, s1 = s0;
+        int i = 0;
+        for (; i + 2 * w <= vec; i += 2 * w) { s0 += At(ref rx, i); s1 += At(ref rx, i + w); }
+        for (; i < vec; i += w) s0 += At(ref rx, i);
+        TLane sum = Vector.Sum(s0 + s1);
+        for (i = vec; i < x.Length; i++) sum = TL.Add(sum, x[i]);
+        return sum;
+    }
+
+    /// <summary>Σ (x − c)² (c = 0 for a plain sum of squares).</summary>
+    public static TLane SumSq(ReadOnlySpan<TLane> x, TLane c)
+    {
+        int w = W, vec = x.Length / w * w;
+        ref TLane rx = ref MemoryMarshal.GetReference(x);
+        var cv = new Vector<TLane>(c);
+        Vector<TLane> s0 = Vector<TLane>.Zero, s1 = s0;
+        int i = 0;
+        for (; i + 2 * w <= vec; i += 2 * w)
+        {
+            var d0 = At(ref rx, i) - cv; var d1 = At(ref rx, i + w) - cv;
+            s0 = TL.Fma(d0, d0, s0); s1 = TL.Fma(d1, d1, s1);
+        }
+
+        for (; i < vec; i += w) { var d0 = At(ref rx, i) - cv; s0 = TL.Fma(d0, d0, s0); }
+        TLane sum = Vector.Sum(s0 + s1);
+        for (i = vec; i < x.Length; i++) { var d = TL.Sub(x[i], c); sum = TL.Fma(d, d, sum); }
+        return sum;
+    }
+
+    public static TLane Dot(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> y)
+    {
+        int w = W, vec = x.Length / w * w;
+        ref TLane rx = ref MemoryMarshal.GetReference(x);
+        ref TLane ry = ref MemoryMarshal.GetReference(y);
+        Vector<TLane> s0 = Vector<TLane>.Zero, s1 = s0;
+        int i = 0;
+        for (; i + 2 * w <= vec; i += 2 * w) { s0 = TL.Fma(At(ref rx, i), At(ref ry, i), s0); s1 = TL.Fma(At(ref rx, i + w), At(ref ry, i + w), s1); }
+        for (; i < vec; i += w) s0 = TL.Fma(At(ref rx, i), At(ref ry, i), s0);
+        TLane sum = Vector.Sum(s0 + s1);
+        for (i = vec; i < x.Length; i++) sum = TL.Fma(x[i], y[i], sum);
+        return sum;
+    }
+
+    /// <summary>Σ x·y·(z − c).</summary>
+    public static TLane Dot3(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> y, ReadOnlySpan<TLane> z, TLane c)
+    {
+        int w = W, vec = x.Length / w * w;
+        ref TLane rx = ref MemoryMarshal.GetReference(x);
+        ref TLane ry = ref MemoryMarshal.GetReference(y);
+        ref TLane rz = ref MemoryMarshal.GetReference(z);
+        var cv = new Vector<TLane>(c);
+        Vector<TLane> s0 = Vector<TLane>.Zero, s1 = s0;
+        int i = 0;
+        for (; i + 2 * w <= vec; i += 2 * w)
+        {
+            s0 = TL.Fma(At(ref rx, i) * At(ref ry, i), At(ref rz, i) - cv, s0);
+            s1 = TL.Fma(At(ref rx, i + w) * At(ref ry, i + w), At(ref rz, i + w) - cv, s1);
+        }
+
+        for (; i < vec; i += w) s0 = TL.Fma(At(ref rx, i) * At(ref ry, i), At(ref rz, i) - cv, s0);
+        TLane sum = Vector.Sum(s0 + s1);
+        for (i = vec; i < x.Length; i++) sum = TL.Fma(TL.Mul(x[i], y[i]), TL.Sub(z[i], c), sum);
+        return sum;
+    }
+
+    /// <summary>e = exp(x − m), returning Σ e (e may be x itself).</summary>
+    public static TLane ExpSum(ReadOnlySpan<TLane> x, TLane m, Span<TLane> e)
+    {
+        int w = W, vec = x.Length / w * w;
+        ref TLane rx = ref MemoryMarshal.GetReference(x);
+        ref TLane re = ref MemoryMarshal.GetReference(e);
+        var mv = new Vector<TLane>(m);
+        Vector<TLane> s0 = Vector<TLane>.Zero, s1 = s0;
+        int i = 0;
+        for (; i + 2 * w <= vec; i += 2 * w)
+        {
+            var e0 = TL.Exp(At(ref rx, i) - mv); var e1 = TL.Exp(At(ref rx, i + w) - mv);
+            e0.StoreUnsafe(ref re, (nuint)i); e1.StoreUnsafe(ref re, (nuint)(i + w));
+            s0 += e0; s1 += e1;
+        }
+
+        for (; i < vec; i += w) { var e0 = TL.Exp(At(ref rx, i) - mv); e0.StoreUnsafe(ref re, (nuint)i); s0 += e0; }
+        TLane sum = Vector.Sum(s0 + s1);
+        for (i = vec; i < x.Length; i++) { var t = TL.Exp(TL.Sub(x[i], m)); e[i] = t; sum = TL.Add(sum, t); }
+        return sum;
+    }
+
+    /// <summary>y = (x − c)·k.</summary>
+    public static void Scale(ReadOnlySpan<TLane> x, TLane c, TLane k, Span<TLane> y)
+    {
+        int w = W, vec = x.Length / w * w;
+        ref TLane rx = ref MemoryMarshal.GetReference(x);
+        ref TLane ry = ref MemoryMarshal.GetReference(y);
+        Vector<TLane> cv = new(c), kv = new(k);
+        int i = 0;
+        for (; i < vec; i += w) ((At(ref rx, i) - cv) * kv).StoreUnsafe(ref ry, (nuint)i);
+        for (; i < x.Length; i++) y[i] = TL.Mul(TL.Sub(x[i], c), k);
+    }
+
+    /// <summary>y = (x − c)·k·g + bt (bt empty: none).</summary>
+    public static void Normalize(ReadOnlySpan<TLane> x, TLane c, TLane k, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, Span<TLane> y)
+    {
+        int w = W, vec = x.Length / w * w;
+        ref TLane rx = ref MemoryMarshal.GetReference(x);
+        ref TLane rg = ref MemoryMarshal.GetReference(g);
+        ref TLane ry = ref MemoryMarshal.GetReference(y);
+        Vector<TLane> cv = new(c), kv = new(k);
+        int i = 0;
+        if (bt.IsEmpty)
+        {
+            for (; i < vec; i += w) ((At(ref rx, i) - cv) * kv * At(ref rg, i)).StoreUnsafe(ref ry, (nuint)i);
+            for (; i < x.Length; i++) y[i] = TL.Mul(TL.Mul(TL.Sub(x[i], c), k), g[i]);
+            return;
+        }
+
+        ref TLane rb = ref MemoryMarshal.GetReference(bt);
+        for (; i < vec; i += w) TL.Fma((At(ref rx, i) - cv) * kv, At(ref rg, i), At(ref rb, i)).StoreUnsafe(ref ry, (nuint)i);
+        for (; i < x.Length; i++) y[i] = TL.Fma(TL.Mul(TL.Sub(x[i], c), k), g[i], bt[i]);
+    }
+
+    /// <summary>y = x + x2.</summary>
+    public static void Add(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, Span<TLane> y)
+    {
+        int w = W, vec = x.Length / w * w;
+        ref TLane rx = ref MemoryMarshal.GetReference(x);
+        ref TLane r2 = ref MemoryMarshal.GetReference(x2);
+        ref TLane ry = ref MemoryMarshal.GetReference(y);
+        int i = 0;
+        for (; i < vec; i += w) (At(ref rx, i) + At(ref r2, i)).StoreUnsafe(ref ry, (nuint)i);
+        for (; i < x.Length; i++) y[i] = TL.Add(x[i], x2[i]);
+    }
+
+    /// <summary>y = k·(g·dy − m1 − (x − c)·k2) (the normalization backward passes; m1 = 0, c = 0 for rms).</summary>
+    public static void NormBackward(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> dy, ReadOnlySpan<TLane> g, TLane c, TLane k, TLane m1, TLane k2, Span<TLane> y)
+    {
+        int w = W, vec = x.Length / w * w;
+        ref TLane rx = ref MemoryMarshal.GetReference(x);
+        ref TLane rd = ref MemoryMarshal.GetReference(dy);
+        ref TLane rg = ref MemoryMarshal.GetReference(g);
+        ref TLane ry = ref MemoryMarshal.GetReference(y);
+        Vector<TLane> cv = new(c), kv = new(k), m1v = new(m1), k2v = new(k2);
+        int i = 0;
+        for (; i < vec; i += w)
+        {
+            var t = At(ref rg, i) * At(ref rd, i) - m1v - (At(ref rx, i) - cv) * k2v;
+            (t * kv).StoreUnsafe(ref ry, (nuint)i);
+        }
+
+        for (; i < x.Length; i++) y[i] = TL.Mul(TL.Sub(TL.Sub(TL.Mul(g[i], dy[i]), m1), TL.Mul(TL.Sub(x[i], c), k2)), k);
+    }
+
+    public static TLane Log(TLane v) => TL.Log(new Vector<TLane>(v))[0];
+}
+
+/// <summary>The row kernels, one struct per operation (the catalogue's references in lane arithmetic).</summary>
+internal static class RowKernels
+{
+    public struct LogSoftmax<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+    {
+        public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
+        {
+            TLane m = RowMath<TLane, TL>.Max(x);
+            TLane sum = RowMath<TLane, TL>.ExpSum(x, m, y);
+            TLane ls = TL.Add(m, RowMath<TLane, TL>.Log(sum));
+            RowMath<TLane, TL>.Scale(x, ls, TL.From(1), y);
+        }
+    }
+
+    public struct SoftmaxBwd<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+    {
+        public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
+        {
+            TLane d = RowMath<TLane, TL>.Dot(x, x2);
+            int w = Vector<TLane>.Count, vec = x.Length / w * w, i = 0;
+            var dv = new Vector<TLane>(d);
+            for (; i < vec; i += w) (new Vector<TLane>(x[i..]) * (new Vector<TLane>(x2[i..]) - dv)).CopyTo(y[i..]);
+            for (; i < x.Length; i++) y[i] = TL.Mul(x[i], TL.Sub(x2[i], d));
+        }
+    }
+
+    public struct LogSoftmaxBwd<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+    {
+        public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
+        {
+            TLane sd = RowMath<TLane, TL>.Sum(x2);
+            int w = Vector<TLane>.Count, vec = x.Length / w * w, i = 0;
+            var sv = new Vector<TLane>(sd);
+            for (; i < vec; i += w) (new Vector<TLane>(x2[i..]) - TL.Exp(new Vector<TLane>(x[i..])) * sv).CopyTo(y[i..]);
+            for (; i < x.Length; i++) y[i] = TL.Sub(x2[i], TL.Mul(TL.Exp(x[i]), sd));
+        }
+    }
+
+    private static TLane Rstd<TLane, TL>(TLane sumSq, int n, TLane eps) where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane> =>
+        TL.Div(TL.From(1), TL.Sqrt(TL.Add(TL.Div(sumSq, TL.From(n)), eps)));
+
+    public struct RmsNormAffine<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+    {
+        public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
+        {
+            TLane rstd = Rstd<TLane, TL>(RowMath<TLane, TL>.SumSq(x, TL.Zero), x.Length, a);
+            RowMath<TLane, TL>.Normalize(x, TL.Zero, rstd, g, default, y);
+        }
+    }
+
+    public struct RmsNormBwd<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+    {
+        public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
+        {
+            TLane rstd = Rstd<TLane, TL>(RowMath<TLane, TL>.SumSq(x, TL.Zero), x.Length, a);
+            TLane t = RowMath<TLane, TL>.Dot3(g, x2, x, TL.Zero);                 // Σ g·dy·x
+            TLane m = TL.Div(TL.Mul(rstd, t), TL.From(x.Length));                 // mean(g·dy·x̂)
+            RowMath<TLane, TL>.NormBackward(x, x2, g, TL.Zero, rstd, TL.Zero, TL.Mul(rstd, m), y);
+        }
+    }
+
+    public struct LayerNorm<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+    {
+        public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
+        {
+            TLane mu = TL.Div(RowMath<TLane, TL>.Sum(x), TL.From(x.Length));
+            TLane rstd = Rstd<TLane, TL>(RowMath<TLane, TL>.SumSq(x, mu), x.Length, a);
+            RowMath<TLane, TL>.Normalize(x, mu, rstd, g, bt, y);
+        }
+    }
+
+    public struct LayerNormBwd<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+    {
+        public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
+        {
+            TLane n = TL.From(x.Length);
+            TLane mu = TL.Div(RowMath<TLane, TL>.Sum(x), n);
+            TLane rstd = Rstd<TLane, TL>(RowMath<TLane, TL>.SumSq(x, mu), x.Length, a);
+            TLane m1 = TL.Div(RowMath<TLane, TL>.Dot(g, x2), n);                              // mean(g·dy)
+            TLane m2 = TL.Div(TL.Mul(rstd, RowMath<TLane, TL>.Dot3(g, x2, x, mu)), n);       // mean(g·dy·x̂)
+            RowMath<TLane, TL>.NormBackward(x, x2, g, mu, rstd, m1, TL.Mul(rstd, m2), y);
+        }
+    }
+
+    public struct WeightNorm<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+    {
+        public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
+        {
+            TLane k = TL.Div(s, TL.Sqrt(TL.Add(RowMath<TLane, TL>.SumSq(x, TL.Zero), a)));
+            RowMath<TLane, TL>.Scale(x, TL.Zero, k, y);
+        }
+    }
+
+    public struct Rope<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+    {
+        public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
+        {
+            int n = x.Length, half = n / 2, w = Vector<TLane>.Count, vec = half / w * w;
+            // θ_i = pos · a^(−2i/n) = pos · exp(i · k), k = −2 ln a / n.
+            TLane k = TL.Mul(TL.From(-2.0 / n), RowMath<TLane, TL>.Log(a)), p = TL.From(pos);
+            Span<TLane> ramp = stackalloc TLane[w];
+            for (int l = 0; l < w; l++) ramp[l] = TL.From(l);
+            var rampV = new Vector<TLane>(ramp);
+            Vector<TLane> kv = new(k), pv = new(p);
+            int i = 0;
+            for (; i < vec; i += w)
+            {
+                var theta = pv * TL.Exp((new Vector<TLane>(TL.From(i)) + rampV) * kv);
+                var c = TL.Cos(theta); var sn = TL.Sin(theta);
+                var lo = new Vector<TLane>(x[i..]); var hi = new Vector<TLane>(x[(i + half)..]);
+                (lo * c - hi * sn).CopyTo(y[i..]);
+                (lo * sn + hi * c).CopyTo(y[(i + half)..]);
+            }
+
+            for (; i < half; i++)
+            {
+                TLane theta = TL.Mul(p, TL.Exp(TL.Mul(TL.From(i), k)));
+                var tv = new Vector<TLane>(theta);
+                TLane c = TL.Cos(tv)[0], sn = TL.Sin(tv)[0];
+                y[i] = TL.Sub(TL.Mul(x[i], c), TL.Mul(x[i + half], sn));
+                y[i + half] = TL.Add(TL.Mul(x[i], sn), TL.Mul(x[i + half], c));
+            }
+
+            if (n % 2 == 1) y[n - 1] = x[n - 1];
+        }
+    }
+
+    public struct ScaleMaskSoftmax<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+    {
+        public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
+        {
+            int n = x.Length, w = Vector<TLane>.Count, vec = n / w * w, i = 0;
+            // z = a·x + mask into y; causal: columns past the row's index excluded.
+            var av = new Vector<TLane>(a);
+            if (x2.IsEmpty) for (; i < vec; i += w) (new Vector<TLane>(x[i..]) * av).CopyTo(y[i..]);
+            else for (; i < vec; i += w) TL.Fma(new Vector<TLane>(x[i..]), av, new Vector<TLane>(x2[i..])).CopyTo(y[i..]);
+            for (; i < n; i++) y[i] = x2.IsEmpty ? TL.Mul(x[i], a) : TL.Fma(x[i], a, x2[i]);
+            int limit = TL.From(0).Equals(b) ? n : Math.Max(0, Math.Min(n, pos + 1));
+            if (limit < n) y[limit..].Fill(TL.NegativeInfinity);
+            TLane m = RowMath<TLane, TL>.Max(y[..limit]);
+            if (limit == 0) { y.Fill(TL.Zero); return; }
+            TLane sum = RowMath<TLane, TL>.ExpSum(y[..limit], m, y[..limit]);
+            RowMath<TLane, TL>.Scale(y[..limit], TL.Zero, TL.Div(TL.From(1), sum), y[..limit]);
+            if (limit < n) y[limit..].Fill(TL.Zero);
+        }
+    }
+
+    public struct CrossEntropyBwd<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+    {
+        public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
+        {
+            TLane m = RowMath<TLane, TL>.Max(x);
+            TLane sum = RowMath<TLane, TL>.ExpSum(x, m, y);
+            RowMath<TLane, TL>.Scale(y, TL.Zero, TL.Div(TL.From(1), sum), y);
+            if ((uint)pos < (uint)x.Length) y[pos] = TL.Sub(y[pos], TL.From(1));
+        }
+    }
+
+    public struct AddRmsNorm<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+    {
+        public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
+        {
+            RowMath<TLane, TL>.Add(x, x2, y2);
+            RmsNormAffine<TLane, TL>.Row(y2, default, g, default, s, pos, row, a, b, y, default);
+        }
+    }
+
+    public struct AddLayerNorm<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+    {
+        public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
+        {
+            RowMath<TLane, TL>.Add(x, x2, y2);
+            LayerNorm<TLane, TL>.Row(y2, default, g, bt, s, pos, row, a, b, y, default);
+        }
+    }
+}
+
+internal static partial class Kernels
+{
+    /// <summary>A row operation over x (rows × cols, stored as TN) into y (and y2) in the type's float lane; returns the lane's name.</summary>
+    public static string RowOp<TN>(RowOp op, byte[] x, byte[]? x2, byte[]? g, byte[]? bt, byte[]? s, int[]? pos, byte[] y, byte[]? y2, int rows, int cols, double a, double b) where TN : struct, IQiyasFloat<TN>
+    {
+        var v = new RowOpVisitor(op, x, x2, g, bt, s, pos, y, y2, rows, cols, a, b);
+        TN.Float(ref v);
+        return v.Lane;
+    }
+
+    private struct RowOpVisitor(RowOp op, byte[] x, byte[]? x2, byte[]? g, byte[]? bt, byte[]? s, int[]? pos, byte[] y, byte[]? y2, int rows, int cols, double a, double b) : IFloatLaneVisitor
+    {
+        public string Lane = "";
+
+        public void Run<TN, TLane, TL>() where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+        {
+            Lane = TL.Name;
+            switch (op.Name)
+            {
+                case "log_softmax": Go<TN, TLane, TL, RowKernels.LogSoftmax<TLane, TL>>(); break;
+                case "softmax_bwd": Go<TN, TLane, TL, RowKernels.SoftmaxBwd<TLane, TL>>(); break;
+                case "log_softmax_bwd": Go<TN, TLane, TL, RowKernels.LogSoftmaxBwd<TLane, TL>>(); break;
+                case "rms_norm_affine": Go<TN, TLane, TL, RowKernels.RmsNormAffine<TLane, TL>>(); break;
+                case "rms_norm_bwd": Go<TN, TLane, TL, RowKernels.RmsNormBwd<TLane, TL>>(); break;
+                case "layer_norm": Go<TN, TLane, TL, RowKernels.LayerNorm<TLane, TL>>(); break;
+                case "layer_norm_bwd": Go<TN, TLane, TL, RowKernels.LayerNormBwd<TLane, TL>>(); break;
+                case "weight_norm": Go<TN, TLane, TL, RowKernels.WeightNorm<TLane, TL>>(); break;
+                case "rope": Go<TN, TLane, TL, RowKernels.Rope<TLane, TL>>(); break;
+                case "scale_mask_softmax": Go<TN, TLane, TL, RowKernels.ScaleMaskSoftmax<TLane, TL>>(); break;
+                case "add_rms_norm": Go<TN, TLane, TL, RowKernels.AddRmsNorm<TLane, TL>>(); break;
+                case "add_layer_norm": Go<TN, TLane, TL, RowKernels.AddLayerNorm<TLane, TL>>(); break;
+                case "cross_entropy_bwd": Go<TN, TLane, TL, RowKernels.CrossEntropyBwd<TLane, TL>>(); break;
+                default: throw new NotSupportedException($"row operation {op.Name}");
+            }
+        }
+
+        private readonly void Go<TN, TLane, TL, TK>()
+            where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane> where TK : struct, IRowKernel<TLane, TL>
+        {
+            var body = new RowOpBody<TN, TLane, TL, TK>(op, x, x2, g, bt, s, pos, y, y2, cols, TL.From(a), TL.From(b));
+            Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)rows * cols * 4, body);
+        }
+    }
+
+    private struct RowOpBody<TN, TLane, TL, TK>(RowOp op, byte[] x, byte[]? x2, byte[]? g, byte[]? bt, byte[]? s, int[]? pos, byte[] y, byte[]? y2, int cols, TLane a, TLane b) : Team.IBody
+        where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane> where TK : struct, IRowKernel<TLane, TL>
+    {
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public readonly void Run(int first, int last)
+        {
+            var pool = ArrayPool<TLane>.Shared;
+            // Lane rows for what the stored bytes are not (direct types read and write their own storage).
+            var xl = TN.Direct ? null : pool.Rent(cols);
+            var x2l = x2 is null || TN.Direct ? null : pool.Rent(cols);
+            var yl = TN.Direct ? null : pool.Rent(cols);
+            var y2l = y2 is null || TN.Direct ? null : pool.Rent(cols);
+            var gl = g is null ? null : pool.Rent(cols);
+            var btl = bt is null ? null : pool.Rent(cols);
+            var sl = s is null ? null : pool.Rent(1);
+            try
+            {
+                if (g is not null) TN.Load(g, 0, gl.AsSpan(0, cols));
+                if (bt is not null) TN.Load(bt, 0, btl.AsSpan(0, cols));
+                for (int r = first; r < last; r++)
+                {
+                    ReadOnlySpan<TLane> xs, x2s = default;
+                    Span<TLane> ys, y2s = default;
+                    if (TN.Direct)
+                    {
+                        xs = MemoryMarshal.Cast<byte, TLane>(x.AsSpan()).Slice(r * cols, cols);
+                        if (x2 is not null) x2s = MemoryMarshal.Cast<byte, TLane>(x2.AsSpan()).Slice(r * cols, cols);
+                        ys = MemoryMarshal.Cast<byte, TLane>(y.AsSpan()).Slice(r * cols, cols);
+                        if (y2 is not null) y2s = MemoryMarshal.Cast<byte, TLane>(y2.AsSpan()).Slice(r * cols, cols);
+                    }
+                    else
+                    {
+                        TN.Load(x, r * cols, xl.AsSpan(0, cols));
+                        xs = xl.AsSpan(0, cols);
+                        if (x2 is not null) { TN.Load(x2, r * cols, x2l.AsSpan(0, cols)); x2s = x2l.AsSpan(0, cols); }
+                        ys = yl.AsSpan(0, cols);
+                        if (y2 is not null) y2s = y2l.AsSpan(0, cols);
+                    }
+
+                    TLane sv = TL.From(1);
+                    if (s is not null) { TN.Load(s, r, sl.AsSpan(0, 1)); sv = sl![0]; }
+                    int p = pos is null ? r : pos[r];
+                    TK.Row(xs, x2s, g is null ? default : gl.AsSpan(0, cols), bt is null ? default : btl.AsSpan(0, cols), sv, p, r, a, b, ys, y2s);
+                    if (!TN.Direct)
+                    {
+                        TN.Store(ys, y, r * cols);
+                        if (y2 is not null) TN.Store(y2s, y2, r * cols);
+                    }
+                }
+            }
+            finally
+            {
+                if (xl is not null) pool.Return(xl);
+                if (x2l is not null) pool.Return(x2l);
+                if (yl is not null) pool.Return(yl);
+                if (y2l is not null) pool.Return(y2l);
+                if (gl is not null) pool.Return(gl);
+                if (btl is not null) pool.Return(btl);
+                if (sl is not null) pool.Return(sl);
+            }
+        }
+    }
+
+    /// <summary>dgamma[c] = Σ_r dy·x̂, dbeta[c] = Σ_r dy (x̂ by the row's rms or, centered, layer statistics): results as lane values (cols each); returns the lane's name.</summary>
+    public static string NormParamsBwd<TN>(byte[] x, byte[] dy, byte[] dgamma, byte[] dbeta, int rows, int cols, double eps, bool centered) where TN : struct, IQiyasFloat<TN>
+    {
+        var v = new NormParamsVisitor(x, dy, dgamma, dbeta, rows, cols, eps, centered);
+        TN.Float(ref v);
+        return v.Lane;
+    }
+
+    private struct NormParamsVisitor(byte[] x, byte[] dy, byte[] dgamma, byte[] dbeta, int rows, int cols, double eps, bool centered) : IFloatLaneVisitor
+    {
+        public string Lane = "";
+
+        public void Run<TN, TLane, TL>() where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+        {
+            Lane = TL.Name;
+            // The rows' statistics (mean, rstd), then the columns across the team.
+            var stats = new TLane[rows * 2];
+            Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)rows * cols, new RowStatsBody<TN, TLane, TL>(x, stats, cols, TL.From(eps), centered));
+            int chunk = Math.Max(Vector<TLane>.Count * 4, (cols + Threads - 1) / Threads / Vector<TLane>.Count * Vector<TLane>.Count);
+            Team.For(cols, chunk, (long)rows * cols * 2, new NormParamsBody<TN, TLane, TL>(x, dy, stats, dgamma, dbeta, rows, cols));
+        }
+    }
+
+    private struct RowStatsBody<TN, TLane, TL>(byte[] x, TLane[] stats, int cols, TLane eps, bool centered) : Team.IBody
+        where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+    {
+        public readonly void Run(int first, int last)
+        {
+            var pool = ArrayPool<TLane>.Shared;
+            var xl = TN.Direct ? null : pool.Rent(cols);
+            try
+            {
+                for (int r = first; r < last; r++)
+                {
+                    ReadOnlySpan<TLane> xs;
+                    if (TN.Direct) xs = MemoryMarshal.Cast<byte, TLane>(x.AsSpan()).Slice(r * cols, cols);
+                    else { TN.Load(x, r * cols, xl.AsSpan(0, cols)); xs = xl.AsSpan(0, cols); }
+                    TLane mu = centered ? TL.Div(RowMath<TLane, TL>.Sum(xs), TL.From(cols)) : TL.Zero;
+                    TLane rstd = TL.Div(TL.From(1), TL.Sqrt(TL.Add(TL.Div(RowMath<TLane, TL>.SumSq(xs, mu), TL.From(cols)), eps)));
+                    stats[2 * r] = mu;
+                    stats[2 * r + 1] = rstd;
+                }
+            }
+            finally
+            {
+                if (xl is not null) pool.Return(xl);
+            }
+        }
+    }
+
+    private struct NormParamsBody<TN, TLane, TL>(byte[] x, byte[] dy, TLane[] stats, byte[] dgamma, byte[] dbeta, int rows, int cols) : Team.IBody
+        where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+    {
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public readonly void Run(int first, int last)
+        {
+            int n = last - first, w = Vector<TLane>.Count;
+            var pool = ArrayPool<TLane>.Shared;
+            var xl = pool.Rent(n);
+            var dl = pool.Rent(n);
+            var ag = pool.Rent(n);
+            var ab = pool.Rent(n);
+            try
+            {
+                ag.AsSpan(0, n).Clear();
+                ab.AsSpan(0, n).Clear();
+                for (int r = 0; r < rows; r++)
+                {
+                    TN.Load(x, r * cols + first, xl.AsSpan(0, n));
+                    TN.Load(dy, r * cols + first, dl.AsSpan(0, n));
+                    Vector<TLane> mu = new(stats[2 * r]), rstd = new(stats[2 * r + 1]);
+                    int i = 0;
+                    for (; i + w <= n; i += w)
+                    {
+                        var d = new Vector<TLane>(dl.AsSpan(i));
+                        var h = (new Vector<TLane>(xl.AsSpan(i)) - mu) * rstd;
+                        TL.Fma(d, h, new Vector<TLane>(ag.AsSpan(i))).CopyTo(ag.AsSpan(i));
+                        (new Vector<TLane>(ab.AsSpan(i)) + d).CopyTo(ab.AsSpan(i));
+                    }
+
+                    for (; i < n; i++)
+                    {
+                        TLane h = TL.Mul(TL.Sub(xl[i], stats[2 * r]), stats[2 * r + 1]);
+                        ag[i] = TL.Fma(dl[i], h, ag[i]);
+                        ab[i] = TL.Add(ab[i], dl[i]);
+                    }
+                }
+
+                ag.AsSpan(0, n).CopyTo(MemoryMarshal.Cast<byte, TLane>(dgamma.AsSpan()).Slice(first, n));
+                ab.AsSpan(0, n).CopyTo(MemoryMarshal.Cast<byte, TLane>(dbeta.AsSpan()).Slice(first, n));
+            }
+            finally
+            {
+                pool.Return(xl);
+                pool.Return(dl);
+                pool.Return(ag);
+                pool.Return(ab);
+            }
+        }
+    }
+}

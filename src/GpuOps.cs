@@ -4,7 +4,7 @@ using System.Diagnostics;
 
 namespace Qiyas;
 
-public sealed class GpuOps(Gpu gpu)
+public sealed partial class GpuOps(Gpu gpu)
 {
     private readonly Dictionary<string, int> _tiles = [];
 
@@ -33,6 +33,285 @@ public sealed class GpuOps(Gpu gpu)
         long words = f.Words(n);
         int perThread = f.WordBits == 64 ? 2 : 4;
         Gpu.Launch(fn, Grid((words + perThread - 1) / perThread, 256), 1, 256, 1, 0, a, b, c, Gpu.U(n));
+    }
+
+    // ---------------------------------------------------------------- reductions, broadcasts, transposes, matrix · vector
+
+    /// <summary>The lane a sum takes on this device for the bounds: f32 while exact, s32/u32, f64, s64/u64 (a dot lane's
+    /// accumulator on the CPU is one of these: the device sums narrow values in 32-bit integers directly).</summary>
+    public static Lane SumLane(Fmt f, in Bounds bounds)
+    {
+        if (f.IsFloat) return f.Bits == 64 ? Lane.F64 : Lane.F32;
+        double bound = bounds.Bound;
+        if (bound <= Exact.Float32) return Lane.F32;
+        if (bound <= (f.Signed ? int.MaxValue : uint.MaxValue)) return f.Signed ? Lane.S32 : Lane.U32;
+        // Past 32 bits an integer sum takes the 64-bit integer lane: exact further than f64 (2^63 against 2^53) and, on a
+        // device whose f64 rate is a fraction of its f32 rate, several times faster (measured: int32 rows 0.133 ms in f64,
+        // 0.089 in s64 at 4096 × 4096).
+        return f.Signed ? Lane.S64 : Lane.U64;
+    }
+
+    /// <summary>Reduces x (rows × cols) along the axis into lane values at `output` (1, rows or cols of them; argmax: s32 indices). Returns the lane's name.</summary>
+    public string Reduce<TN>(string op, Axis axis, ulong x, int rows, int cols, ulong output) where TN : struct, IQiyasNumber<TN>
+    {
+        var f = Fmt.Of<TN>();
+        int total = rows * cols;
+        if (op is "max" or "min" or "argmax")
+        {
+            var own = f.Natural;
+            if (op == "argmax")
+            {
+                if (axis == Axis.Cols)
+                {
+                    var fc = gpu.Cached($"argmax_cols:{f.Name}", (out string e) => Ptx.ArgmaxCols(gpu, f, own, out e));
+                    Gpu.Launch(fc, Grid(cols, 256), 1, 256, 1, 0, x, output, Gpu.U(rows), Gpu.U(cols));
+                    return "s32 index";
+                }
+
+                var fn = gpu.Cached($"argmax:{f.Name}", (out string e) => Ptx.ArgmaxRows(gpu, f, own, out e));
+                int r = axis == Axis.Whole ? 1 : rows, c = axis == Axis.Whole ? total : cols;
+                Gpu.Launch(fn, (uint)r, 1, Ptx.ReduceThreads, 1, 0, x, output, Gpu.U(c));
+                return "s32 index";
+            }
+
+            Launch(f, own, op, false, axis, x, rows, cols, output);
+            return own.Name;
+        }
+
+        // The bounds: the type's range for floats and 8-bit values (it decides the lane already) and for 16- and 32-bit
+        // integers (measuring costs a pass as long as the sum, and the lane the type's range gives is exact and runs at the
+        // same bandwidth); measured for 64-bit integers, where the type's range fits no lane.
+        var (lo, hi) = !f.IsFloat && f.Bits is 16 or 32 ? (TN.Min, TN.Max) : Range<TN>(x, total);
+        long terms = axis switch { Axis.Whole => total, Axis.Rows => cols, _ => rows };
+        var bounds = op == "sumsq" ? new Bounds(lo, hi, lo, hi, terms) : new Bounds(lo, hi, 1, 1, terms);
+        var lane = SumLane(f, in bounds);
+        if (axis == Axis.Whole)
+        {
+            // The chunk pass needs only its own terms' bound: a narrower lane there (s32 for 8-bit values over a few thousand
+            // terms) and the wide lane over the partials, instead of the wide lane over every value.
+            var chunkBounds = op == "sumsq" ? new Bounds(lo, hi, lo, hi, WholeChunk(total)) : new Bounds(lo, hi, 1, 1, WholeChunk(total));
+            var chunkLane = SumLane(f, in chunkBounds);
+            // Partials of an integer sum stay integers (a float partial would need a float-to-integer step).
+            if (!lane.IsFloat && chunkLane.IsFloat) chunkLane = f.Signed ? Lane.S32 : Lane.U32;
+            Launch(f, lane, "sum", op == "sumsq", axis, x, rows, cols, output, chunkLane);
+            return lane.Name;
+        }
+
+        Launch(f, lane, "sum", op == "sumsq", axis, x, rows, cols, output);
+        return lane.Name;
+    }
+
+    // A whole reduction's chunking: at most 1024 blocks of at least 4096 values.
+    private static int WholeBlocks(int n) => (int)Math.Min(1024, Math.Max(1, (n + 4095) / 4096));
+    private static int WholeChunk(int n) => (n + WholeBlocks(n) - 1) / WholeBlocks(n);
+
+    private void Launch(Fmt f, Lane lane, string op, bool squares, Axis axis, ulong x, int rows, int cols, ulong output, Lane? chunkLane = null)
+    {
+        if (axis == Axis.Cols)
+        {
+            // Rows in splits so the device has enough threads (a thread per column per split); the splits joined by one more pass.
+            var fc = gpu.Cached($"reduce_cols:{op}:{squares}:{f.Name}:{lane.Name}", (out string e) => Ptx.ReduceCols(gpu, f, lane, op, squares, out e));
+            int splits = Splits(rows, cols), per = (rows + splits - 1) / splits;
+            if (splits == 1)
+            {
+                Gpu.Launch(fc, Grid(cols, 256), 1, 256, 1, 0, x, output, Gpu.U(rows), Gpu.U(cols), Gpu.U(per));
+                return;
+            }
+
+            ulong colParts = gpu.Rent((long)splits * cols * lane.Size);
+            try
+            {
+                Gpu.Launch(fc, Grid(cols, 256), (uint)splits, 256, 1, 0, x, colParts, Gpu.U(rows), Gpu.U(cols), Gpu.U(per));
+                var lf = Ptx.LaneFormat(lane);
+                var f2 = gpu.Cached($"reduce_cols:{op}:False:{lf.Name}:{lane.Name}", (out string e) => Ptx.ReduceCols(gpu, lf, lane, op, false, out e));
+                Gpu.Launch(f2, Grid(cols, 256), 1, 256, 1, 0, colParts, output, Gpu.U(splits), Gpu.U(cols), Gpu.U(splits));
+            }
+            finally
+            {
+                gpu.Return(colParts);
+            }
+
+            return;
+        }
+
+        var fr = gpu.Cached($"reduce_rows:{op}:{squares}:{f.Name}:{lane.Name}", (out string e) => Ptx.ReduceRows(gpu, f, lane, op, squares, out e));
+        if (axis == Axis.Rows)
+        {
+            Gpu.Launch(fr, (uint)rows, 1, Ptx.ReduceThreads, 1, 0, x, output, Gpu.U(cols), Gpu.U(0));
+            return;
+        }
+
+        // Whole: blocks over chunks into partials (lane values; the chunk lane, narrower when a chunk's bound allows), then
+        // the partials as one row in the lane (the identity on squares: plain sum).
+        int n = rows * cols, blocks = WholeBlocks(n), chunk = WholeChunk(n);
+        var first = chunkLane ?? lane;
+        if (first.Name != lane.Name) fr = gpu.Cached($"reduce_rows:{op}:{squares}:{f.Name}:{first.Name}", (out string e) => Ptx.ReduceRows(gpu, f, first, op, squares, out e));
+        ulong partials = gpu.Rent((long)blocks * first.Size);
+        try
+        {
+            Gpu.Launch(fr, (uint)blocks, 1, Ptx.ReduceThreads, 1, 0, x, partials, Gpu.U(n), Gpu.U(chunk));
+            var lf = Ptx.LaneFormat(first);
+            var f2 = gpu.Cached($"reduce_rows:{op}:False:{lf.Name}:{lane.Name}", (out string e) => Ptx.ReduceRows(gpu, lf, lane, op, false, out e));
+            Gpu.Launch(f2, 1, 1, Ptx.ReduceThreads, 1, 0, partials, output, Gpu.U(blocks), Gpu.U(0));
+        }
+        finally
+        {
+            gpu.Return(partials);
+        }
+    }
+
+    // Row splits for a per-column pass: enough column·split threads to fill the device, at most 64.
+    private int Splits(int rows, int cols)
+    {
+        int want = gpu.Multiprocessors * 2048;
+        int splits = (int)Math.Min(64, Math.Max(1, (want + cols - 1) / cols));
+        return Math.Min(splits, Math.Max(1, rows / 64));
+    }
+
+    /// <summary>output[r][c] = op(x[r][c], v[c]) in the format's natural lane.</summary>
+    public string MapRow<TN>(MapOp op, ulong x, ulong v, ulong output, int rows, int cols) where TN : struct, IQiyasNumber<TN>
+    {
+        var f = Fmt.Of<TN>();
+        if (f.IsBlock)
+        {
+            var r = new List<ulong>();
+            try
+            {
+                ulong lx = Lanes(f, Lane.F32, x, (long)rows * cols, r), lv = Lanes(f, Lane.F32, v, cols, r), lo = gpu.Rent((long)rows * cols * 4);
+                r.Add(lo);
+                MapRow<Float32>(op, lx, lv, lo, rows, cols);
+                Back(f, Lane.F32, lo, output, (long)rows * cols);
+                return "f32 (blocks through lane storage)";
+            }
+            finally { foreach (var p in r) gpu.Return(p); }
+        }
+
+        var lane = f.Natural;
+        var fn = gpu.Cached($"maprow:{op.Name}:{f.Name}", (out string e) => Ptx.MapRow(gpu, f, lane, op, out e));
+        int n = rows * cols;
+        Gpu.Launch(fn, Grid(f.Words(n), 256), 1, 256, 1, 0, x, v, output, Gpu.U(n), Gpu.U(cols));
+        return lane.Name;
+    }
+
+    public string Transpose<TN>(ulong x, ulong output, int rows, int cols) where TN : struct, IQiyasNumber<TN>
+    {
+        var f = Fmt.Of<TN>();
+        if (f.IsBlock)
+        {
+            var r = new List<ulong>();
+            try
+            {
+                ulong lx = Lanes(f, Lane.F32, x, (long)rows * cols, r), lo = gpu.Rent((long)rows * cols * 4);
+                r.Add(lo);
+                Transpose<Float32>(lx, lo, rows, cols);
+                Back(f, Lane.F32, lo, output, (long)rows * cols);
+                return "f32 (blocks through lane storage)";
+            }
+            finally { foreach (var p in r) gpu.Return(p); }
+        }
+
+        var lane = f.Natural;
+        // Output rows end on words when the input row count is a multiple of the values a word holds; otherwise values are
+        // written one by one (sub-byte values ORed into a zeroed output).
+        bool valueWise = rows % f.Per != 0;
+        if (valueWise && f.Bits < 8) Gpu.Clear(output, f.Words((long)rows * cols) * (f.WordBits / 8));
+        var fn = gpu.Cached($"transpose:{f.Name}:{valueWise}", (out string e) => Ptx.Transpose(gpu, f, lane, valueWise, out e));
+        Gpu.Launch(fn, Grid(cols, Ptx.TransposeTile), Grid(rows, Ptx.TransposeTile), 256, 1, 0, x, output, Gpu.U(rows), Gpu.U(cols));
+        return lane.Name;
+    }
+
+    /// <summary>y = A·x (or Aᵀ·x) in the sum lane for the measured bounds, y stored as the type.</summary>
+    public string Gemv<TN>(ulong a, ulong x, ulong y, int rows, int cols, bool transposed) where TN : struct, IQiyasNumber<TN>
+    {
+        var f = Fmt.Of<TN>();
+        if (f.IsBlock)
+        {
+            var r = new List<ulong>();
+            try
+            {
+                int xCount = transposed ? rows : cols, yCount = transposed ? cols : rows;
+                ulong la = Lanes(f, Lane.F32, a, (long)rows * cols, r), lx = Lanes(f, Lane.F32, x, xCount, r), ly = gpu.Rent(yCount * 4L);
+                r.Add(ly);
+                Gemv<Float32>(la, lx, ly, rows, cols, transposed);
+                Back(f, Lane.F32, ly, y, yCount);
+                return "f32 (blocks through lane storage)";
+            }
+            finally { foreach (var p in r) gpu.Return(p); }
+        }
+
+        int xn = transposed ? rows : cols, yn = transposed ? cols : rows;
+        var ((aLo, aHi), (xLo, xHi)) = RangePair<TN>(a, rows * cols, x, xn);
+        var bounds = new Bounds(aLo, aHi, xLo, xHi, xn);
+        var lane = SumLane(f, in bounds);
+        ulong yl = gpu.Rent((long)yn * lane.Size);
+        try
+        {
+            if (transposed)
+            {
+                var fc = gpu.Cached($"gemv_cols:{f.Name}:{lane.Name}", (out string e) => Ptx.GemvCols(gpu, f, lane, out e));
+                int splits = Splits(rows, cols), per = (rows + splits - 1) / splits;
+                if (splits == 1) Gpu.Launch(fc, Grid(cols, 256), 1, 256, 1, 0, a, x, yl, Gpu.U(rows), Gpu.U(cols), Gpu.U(per));
+                else
+                {
+                    ulong partials = gpu.Rent((long)splits * cols * lane.Size);
+                    try
+                    {
+                        Gpu.Launch(fc, Grid(cols, 256), (uint)splits, 256, 1, 0, a, x, partials, Gpu.U(rows), Gpu.U(cols), Gpu.U(per));
+                        var lf = Ptx.LaneFormat(lane);
+                        var f2 = gpu.Cached($"reduce_cols:sum:False:{lf.Name}:{lane.Name}", (out string e) => Ptx.ReduceCols(gpu, lf, lane, "sum", false, out e));
+                        Gpu.Launch(f2, Grid(cols, 256), 1, 256, 1, 0, partials, yl, Gpu.U(splits), Gpu.U(cols), Gpu.U(splits));
+                    }
+                    finally
+                    {
+                        gpu.Return(partials);
+                    }
+                }
+            }
+            else
+            {
+                var fr = gpu.Cached($"gemv_rows:{f.Name}:{lane.Name}", (out string e) => Ptx.GemvRows(gpu, f, lane, out e));
+                Gpu.Launch(fr, Grid(rows, 8), 1, 256, 1, 0, a, x, yl, Gpu.U(rows), Gpu.U(cols));
+            }
+
+            Back(f, lane, yl, y, yn);
+        }
+        finally
+        {
+            gpu.Return(yl);
+        }
+
+        return lane.Name;
+    }
+
+    // ---------------------------------------------------------------- element-wise formulas
+
+    /// <summary>output = op(x, y, z; a, b) over n values: the formulas every lane has in the format's natural lane, the float
+    /// ones in its float lane (f32 for the small floats, f64 for float64). Absent inputs may be 0.</summary>
+    public string Map<TN>(MapOp op, ulong x, ulong y, ulong z, ulong output, int n, double a, double b) where TN : struct, IQiyasNumber<TN>
+    {
+        var f = Fmt.Of<TN>();
+        if (f.IsBlock)
+        {
+            var r = new List<ulong>();
+            try
+            {
+                ulong lx = x == 0 ? 0 : Lanes(f, Lane.F32, x, n, r), ly = y == 0 ? 0 : Lanes(f, Lane.F32, y, n, r), lz = z == 0 ? 0 : Lanes(f, Lane.F32, z, n, r), lo = gpu.Rent(n * 4L);
+                r.Add(lo);
+                Map<Float32>(op, lx, ly, lz, lo, n, a, b);
+                Back(f, Lane.F32, lo, output, n);
+                return "f32 (blocks through lane storage)";
+            }
+            finally { foreach (var p in r) gpu.Return(p); }
+        }
+
+        if (op.FloatOnly && !f.IsFloat) throw new NotSupportedException($"{op.Name}: a float formula; {f.Name} is not a float type");
+        var lane = f.Natural;
+        (a, b) = Kernels.Held<TN>(a, b);
+        var fn = gpu.Cached($"map:{op.Name}:{f.Name}:{lane.Name}", (out string e) => Ptx.Map(gpu, f, lane, op, out e));
+        ulong pa = lane.IsFloat ? (lane.Wide ? Gpu.D(a) : Gpu.F((float)a)) : lane.Wide ? (ulong)(long)a : (ulong)(uint)(int)a;
+        ulong pb = lane.IsFloat ? (lane.Wide ? Gpu.D(b) : Gpu.F((float)b)) : lane.Wide ? (ulong)(long)b : (ulong)(uint)(int)b;
+        Gpu.Launch(fn, Grid(f.Words(n), 256), 1, 256, 1, 0, x, y, z, output, Gpu.U(n), pa, pb);
+        return lane.Name;
     }
 
     // ---------------------------------------------------------------- the range of stored values
@@ -173,7 +452,7 @@ public sealed class GpuOps(Gpu gpu)
     {
         string key = $"{a.Tag}<{b.Tag}:{terms}";
         if (_faster.TryGetValue(key, out bool faster)) return faster;
-        int size = (int)Math.Min(terms, 2048), kp = Ptx.Padded(size);
+        int size = (int)Math.Clamp(terms, 256, 2048), kp = Ptx.Padded(size);     // at least the kernels' widest tile
         int bits = Math.Max(a.Bits, b.Bits);
         ulong x = gpu.Rent((long)size * kp * bits / 8), y = gpu.Rent((long)size * kp * bits / 8), z = gpu.Rent((long)size * size * 4);
         var fa = MmaFunction(a, out uint sa, out int bna);
@@ -181,6 +460,7 @@ public sealed class GpuOps(Gpu gpu)
         double ta = TimeMma(fa, sa, bna, x, y, z, size, kp), tb = TimeMma(fb, sb, bnb, x, y, z, size, kp);
         gpu.Return(x); gpu.Return(y); gpu.Return(z);
         Console.WriteLine($"device measured {a.Tag} tensor kernel {ta:0.000} ms against {b.Tag} {tb:0.000} ms at {size}³: {(ta < tb ? a.Tag : b.Tag)} kept");
+        Note($"{a.Tag} {ta:0.000} ms against {b.Tag} {tb:0.000} ms at {size}³ (k = {kp}): {(ta < tb ? a.Tag : b.Tag)}");
         return _faster[key] = ta < tb;
     }
 
@@ -213,6 +493,7 @@ public sealed class GpuOps(Gpu gpu)
     public string MatMul<TN>(ulong a, ulong b, ulong c, int m, int n, int k, in Bounds bounds) where TN : struct, IQiyasNumber<TN>
     {
         var f = Fmt.Of<TN>();
+        if (m % 128 != 0 || n % 256 != 0 || k % 128 != 0) return MatMulPadded<TN>(a, b, c, m, n, k, in bounds);
         string laneName = ProductLane<TN>(bounds);
         var lane = LaneOf(laneName);
         var rented = new List<ulong>();
@@ -254,7 +535,8 @@ public sealed class GpuOps(Gpu gpu)
                 return laneName;
             }
 
-            if (f.Is("float64") && SlicedProven && SlicedFaster(m, n, k, a, b, c) && MatMulSliced(a, b, c, m, n, k)) return "f64x";
+            // The sliced route's kernels take shapes in multiples of 8 (their slices and tiles); other shapes take the float64 lane.
+            if (f.Is("float64") && SlicedProven && m % 8 == 0 && n % 8 == 0 && k % 8 == 0 && SlicedFaster(m, n, k, a, b, c) && MatMulSliced(a, b, c, m, n, k)) return "f64x";
             bool direct = f.Natural == lane && f.Bits == lane.Size * 8 && (f.IsFloat == lane.IsFloat);
             ulong la = direct ? a : Lanes(f, lane, a, (long)m * k, rented);
             ulong lb = direct ? b : Lanes(f, lane, b, (long)k * n, rented);
@@ -284,6 +566,31 @@ public sealed class GpuOps(Gpu gpu)
         }
     }
 
+    /// <summary>A product whose shape the kernels' tiles and vector loads cannot take as stored: A padded to mp × kp, B to
+    /// kp × np (multiples of 128; zeros beyond m, k and n: the sums are unchanged), the product at the padded shape, C's
+    /// m × n taken from mp × np.</summary>
+    private string MatMulPadded<TN>(ulong a, ulong b, ulong c, int m, int n, int k, in Bounds bounds) where TN : struct, IQiyasNumber<TN>
+    {
+        var f = Fmt.Of<TN>();
+        int mp = (m + 127) / 128 * 128, kp = (k + 127) / 128 * 128, np = (n + 255) / 256 * 256;   // the tensor kernels' widest tile is 256 columns
+        long bytesA = f.Words((long)mp * kp) * (f.WordBits / 8), bytesB = f.Words((long)kp * np) * (f.WordBits / 8), bytesC = f.Words((long)mp * np) * (f.WordBits / 8);
+        ulong pa = gpu.Rent(bytesA), pb = gpu.Rent(bytesB), pc = gpu.Rent(bytesC);
+        try
+        {
+            Gpu.Clear(pa, bytesA);
+            Layout<TN>(new LayoutArgs { Name = "pad2d", X = [], P = [m, k, kp], Output = [], Count = m * kp, InputCount = m * k }, a, 0, pa);
+            Gpu.Clear(pb, bytesB);
+            Layout<TN>(new LayoutArgs { Name = "pad2d", X = [], P = [k, n, np], Output = [], Count = k * np, InputCount = k * n }, b, 0, pb);
+            string lane = MatMul<TN>(pa, pb, pc, mp, np, kp, in bounds);
+            Layout<TN>(new LayoutArgs { Name = "strided", X = [], P = [1, 1, m, n, 0, 0, np, 1, 0], Output = [], Count = m * n, InputCount = mp * np }, pc, 0, c);
+            return lane;
+        }
+        finally
+        {
+            gpu.Return(pa); gpu.Return(pb); gpu.Return(pc);
+        }
+    }
+
     // ---------------------------------------------------------------- float64 products through the 8-bit tensor lane
 
     /// <summary>Set by the device proof (Checks.Gpu): the sliced product reproduces float64 math to within an ulp on this device.</summary>
@@ -307,7 +614,10 @@ public sealed class GpuOps(Gpu gpu)
         }
 
         double plain = Time(() => PlainF64(a, b, c, m, n, k));
-        double sliced = Time(() => { if (!MatMulSliced(a, b, c, m, n, k)) throw new InvalidOperationException("sliced product refused"); });
+        bool refused = false;
+        double sliced = Time(() => { if (!MatMulSliced(a, b, c, m, n, k)) refused = true; });
+        if (refused) { Note($"sliced float64 product refused at {key} (exponents beyond the slicing scale): the f64 lane"); return _slicedFaster[key] = false; }
+        Note($"float64 product at {key}: f64 lane {plain:0.000} ms, sliced {sliced:0.000} ms: {(sliced < plain ? "sliced" : "f64 lane")}");
         Console.WriteLine($"device measured float64 product at {key}: float64 lane {plain:0.000} ms, sliced 8-bit tensor lane {sliced:0.000} ms: {(sliced < plain ? "sliced" : "float64")} kept");
         return _slicedFaster[key] = sliced < plain;
     }
@@ -342,6 +652,12 @@ public sealed class GpuOps(Gpu gpu)
             var fa = new int[n];
             Gpu.Download<int>(e, ea);
             Gpu.Download<int>(f, fa);
+            // A row or column of zeros has no exponent (far below any scale): it takes 0, any finite scale slicing it to zeros.
+            bool zeroRows = false, zeroCols = false;
+            for (int i = 0; i < m; i++) if (ea[i] < -900) { ea[i] = 0; zeroRows = true; }
+            for (int i = 0; i < n; i++) if (fa[i] < -900) { fa[i] = 0; zeroCols = true; }
+            if (zeroRows) Gpu.Upload<int>(ea, e);
+            if (zeroCols) Gpu.Upload<int>(fa, f);
             int eMin = ea.Min(), eMax = ea.Max(), fMin = fa.Min(), fMax = fa.Max();
             if (eMax > 1086 || fMax > 1086 || eMin + fMin < -918 || eMax + fMax > 1057) return false;
             if (kpad != k) Gpu.Clear(sa, (long)m * rowLen);
@@ -450,6 +766,13 @@ public sealed class GpuOps(Gpu gpu)
     {
         ulong buffer = gpu.Rent(count * lane.Size);
         rented.Add(buffer);
+        if (f.IsBlock)
+        {
+            var widen = gpu.Cached($"widen:{f.Name}:{lane.Name}", (out string e) => Ptx.Widen(gpu, f, lane, out e));
+            Gpu.Launch(widen, Grid(count, 256), 1, 256, 1, 0, stored, buffer, Gpu.U((int)count));
+            return buffer;
+        }
+
         var fn = gpu.Cached($"to:{f.Name}:{lane.Name}", (out string e) => Ptx.ToLanes(gpu, f, lane, out e));
         Gpu.Launch(fn, Grid(f.Words(count), 256), 1, 256, 1, 0, stored, buffer, Gpu.U((int)count));
         return buffer;
@@ -457,6 +780,13 @@ public sealed class GpuOps(Gpu gpu)
 
     private void Back(Fmt f, Lane lane, ulong lanes, ulong stored, long count)
     {
+        if (f.IsBlock)
+        {
+            var encode = gpu.Cached($"lanes_to:{f.Name}:{lane.Name}", (out string e) => Ptx.LanesToBlock(gpu, f, lane, out e));
+            Gpu.Launch(encode, Grid((count + f.BlockValues - 1) / f.BlockValues, 256), 1, 256, 1, 0, lanes, stored, Gpu.U((int)count));
+            return;
+        }
+
         var fn = gpu.Cached($"back:{lane.Name}:{f.Name}", (out string e) => Ptx.FromLanes(gpu, lane, f, out e));
         Gpu.Launch(fn, Grid(f.Words(count), 256), 1, 256, 1, 0, lanes, stored, Gpu.U((int)count));
     }
@@ -465,6 +795,13 @@ public sealed class GpuOps(Gpu gpu)
     public void ToLanes<TN>(Lane lane, ulong stored, ulong lanes, int count) where TN : struct, IQiyasNumber<TN>
     {
         var f = Fmt.Of<TN>();
+        if (f.IsBlock)
+        {
+            var widen = gpu.Cached($"widen:{f.Name}:{lane.Name}", (out string e) => Ptx.Widen(gpu, f, lane, out e));
+            Gpu.Launch(widen, Grid(count, 256), 1, 256, 1, 0, stored, lanes, Gpu.U(count));
+            return;
+        }
+
         var fn = gpu.Cached($"to:{f.Name}:{lane.Name}", (out string e) => Ptx.ToLanes(gpu, f, lane, out e));
         Gpu.Launch(fn, Grid(f.Words(count), 256), 1, 256, 1, 0, stored, lanes, Gpu.U(count));
     }
@@ -472,6 +809,7 @@ public sealed class GpuOps(Gpu gpu)
     public void FromLanes<TN>(Lane lane, ulong lanes, ulong stored, int count) where TN : struct, IQiyasNumber<TN>
     {
         var f = Fmt.Of<TN>();
+        if (f.IsBlock) { Back(f, lane, lanes, stored, count); return; }
         var fn = gpu.Cached($"back:{lane.Name}:{f.Name}", (out string e) => Ptx.FromLanes(gpu, lane, f, out e));
         Gpu.Launch(fn, Grid(f.Words(count), 256), 1, 256, 1, 0, lanes, stored, Gpu.U(count));
     }

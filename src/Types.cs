@@ -262,16 +262,74 @@ internal static class Packed
 {
     public const int Chunk = 2048;
 
+    /// <summary>Values first .. first + l.Length as 8-bit lanes (any first: the values before the first whole byte one by one).</summary>
+    public static void Load8(ReadOnlySpan<byte> s, int first, Span<byte> l, int bits, bool signed)
+    {
+        int per = 8 / bits, skip = first % per, mask = (1 << bits) - 1;
+        int head = skip == 0 ? 0 : Math.Min(per - skip, l.Length);
+        for (int i = 0; i < head; i++)
+        {
+            int v = (s[(first + i) / per] >> ((first + i) % per * bits)) & mask;
+            l[i] = (byte)(signed && v >= 1 << (bits - 1) ? v - (1 << bits) : v);
+        }
+
+        if (head == l.Length) return;
+        var rest = l[head..];
+        var src = s[((first + head) / per)..];
+        if (bits == 1)
+        {
+            for (int i = 0; i < rest.Length; i++) rest[i] = (byte)((src[i / 8] >> (i % 8)) & 1);
+            return;
+        }
+
+        if (bits == 4) Cvt.Int4ToSByte(src, MemoryMarshal.Cast<byte, sbyte>(rest));
+        else Cvt.Int2ToByte(src, rest, signed);
+    }
+
+    /// <summary>8-bit lanes into values first .. (any first), held to the range of the type.</summary>
+    public static void Store8(ReadOnlySpan<byte> l, Span<byte> s, int first, int bits, bool signed)
+    {
+        int per = 8 / bits, skip = first % per, mask = (1 << bits) - 1;
+        int head = skip == 0 ? 0 : Math.Min(per - skip, l.Length);
+        long low = signed ? -(1 << (bits - 1)) : 0, high = signed ? (1 << (bits - 1)) - 1 : mask;
+        for (int i = 0; i < head; i++)
+        {
+            int at = first + i, shift = at % per * bits;
+            int v = (int)Math.Clamp(signed ? (sbyte)l[i] : l[i], low, high) & mask;
+            s[at / per] = (byte)((s[at / per] & ~(mask << shift)) | v << shift);
+        }
+
+        if (head == l.Length) return;
+        var rest = l[head..];
+        var dst = s[((first + head) / per)..];
+        if (bits == 4) Cvt.SByteToInt4(MemoryMarshal.Cast<byte, sbyte>(rest), dst);
+        else if (bits == 2) Cvt.ByteToInt2(rest, dst, signed);
+        else
+        {
+            // 1-bit values: 8 a byte, the first in the low bit (a whole byte at a time, the last partial byte kept beyond the values).
+            int whole = rest.Length / 8;
+            for (int i = 0; i < whole; i++)
+            {
+                int v = 0;
+                for (int t = 0; t < 8; t++) v |= (rest[i * 8 + t] & 1) << t;
+                dst[i] = (byte)v;
+            }
+
+            for (int i = whole * 8; i < rest.Length; i++)
+            {
+                int t = i % 8;
+                dst[whole] = (byte)((dst[whole] & ~(1 << t)) | (rest[i] & 1) << t);
+            }
+        }
+    }
+
     public static void Load<TL>(ReadOnlySpan<byte> s, int first, Span<TL> l, int bits, bool signed) where TL : unmanaged
     {
         Span<byte> t = stackalloc byte[Chunk];
-        int per = 8 / bits;
         for (int at = 0; at < l.Length; at += Chunk)
         {
             int n = Math.Min(Chunk, l.Length - at);
-            var src = s[((first + at) / per)..];
-            if (bits == 4) Cvt.Int4ToSByte(src, MemoryMarshal.Cast<byte, sbyte>(t[..n]));
-            else Cvt.Int2ToByte(src, t[..n], signed);
+            Load8(s, first + at, t[..n], bits, signed);
             if (signed) Widths.Load(MemoryMarshal.Cast<byte, sbyte>(t[..n]), l.Slice(at, n));
             else Widths.Load(t[..n], l.Slice(at, n));
         }
@@ -280,15 +338,12 @@ internal static class Packed
     public static void Store<TL>(ReadOnlySpan<TL> l, Span<byte> s, int first, int bits, bool signed) where TL : unmanaged
     {
         Span<byte> t = stackalloc byte[Chunk];
-        int per = 8 / bits;
         for (int at = 0; at < l.Length; at += Chunk)
         {
             int n = Math.Min(Chunk, l.Length - at);
             if (signed) Widths.Store(l.Slice(at, n), MemoryMarshal.Cast<byte, sbyte>(t[..n]));
             else Widths.Store(l.Slice(at, n), t[..n]);
-            var dst = s[((first + at) / per)..];
-            if (bits == 4) Cvt.SByteToInt4(MemoryMarshal.Cast<byte, sbyte>(t[..n]), dst);
-            else Cvt.ByteToInt2(t[..n], dst, signed);
+            Store8(t[..n], s, first + at, bits, signed);
         }
     }
 }
@@ -300,8 +355,8 @@ public readonly struct Int4 : IQiyasNumber<Int4, sbyte>, IQiyasNumber<Int4, floa
     public static bool IsFloat => false;
     public static double Min => -8;
     public static double Max => 7;
-    public static void Load(ReadOnlySpan<byte> s, int first, Span<sbyte> l) => Cvt.Int4ToSByte(s[(first / 2)..], l);
-    public static void Store(ReadOnlySpan<sbyte> l, Span<byte> s, int first) => Cvt.SByteToInt4(l, s[(first / 2)..]);
+    public static void Load(ReadOnlySpan<byte> s, int first, Span<sbyte> l) => Packed.Load8(s, first, MemoryMarshal.AsBytes(l), 4, signed: true);
+    public static void Store(ReadOnlySpan<sbyte> l, Span<byte> s, int first) => Packed.Store8(MemoryMarshal.AsBytes(l), s, first, 4, signed: true);
     public static void Load(ReadOnlySpan<byte> s, int first, Span<float> l) => Packed.Load(s, first, l, 4, signed: true);
     public static void Store(ReadOnlySpan<float> l, Span<byte> s, int first) => Packed.Store(l, s, first, 4, signed: true);
     public static void Load(ReadOnlySpan<byte> s, int first, Span<double> l) => Packed.Load(s, first, l, 4, signed: true);
@@ -325,8 +380,8 @@ public readonly struct Int2 : IQiyasNumber<Int2, sbyte>, IQiyasNumber<Int2, floa
     public static bool IsFloat => false;
     public static double Min => -2;
     public static double Max => 1;
-    public static void Load(ReadOnlySpan<byte> s, int first, Span<sbyte> l) => Cvt.Int2ToByte(s[(first / 4)..], MemoryMarshal.AsBytes(l), signed: true);
-    public static void Store(ReadOnlySpan<sbyte> l, Span<byte> s, int first) => Cvt.ByteToInt2(MemoryMarshal.AsBytes(l), s[(first / 4)..], signed: true);
+    public static void Load(ReadOnlySpan<byte> s, int first, Span<sbyte> l) => Packed.Load8(s, first, MemoryMarshal.AsBytes(l), 2, signed: true);
+    public static void Store(ReadOnlySpan<sbyte> l, Span<byte> s, int first) => Packed.Store8(MemoryMarshal.AsBytes(l), s, first, 2, signed: true);
     public static void Load(ReadOnlySpan<byte> s, int first, Span<float> l) => Packed.Load(s, first, l, 2, signed: true);
     public static void Store(ReadOnlySpan<float> l, Span<byte> s, int first) => Packed.Store(l, s, first, 2, signed: true);
     public static void Load(ReadOnlySpan<byte> s, int first, Span<double> l) => Packed.Load(s, first, l, 2, signed: true);
@@ -481,8 +536,8 @@ public readonly struct UInt2 : IQiyasNumber<UInt2, byte>, IQiyasNumber<UInt2, fl
     public static bool IsFloat => false;
     public static double Min => 0;
     public static double Max => 3;
-    public static void Load(ReadOnlySpan<byte> s, int first, Span<byte> l) => Cvt.Int2ToByte(s[(first / 4)..], l, signed: false);
-    public static void Store(ReadOnlySpan<byte> l, Span<byte> s, int first) => Cvt.ByteToInt2(l, s[(first / 4)..], signed: false);
+    public static void Load(ReadOnlySpan<byte> s, int first, Span<byte> l) => Packed.Load8(s, first, l, 2, signed: false);
+    public static void Store(ReadOnlySpan<byte> l, Span<byte> s, int first) => Packed.Store8(l, s, first, 2, signed: false);
     public static void Load(ReadOnlySpan<byte> s, int first, Span<float> l) => Packed.Load(s, first, l, 2, signed: false);
     public static void Store(ReadOnlySpan<float> l, Span<byte> s, int first) => Packed.Store(l, s, first, 2, signed: false);
     public static void Load(ReadOnlySpan<byte> s, int first, Span<double> l) => Packed.Load(s, first, l, 2, signed: false);

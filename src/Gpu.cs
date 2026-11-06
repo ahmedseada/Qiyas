@@ -129,6 +129,12 @@ public sealed unsafe class Gpu : IDisposable
     /// <summary>The function <paramref name="entry"/> of the module built from <paramref name="ptx"/> (JIT-compiled once per text).</summary>
     public IntPtr Function(string ptx, string entry)
     {
+        if (Environment.GetEnvironmentVariable("QIYAS_PTX_DUMP") is { Length: > 0 } dir && !_modules.ContainsKey(ptx))
+        {
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, entry + ".ptx"), ptx);
+        }
+
         if (!_modules.TryGetValue(ptx, out var module))
         {
             byte[] image = Encoding.UTF8.GetBytes(ptx + "\0");

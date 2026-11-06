@@ -751,6 +751,15 @@ internal static class Widths
         _ => typeof(T) == typeof(long) ? Unsafe.As<T, long>(ref v) : (long)Math.Min(Unsafe.As<T, ulong>(ref v), long.MaxValue),
     };
 
+    /// <summary>Orders two lane values (floats by value, unsigned 64-bit values as unsigned): negative, zero or positive.</summary>
+    public static int Compare<T>(T a, T b) where T : unmanaged
+    {
+        if (typeof(T) == typeof(float)) return Unsafe.As<T, float>(ref a).CompareTo(Unsafe.As<T, float>(ref b));
+        if (typeof(T) == typeof(double)) return Unsafe.As<T, double>(ref a).CompareTo(Unsafe.As<T, double>(ref b));
+        if (typeof(T) == typeof(ulong)) return Unsafe.As<T, ulong>(ref a).CompareTo(Unsafe.As<T, ulong>(ref b));
+        return AsLong(a).CompareTo(AsLong(b));
+    }
+
     public static T FromLong<T>(long v) where T : unmanaged
     {
         if (typeof(T) == typeof(sbyte)) { var x = (sbyte)v; return Unsafe.As<sbyte, T>(ref x); }

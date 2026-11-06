@@ -48,6 +48,103 @@ public interface IBenchSubject
 
     /// <summary>y = x / sqrt(mean(x²) + eps) over each row.</summary>
     IBenchRun? RmsNorm(Device device, string type, byte[] x, byte[] y, int rows, int cols, double eps);
+
+    /// <summary>output = op(x, y, z; a, b) over n values (Ops.All names the formulas; inputs past op.Inputs are null).</summary>
+    IBenchRun? Map(Device device, MapOp op, string type, byte[]? x, byte[]? y, byte[]? z, byte[] output, int n, double a, double b) => null;
+
+    /// <summary>A reduction (sum, sumsq, max, min, argmax) of x (rows × cols) along the axis: the result is written as the
+    /// subject's lane values (Lane names it: f32, f64, s32, u32, s64, u64, or "s32 index"); output holds 8 bytes per result.</summary>
+    IBenchRun? Reduce(Device device, string op, Axis axis, string type, byte[] x, int rows, int cols, byte[] output) => null;
+
+    /// <summary>output[r][c] = op(x[r][c], v[c]) for a two-input formula (add, sub, mul, div, max, min).</summary>
+    IBenchRun? MapRow(Device device, MapOp op, string type, byte[] x, byte[] v, byte[] output, int rows, int cols) => null;
+
+    /// <summary>output (cols × rows) = xᵀ.</summary>
+    IBenchRun? Transpose(Device device, string type, byte[] x, byte[] output, int rows, int cols) => null;
+
+    /// <summary>y = A·x (A rows × cols, x cols) or, transposed, y = Aᵀ·x (x rows); y stored as the type.</summary>
+    IBenchRun? Gemv(Device device, string type, byte[] a, byte[] x, byte[] y, int rows, int cols, bool transposed) => null;
+
+    /// <summary>A row operation (RowOps.All) over x (rows × cols): the second row x2, the per-column vectors g and bt, the
+    /// per-row scalars s and positions pos are null when the operation has none; y2 is the second output when it has one.</summary>
+    IBenchRun? RowOp(Device device, RowOp op, string type, byte[] x, byte[]? x2, byte[]? g, byte[]? bt, byte[]? s, int[]? pos, byte[] y, byte[]? y2, int rows, int cols, double a, double b) => null;
+
+    /// <summary>dgamma[c] = Σ_r dy·x̂, dbeta[c] = Σ_r dy (x̂ by rms or, centered, layer statistics with eps): output holds dgamma then
+    /// dbeta as the subject's lane values (8 bytes a slot, 2·cols slots).</summary>
+    IBenchRun? NormParamsBwd(Device device, string type, byte[] x, byte[] dy, byte[] output, int rows, int cols, double eps, bool centered) => null;
+
+    /// <summary>A layout operation (LayoutArgs.Names): the input, the index array and the parameters in k; the output in k.Output (stored as the type).</summary>
+    IBenchRun? Layout(Device device, string type, LayoutArgs k) => null;
+
+    /// <summary>C = op(A)·op(B) over a view's batches (ProductView: transposed operands, batch strides); c stored as the type.</summary>
+    IBenchRun? MatMulView(Device device, string type, ProductView v, byte[] a, byte[] b, byte[] c) => null;
+
+    /// <summary>dA = dC·Bᵀ and dB = Aᵀ·dC for C = A·B (A m × k, B k × n, dC m × n), both stored as the type.</summary>
+    IBenchRun? MatMulBackward(Device device, string type, byte[] a, byte[] b, byte[] dc, byte[] da, byte[] db, int m, int n, int k) => null;
+
+    /// <summary>O = softmax(scale·Q·Kᵀ, masked)·V per head for rows of queries (AttentionArgs); decode: a few queries against a long cache.</summary>
+    IBenchRun? Attention(Device device, string type, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o, bool decode) => null;
+
+    /// <summary>dQ, dK, dV from dO.</summary>
+    IBenchRun? AttentionBackward(Device device, string type, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] dO, byte[] dq, byte[] dk, byte[] dv) => null;
+
+    /// <summary>An optimizer step (OptimizerArgs.Names) over n values: p (updated in place) and g as the type, the moments m, v as
+    /// the subject's lane storage (float32 or float64 bytes; v null for one moment), updated in place.</summary>
+    IBenchRun? Optimizer(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) => null;
+
+    /// <summary>y = conv(x, w) for one image (ConvArgs); backward: dx and dw from dy when dx is given (y is then dy).</summary>
+    IBenchRun? Conv(Device device, string type, ConvArgs a, byte[] x, byte[] w, byte[] y, byte[]? dx, byte[]? dw) => null;
+
+    /// <summary>top-k of each row of x (rows × cols): values (rows × k, as the type) and indices (s32), largest first.</summary>
+    IBenchRun? TopK(Device device, string type, byte[] x, int rows, int cols, int k, byte[] values, int[] indices) => null;
+
+    /// <summary>output[r] = x[r][index[r]] as the type.</summary>
+    IBenchRun? Pick(Device device, string type, byte[] x, int rows, int cols, int[] index, byte[] output) => null;
+
+    /// <summary>picks[r] = the first column whose running sum of row r reaches u[r] · Σ row (u as the type, one per row).</summary>
+    IBenchRun? Sample(Device device, string type, byte[] x, int rows, int cols, byte[] u, int[] picks) => null;
+
+    /// <summary>counts[b], offsets[b + 1], order (the sources grouped by bucket, in source order) from n indices into buckets.</summary>
+    IBenchRun? Route(Device device, int[] index, int buckets, int[] counts, int[] offsets, int[] order) => null;
+
+    /// <summary>An LSTM sequence of T steps (x: T × B × D; h0, c0; h, c out: T × B × H), or with dx given its backward (hOut is then dh
+    /// per step, cOut the last step's dc; dx, dh0, dc0, dw, du, db the gradients).</summary>
+    IBenchRun? LstmSequence(Device device, string type, CellArgs a, int T, byte[] x, byte[] h0, byte[] c0, byte[] w, byte[] u, byte[] b, byte[] hOut, byte[] cOut,
+        byte[]? dx, byte[]? dh0, byte[]? dc0, byte[]? dw, byte[]? du, byte[]? db) => null;
+
+    /// <summary>A recurrent step (CellArgs: lstm or gru): h' (and c' for LSTM) from x, h (, c) and the weights W (GH × D), U (GH × H),
+    /// b (GH), bh (GRU's second bias, GH); when dx is given the backward pass instead: hOut (, cOut) are then dh', dc', and the
+    /// gradients go to dx, dh, dc, dw, du, db, dbh.</summary>
+    IBenchRun? Recurrent(Device device, string type, CellArgs a, byte[] x, byte[] h, byte[]? c, byte[] w, byte[] u, byte[] b, byte[]? bh, byte[] hOut, byte[]? cOut,
+        byte[]? dx, byte[]? dh, byte[]? dc, byte[]? dw, byte[]? du, byte[]? db, byte[]? dbh) => null;
+}
+
+/// <summary>Lane values as float64 (what a reduction returns).</summary>
+public static class LaneValues
+{
+    public static double[] Decode(string lane, byte[] bytes, int count)
+    {
+        var d = new double[count];
+        // A subject may add a note after the lane name ("f32; converted on the device"): the name is what is decoded.
+        int note = lane.IndexOf(';');
+        if (note > 0) lane = lane[..note].Trim();
+        switch (lane)
+        {
+            case "s8": for (int i = 0; i < count; i++) d[i] = (sbyte)bytes[i]; break;
+            case "u8": for (int i = 0; i < count; i++) d[i] = bytes[i]; break;
+            case "s16": for (int i = 0; i < count; i++) d[i] = BitConverter.ToInt16(bytes, i * 2); break;
+            case "u16": for (int i = 0; i < count; i++) d[i] = BitConverter.ToUInt16(bytes, i * 2); break;
+            case "f32" or "f32 index": for (int i = 0; i < count; i++) d[i] = BitConverter.ToSingle(bytes, i * 4); break;
+            case "f64": for (int i = 0; i < count; i++) d[i] = BitConverter.ToDouble(bytes, i * 8); break;
+            case "s32" or "s8dp" or "s16dp" or "s32 index": for (int i = 0; i < count; i++) d[i] = BitConverter.ToInt32(bytes, i * 4); break;
+            case "u32" or "u8dp" or "u16dp": for (int i = 0; i < count; i++) d[i] = BitConverter.ToUInt32(bytes, i * 4); break;
+            case "s64": for (int i = 0; i < count; i++) d[i] = BitConverter.ToInt64(bytes, i * 8); break;
+            case "u64": for (int i = 0; i < count; i++) d[i] = BitConverter.ToUInt64(bytes, i * 8); break;
+            default: throw new ArgumentException(lane);
+        }
+
+        return d;
+    }
 }
 
 /// <summary>An IBenchRun from delegates.</summary>

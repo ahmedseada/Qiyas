@@ -27,12 +27,17 @@ public sealed record Fmt(string Name, int Bits, bool IsFloat, bool Signed)
     /// <summary>Values a word holds.</summary>
     public int Per => WordBits / Bits;
 
+    /// <summary>A block format: values in blocks of BlockValues taking BlockBytes (0 for the plain formats).</summary>
+    public int BlockValues => Name switch { "q8_0" or "q4_0" => 32, "q4_k" or "q6_k" => 256, _ => 0 };
+    public int BlockBytes => Name switch { "q8_0" => 34, "q4_0" => 18, "q4_k" => 144, "q6_k" => 210, _ => 0 };
+    public bool IsBlock => BlockValues > 0;
+
     public static Fmt Of<TN>() where TN : struct, IQiyasNumber<TN> => new(TN.Name, TN.Bits, TN.IsFloat, TN.Min < 0);
 
     public bool Is(string name) => Name == name;
 
-    /// <summary>Words that hold <paramref name="values"/> values.</summary>
-    public long Words(long values) => (values * Bits + WordBits - 1) / WordBits;
+    /// <summary>Words that hold <paramref name="values"/> values (a block format: its whole blocks, in words).</summary>
+    public long Words(long values) => IsBlock ? ((values + BlockValues - 1) / BlockValues * BlockBytes + 3) / 4 : (values * Bits + WordBits - 1) / WordBits;
 
     /// <summary>The lane this format's values are read into before any other (floats f32/f64, integers s32/u32/s64/u64).</summary>
     public Lane Natural => IsFloat ? (Bits == 64 ? Lane.F64 : Lane.F32) : Bits == 64 ? (Signed ? Lane.S64 : Lane.U64) : Signed ? Lane.S32 : Lane.U32;
@@ -115,6 +120,7 @@ internal static class Codec
     /// <summary>The value at linear index <paramref name="index"/> (a .b32 register) of the array at <paramref name="basePtr"/>, as a lane register (integer formats).</summary>
     public static string UnpackAt(PtxBuilder b, Fmt f, string basePtr, string index, Lane lane)
     {
+        if (f.IsBlock) return Convert(b, Lane.F32, BlockDecode(b, f, basePtr, index), lane, f);
         if (f.WordBits == 64)
         {
             string a = b.RD(), w = b.RD();
@@ -136,6 +142,135 @@ internal static class Codec
         if (f.Bits == 32) b.L($"mov.b32 {v}, {wr};");
         else b.L($"bfe.{(f.Signed ? "s32" : "u32")} {v}, {wr}, {shift}, {f.Bits};");
         return Convert(b, f.Natural, v, lane, f);
+    }
+
+    // ---- block formats: the value at a linear index, decoded from its block (byte loads), as f32
+    private static string BlockDecode(PtxBuilder b, Fmt f, string basePtr, string index)
+    {
+        string blk = b.R(), off = b.R(), bAddr = b.RD(), t = b.R(), v = b.F();
+        b.L($"div.u32 {blk}, {index}, {f.BlockValues};");
+        b.L($"mul.lo.u32 {t}, {blk}, {f.BlockValues};");
+        b.L($"sub.u32 {off}, {index}, {t};");
+        b.L($"mul.wide.u32 {bAddr}, {blk}, {f.BlockBytes};");
+        b.L($"add.u64 {bAddr}, {basePtr}, {bAddr};");
+        string HalfAt(int at) { string h = b.H(), r = b.F(); b.L($"ld.global.u16 {h}, [{bAddr}+{at}];"); b.L($"cvt.f32.f16 {r}, {h};"); return r; }
+        string ByteAt(string offset, int at) { string a = b.RD(), r = b.R(); b.L($"cvt.u64.u32 {a}, {offset};"); b.L($"add.u64 {a}, {bAddr}, {a};"); b.L($"ld.global.u8 {r}, [{a}+{at}];"); return r; }
+        string I2F(string r) { string fr = b.F(); b.L($"cvt.rn.f32.s32 {fr}, {r};"); return fr; }
+        switch (f.Name)
+        {
+            case "q8_0":
+            {
+                string d = HalfAt(0), q = ByteAt(off, 2), qs = b.R();
+                b.L($"cvt.s32.s8 {qs}, {q};");
+                b.L($"mul.rn.f32 {v}, {d}, {I2F(qs)};");
+                return v;
+            }
+
+            case "q4_0":
+            {
+                // value i: the low nibble of byte i (i < 16), the high nibble of byte i − 16.
+                string d = HalfAt(0), lo = b.R(), pHi = b.P(), nib = b.R(), q = b.R(), byteOff = b.R();
+                b.L($"and.b32 {byteOff}, {off}, 15;");
+                string by = ByteAt(byteOff, 2);
+                b.L($"setp.ge.u32 {pHi}, {off}, 16;");
+                b.L($"and.b32 {lo}, {by}, 15;");
+                b.L($"shr.u32 {nib}, {by}, 4;");
+                b.L($"selp.u32 {q}, {nib}, {lo}, {pHi};");
+                b.L($"sub.s32 {q}, {q}, 8;");
+                b.L($"mul.rn.f32 {v}, {d}, {I2F(q)};");
+                return v;
+            }
+
+            case "q4_k":
+            {
+                // sub-block j = off / 32 (pair j/2, the low nibbles for even j, the high for odd); scale_j, min_j from the 12 bytes at 4.
+                string d = HalfAt(0), dmin = HalfAt(2), j = b.R(), i = b.R(), pair = b.R(), pOdd = b.R(), byteOff = b.R(), lo = b.R(), hi = b.R(), q = b.R(), pIsOdd = b.P();
+                b.L($"shr.u32 {j}, {off}, 5;");
+                b.L($"and.b32 {i}, {off}, 31;");
+                b.L($"shr.u32 {pair}, {j}, 1;");
+                b.L($"and.b32 {pOdd}, {j}, 1;");
+                b.L($"setp.ne.u32 {pIsOdd}, {pOdd}, 0;");
+                b.L($"shl.b32 {byteOff}, {pair}, 5;");
+                b.L($"add.u32 {byteOff}, {byteOff}, {i};");
+                string by = ByteAt(byteOff, 16);
+                b.L($"and.b32 {lo}, {by}, 15;");
+                b.L($"shr.u32 {hi}, {by}, 4;");
+                b.L($"selp.u32 {q}, {hi}, {lo}, {pIsOdd};");
+                // scale, min: j < 4: sc[j] & 63, sc[j+4] & 63; else (sc[j+4] & 0xF) | (sc[j-4] >> 6) << 4, (sc[j+4] >> 4) | (sc[j] >> 6) << 4
+                string pLow = b.P(), sA = b.R(), sB = b.R(), sC = b.R(), scale = b.R(), min = b.R(), jp4 = b.R(), jm4 = b.R(), jc = b.R();
+                b.L($"setp.lt.u32 {pLow}, {j}, 4;");
+                b.L($"add.u32 {jp4}, {j}, 4;");
+                b.L($"sub.u32 {jm4}, {j}, 4;");
+                b.L($"selp.u32 {jm4}, {j}, {jm4}, {pLow};");                 // a valid byte either way
+                b.L($"mov.u32 {jc}, {j};");
+                string scJ = ByteAt(jc, 4), scJp4 = ByteAt(jp4, 4), scJm4 = ByteAt(jm4, 4);
+                string lowS = b.R(), lowM = b.R(), highS = b.R(), highM = b.R();
+                b.L($"and.b32 {lowS}, {scJ}, 63;");
+                b.L($"and.b32 {lowM}, {scJp4}, 63;");
+                b.L($"and.b32 {sA}, {scJp4}, 15;");
+                b.L($"shr.u32 {sB}, {scJm4}, 6;");
+                b.L($"shl.b32 {sB}, {sB}, 4;");
+                b.L($"or.b32 {highS}, {sA}, {sB};");
+                b.L($"shr.u32 {sC}, {scJp4}, 4;");
+                b.L($"shr.u32 {sB}, {scJ}, 6;");
+                b.L($"shl.b32 {sB}, {sB}, 4;");
+                b.L($"or.b32 {highM}, {sC}, {sB};");
+                b.L($"selp.u32 {scale}, {lowS}, {highS}, {pLow};");
+                b.L($"selp.u32 {min}, {lowM}, {highM}, {pLow};");
+                string ds = b.F(), dm = b.F(), prod = b.F();
+                b.L($"mul.rn.f32 {ds}, {d}, {I2F(scale)};");
+                b.L($"mul.rn.f32 {dm}, {dmin}, {I2F(min)};");
+                b.L($"mul.rn.f32 {prod}, {ds}, {I2F(q)};");
+                b.L($"sub.rn.f32 {v}, {prod}, {dm};");
+                return v;
+            }
+
+            case "q6_k":
+            {
+                // half = off / 128; l = off % 32; quarter = (off % 128) / 32 (0..3): the ql byte and the qh bits by the layout.
+                string d = HalfAt(208), half = b.R(), rest = b.R(), quarter = b.R(), l = b.R(), lBase = b.R(), hBase = b.R(), sBase = b.R();
+                b.L($"shr.u32 {half}, {off}, 7;");
+                b.L($"and.b32 {rest}, {off}, 127;");
+                b.L($"shr.u32 {quarter}, {rest}, 5;");
+                b.L($"and.b32 {l}, {rest}, 31;");
+                b.L($"shl.b32 {lBase}, {half}, 6;");
+                b.L($"shl.b32 {hBase}, {half}, 5;");
+                b.L($"shl.b32 {sBase}, {half}, 3;");
+                // ql byte: l (quarters 0, 2) or l + 32 (quarters 1, 3); the nibble: low (quarters 0, 1) or high (2, 3); qh shift = 2·quarter.
+                string qlOff = b.R(), odd = b.R(), pOdd = b.P(), pHigh = b.P(), qlo = b.R(), qhi = b.R(), qn = b.R(), qhOff = b.R(), shiftH = b.R(), hbits = b.R(), q = b.R();
+                b.L($"and.b32 {odd}, {quarter}, 1;");
+                b.L($"setp.ne.u32 {pOdd}, {odd}, 0;");
+                b.L($"setp.ge.u32 {pHigh}, {quarter}, 2;");
+                b.L($"add.u32 {qlOff}, {lBase}, {l};");
+                b.L($"@{pOdd} add.u32 {qlOff}, {qlOff}, 32;");
+                string qlByte = ByteAt(qlOff, 0);
+                b.L($"and.b32 {qlo}, {qlByte}, 15;");
+                b.L($"shr.u32 {qhi}, {qlByte}, 4;");
+                b.L($"selp.u32 {qn}, {qhi}, {qlo}, {pHigh};");
+                b.L($"add.u32 {qhOff}, {hBase}, {l};");
+                string qhByte = ByteAt(qhOff, 128);
+                b.L($"shl.b32 {shiftH}, {quarter}, 1;");
+                b.L($"shr.u32 {hbits}, {qhByte}, {shiftH};");
+                b.L($"and.b32 {hbits}, {hbits}, 3;");
+                b.L($"shl.b32 {hbits}, {hbits}, 4;");
+                b.L($"or.b32 {q}, {qn}, {hbits};");
+                b.L($"sub.s32 {q}, {q}, 32;");
+                // scale index: sBase + (l / 16) + 2·quarter
+                string sIdx = b.R(), sc = b.R(), scS = b.R();
+                b.L($"shr.u32 {sIdx}, {l}, 4;");
+                b.L($"add.u32 {sIdx}, {sIdx}, {sBase};");
+                b.L($"mad.lo.u32 {sIdx}, {quarter}, 2, {sIdx};");
+                string scByte = ByteAt(sIdx, 192);
+                b.L($"cvt.s32.s8 {scS}, {scByte};");
+                string ds = b.F();
+                b.L($"mul.rn.f32 {ds}, {d}, {I2F(scS)};");
+                b.L($"mul.rn.f32 {v}, {ds}, {I2F(q)};");
+                _ = sc;
+                return v;
+            }
+
+            default: throw new NotSupportedException($"{f.Name}: no block decoder");
+        }
     }
 
     private static string Float(PtxBuilder b, Fmt f, string word, int i) => FloatDecode(b, f, word, (i * f.Bits).ToString());
@@ -243,8 +378,9 @@ internal static class Codec
     // ---------------------------------------------------------------- a lane value into a word
 
     /// <summary>Value <paramref name="v"/> (a <paramref name="lane"/> register) into position <paramref name="i"/> of <paramref name="word"/>, which starts at zero (64-bit formats: becomes the word).</summary>
-    public static void Pack(PtxBuilder b, Fmt f, string v, Lane lane, int i, string word)
+    public static void Pack(PtxBuilder b, Fmt f, string v, Lane lane, int i, string word, bool wrap = false)
     {
+        if (f.IsBlock) throw new NotSupportedException($"{f.Name}: a block format is encoded a block at a time (Ptx.LanesToBlock), not a value at a time");
         if (f.IsFloat)
         {
             if (f.Is("float64"))
@@ -323,6 +459,12 @@ internal static class Codec
 
         string n = b.R();
         string nat = f.Signed ? "s32" : "u32";
+        if (wrap && !lane.IsFloat && !lane.Wide)
+        {
+            Insert(b, f, v, i, word);                                          // the low bits: modular at the type's width
+            return;
+        }
+
         if (lane.IsFloat) b.L($"cvt.rni.sat.{nat}.{lane.Op} {n}, {v};");
         else if (lane.Wide)
         {
@@ -421,7 +563,7 @@ internal static class Codec
 }
 
 /// <summary>The kernels.</summary>
-internal static class Ptx
+internal static partial class Ptx
 {
     private static string Header(Gpu gpu) => gpu.Target;
 
@@ -2422,7 +2564,7 @@ internal static class Ptx
         b.L($"setp.ne.u32 {p0}, {laneId}, 0;");
         b.L($"@!{p0} st.shared.{lane.Mem} [{slot}], {acc};");
         b.L("bar.sync 0;");
-        string pw = b.P(), pl = b.P(), mine = b.R(), identity = op == "max" ? lane.Literal(double.NegativeInfinity) : lane.Zero;
+        string pw = b.P(), pl = b.P(), mine = b.R(), identity = op == "max" ? ReduceIdentity(lane, "max") : op == "min" ? ReduceIdentity(lane, "min") : lane.Zero;
         b.L($"setp.ne.u32 {pw}, {warp}, 0;");
         b.L($"@{pw} bra {tag}_SKIP;");
         b.L($"setp.lt.u32 {pl}, {laneId}, {warps};");
@@ -2437,6 +2579,14 @@ internal static class Ptx
         b.L($"ld.shared.{lane.Mem} {result}, [{smem}+256];");
         return result;
     }
+
+    /// <summary>The value a reduction starts from: −∞ / the smallest value for max, +∞ / the largest for min, zero for sums.</summary>
+    private static string ReduceIdentity(Lane lane, string op) => op switch
+    {
+        "max" => lane.IsFloat ? lane.Literal(double.NegativeInfinity) : lane.Name[0] == 'u' ? "0" : lane.Wide ? "0x8000000000000000" : "0x80000000",
+        "min" => lane.IsFloat ? lane.Literal(double.PositiveInfinity) : lane.Name[0] == 'u' ? (lane.Wide ? "0xFFFFFFFFFFFFFFFF" : "0xFFFFFFFF") : lane.Wide ? "0x7FFFFFFFFFFFFFFF" : "0x7FFFFFFF",
+        _ => lane.Zero,
+    };
 
     private static void WarpReduce(PtxBuilder b, Lane lane, string acc, string op)
     {
@@ -2459,7 +2609,7 @@ internal static class Ptx
                 b.L($"mov.b32 {other}, {bits2};");
             }
 
-            b.L(op == "max" ? $"max.{lane.Op} {acc}, {acc}, {other};" : lane.Add(acc, acc, other));
+            b.L(op == "max" ? $"max.{lane.Op} {acc}, {acc}, {other};" : op == "min" ? $"min.{lane.Op} {acc}, {acc}, {other};" : lane.Add(acc, acc, other));
         }
     }
 }

@@ -14,7 +14,7 @@ using System.Runtime.InteropServices;
 
 namespace Qiyas;
 
-internal static class Kernels
+internal static partial class Kernels
 {
     private const int Tile = 2048;                                           // lanes an element-wise tile holds (L1)
 

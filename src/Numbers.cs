@@ -40,6 +40,13 @@ public interface IQiyasNumber<TSelf> where TSelf : struct, IQiyasNumber<TSelf>
     /// <summary>The smallest and largest of <paramref name="count"/> stored values (the type's range when it is not read).</summary>
     static virtual (double Min, double Max) Range(ReadOnlySpan<byte> stored, int count) => (TSelf.Min, TSelf.Max);
 
+    /// <summary>The bytes `values` of the type take as stored (whole bytes; a block format's whole blocks).</summary>
+    static virtual long Bytes(long values) => (values * TSelf.Bits + 7) / 8;
+
+    /// <summary>Values that share a storage unit (a byte of packed values, a block): a store of fewer than this many,
+    /// or not starting on one, rewrites the unit; two threads must not write one unit.</summary>
+    static virtual int Granularity => TSelf.Bits >= 8 ? 1 : 8 / TSelf.Bits;
+
     /// <summary>Runs <paramref name="visitor"/> with the lane element-wise operations take.</summary>
     static abstract void Elementwise<TV>(ref TV visitor) where TV : struct, ILaneVisitor;
 
@@ -59,7 +66,7 @@ public interface IQiyasNumber<TSelf, TLane> : IQiyasNumber<TSelf>
     /// <summary>The stored bytes are TLane values: kernels read and write them in place.</summary>
     static virtual bool Direct => false;
 
-    /// <summary>Values first .. first + lanes.Length into lanes (first a multiple of the values a byte holds).</summary>
+    /// <summary>Values first .. first + lanes.Length into lanes (any first).</summary>
     static abstract void Load(ReadOnlySpan<byte> stored, int first, Span<TLane> lanes);
 
     /// <summary>Lanes into values first ..: rounded to nearest (ties to even), held to the type's range.</summary>
@@ -100,6 +107,28 @@ public interface IQiyasLane<TSelf, T> where TSelf : struct, IQiyasLane<TSelf, T>
     static abstract T Fma(T a, T b, T c);
 
     static abstract T Mul(T a, T b);
+
+    // The element-wise operations every lane has, on vectors (the defaults are Vector<T>'s own, exact for every lane).
+    static virtual Vector<T> Sub(Vector<T> a, Vector<T> b) => a - b;
+
+    static virtual Vector<T> Mul(Vector<T> a, Vector<T> b) => a * b;
+
+    static virtual Vector<T> Div(Vector<T> a, Vector<T> b) => a / b;
+
+    static virtual Vector<T> Max(Vector<T> a, Vector<T> b) => Vector.Max(a, b);
+
+    static virtual Vector<T> Min(Vector<T> a, Vector<T> b) => Vector.Min(a, b);
+
+    static virtual Vector<T> Neg(Vector<T> a) => Vector<T>.Zero - a;
+
+    static virtual Vector<T> Abs(Vector<T> a) => Vector.Abs(a);
+
+    /// <summary>All ones where a &gt; b.</summary>
+    static virtual Vector<T> Greater(Vector<T> a, Vector<T> b) => Vector.GreaterThan(a, b);
+
+    static virtual Vector<T> Equal(Vector<T> a, Vector<T> b) => Vector.Equals(a, b);
+
+    static virtual Vector<T> Select(Vector<T> mask, Vector<T> a, Vector<T> b) => Vector.ConditionalSelect(mask, a, b);
 }
 
 public interface IQiyasFloatLane<TSelf, T> : IQiyasLane<TSelf, T> where TSelf : struct, IQiyasFloatLane<TSelf, T> where T : unmanaged
@@ -107,6 +136,30 @@ public interface IQiyasFloatLane<TSelf, T> : IQiyasLane<TSelf, T> where TSelf : 
     static abstract T NegativeInfinity { get; }
 
     static abstract Vector<T> Exp(Vector<T> x);
+
+    static abstract Vector<T> Expm1(Vector<T> x);
+
+    static abstract Vector<T> Log(Vector<T> x);
+
+    static abstract Vector<T> Sin(Vector<T> x);
+
+    static abstract Vector<T> Cos(Vector<T> x);
+
+    static abstract Vector<T> Tanh(Vector<T> x);
+
+    static abstract Vector<T> Sigmoid(Vector<T> x);
+
+    static abstract Vector<T> Erf(Vector<T> x);
+
+    static abstract Vector<T> Erfc(Vector<T> x);
+
+    static abstract Vector<T> Sqrt(Vector<T> x);
+
+    static abstract Vector<T> Round(Vector<T> x);
+
+    static abstract Vector<T> Floor(Vector<T> x);
+
+    static abstract Vector<T> IsNaN(Vector<T> x);
 
     static abstract T Exp(T x);
 
@@ -164,6 +217,18 @@ public readonly struct F32 : IQiyasFloatLane<F32, float>
     public static float Mul(float a, float b) => a * b;
     public static float Fma(float a, float b, float c) => MathF.FusedMultiplyAdd(a, b, c);
     public static Vector<float> Exp(Vector<float> x) => Exps.Exp(x);
+    public static Vector<float> Expm1(Vector<float> x) => Funcs.Expm1(x);
+    public static Vector<float> Log(Vector<float> x) => Funcs.Log(x);
+    public static Vector<float> Sin(Vector<float> x) => Funcs.Sin(x);
+    public static Vector<float> Cos(Vector<float> x) => Funcs.Cos(x);
+    public static Vector<float> Tanh(Vector<float> x) => Funcs.Tanh(x);
+    public static Vector<float> Sigmoid(Vector<float> x) => Funcs.Sigmoid(x);
+    public static Vector<float> Erf(Vector<float> x) => Funcs.Erf(x);
+    public static Vector<float> Erfc(Vector<float> x) => Funcs.Erfc(x);
+    public static Vector<float> Sqrt(Vector<float> x) => Vector.SquareRoot(x);
+    public static Vector<float> Round(Vector<float> x) => Vector.Round(x);
+    public static Vector<float> Floor(Vector<float> x) => Vector.Floor(x);
+    public static Vector<float> IsNaN(Vector<float> x) => Vector.AsVectorSingle(~Vector.AsVectorInt32(Vector.Equals(x, x)));
     public static float Exp(float x) => MathF.Exp(x);
     public static float Max(float a, float b) => MathF.Max(a, b);
     public static float Sub(float a, float b) => a - b;
@@ -183,6 +248,18 @@ public readonly struct F64 : IQiyasFloatLane<F64, double>
     public static double Mul(double a, double b) => a * b;
     public static double Fma(double a, double b, double c) => Math.FusedMultiplyAdd(a, b, c);
     public static Vector<double> Exp(Vector<double> x) => Exps.Exp(x);
+    public static Vector<double> Expm1(Vector<double> x) => Funcs.Expm1(x);
+    public static Vector<double> Log(Vector<double> x) => Funcs.Log(x);
+    public static Vector<double> Sin(Vector<double> x) => Funcs.Sin(x);
+    public static Vector<double> Cos(Vector<double> x) => Funcs.Cos(x);
+    public static Vector<double> Tanh(Vector<double> x) => Funcs.Tanh(x);
+    public static Vector<double> Sigmoid(Vector<double> x) => Funcs.Sigmoid(x);
+    public static Vector<double> Erf(Vector<double> x) => Funcs.Erf(x);
+    public static Vector<double> Erfc(Vector<double> x) => Funcs.Erfc(x);
+    public static Vector<double> Sqrt(Vector<double> x) => Vector.SquareRoot(x);
+    public static Vector<double> Round(Vector<double> x) => Vector.Round(x);
+    public static Vector<double> Floor(Vector<double> x) => Vector.Floor(x);
+    public static Vector<double> IsNaN(Vector<double> x) => Vector.AsVectorDouble(~Vector.AsVectorInt64(Vector.Equals(x, x)));
     public static double Exp(double x) => Math.Exp(x);
     public static double Max(double a, double b) => Math.Max(a, b);
     public static double Sub(double a, double b) => a - b;

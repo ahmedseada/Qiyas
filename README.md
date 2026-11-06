@@ -19,7 +19,32 @@ does best for it, chosen per operation from the data itself. No type is fixed an
 
 ## The bench
 
-`Qiyas.dll [cpu|cuda|cuda,cpu] [--subjects a,b] [--types ...] [--ops add,matmul,softmax,rms_norm] [--baseline name]`
+`Qiyas.dll [cpu|cuda|cuda,cpu] [--subjects a,b] [--types ...] [--ops add,matmul,softmax,rms_norm,map|reduce|rows|layout|products|attention|optimizers|conv|recurrent|routing|all] [--baseline name] [--shapes regular|odd] [--report]`
+
+`--shapes odd` runs every row at the nearest primes below its regular sizes (4093 × 4091 instead of 4096², 16M − 5,
+…) so no dimension ends on a tile, a word or a block: the padded, value-wise and segmented paths are what is timed.
+`--report` prints, after the gates, the facts the run's kernels were chosen by (the team and vector widths, the dot
+lanes the runtime reports, the tensor kinds the JIT accepted, the sliced-float64 proof and every measured decision).
+
+`--ops map` adds a row per element-wise formula (`map:<name>`, 16M values); `reduce` adds the reductions (`sum:whole`,
+`sum:rows`, `sum:cols`, `sumsq:rows`, `max:whole`, `max:rows`, `max:cols`, `min:rows`, `argmax:rows`), the row-vector
+broadcasts (`maprow:add`, `maprow:mul`), `transpose` (4096 × 4096) and `gemv`, `gemv_t` (8192 × 8192); `all` is the four
+core operations plus every formula, every reduction and every row operation; `rows` adds the row family (`row:<name>`
+for each of `RowOps.All` — log_softmax, the softmax backward passes, rms_norm_affine and its backward, layer_norm and
+its backward, weight_norm, rope, scale_mask_softmax, add_rms_norm, add_layer_norm — and `norm_params_bwd:rms|layer`,
+4096 × 4096, float types); `layout` adds the layout operations (`layout:<name>` for each of `LayoutArgs.Names`: strided,
+one_hot, gather_rows, gather_cols, scatter_add_rows, im2col, col2im, interpolate_nearest, interpolate_bilinear, shift).
+`products` adds the products on views (`matmul_nt`, `matmul_tn`, `matmul_tt` at 4096³, `matmul_batched`: 16 × 1024³,
+`matmul_bwd`: dA and dB at 4096³); `attention` adds `attention`, `attention_causal` (16 heads, 2048 × 2048, d = 128),
+`attention_decode` (32 heads, one query over 4096 keys) and `attention_bwd` (8 heads of 1024). A single name works too
+(`--ops map:erf,sum:rows,row:rope,layout:im2col,attention_decode`); `optimizers` adds `optimizer:sgd_momentum`,
+`optimizer:adam`, `optimizer:adamw` over 16M parameters (the moments in lane storage; each run restores p, m, v first,
+named in the lane column); `conv` adds `conv` and `conv_bwd` (a 64 × 128 × 128 image by 128 filters of 3 × 3); the
+pools and the depthwise convolution are layout operations (`layout:maxpool`, `layout:avgpool`, their `_bwd`,
+`layout:adaptive_maxpool`, `layout:adaptive_avgpool`, `layout:depthwise_conv`); `recurrent` adds `lstm_step`, `gru_step`
+and their `_bwd` (a batch of 1024, input 1024, hidden 1024), `lstm_seq` and `lstm_seq_bwd` (16 steps of 256 × 512 → 512); `routing` adds `topk_rows`, `pick_rows`, `sample_rows`
+(4096 rows of 32768), `route` (1M indices into 64 buckets) and `cross_entropy` (the loss by log_softmax, pick, neg).
+`COVERAGE.md` lists every operation with its lane rule on each device.
 
 Every implementation in the assembly that implements `IBenchSubject` (`src/Bench/Contract.cs`) is found by reflection
 and becomes a column: `qiyas`, `number` (one implementation over .NET's `INumberBase<T>`, for the types .NET has a
@@ -27,8 +52,9 @@ and becomes a column: `qiyas`, `number` (one implementation over .NET's `INumber
 conversions, so every subject sees the same bits), times `Run` (medians over an adaptive number of runs), reads the
 output after `Collect`, and scores it against float64 math on the same inputs. Results go to `results-qiyas-<devices>.md`.
 
-To add an implementation: one class with a parameterless constructor implementing the four methods, each returning
-`null` for anything it does not do (shown as —), never an approximation. Inputs and outputs are stored bytes of the
+To add an implementation: one class with a parameterless constructor implementing the four methods (and `Map`, `Reduce`,
+`MapRow`, `Transpose`, `Gemv` for the other families, which default to `null`), each returning `null` for anything it does not do (shown as —),
+never an approximation. Inputs and outputs are stored bytes of the
 named type; `Run` must include your device synchronization; `Collect` writes the output; `Lane` says what you computed in.
 
 `profile`, `gpuprofile` and `team` are Qiyas's own diagnostics (matmul phases on each device; the thread team's dispatch cost).
@@ -47,6 +73,17 @@ checkout (files listed in `.gitignore`); a clone runs the other subjects.
 | `src/Types.cs` | the seventeen stored types and their lane rules |
 | `src/Convert.cs` | every load and store on vectors; `Widths`, any lane to any lane |
 | `src/Kernels.cs` | the CPU kernels: add, product (GotoBLAS-shaped, dot lanes in groups), softmax, rms_norm |
+| `src/Map.cs`, `src/Ptx.Map.cs` | the element-wise family: the catalogue of formulas (with float64 references), the CPU kernel, the device kernel |
+| `src/Rows.cs`, `src/Ptx.Rows.cs`, `src/GpuOps.Rows.cs`, `src/Bench/RowInputs.cs` | the row family: the catalogue (references, error scales), the CPU kernels, the device kernels, the inputs and tolerance shared by the checks and the bench |
+| `src/Routing.cs`, `src/Ptx.Routing.cs`, `src/GpuOps.Routing.cs` | top-k, pick, sampling, the route; cross-entropy's backward is a row operation |
+| `src/Recurrent.cs`, `src/Ptx.Recurrent.cs`, `src/GpuOps.Recurrent.cs`, `src/Bench/RecurrentCases.cs` | LSTM and GRU cells and steps, forward and backward |
+| `src/Conv.cs`, `src/GpuOps.Conv.cs` | convolution forward and backward as im2col / product / col2im compositions |
+| `src/Optimizers.cs`, `src/Ptx.Optimizers.cs`, `src/GpuOps.Optimizers.cs` | optimizer steps: sgd with momentum, adam, adamw |
+| `src/Attention.cs`, `src/Ptx.Attention.cs`, `src/GpuOps.Attention.cs` | attention: the composition in lane storage, the fused decode kernel, the backward composition; the lane-storage conversions |
+| `src/Products.cs`, `src/GpuOps.Products.cs` | products on views (transposed operands, batches) and the matmul backward, through the strided copy and the product kernel |
+| `src/Layout.cs`, `src/Ptx.Layout.cs`, `src/GpuOps.Layout.cs`, `src/Bench/LayoutCases.cs` | layout and indexing: the references, the CPU kernels, the device kernels, the gate's and the bench's cases |
+| `src/Reduce.cs`, `src/Ptx.Reduce.cs` | reductions (sum, sum of squares, max, min, argmax: whole, rows, columns), row-vector broadcasts, transpose, gemv: the CPU kernels, the device kernels |
+| `src/Functions.cs` | log, sin, cos, expm1, tanh, sigmoid, erf, erfc on vectors: coefficient tables shared with the device emitter |
 | `src/Team.cs` | the CPU thread team |
 | `src/Gpu.cs`, `src/Ptx.cs`, `src/GpuOps.cs` | the CUDA side: driver binding, PTX generation, the operations |
 | `src/Checks.cs` | the proofs |
