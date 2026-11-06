@@ -128,7 +128,9 @@ public static class LayoutCases
                 break;
             case "depthwise_conv":
             {
-                int[][] shapes = [[3, 7, 9, 3, 3, 1, 1, 1, 1, 1, 1], [2, 11, 5, 3, 2, 2, 1, 1, 0, 2, 1]];
+                // The last two (6j): a column stride of 2 (the value-at-a-time loop), and rows of 37 with a column dilation of 3
+                // (the stride-1 vector passes over several vectors and a tail, taps reaching past both edges).
+                int[][] shapes = [[3, 7, 9, 3, 3, 1, 1, 1, 1, 1, 1], [2, 11, 5, 3, 2, 2, 1, 1, 0, 2, 1], [2, 9, 11, 3, 3, 1, 2, 1, 1, 1, 2], [1, 5, 37, 2, 3, 1, 1, 0, 2, 1, 3]];
                 foreach (var p in shapes) yield return Make(name, type, p[0] * p[1] * p[2], null, p, PoolCount(p), 96, p[0] * p[3] * p[4]);
                 break;
             }

@@ -507,17 +507,14 @@ internal static class RowKernels
         public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
         {
             int n = x.Length, half = n / 2, w = Vector<TLane>.Count, vec = half / w * w;
-            // θ_i = pos · a^(−2i/n) = pos · exp(i · k), k = −2 ln a / n.
-            TLane k = TL.Mul(TL.From(-2.0 / n), RowMath<TLane, TL>.Log(a)), p = TL.From(pos);
-            Span<TLane> ramp = stackalloc TLane[w];
-            for (int l = 0; l < w; l++) ramp[l] = TL.From(l);
-            var rampV = new Vector<TLane>(ramp);
-            Vector<TLane> kv = new(k), pv = new(p);
+            TLane p = TL.From(pos);
+            var freq = Frequencies(n, a);
+            Vector<TLane> pv = new(p);
             int i = 0;
             for (; i < vec; i += w)
             {
-                var theta = pv * TL.Exp((new Vector<TLane>(TL.From(i)) + rampV) * kv);
-                var c = TL.Cos(theta); var sn = TL.Sin(theta);
+                var theta = pv * new Vector<TLane>(freq.AsSpan(i));
+                var (sn, c) = TL.SinCos(theta);
                 var lo = new Vector<TLane>(x[i..]); var hi = new Vector<TLane>(x[(i + half)..]);
                 (lo * c - hi * sn).CopyTo(y[i..]);
                 (lo * sn + hi * c).CopyTo(y[(i + half)..]);
@@ -525,7 +522,7 @@ internal static class RowKernels
 
             for (; i < half; i++)
             {
-                TLane theta = TL.Mul(p, TL.Exp(TL.Mul(TL.From(i), k)));
+                TLane theta = TL.Mul(p, freq[i]);
                 var tv = new Vector<TLane>(theta);
                 TLane c = TL.Cos(tv)[0], sn = TL.Sin(tv)[0];
                 y[i] = TL.Sub(TL.Mul(x[i], c), TL.Mul(x[i + half], sn));
@@ -534,22 +531,45 @@ internal static class RowKernels
 
             if (n % 2 == 1) y[n - 1] = x[n - 1];
         }
+
+        // The frequencies a^(−2i/n) = exp(i · k), k = −2 ln a / n, of the pairs (i < n/2): the same for every row, kept per
+        // thread for the last (n, a) (computed as the row did: the vector exp over whole vectors, the scalar over the rest).
+        [ThreadStatic] private static TLane[]? s_freq;
+        [ThreadStatic] private static int s_freqN;
+        [ThreadStatic] private static TLane s_freqA;
+
+        private static TLane[] Frequencies(int n, TLane a)
+        {
+            if (s_freq is not null && s_freqN == n && EqualityComparer<TLane>.Default.Equals(s_freqA, a)) return s_freq;
+            int half = n / 2, w = Vector<TLane>.Count, vec = half / w * w;
+            var freq = new TLane[Math.Max(1, half)];
+            TLane k = TL.Mul(TL.From(-2.0 / n), RowMath<TLane, TL>.Log(a));
+            Span<TLane> ramp = stackalloc TLane[w];
+            for (int l = 0; l < w; l++) ramp[l] = TL.From(l);
+            var rampV = new Vector<TLane>(ramp);
+            Vector<TLane> kv = new(k);
+            int i = 0;
+            for (; i < vec; i += w) TL.Exp((new Vector<TLane>(TL.From(i)) + rampV) * kv).CopyTo(freq.AsSpan(i));
+            for (; i < half; i++) freq[i] = TL.Exp(TL.Mul(TL.From(i), k));
+            (s_freq, s_freqN, s_freqA) = (freq, n, a);
+            return freq;
+        }
     }
 
     public struct ScaleMaskSoftmax<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
     {
         public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
         {
-            int n = x.Length, w = Vector<TLane>.Count, vec = n / w * w, i = 0;
-            // z = a·x + mask into y; causal: columns past the row's index excluded.
+            // z = a·x + mask into y over the columns kept (causal: columns past the row's position excluded, never read:
+            // their outputs are 0 whatever x and the mask hold there).
+            int n = x.Length, w = Vector<TLane>.Count, i = 0;
+            int limit = TL.From(0).Equals(b) ? n : Math.Max(0, Math.Min(n, pos + 1)), vec = limit / w * w;
+            if (limit == 0) { y.Fill(TL.Zero); return; }
             var av = new Vector<TLane>(a);
             if (x2.IsEmpty) for (; i < vec; i += w) (new Vector<TLane>(x[i..]) * av).CopyTo(y[i..]);
             else for (; i < vec; i += w) TL.Fma(new Vector<TLane>(x[i..]), av, new Vector<TLane>(x2[i..])).CopyTo(y[i..]);
-            for (; i < n; i++) y[i] = x2.IsEmpty ? TL.Mul(x[i], a) : TL.Fma(x[i], a, x2[i]);
-            int limit = TL.From(0).Equals(b) ? n : Math.Max(0, Math.Min(n, pos + 1));
-            if (limit < n) y[limit..].Fill(TL.NegativeInfinity);
+            for (; i < limit; i++) y[i] = x2.IsEmpty ? TL.Mul(x[i], a) : TL.Fma(x[i], a, x2[i]);
             TLane m = RowMath<TLane, TL>.Max(y[..limit]);
-            if (limit == 0) { y.Fill(TL.Zero); return; }
             TLane sum = RowMath<TLane, TL>.ExpSum(y[..limit], m, y[..limit]);
             RowMath<TLane, TL>.Scale(y[..limit], TL.Zero, TL.Div(TL.From(1), sum), y[..limit]);
             if (limit < n) y[limit..].Fill(TL.Zero);

@@ -140,6 +140,24 @@ public static class Funcs
         return Vector.ConditionalSelect(Vector.Equals(x, x) & Vector.LessThan(Vector.Abs(x), new Vector<float>(float.PositiveInfinity)), y, new Vector<float>(float.NaN));
     }
 
+    /// <summary>Sin and Cos of the same values from one reduction and one pair of polynomials: each equal bit for bit to
+    /// Sin and Cos (the same steps; rope takes both of every angle).</summary>
+    public static (Vector<float> Sin, Vector<float> Cos) SinCos(Vector<float> x)
+    {
+        var (r, k) = ReduceHalfPi(x);
+        var s = SinPoly(r);
+        var c = CosPoly(r);
+        var q = k & new Vector<int>(3);
+        var odd = Vector.AsVectorSingle(Vector.Equals(q & Vector<int>.One, Vector<int>.One));
+        var neg = Vector.AsVectorSingle(Vector.Equals(q & new Vector<int>(2), new Vector<int>(2)));
+        var ys = Vector.ConditionalSelect(odd, c, s);
+        ys = Vector.ConditionalSelect(neg, -ys, ys);
+        var yc = Vector.ConditionalSelect(odd, -s, c);
+        yc = Vector.ConditionalSelect(neg, -yc, yc);
+        var finite = Vector.Equals(x, x) & Vector.LessThan(Vector.Abs(x), new Vector<float>(float.PositiveInfinity));
+        return (Vector.ConditionalSelect(finite, ys, new Vector<float>(float.NaN)), Vector.ConditionalSelect(finite, yc, new Vector<float>(float.NaN)));
+    }
+
     public static Vector<float> Cos(Vector<float> x)
     {
         var (r, k) = ReduceHalfPi(x);
@@ -288,6 +306,23 @@ public static class Funcs
         var neg = Vector.Equals(q & new Vector<long>(2), new Vector<long>(2));
         y = Vector.ConditionalSelect(Vector.AsVectorDouble(neg), -y, y);
         return Vector.ConditionalSelect(Vector.Equals(x, x) & Vector.LessThan(Vector.Abs(x), new Vector<double>(double.PositiveInfinity)), y, new Vector<double>(double.NaN));
+    }
+
+    /// <summary>Sin and Cos of the same values from one reduction (each equal bit for bit to Sin and Cos).</summary>
+    public static (Vector<double> Sin, Vector<double> Cos) SinCos(Vector<double> x)
+    {
+        var (r, k) = ReduceHalfPi(x);
+        var s = SinPoly(r);
+        var c = CosPoly(r);
+        var q = k & new Vector<long>(3);
+        var odd = Vector.AsVectorDouble(Vector.Equals(q & Vector<long>.One, Vector<long>.One));
+        var neg = Vector.AsVectorDouble(Vector.Equals(q & new Vector<long>(2), new Vector<long>(2)));
+        var ys = Vector.ConditionalSelect(odd, c, s);
+        ys = Vector.ConditionalSelect(neg, -ys, ys);
+        var yc = Vector.ConditionalSelect(odd, -s, c);
+        yc = Vector.ConditionalSelect(neg, -yc, yc);
+        var finite = Vector.Equals(x, x) & Vector.LessThan(Vector.Abs(x), new Vector<double>(double.PositiveInfinity));
+        return (Vector.ConditionalSelect(finite, ys, new Vector<double>(double.NaN)), Vector.ConditionalSelect(finite, yc, new Vector<double>(double.NaN)));
     }
 
     public static Vector<double> Cos(Vector<double> x)

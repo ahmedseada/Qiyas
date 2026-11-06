@@ -145,6 +145,9 @@ public interface IQiyasFloatLane<TSelf, T> : IQiyasLane<TSelf, T> where TSelf : 
 
     static abstract Vector<T> Cos(Vector<T> x);
 
+    /// <summary>Sin and Cos of the same values; a lane may share their reduction (each must equal Sin and Cos).</summary>
+    static virtual (Vector<T> Sin, Vector<T> Cos) SinCos(Vector<T> x) => (TSelf.Sin(x), TSelf.Cos(x));
+
     static abstract Vector<T> Tanh(Vector<T> x);
 
     static abstract Vector<T> Sigmoid(Vector<T> x);
@@ -221,6 +224,7 @@ public readonly struct F32 : IQiyasFloatLane<F32, float>
     public static Vector<float> Log(Vector<float> x) => Funcs.Log(x);
     public static Vector<float> Sin(Vector<float> x) => Funcs.Sin(x);
     public static Vector<float> Cos(Vector<float> x) => Funcs.Cos(x);
+    public static (Vector<float> Sin, Vector<float> Cos) SinCos(Vector<float> x) => Funcs.SinCos(x);
     public static Vector<float> Tanh(Vector<float> x) => Funcs.Tanh(x);
     public static Vector<float> Sigmoid(Vector<float> x) => Funcs.Sigmoid(x);
     public static Vector<float> Erf(Vector<float> x) => Funcs.Erf(x);
@@ -252,6 +256,7 @@ public readonly struct F64 : IQiyasFloatLane<F64, double>
     public static Vector<double> Log(Vector<double> x) => Funcs.Log(x);
     public static Vector<double> Sin(Vector<double> x) => Funcs.Sin(x);
     public static Vector<double> Cos(Vector<double> x) => Funcs.Cos(x);
+    public static (Vector<double> Sin, Vector<double> Cos) SinCos(Vector<double> x) => Funcs.SinCos(x);
     public static Vector<double> Tanh(Vector<double> x) => Funcs.Tanh(x);
     public static Vector<double> Sigmoid(Vector<double> x) => Funcs.Sigmoid(x);
     public static Vector<double> Erf(Vector<double> x) => Funcs.Erf(x);

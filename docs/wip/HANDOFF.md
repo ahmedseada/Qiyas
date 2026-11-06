@@ -576,6 +576,22 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
     whose code did not change read 1.5–1.9× in one run and as before in the next (a different row slow each time: the
     memory clock).
 
+- 6j small cells, boundary 2 (the CPU's cells): done, reported (uncommitted until go).
+  - Layout jobs measured by outputs × the values each reads (`LayoutArgs.ValueReads`, `Kernels.Work`): the team ran an
+    adaptive pool (3136 outputs over 37 × 37 windows) on the caller alone, under its inline threshold.
+  - depthwise_conv at column stride 1 (input read in place or decoded): a vector Fma pass per tap along the output row,
+    the taps in the scalar loop's order (bit for bit). Other strides keep the value loop. Gate: two new depthwise cases
+    (a column stride of 2; 37 wide with a column dilation of 3). Mutation: each tap's last column dropped → `check layout
+    depthwise_conv` DIFFERS on every type (65 cases); restored.
+  - adaptive_avgpool_bwd: each window holding the row adds its share over its columns, windows in the pixel's order.
+  - rope: `IQiyasFloatLane.SinCos` (default Sin and Cos; F32 / F64 `Funcs.SinCos`: one reduction, both results equal bit
+    for bit to Sin and Cos) and the frequencies per thread for the last (n, a), computed as the row did.
+  - scale_mask_softmax: x and the mask read only over the kept columns.
+  - Closed with no change: log_softmax (layer_norm plus one exp a value), CPU ctc (see COVERAGE: a three-pass version
+    measured no faster in alternating cooled runs and was reverted; an exp change for −∞ inputs measured no effect and
+    was reverted).
+  - Measured: see COVERAGE (the pools, the row operations, ctc).
+
 ## Item 5 progress
 
 - Done, reported (uncommitted until the coordinator's go). What landed:
