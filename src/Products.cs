@@ -1,7 +1,8 @@
 // Products on views: C = op(A)·op(B) over batches, where op transposes a stored operand, and each batch is at a
-// stride in values; the matmul backward passes dA = dC·Bᵀ and dB = Aᵀ·dC. A view is made contiguous by the strided
-// copy (Layout.cs: exact in any type, any offset) and the product is Qiyas's product kernel on it — the same lanes,
-// the same bounds rule, the same proofs. Fusing the transposition into the product's packing is the step past this.
+// stride in values; the matmul backward passes dA = dC·Bᵀ and dB = Aᵀ·dC. The product kernel reads a view's operands
+// where they are stored — Aᵀ's k-rows straight into its A blocks, Bᵀ's rows into its packed strips, a batch's offset as
+// a base index (Kernels.Operands) — for every type whose rows start on whole bytes; otherwise a view is made contiguous by
+// the strided copy (Layout.cs: exact in any type, any offset) first. The same lanes, the same bounds rule, the same proofs.
 using System.Buffers;
 
 namespace Qiyas;
@@ -55,8 +56,38 @@ internal static partial class Kernels
         return MatMulViewRoute<TN>(v, a, b, c);
     }
 
-    /// <summary>C = op(A)·op(B) by the strided copies and the product kernel.</summary>
+    /// <summary>Whether the product kernel can read the view's operands where they are stored: every row on a whole byte
+    /// (a type of a byte or more, or a block format, read a value at a time, at even shapes), every batch offset on
+    /// whole storage units.</summary>
+    private static bool InPlace<TN>(ProductView v) where TN : struct, IQiyasNumber<TN>
+    {
+        int per = TN.Bits >= 8 ? 1 : 8 / TN.Bits, unit = TN.Granularity;
+        bool rows = per == 1 || (unit % 32 == 0 && v.M % per == 0 && v.N % per == 0 && v.K % per == 0);
+        return rows && v.StrideAOrDefault % unit == 0 && v.StrideBOrDefault % unit == 0 && (v.Batch == 1 || v.StrideCOrDefault % unit == 0)
+            && v.ValuesA <= int.MaxValue && v.ValuesB <= int.MaxValue && v.ValuesC <= int.MaxValue;
+    }
+
+    /// <summary>C = op(A)·op(B): the product kernel reading each batch's operands where they are stored (transposed or
+    /// at an offset; Kernels.Operands), or, where it cannot, by the strided copies.</summary>
     private static string MatMulViewRoute<TN>(ProductView v, byte[] a, byte[] b, byte[] c) where TN : struct, IQiyasNumber<TN>
+    {
+        if (v.Batch == 1 && !v.TransA && !v.TransB || !InPlace<TN>(v)) return MatMulViewCopies<TN>(v, a, b, c);
+        string lane = "";
+        for (int i = 0; i < v.Batch; i++)
+        {
+            int ao = (int)(i * v.StrideAOrDefault), bo = (int)(i * v.StrideBOrDefault), co = (int)(i * v.StrideCOrDefault);
+            var (aLo, aHi) = TN.Range(a.AsSpan((int)TN.Bytes(ao)), v.M * v.K);
+            var (bLo, bHi) = TN.Range(b.AsSpan((int)TN.Bytes(bo)), v.K * v.N);
+            var product = new MatMulVisitor(a, b, c, v.M, v.N, v.K) { Where = new Operands(ao, v.TransA, bo, v.TransB, co) };
+            TN.Sum(ref product, new Bounds(aLo, aHi, bLo, bHi, v.K));
+            lane = product.Lane;
+        }
+
+        return lane;
+    }
+
+    /// <summary>C = op(A)·op(B) by the strided copies and the product kernel.</summary>
+    private static string MatMulViewCopies<TN>(ProductView v, byte[] a, byte[] b, byte[] c) where TN : struct, IQiyasNumber<TN>
     {
         string lane = "";
         bool direct = v.Batch == 1 && !v.TransA && !v.TransB;

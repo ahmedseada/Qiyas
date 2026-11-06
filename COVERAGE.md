@@ -59,7 +59,7 @@ regression comparer and the baseline run.
 **Open, in the order they are taken:**
 
 1. The todo rows below (item 4, in this order: fused attention rows — done, ctc — done, the GRU sequence bench row — done, the block-scaled
-   tiled product — done, the transposition fused into the product's packing, the radix step of scatter-add, the fused direct
+   tiled product — done, the transposition fused into the product's packing — done, the radix step of scatter-add, the fused direct
    convolution); the designs and the progress are in `docs/wip/HANDOFF.md`.
 2. A bump-allocated scope past the pool (buffers reserved once from the shapes; zero rents on the hot path).
 3. The known-slow list.
@@ -124,7 +124,9 @@ and measured against the baseline when it is.
 | CPU | the strided copy (a 3-d permutation of 16M values) | 16.2 ms float32, 7.3 int8 against 1.8 for a plain copy: a value-at-a-time gather (tiling by the source's rows is the step) |
 | CPU | the pools and the depthwise convolution | maxpool_bwd 5.1 ms, adaptive_maxpool 5.8, depthwise_conv 4.8 (float32, 64 × 256 × 256); int8 adaptive_maxpool 18.6, depthwise 24.4 (value-at-a-time loads of a packed type) |
 | CPU | the convolution backward | 33 ms against 6.9 forward (64 × 128 × 128 by 128 of 3 × 3): three passes in lane storage |
-| CUDA | attention rows | 3.8 ms (causal 2.1) for 16 heads of 2048² at d = 128 by the fused rows in the FMA lane, from 6.1 by the composition (since item 4a); the tensor lanes inside the fused kernel are the step. float64 4.6 % apart either way (61 fused, 59 composition): the measurement keeps the composition there |
+| CUDA | attention rows | 3.8 ms (causal 2.1) for 16 heads of 2048² at d = 128 by the fused rows in the FMA lane, from 6.1 by the composition (since item 4a); the tensor lanes inside the fused kernel are the step. float64: see the next row |
+| CUDA | float64 non-causal attention: which path | 62.6 ms on the fused rows since item 4d, against 59 by the composition at 4a; the shared measurement (`Measure.Faster`) timed the composition at 89 this time and chose the fused rows. To re-measure both paths in item 6 (the `attention` row, the composition forced); if the composition is really faster, explain the 89 |
+| CPU | the block-scaled product with AggressiveOptimization | steady 3.5–3.65 ms with the attribute against 3.15–3.18 without in one A/B (1024³ q8_0, item 4d); the attribute keeps the first calls off the runtime's first tier. To re-measure in item 6 in both orders; if the gap holds, keep first-call optimization without the steady-state cost |
 | CPU | attention rows | 60–80 ms float32 (causal 33–38) for 16 heads of 2048² at d = 128 by the fused rows, from 100–148 by the composition (since item 4a) |
 | CUDA | attention backward by the composition | 4.0 ms for 8 heads of 1024² |
 | CUDA | int8 adaptive_maxpool | 0.265 ms against float32 0.079 (per-value unpacking of 4 values a word in the window loop) |
@@ -166,7 +168,7 @@ sum_axis, sumsq, max, min, argmax → the reductions; transpose; gemv_nn / gemv_
 | matmul C = A·B | ✓ sum | ✓ sum | tensor/dot lanes first; float64 by `f64x` where faster (proven 0 ulp; shapes in multiples of 8, others in the f64 lane); on the device a shape not in the kernels' tiles (m, k in 128s, n in 256s) is padded with zeros (pad2d) and C taken back by the strided copy |
 | gemv: y = A·x, y = Aᵀ·x | ✓ sum | ✓ sum | a warp per row / a thread per column on the device; dot lanes on the CPU (rows are groups as stored) |
 | multi-vector products | ✓ sum | ✓ sum | matmul with a narrow B |
-| batched, strided, transposed operands (`ProductView`) | ✓ sum | ✓ sum | each operand of a batch made contiguous by the exact strided copy, then the product kernel (same lanes, bounds, proofs); fusing the transposition into the packing: todo |
+| batched, strided, transposed operands (`ProductView`) | ✓ sum | ✓ sum | the product kernel reads the operands where they are stored (same lanes, bounds, proofs): CPU every type whose rows start on whole bytes (a byte or more, and the block formats at even shapes; batch offsets on whole storage units) — Aᵀ's k-rows straight into the A blocks, Bᵀ's rows into the packed strips, a batch's offset as a base index; the device's tensor and dot routes at whole tiles (Aᵀ by the transposed packer, Bᵀ by the row packer, batch offsets on 16 bytes as pointer offsets). The rest (sub-byte types on the CPU; on the device the plain f32 / f64 lanes, the block formats through lane storage, shapes off the tiles) makes each operand of a batch contiguous by the exact strided copy first. A transposed block-format operand is no longer re-encoded through a copy (its error dropped, e.g. CPU q4_k matmul_nt 4.65 → 2.73). Gate: also at 64 × 40 × 330 and 64 × 48 × 320 (CPU) and 128 × 256 × 128 (device), where the views take the in-place route, plus a batch of untransposed operands |
 | matmul backward (dA = dC·Bᵀ, dB = Aᵀ·dC) | ✓ sum | ✓ sum | two products on views |
 
 ## Rows and normalization

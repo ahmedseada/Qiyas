@@ -964,9 +964,18 @@ internal static class Checks
         }
 
         if (ops is not null) { ops.FourBit = null; ops.K32 = null; }
+        // The packing reading the views' operands where they are stored (Aᵀ, Bᵀ, batch offsets): shapes that take that
+        // route. CPU: two panels of k with a partial last group, edge rows and strips; and batch strides on whole blocks
+        // (the block formats in place too). Device: whole tiles (the tensor and dot routes).
+        if (ops is null)
+        {
+            ok &= ProductsWith(null, where, 64, 40, 330, " [in place]");
+            ok &= ProductsWith(null, where, 64, 48, 320, " [in place]");
+        }
+        else ok &= ProductsWith(ops, where, 128, 256, 128, " [in place]");
         if (ops is not null) ok &= TensorConfigs(ops);
         ok &= BlockProducts(ops, where);
-        if (ok) Console.WriteLine($"check products               {where,-6} every type at 37 x 29 x 53, transposed, batched, and the backward pair{(ops is null ? "" : ", under every tensor kind")}: within the product's rounding");
+        if (ok) Console.WriteLine($"check products               {where,-6} every type at 37 x 29 x 53, transposed, batched, and the backward pair{(ops is null ? "" : ", under every tensor kind")}; read in place at {(ops is null ? "64 x 40 x 330 and 64 x 48 x 320" : "128 x 256 x 128")}: within the product's rounding");
         return ok;
     }
 
@@ -1063,6 +1072,7 @@ internal static class Checks
             foreach (bool ta in new[] { false, true }) foreach (bool tb in new[] { false, true }) views.Add(new ProductView(M, N, K, ta, tb));
             views.Add(new ProductView(M, N, K, false, true, 3, M * K, N * K, M * N));
             views.Add(new ProductView(M, N, K, true, false, 3, M * K, 0, M * N));
+            views.Add(new ProductView(M, N, K, false, false, 2, M * K, K * N, M * N));     // batched as stored (4e: batch 0 at offset 0 is still a view)
             foreach (var v in views)
             {
                 var a = Bench.Registry.Make(type, (int)v.ValuesA, 34, -1, 1);

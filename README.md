@@ -19,7 +19,8 @@ does best for it, chosen per operation from the data itself. No type is fixed an
   the device's conversions against the CPU's; then every operation of every family runs over every type it applies to
   on both devices, on small odd shapes, against float64 references (`src/Checks.cs`); the block codecs against blocks
   laid out by hand from the formats' specifications; the block-scaled products of Q8_0 / Q4_0 (A·Bᵀ and gemv, k in whole
-  blocks) forced on both devices; the products on the device under every tensor kind the device
+  blocks) forced on both devices; the products on views at shapes where the packing reads transposed and batched
+  operands where they are stored, on both devices; the products on the device under every tensor kind the device
   accepts (the measured choice, then the 4-bit kinds and the 32-deep 8-bit instruction forced on and off), and under
   every tensor-kernel configuration the device can run with every kind choice (k = 53 and 300, every integer and
   narrow-float type); attention rows by both the composition and the fused rows (causal, spans with starts, head
@@ -125,7 +126,7 @@ checkout (files listed in `.gitignore`); a clone runs the other subjects.
 | `src/Optimizers.cs`, `src/Ptx.Optimizers.cs`, `src/GpuOps.Optimizers.cs` | optimizer steps: sgd with momentum, adam, adamw |
 | `src/Attention.cs`, `src/Ptx.Attention.cs`, `src/GpuOps.Attention.cs` | attention: the measured choice, the composition in lane storage, the fused decode kernel, the backward composition; the lane-storage conversions |
 | `src/AttentionRows.cs`, `src/Ptx.AttentionRows.cs` | attention's fused rows (flash: keys in tiles, the softmax online, no scores in memory) on the CPU and the device |
-| `src/Products.cs`, `src/GpuOps.Products.cs` | products on views (transposed operands, batches) and the matmul backward, through the strided copy and the product kernel |
+| `src/Products.cs`, `src/GpuOps.Products.cs` | products on views (transposed operands, batches) and the matmul backward: the product's packing reads the operands where they are stored (`Kernels.Operands`; the device's tensor and dot routes), otherwise through the strided copy |
 | `src/Layout.cs`, `src/Ptx.Layout.cs`, `src/GpuOps.Layout.cs`, `src/Bench/LayoutCases.cs` | layout and indexing: the references, the CPU kernels, the device kernels, the gate's and the bench's cases |
 | `src/Reduce.cs`, `src/Ptx.Reduce.cs` | reductions (sum, sum of squares, max, min, argmax: whole, rows, columns), row-vector broadcasts, transpose, gemv: the CPU kernels, the device kernels |
 | `src/Functions.cs` | log, sin, cos, expm1, tanh, sigmoid, erf, erfc on vectors: coefficient tables shared with the device emitter |
@@ -217,7 +218,7 @@ allows.
 ## Open
 
 What the gates have not confirmed, or is not done, is in `COVERAGE.md` ("State" for the order, **todo** in the rows):
-the transposition fused into the product's packing, the
+the
 radix step of scatter-add, a fused direct convolution, a bump-allocated scope past the buffer pool, and the known-slow
 cells (among them the tensor lanes inside the fused attention kernel, which runs in the FMA lane). The README claims nothing beyond what the gates and the regression
 comparison have confirmed.

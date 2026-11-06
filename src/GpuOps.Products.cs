@@ -1,6 +1,8 @@
-// The device's products on views (Products.cs): each operand of a batch made contiguous by the strided-copy kernel
-// (exact, any format), the product kernel on it, the result copied to its place (a contiguous slice: a device copy
-// when the slice ends on a byte; otherwise the strided copy with a word-aligned output is the step past this).
+// The device's products on views (Products.cs): where the product takes the tensor or dot route at whole tiles, each
+// batch's operands are read where they are stored (Aᵀ and Bᵀ by the packing's two orientations, a batch's offset on the
+// pointer, C written in place); otherwise each operand of a batch made contiguous by the strided-copy kernel (exact,
+// any format), the product kernel on it, the result copied to its place (a contiguous slice: a device copy when the
+// slice ends on a byte; otherwise the strided copy with a word-aligned output is the step past this).
 namespace Qiyas;
 
 public sealed partial class GpuOps
@@ -13,7 +15,8 @@ public sealed partial class GpuOps
         return MatMulViewRoute<TN>(v, a, b, c);
     }
 
-    /// <summary>C = op(A)·op(B) by the strided copies and the product kernel.</summary>
+    /// <summary>C = op(A)·op(B): each batch's operands read where they are stored by the packing (the tensor and dot
+    /// routes), or made contiguous by the strided copies; then the product kernel.</summary>
     private string MatMulViewRoute<TN>(ProductView v, ulong a, ulong b, ulong c) where TN : struct, IQiyasNumber<TN>
     {
         var f = Fmt.Of<TN>();
@@ -36,14 +39,33 @@ public sealed partial class GpuOps
         }
 
         long bytesA = f.Words((long)v.M * v.K) * (f.WordBits / 8), bytesB = f.Words((long)v.K * v.N) * (f.WordBits / 8), bytesC = f.Words((long)v.M * v.N) * (f.WordBits / 8);
-        ulong ca = direct ? a : gpu.Rent(bytesA), cb = direct ? b : gpu.Rent(bytesB), cc = direct ? c : gpu.Rent(bytesC);
+        // A batch's operands read where they are stored (Aᵀ, Bᵀ, a batch's offset on the pointer) where the product's packing
+        // reads them: the tensor and dot routes at whole tiles, each offset on 16 bytes (the kernels' widest loads).
+        bool Aligned(long values) => values * f.Bits % 128 == 0;
+        bool placeable = !direct && Aligned(v.StrideAOrDefault) && Aligned(v.StrideBOrDefault) && Aligned(v.Batch > 1 ? v.StrideCOrDefault : 0);
+        ulong ca = 0, cb = 0, cc = 0;
         // Sub-byte results at batch offsets that do not end on a byte are OR-ed into a zeroed C (the bits placed one value at a time).
         bool bitwise = !direct && f.Bits < 8 && (v.StrideCOrDefault * f.Bits % 8 != 0 || (long)v.M * v.N * f.Bits % 8 != 0);
-        if (bitwise) Gpu.Clear(c, f.Words(v.ValuesC) * (f.WordBits / 8));
+        bool cleared = false;
         try
         {
             for (int i = 0; i < v.Batch; i++)
             {
+                if (placeable)
+                {
+                    ulong pa = a + (ulong)(i * v.StrideAOrDefault * f.Bits / 8), pb = b + (ulong)(i * v.StrideBOrDefault * f.Bits / 8);
+                    var ((pLo, pHi), (qLo, qHi)) = RangePair<TN>(pa, v.M * v.K, pb, v.K * v.N);
+                    var placed = new Bounds(pLo, pHi, qLo, qHi, v.K);
+                    if (PackedRoute<TN>(placed, v.M, v.N, v.K))
+                    {
+                        lane = MatMul<TN>(pa, pb, c + (ulong)(i * v.StrideCOrDefault * f.Bits / 8), v.M, v.N, v.K, placed, v.TransA, v.TransB);
+                        continue;
+                    }
+                }
+
+                if (direct) { ca = a; cb = b; cc = c; }
+                else if (ca == 0) { ca = gpu.Rent(bytesA); cb = gpu.Rent(bytesB); cc = gpu.Rent(bytesC); }
+                if (bitwise && !cleared) { Gpu.Clear(c, f.Words(v.ValuesC) * (f.WordBits / 8)); cleared = true; }
                 if (!direct)
                 {
                     Layout<TN>(new LayoutArgs { Name = "strided", X = [], P = v.ViewA(i), Output = [], Count = v.M * v.K, InputCount = (int)v.ValuesA }, a, 0, ca);
@@ -66,7 +88,7 @@ public sealed partial class GpuOps
         }
         finally
         {
-            if (!direct) { gpu.Return(ca); gpu.Return(cb); gpu.Return(cc); }
+            if (!direct && ca != 0) { gpu.Return(ca); gpu.Return(cb); gpu.Return(cc); }
         }
 
         return lane;

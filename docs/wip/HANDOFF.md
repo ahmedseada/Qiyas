@@ -153,7 +153,38 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
     of the attribute: the steady CPU block row 3.5–3.65 ms with it, 3.15–3.18 without; profile-guided optimization off
     left the build without it unchanged, so the gap is within this laptop's swing or a real ~10 % — re-check at item 4's
     full run.
-- 5 pieces left in item 4 after 4d: 4e, 4f, 4g, then the GRU sequence backward (below), then item 4's full run.
+- 4d committed as a784145 (the coordinator: keep AggressiveOptimization; the full run settles the ~10 %).
+- 4 pieces left in item 4 after 4e: 4f, 4g, then the GRU sequence backward (below), then item 4's full run.
+- The two open timing questions (the CPU block product with AggressiveOptimization; device float64 non-causal attention,
+  the composition timed at 89 ms by the helper) moved to item 6 by the owner: COVERAGE Known slow rows, and below
+  under item 6. Item 4's full run only records them.
+- 4e: done, reported as its own boundary (uncommitted until the coordinator's go). What landed:
+  - CPU `Kernels.Operands(AOff, TransA, BOff, TransB, COff, Viewed)` and `MatMul<TN, TIn, TAcc, TL>(…, Operands)` (the old
+    signature calls it with `default`, a plain product): `PackBody` takes Bᵀ by `RunTransposed` (a task reads each Bᵀ
+    row's span of its k-groups once — a unit of g values is contiguous there — and lays the units into the strips,
+    zero past n and past k); `ProductBody` takes Aᵀ by `PanelOfTransposed` (k-row p of Aᵀ holds the tile's rows
+    contiguously: R values a k-row straight into the [group][R] block; no staging or transpose step; non-lane types
+    load the tile's span of each k-row once per panel); every index offset by the batch's base; `Micro` and the stores
+    take C's offset. `Products.cs`: `InPlace<TN>` (rows on whole bytes: a byte or more, or a block format at even m, n,
+    k; strides on whole storage units) → the in-place route per batch, ranges taken on the stored slice; otherwise
+    `MatMulViewCopies` (the old body).
+  - device: `GpuOps.PackedRoute<TN>` (tensor or dot lane at whole tiles) and `MatMul<TN>(…, transA, transB)`: Aᵀ by
+    `Pack(…, transposed: true)` (the transposed packer, rows = m), Bᵀ by `Pack(…, transposed: false)` (the row packer);
+    `MatMulViewRoute` takes a batch in place when every offset is on 16 bytes and the lane is packed, else the copies
+    (rented only when a batch needs them). The plain f32 / f64 lanes and the block formats keep the copies (their
+    kernels read row-major operands; a strided `Gemm` / `Lanes` is the step past this).
+  - a bug found on the way by the bench: batch 0 of an untransposed batch has an all-zero Operands, which read as the
+    plain product and failed C's exact-size check; `Viewed` marks a view. The gate had no untransposed batch: added.
+  - gate: `ProductsWith` also at 64 × 40 × 330 and 64 × 48 × 320 (CPU) and 128 × 256 × 128 (device), and a batch of two
+    untransposed products in every shape. Mutations: CPU Bᵀ units (one group for all) and Aᵀ rows (shifted by one) fail
+    the CPU checks across types; device Bᵀ packed as if stored k × n fails the device in-place checks on every tensor and
+    dot type (int4 included).
+  - measured, `--subjects qiyas --ops products` against the same command on a784145 (a worktree; the baseline holds no
+    product rows): CPU 0.07–0.87× on every byte-wide and block type (float32 matmul_nt 11.0 → 1.96 ms, float16 10.9 →
+    2.16, int64 11.8 → 0.81, q4_k 34.4 → 9.6, q6_k 50.1 → 10.9; block errors lower: no re-encoding); device 0.38–0.87×
+    on the tensor and dot types (int8 matmul_tt 0.274 → 0.103, float16 0.409 → 0.269), unchanged on f32 / f64 / blocks.
+    Sub-byte types (copy route as before) flagged slower in three cells; one A/B both orders: int4 matmul_tn and int2
+    matmul_nt slower in both (7–26 %), uint2 mixed — the shared kernel only gained offsets; re-check in the full run.
 - GRU sequence backward (the owner's addition; after 4g): dx, dh0, dW, dU, db of the GRU sequence, on both devices, built
   the way the LSTM sequence backward is (float64 reference looped over the steps, gate in `Checks.Recurrents` on every
   float type incl. blocks, contract method, bench row `gru_seq_bwd` in Group8). "A complete core cannot leave it out."
@@ -296,6 +327,10 @@ the plain-lane kernels (`Gemm`, `Gemm2`) need a strided A/B variant or the lane 
 `to:` kernel with a stride. Gate: `Checks.Products` already covers Aᵀ, Bᵀ, AᵀBᵀ, batched — unchanged, must stay green;
 bench rows `matmul_nt`, `matmul_tn`, `matmul_tt`, `matmul_batched` show the gain (compare.py on `--ops products`).
 
+As built (see the progress entry 4e): the CPU as designed, every type whose rows start on whole bytes; the device in the
+tensor and dot routes only (the packers' two orientations, offsets on the pointer) — the plain f32 / f64 lanes and the
+block formats keep the copies (a strided `Gemm` / `Lanes` is the step past this, not taken in 4e).
+
 ## Item 4f — the radix step of scatter-add
 
 Today: the device orders scatter-add sources by `scatter_count` (atomic counts) → `scatter_scan` (one warp scans the
@@ -380,6 +415,13 @@ Each: measure against the baseline cell, change, re-measure (the full run or the
   rows (`src/Layout.cs` `MoveBody`); a partial sort (a per-row heap of k) for top-k in `src/Routing.cs` `TopKBody`.
 - When a cell lands: update its Known-slow row with the new measurement (or remove the row and say so in the item
   report); README Results regenerated from the full run that includes it.
+- CPU block-scaled product with AggressiveOptimization (the owner's, from 4d): steady 3.5–3.65 ms with the attribute,
+  3.15–3.18 without, in one A/B (1024³ q8_0). Re-measure both orders; if the gap holds, find a way to keep first-call
+  optimization (the reason: the first tier ran it 20× slower for the first rounds) without the steady-state cost.
+  Stable on re-measurement: mark the Known-slow row done.
+- Device float64 non-causal attention (the owner's, from 4d): 62.6 ms on the fused rows now, 59 by the composition at
+  4a, and `Measure.Faster` timed the composition at 89. Re-measure both paths (the `attention` row; the composition
+  forced through `AttentionComposed`); if the composition is really faster, explain the 89 and fix the measurement.
 - CPU recurrent sequences (the coordinator's observation at 4c): gru_seq 65–71 ms, lstm_seq 83 ms against ~15–20 ms
   implied by the f32 product rate (COVERAGE Known slow).
 

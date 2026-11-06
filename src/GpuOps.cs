@@ -548,9 +548,21 @@ public sealed partial class GpuOps(Gpu gpu)
         _ => Lane.U64,
     };
 
-    public string MatMul<TN>(ulong a, ulong b, ulong c, int m, int n, int k, in Bounds bounds) where TN : struct, IQiyasNumber<TN>
+    /// <summary>Whether MatMul takes operands stored transposed at this shape and these bounds: the tensor or dot route
+    /// (its packing reads either orientation) at whole tiles.</summary>
+    public bool PackedRoute<TN>(in Bounds bounds, int m, int n, int k) where TN : struct, IQiyasNumber<TN>
+    {
+        if (m % 128 != 0 || n % 256 != 0 || k % 128 != 0) return false;
+        string laneName = ProductLane<TN>(bounds);
+        return laneName.EndsWith("mma", StringComparison.Ordinal) || laneName.EndsWith("dp", StringComparison.Ordinal);
+    }
+
+    /// <summary>C = A·B (A m × k, B k × n); with transA A is stored k × m (Aᵀ), with transB B is stored n × k (Bᵀ), read
+    /// that way by the packing (only where PackedRoute says so).</summary>
+    public string MatMul<TN>(ulong a, ulong b, ulong c, int m, int n, int k, in Bounds bounds, bool transA = false, bool transB = false) where TN : struct, IQiyasNumber<TN>
     {
         var f = Fmt.Of<TN>();
+        if ((transA || transB) && !PackedRoute<TN>(bounds, m, n, k)) throw new InvalidOperationException("transposed operands are read in place by the tensor and dot routes at whole tiles only");
         if (m % 128 != 0 || n % 256 != 0 || k % 128 != 0) return MatMulPadded<TN>(a, b, c, m, n, k, in bounds);
         string laneName = ProductLane<TN>(bounds);
         var lane = LaneOf(laneName);
@@ -569,9 +581,9 @@ public sealed partial class GpuOps(Gpu gpu)
                 // A's rows as stored already have the kind's layout when the type is the kind and k is whole blocks.
                 bool aAsIs = f.Bits == kind.Bits && kp == k && (f.IsFloat == kind.IsFloat) && (!f.IsFloat || f.Is(kind == Ptx.Kind.F16 ? "float16" : "bfloat16"));
                 long t0 = Phases is null ? 0 : Stopwatch.GetTimestamp();
-                ulong pa = aAsIs ? a : Pack(f, kind, a, m, k, kp, transposed: false, rented);
+                ulong pa = aAsIs && !transA ? a : Pack(f, kind, a, m, k, kp, transposed: transA, rented);
                 t0 = Mark(t0, 0);
-                ulong pb = Pack(f, kind, b, n, k, kp, transposed: true, rented);
+                ulong pb = Pack(f, kind, b, n, k, kp, transposed: !transB, rented);
                 t0 = Mark(t0, 1);
                 bool cAsIs = f.Bits == 32 && f.IsFloat == lane.IsFloat;
                 ulong lc = cAsIs ? c : gpu.Rent((long)m * n * 4);
