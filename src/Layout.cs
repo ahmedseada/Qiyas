@@ -328,8 +328,10 @@ internal static partial class Kernels
     {
         if (LayoutArgs.Sums(k.Name))
         {
-            var (lo, hi) = TN.Range(k.X, k.InputCount);
-            var (lo2, hi2) = k.X2 is null || k.Name != "depthwise_conv" ? (1, 1) : TN.Range(k.X2, k.P[0] * k.P[3] * k.P[4]);
+            // The bounds choose an integer type's sum lane; a float type's lane is its float lane whatever the values, so its
+            // range is not read (a block format's range decodes every block, serially).
+            var (lo, hi) = TN.IsFloat ? (0, 0) : TN.Range(k.X, k.InputCount);
+            var (lo2, hi2) = TN.IsFloat || k.X2 is null || k.Name != "depthwise_conv" ? (1, 1) : TN.Range(k.X2, k.P[0] * k.P[3] * k.P[4]);
             var sum = new LayoutSumVisitor(k);
             TN.Sum(ref sum, new Bounds(lo, hi, lo2, hi2, LayoutArgs.Terms(k.Name, k.P)));
             return sum.Lane;
@@ -355,7 +357,12 @@ internal static partial class Kernels
         {
             Lane = TL.Name;
             var (rows, cols) = OutputRows(k);
-            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)k.Count, new MoveBody<TN, TLane, TL>(k, rows, cols));
+            var xl = Decoded<TN, TLane>(k);
+            var at = WindowArgmax<TN, TLane>(k);
+            var x2l = DecodedWeights<TN, TLane>(k);
+            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)k.Count, new MoveBody<TN, TLane, TL>(k, rows, cols, xl, at, x2l));
+            if (xl is not null) ArrayPool<TLane>.Shared.Return(xl);
+            if (x2l is not null) ArrayPool<TLane>.Shared.Return(x2l);
         }
     }
 
@@ -367,7 +374,12 @@ internal static partial class Kernels
         {
             Lane = TL.Name;
             var (rows, cols) = OutputRows(k);
-            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)k.Count, new MoveBody<TN, TLane, TL>(k, rows, cols));
+            var xl = Decoded<TN, TLane>(k);
+            var at = WindowArgmax<TN, TLane>(k);
+            var x2l = DecodedWeights<TN, TLane>(k);
+            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)k.Count, new MoveBody<TN, TLane, TL>(k, rows, cols, xl, at, x2l));
+            if (xl is not null) ArrayPool<TLane>.Shared.Return(xl);
+            if (x2l is not null) ArrayPool<TLane>.Shared.Return(x2l);
         }
     }
 
@@ -379,7 +391,12 @@ internal static partial class Kernels
         {
             Lane = TL.Name;
             var (rows, cols) = OutputRows(k);
-            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)k.Count, new MoveBody<TN, TLane, TL>(k, rows, cols));
+            var xl = Decoded<TN, TLane>(k);
+            var at = WindowArgmax<TN, TLane>(k);
+            var x2l = DecodedWeights<TN, TLane>(k);
+            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)k.Count, new MoveBody<TN, TLane, TL>(k, rows, cols, xl, at, x2l));
+            if (xl is not null) ArrayPool<TLane>.Shared.Return(xl);
+            if (x2l is not null) ArrayPool<TLane>.Shared.Return(x2l);
         }
 
         public void RunDot<TN, TIn, TAcc, TD>()
@@ -397,15 +414,99 @@ internal static partial class Kernels
         private static void Plain<TN, TLane, TL>(LayoutArgs k) where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasLane<TL, TLane>
         {
             var (rows, cols) = OutputRows(k);
-            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)k.Count, new MoveBody<TN, TLane, TL>(k, rows, cols));
+            var xl = Decoded<TN, TLane>(k);
+            var at = WindowArgmax<TN, TLane>(k);
+            var x2l = DecodedWeights<TN, TLane>(k);
+            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)k.Count, new MoveBody<TN, TLane, TL>(k, rows, cols, xl, at, x2l));
+            if (xl is not null) ArrayPool<TLane>.Shared.Return(xl);
+            if (x2l is not null) ArrayPool<TLane>.Shared.Return(x2l);
         }
     }
 
     private static (int Rows, int Cols) OutputRows(LayoutArgs k) => LayoutArgs.OutputRows(k);
 
+    /// <summary>The max-pool backward's first largest of every window of the forward input (x2), found once by the team
+    /// (index into the input, -1 for an empty window): each input row then reads its windows' choice instead of scanning
+    /// every window it lies in. Null for the other operations.</summary>
+    private static long[]? WindowArgmax<TN, TLane>(LayoutArgs k) where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged
+    {
+        if (k.Name is not ("maxpool_bwd" or "adaptive_maxpool_bwd")) return null;
+        var p = k.P;
+        int C = p[0], H = p[1], W = p[2];
+        var (OH, OW) = k.Name == "maxpool_bwd" ? LayoutArgs.PoolOut(p) : (p[3], p[4]);
+        int windows = C * OH * OW, n = C * H * W;
+        TLane[]? lanes = null;
+        if (!TN.Direct)
+        {
+            lanes = ArrayPool<TLane>.Shared.Rent(n);
+            int unit = Math.Max(256, TN.Granularity);
+            Team.For(n, Math.Max(4096, n / (Threads * 2)) / unit * unit + unit, n, new LoadBody<TN, TLane>(k.X2!, lanes));
+        }
+
+        var at = new long[windows];
+        Team.For(windows, Math.Max(1, windows / (Threads * 4)), (long)n, new ArgmaxBody<TN, TLane>(k, lanes, at, OH, OW));
+        if (lanes is not null) ArrayPool<TLane>.Shared.Return(lanes);
+        return at;
+    }
+
+    private readonly struct ArgmaxBody<TN, TLane>(LayoutArgs k, TLane[]? lanes, long[] at, int OH, int OW) : Team.IBody
+        where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged
+    {
+        public void Run(int first, int last)
+        {
+            var p = k.P;
+            int H = p[1], W = p[2];
+            ReadOnlySpan<TLane> x = lanes ?? MemoryMarshal.Cast<byte, TLane>(k.X2!.AsSpan());
+            bool adaptive = k.Name == "adaptive_maxpool_bwd";
+            for (int i = first; i < last; i++)
+            {
+                int ow = i % OW, oh = i / OW % OH, c = i / (OW * OH);
+                int h0, h1, w0, w1;
+                if (adaptive) { (h0, h1) = LayoutArgs.Adaptive(oh, H, OH); (w0, w1) = LayoutArgs.Adaptive(ow, W, OW); }
+                else { h0 = oh * p[5] - p[7]; h1 = h0 + p[3]; w0 = ow * p[6] - p[8]; w1 = w0 + p[4]; }
+                h0 = Math.Max(h0, 0); h1 = Math.Min(h1, H); w0 = Math.Max(w0, 0); w1 = Math.Min(w1, W);
+                // The first largest in row-major order: a later value takes it only when strictly larger.
+                long bestAt = -1;
+                TLane best = default;
+                for (int hh = h0; hh < h1; hh++) for (int ww = w0; ww < w1; ww++)
+                {
+                    long j = ((long)c * H + hh) * W + ww;
+                    TLane v = x[(int)j];
+                    if (bestAt < 0 || Widths.Compare(v, best) > 0) { best = v; bestAt = j; }
+                }
+
+                at[i] = bestAt;
+            }
+        }
+    }
+
+    /// <summary>The depthwise convolution's weights (x2) decoded to lane values once for the types not read in place (each
+    /// weight is read for every output value); null otherwise.</summary>
+    private static TLane[]? DecodedWeights<TN, TLane>(LayoutArgs k) where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged
+    {
+        if (TN.Direct || k.Name != "depthwise_conv") return null;
+        int n = k.P[0] * k.P[3] * k.P[4];
+        var lanes = ArrayPool<TLane>.Shared.Rent(n);
+        TN.Load(k.X2!, 0, lanes.AsSpan(0, n));
+        return lanes;
+    }
+
+    /// <summary>The input of a type not read in place (narrow floats, packed and block types) decoded to lane values once, by
+    /// the team (a value read one at a time would convert, or decode its unit or block, each time); null for the types read
+    /// in place and the operations that read few values.</summary>
+    private static TLane[]? Decoded<TN, TLane>(LayoutArgs k) where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged
+    {
+        if (TN.Direct || k.Name is "one_hot" or "gather_rows" or "pad2d") return null;      // those read rows whole already
+        int n = (int)k.InputCount;
+        var lanes = ArrayPool<TLane>.Shared.Rent(n);
+        int unit = Math.Max(256, TN.Granularity);
+        Team.For(n, Math.Max(4096, n / (Threads * 2)) / unit * unit + unit, n, new LoadBody<TN, TLane>(k.X, lanes));
+        return lanes;
+    }
+
     /// <summary>Every output row computed value by value from the input's lane values (loaded one at a time by index:
     /// the operations are gathers), the row stored once; rows chunked on whole bytes for the packed types.</summary>
-    private struct MoveBody<TN, TLane, TL>(LayoutArgs k, int rows, int cols) : Team.IBody
+    private struct MoveBody<TN, TLane, TL>(LayoutArgs k, int rows, int cols, TLane[]? xl = null, long[]? at = null, TLane[]? x2l = null) : Team.IBody
         where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasLane<TL, TLane>
     {
         public readonly void Run(int first, int last)
@@ -419,18 +520,21 @@ internal static partial class Kernels
             {
                 // Compute into a lane buffer for these rows and store value-aligned pieces: the first and last partial bytes
                 // are stored one value at a time by the same thread only when it owns the byte's first value.
-                RunRows(first, last, k, rows, cols, exclusiveBytes: true);
+                RunRows(first, last, k, rows, cols, exclusiveBytes: true, xl, at, x2l);
                 return;
             }
 
-            RunRows(first, last, k, rows, cols, exclusiveBytes: false);
+            RunRows(first, last, k, rows, cols, exclusiveBytes: false, xl, at, x2l);
         }
 
-        private static void RunRows(int first, int last, LayoutArgs k, int rows, int cols, bool exclusiveBytes)
+        // xl: the input decoded to lane values once (packed and block types), else null and values are loaded one at a time.
+        // at: the max-pool backward's first largest of every window (input index, -1 for an empty window), found once.
+        private static void RunRows(int first, int last, LayoutArgs k, int rows, int cols, bool exclusiveBytes, TLane[]? xl, long[]? at, TLane[]? x2l)
         {
             var pool = ArrayPool<TLane>.Shared;
             var row = pool.Rent(cols);
             var one = pool.Rent(1);
+            TLane[]? source = null;
             try
             {
                 var p = k.P;
@@ -444,7 +548,7 @@ internal static partial class Kernels
                         {
                             int i2 = r % p[2], i1 = r / p[2] % p[1], i0 = r / (p[2] * p[1]);
                             long b = p[8] + (long)i0 * p[4] + (long)i1 * p[5] + (long)i2 * p[6];
-                            for (int c = 0; c < cols; c++) o[c] = Value(k.X, b + (long)c * p[7], one);
+                            for (int c = 0; c < cols; c++) o[c] = Value(xl, k.X, b + (long)c * p[7], one);
                             break;
                         }
 
@@ -456,16 +560,27 @@ internal static partial class Kernels
                             TN.Load(k.X, idx![r] * cols, o);
                             break;
                         case "gather_cols":
-                            for (int c = 0; c < cols; c++) o[c] = Value(k.X, (long)r * p[1] + idx![c], one);
+                            for (int c = 0; c < cols; c++) o[c] = Value(xl, k.X, (long)r * p[1] + idx![c], one);
                             break;
                         case "scatter_add_rows":
                         {
-                            // Output row r: the sum of every source row whose index is r, in source order.
+                            // Output row r: the sum of every source row whose index is r, in source order; a source row read
+                            // whole (one load of its values: a block format decodes each block once, not once per value).
                             o.Clear();
                             for (int i = 0; i < p[0]; i++)
                             {
                                 if (idx![i] != r) continue;
-                                for (int c = 0; c < cols; c++) o[c] = TL.Add(o[c], Value(k.X, (long)i * cols + c, one));
+                                ReadOnlySpan<TLane> s;
+                                if (TN.Direct) s = MemoryMarshal.Cast<byte, TLane>(k.X.AsSpan()).Slice(i * cols, cols);
+                                else if (xl is not null) s = xl.AsSpan(i * cols, cols);
+                                else
+                                {
+                                    source ??= pool.Rent(cols);
+                                    TN.Load(k.X, i * cols, source.AsSpan(0, cols));
+                                    s = source.AsSpan(0, cols);
+                                }
+
+                                for (int c = 0; c < cols; c++) o[c] = TL.Add(o[c], s[c]);
                             }
 
                             break;
@@ -482,7 +597,7 @@ internal static partial class Kernels
                                 for (int ow = 0; ow < OW; ow++)
                                 {
                                     int iw = ow * p[6] - p[8] + b * p[10];
-                                    o[oh * OW + ow] = (uint)ih < (uint)H && (uint)iw < (uint)W ? Value(k.X, ((long)c * H + ih) * W + iw, one) : TL.Zero;
+                                    o[oh * OW + ow] = (uint)ih < (uint)H && (uint)iw < (uint)W ? Value(xl, k.X, ((long)c * H + ih) * W + iw, one) : TL.Zero;
                                 }
                             }
 
@@ -506,7 +621,7 @@ internal static partial class Kernels
                                     {
                                         int tw = iw + pw - b * dw;
                                         if (tw < 0 || tw % sw != 0 || tw / sw >= OW) continue;
-                                        acc = TL.Add(acc, Value(k.X, ((long)((c * kh + a) * kw + b) * (OH * OW)) + (th / sh) * OW + tw / sw, one));
+                                        acc = TL.Add(acc, Value(xl, k.X, ((long)((c * kh + a) * kw + b) * (OH * OW)) + (th / sh) * OW + tw / sw, one));
                                     }
                                 }
 
@@ -524,7 +639,7 @@ internal static partial class Kernels
                             for (int ow = 0; ow < OW; ow++)
                             {
                                 int iw = Math.Min(W - 1, (2 * ow + 1) * W / (2 * OW));
-                                o[ow] = Value(k.X, ((long)c * H + ih) * W + iw, one);
+                                o[ow] = Value(xl, k.X, ((long)c * H + ih) * W + iw, one);
                             }
 
                             break;
@@ -542,8 +657,8 @@ internal static partial class Kernels
                                 double sx = Math.Max((ow + 0.5) * W / OW - 0.5, 0);
                                 int x0 = Math.Min((int)Math.Floor(sx), W - 1), x1 = Math.Min(x0 + 1, W - 1);
                                 TLane fx = TL.From(sx - x0), gx = TL.From(1 - (sx - x0));
-                                TLane top = TL.Fma(Value(k.X, ((long)c * H + y0) * W + x1, one), fx, TL.Mul(Value(k.X, ((long)c * H + y0) * W + x0, one), gx));
-                                TLane bottom = TL.Fma(Value(k.X, ((long)c * H + y1) * W + x1, one), fx, TL.Mul(Value(k.X, ((long)c * H + y1) * W + x0, one), gx));
+                                TLane top = TL.Fma(Value(xl, k.X, ((long)c * H + y0) * W + x1, one), fx, TL.Mul(Value(xl, k.X, ((long)c * H + y0) * W + x0, one), gx));
+                                TLane bottom = TL.Fma(Value(xl, k.X, ((long)c * H + y1) * W + x1, one), fx, TL.Mul(Value(xl, k.X, ((long)c * H + y1) * W + x0, one), gx));
                                 o[ow] = TL.Fma(bottom, fy, TL.Mul(top, gy));
                             }
 
@@ -551,7 +666,7 @@ internal static partial class Kernels
                         }
 
                         case "shift":
-                            for (int c = 0; c < cols; c++) { int s = c - p[2]; o[c] = (uint)s < (uint)cols ? Value(k.X, (long)r * cols + s, one) : TL.Zero; }
+                            for (int c = 0; c < cols; c++) { int s = c - p[2]; o[c] = (uint)s < (uint)cols ? Value(xl, k.X, (long)r * cols + s, one) : TL.Zero; }
                             break;
                         case "pad2d":
                             o.Clear();
@@ -576,7 +691,7 @@ internal static partial class Kernels
                                     {
                                         int iw = ow * sw - pw + b;
                                         if ((uint)iw >= (uint)W) continue;
-                                        TLane v = Value(k.X, ((long)c * H + ih) * W + iw, one);
+                                        TLane v = Value(xl, k.X, ((long)c * H + ih) * W + iw, one);
                                         acc = max ? (n == 0 || Widths.Compare(v, acc) > 0 ? v : acc) : TL.Add(acc, v);
                                         n++;
                                     }
@@ -596,6 +711,27 @@ internal static partial class Kernels
                             int H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8];
                             int ih = r % H, c = r / H;
                             bool max = k.Name == "maxpool_bwd";
+                            if (max && at is not null)
+                            {
+                                // The windows over row ih in the order a pixel met them (kernel row a ascending: oh descending;
+                                // then ow descending), each adding dy where its first largest lies on this row.
+                                o.Clear();
+                                long rowAt = (long)c * H + ih;
+                                for (int a = 0; a < kh; a++)
+                                {
+                                    int th = ih + ph - a;
+                                    if (th < 0 || th % sh != 0 || th / sh >= OH) continue;
+                                    int oh = th / sh;
+                                    for (int ow = OW - 1; ow >= 0; ow--)
+                                    {
+                                        long w = at[((long)c * OH + oh) * OW + ow];
+                                        if (w >= 0 && w / W == rowAt) o[(int)(w % W)] = TL.Add(o[(int)(w % W)], Value(xl, k.X, ((long)c * OH + oh) * OW + ow, one));
+                                    }
+                                }
+
+                                break;
+                            }
+
                             for (int iw = 0; iw < W; iw++)
                             {
                                 TLane acc = TL.Zero;
@@ -609,7 +745,7 @@ internal static partial class Kernels
                                         int tw = iw + pw - b;
                                         if (tw < 0 || tw % sw != 0 || tw / sw >= OW) continue;
                                         int ow = tw / sw;
-                                        TLane dy = Value(k.X, ((long)c * OH + oh) * OW + ow, one);
+                                        TLane dy = Value(xl, k.X, ((long)c * OH + oh) * OW + ow, one);
                                         if (!max)
                                         {
                                             int n = 0;
@@ -629,7 +765,7 @@ internal static partial class Kernels
                                             {
                                                 int ww = ow * sw - pw + bb;
                                                 if ((uint)ww >= (uint)W) continue;
-                                                TLane v = Value(k.X2!, ((long)c * H + hh) * W + ww, one);
+                                                TLane v = Value(x2l, k.X2!, ((long)c * H + hh) * W + ww, one);
                                                 if (bestAt < 0 || Widths.Compare(v, best) > 0) { best = v; bestAt = ((long)c * H + hh) * W + ww; }
                                             }
                                         }
@@ -658,7 +794,7 @@ internal static partial class Kernels
                                 bool unset = true;
                                 for (int ih = h0; ih < h1; ih++) for (int iw = w0; iw < w1; iw++)
                                 {
-                                    TLane v = Value(k.X, ((long)c * H + ih) * W + iw, one);
+                                    TLane v = Value(xl, k.X, ((long)c * H + ih) * W + iw, one);
                                     acc = max ? (unset || Widths.Compare(v, acc) > 0 ? v : acc) : TL.Add(acc, v);
                                     unset = false;
                                 }
@@ -676,6 +812,25 @@ internal static partial class Kernels
                             int H = p[1], W = p[2], OH = p[3], OW = p[4];
                             int ih = r % H, c = r / H;
                             bool max = k.Name == "adaptive_maxpool_bwd";
+                            if (max && at is not null)
+                            {
+                                // The windows over row ih in the order a pixel met them (oh, then ow ascending).
+                                o.Clear();
+                                long rowAt = (long)c * H + ih;
+                                for (int oh = 0; oh < OH; oh++)
+                                {
+                                    var (h0, h1) = LayoutArgs.Adaptive(oh, H, OH);
+                                    if (ih < h0 || ih >= h1) continue;
+                                    for (int ow = 0; ow < OW; ow++)
+                                    {
+                                        long w = at[((long)c * OH + oh) * OW + ow];
+                                        if (w >= 0 && w / W == rowAt) o[(int)(w % W)] = TL.Add(o[(int)(w % W)], Value(xl, k.X, ((long)c * OH + oh) * OW + ow, one));
+                                    }
+                                }
+
+                                break;
+                            }
+
                             for (int iw = 0; iw < W; iw++)
                             {
                                 TLane acc = TL.Zero;
@@ -687,13 +842,13 @@ internal static partial class Kernels
                                     {
                                         var (w0, w1) = LayoutArgs.Adaptive(ow, W, OW);
                                         if (iw < w0 || iw >= w1) continue;
-                                        TLane dy = Value(k.X, ((long)c * OH + oh) * OW + ow, one);
+                                        TLane dy = Value(xl, k.X, ((long)c * OH + oh) * OW + ow, one);
                                         if (!max) { acc = TL.Add(acc, TL.Mul(dy, TL.From(1.0 / ((h1 - h0) * (w1 - w0))))); continue; }
                                         long bestAt = -1;
                                         TLane best = TL.Zero;
                                         for (int hh = h0; hh < h1; hh++) for (int ww = w0; ww < w1; ww++)
                                         {
-                                            TLane v = Value(k.X2!, ((long)c * H + hh) * W + ww, one);
+                                            TLane v = Value(x2l, k.X2!, ((long)c * H + hh) * W + ww, one);
                                             if (bestAt < 0 || Widths.Compare(v, best) > 0) { best = v; bestAt = ((long)c * H + hh) * W + ww; }
                                         }
 
@@ -723,7 +878,7 @@ internal static partial class Kernels
                                     {
                                         int iw = ow * sw - pw + b * dw;
                                         if ((uint)iw >= (uint)W) continue;
-                                        acc = TL.Fma(Value(k.X2!, (long)(c * kh + a) * kw + b, one), Value(k.X, ((long)c * H + ih) * W + iw, one), acc);
+                                        acc = TL.Fma(Value(x2l, k.X2!, (long)(c * kh + a) * kw + b, one), Value(xl, k.X, ((long)c * H + ih) * W + iw, one), acc);
                                     }
                                 }
 
@@ -741,8 +896,12 @@ internal static partial class Kernels
             {
                 pool.Return(row);
                 pool.Return(one);
+                if (source is not null) pool.Return(source);
             }
         }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static TLane Value(TLane[]? lanes, byte[] x, long index, TLane[] one) => lanes is not null ? lanes[index] : Value(x, index, one);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static TLane Value(byte[] x, long index, TLane[] one)

@@ -207,6 +207,24 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
 - Item 4: done (closed by the coordinator with the stopped run). Next: item 5, the arena, on the coordinator's go.
 - Item 4 committed as c936dca.
 
+## Item 6 progress
+
+- 6a (CPU layout family): done, reported. `Kernels.Layout`: a float type's input range is no longer read (its sum lane
+  is its float lane whatever the values; a block format's range decoded every block serially: most of scatter_add_rows'
+  84 ms); `Decoded<TN, TLane>`: a type not read in place has its input decoded to lane values once by the team
+  (LoadBody), and `MoveBody` reads those (one_hot, gather_rows, pad2d excluded: they read rows whole); scatter_add_rows
+  reads each source row whole; `WindowArgmax` finds every max-pool window's first largest once (row-major, a later
+  value only when strictly larger, as before) and maxpool_bwd / adaptive_maxpool_bwd rows add dy where their windows'
+  choice lies, in the order a pixel met its windows before (maxpool: oh then ow descending; adaptive: ascending);
+  `DecodedWeights`: depthwise_conv's weights decoded once. Measured CPU (qiyas, against item 4's baseline):
+  adaptive_maxpool_bwd float32 685 → 0.23 ms, float16 9.9 s → 0.56, q4_k 52 s → 1.25, int16 3.7 s → 1.4;
+  maxpool_bwd q4_k 203 → 4.1; scatter_add_rows q8_0 85 → 5.8–7.0, q4_k 180 → 5.3–8.3, int4 31 → 1.2–2.5;
+  depthwise_conv q4_k 679 → 6.5, float16 86 → 5.0; interpolate_bilinear q4_k 587 → 8.9; adaptive_avgpool q4_k 568 →
+  4.1. float32 cells (code unchanged for types read in place) within swing. Note: adaptive_avgpool q4_k read err
+  3.16e-3 once against 3.06e-3 in the baseline and two reruns: its output rows (7 values) re-encode a partly written
+  block each store, and the bench reuses its output buffer, so the stale values kept depend on the repetition count —
+  a bench property of partial-block outputs, not the kernel.
+
 ## Item 5 progress
 
 - Done, reported (uncommitted until the coordinator's go). What landed:
