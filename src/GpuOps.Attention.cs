@@ -1,7 +1,8 @@
 using System.Diagnostics;
-// The device's attention (Attention.cs): the composition in lane storage for rows of queries (widen once, the view
-// products and the scaled masked softmax per head, narrow once), the fused decode kernel for a few queries against a
-// long cache, the backward composition.
+// The device's attention (Attention.cs): the fused rows (the tensor rows for the types with a tensor kind, else the
+// FMA rows) or the composition in lane storage for rows of queries (widen once, the view products and the scaled masked
+// softmax per head, narrow once), the fused decode kernel for a few queries against a long cache, the backward's fused
+// kernels (d ≤ 128) or its composition.
 namespace Qiyas;
 
 public sealed partial class GpuOps
@@ -81,6 +82,28 @@ public sealed partial class GpuOps
     /// <summary>The fused kernel's largest head dimension.</summary>
     public const int FusedHeadMax = 128;
 
+    /// <summary>The gate's override: false keeps the fused rows of a type with a tensor kind on the FMA lane.</summary>
+    public bool? MmaRows;
+
+    // Each block of `br` query rows: the keys its rows see, [lowest start, highest limit) (0, 0 when none), on the device.
+    private ulong KeyRanges(AttentionArgs a, int br, List<ulong> rented)
+    {
+        int blocks = (a.Lq + br - 1) / br;
+        var range = new int[2 * blocks];
+        for (int qb = 0; qb < blocks; qb++)
+        {
+            int lo = int.MaxValue, hi = 0;
+            for (int i = qb * br; i < Math.Min(a.Lq, qb * br + br); i++) { lo = Math.Min(lo, a.Start(i)); hi = Math.Max(hi, a.Limit(i)); }
+            if (hi <= lo) lo = hi = 0;
+            range[2 * qb] = lo; range[2 * qb + 1] = hi;
+        }
+
+        ulong d = gpu.Rent(range.Length * 4L);
+        rented.Add(d);
+        Gpu.Upload<int>(range, d);
+        return d;
+    }
+
     /// <summary>O for rows of queries by the fused rows: a block per (head, query tile), the keys in tiles through shared
     /// memory, the softmax online; no scores in memory. d ≤ 128. Returns the lane's name.</summary>
     public string AttentionRows<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IQiyasNumber<TN>
@@ -101,20 +124,22 @@ public sealed partial class GpuOps
                 return "f32 (blocks through lane storage)";
             }
 
-            var (br, _) = Ptx.AttentionTile(lane);
-            int blocks = (a.Lq + br - 1) / br;
-            var range = new int[2 * blocks];
-            for (int qb = 0; qb < blocks; qb++)
+            var kind = MmaRows != false ? Ptx.AttentionKind(f) : null;
+            if (kind is not null)
             {
-                int lo = int.MaxValue, hi = 0;
-                for (int i = qb * br; i < Math.Min(a.Lq, qb * br + br); i++) { lo = Math.Min(lo, a.Start(i)); hi = Math.Max(hi, a.Limit(i)); }
-                if (hi <= lo) lo = hi = 0;
-                range[2 * qb] = lo; range[2 * qb + 1] = hi;
+                // The tensor rows (Ptx.AttentionMma.cs): Q, K, V exact in the kind; 16-byte copies or 32-bit words where the
+                // rows allow, else value by value.
+                int mBlocks = (a.Lq + Ptx.MmaRowsBr - 1) / Ptx.MmaRowsBr;
+                ulong mLimits = Limits(a, rented), mStarts = Starts(a, rented), mRanges = KeyRanges(a, Ptx.MmaRowsBr, rented);
+                char load = f.Bits == 16 && a.D % 8 == 0 && (q | k | v) % 16 == 0 ? 'c' : f.Bits == 8 && a.D % 4 == 0 && (q | k | v) % 4 == 0 ? 'w' : 'v';
+                var mfn = gpu.Cached($"attention_rows_mma:{f.Name}:{dCap}:{load}", (out string e) => Ptx.AttentionRowsMma(gpu, f, kind, dCap, load, out e));
+                Gpu.Launch(mfn, (uint)mBlocks, (uint)a.Heads, Ptx.MmaRowsThreads, 1, 0, q, k, v, o, mLimits, mStarts, mRanges, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), Gpu.F((float)a.Scale));
+                return kind.Name + "mma";
             }
 
-            ulong limits = Limits(a, rented), starts = Starts(a, rented), ranges = gpu.Rent(range.Length * 4L);
-            rented.Add(ranges);
-            Gpu.Upload<int>(range, ranges);
+            var (br, _) = Ptx.AttentionTile(lane);
+            int blocks = (a.Lq + br - 1) / br;
+            ulong limits = Limits(a, rented), starts = Starts(a, rented), ranges = KeyRanges(a, br, rented);
             var fn = gpu.Cached($"attention_rows:{f.Name}:{dCap}", (out string e) => Ptx.AttentionRows(gpu, f, lane, dCap, out e));
             Gpu.Launch(fn, (uint)blocks, (uint)a.Heads, Ptx.RowsThreads, 1, 0, q, k, v, o, limits, starts, ranges, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), lane.Wide ? Gpu.D(a.Scale) : Gpu.F((float)a.Scale));
             return lane.Name;
@@ -216,6 +241,50 @@ public sealed partial class GpuOps
         }
     }
 
+    // ---- backward: the fused kernels (Ptx.AttentionBackward.cs), or the composition
+
+    // The rows kernel (dQ, and each row's m, 1/l, D), then the keys kernel (dK, dV), over lane storage.
+    private void BackwardFused<TS>(AttentionArgs a, ulong q, ulong k, ulong v, ulong dO, ulong dq, ulong dk, ulong dv, List<ulong> rented) where TS : struct, IQiyasFloat<TS>
+    {
+        var lane = TS.Bits == 64 ? Lane.F64 : Lane.F32;
+        int dCap = a.D <= 32 ? 32 : a.D <= 64 ? 64 : 128;
+        var (br, bc) = Ptx.AttentionTile(lane);
+        ulong limits = Limits(a, rented), starts = Starts(a, rented), rowRanges = KeyRanges(a, br, rented), keyRanges = QueryRanges(a, bc, rented);
+        ulong stats = gpu.Rent((long)a.Heads * a.Lq * 3 * lane.Size);
+        rented.Add(stats);
+        var scale = lane.Wide ? Gpu.D(a.Scale) : Gpu.F((float)a.Scale);
+        int rowsShared = Ptx.AttentionBackRowsShared(lane, dCap), keysShared = Ptx.AttentionBackKeysShared(lane, dCap);
+        var fr = gpu.Cached($"attention_back_rows:{lane.Name}:{dCap}", (out string e) => Ptx.AttentionBackRows(gpu, lane, dCap, out e));
+        gpu.AllowShared(fr, rowsShared);
+        Gpu.Launch(fr, (uint)((a.Lq + br - 1) / br), (uint)a.Heads, Ptx.RowsThreads, 1, Dynamic(rowsShared), q, k, v, dO, dq, stats, limits, starts, rowRanges, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), scale);
+        var fk = gpu.Cached($"attention_back_keys:{lane.Name}:{dCap}", (out string e) => Ptx.AttentionBackKeys(gpu, lane, dCap, out e));
+        gpu.AllowShared(fk, keysShared);
+        Gpu.Launch(fk, (uint)((a.Lk + bc - 1) / bc), (uint)a.Heads, Ptx.RowsThreads, 1, Dynamic(keysShared), q, k, v, dO, stats, dk, dv, limits, starts, keyRanges, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), scale);
+    }
+
+    // Each block of `bc` keys: the queries that see any of them, [first, last + 1) (0, 0 when none), on the device.
+    private ulong QueryRanges(AttentionArgs a, int bc, List<ulong> rented)
+    {
+        int blocks = (a.Lk + bc - 1) / bc;
+        var range = new int[2 * blocks];
+        for (int kb = 0; kb < blocks; kb++)
+        {
+            int k0 = kb * bc, k1 = Math.Min(a.Lk, k0 + bc), lo = int.MaxValue, hi = 0;
+            for (int i = 0; i < a.Lq; i++)
+            {
+                if (Math.Max(a.Start(i), k0) < Math.Min(Math.Min(a.Limit(i), a.Lk), k1)) { lo = Math.Min(lo, i); hi = i + 1; }
+            }
+
+            if (hi <= lo) lo = hi = 0;
+            range[2 * kb] = lo; range[2 * kb + 1] = hi;
+        }
+
+        ulong d = gpu.Rent(range.Length * 4L);
+        rented.Add(d);
+        Gpu.Upload<int>(range, d);
+        return d;
+    }
+
     // ---- backward: the composition
 
     /// <summary>dQ, dK, dV from dO; returns the lane's name.</summary>
@@ -242,8 +311,12 @@ public sealed partial class GpuOps
         }
     }
 
+    /// <summary>The gate's override: false takes the backward's composition, null the fused kernels where they apply (d ≤ 128).</summary>
+    public bool? FusedBackward;
+
     private void BackwardIn<TS>(AttentionArgs a, ulong q, ulong k, ulong v, ulong dO, ulong dq, ulong dk, ulong dv, List<ulong> rented) where TS : struct, IQiyasFloat<TS>
     {
+        if (FusedBackward != false && a.D <= FusedHeadMax) { BackwardFused<TS>(a, q, k, v, dO, dq, dk, dv, rented); return; }
         int size = TS.Bits / 8;
         long sBytes = (long)a.Lq * a.Lk * size;
         ulong p = gpu.Rent(sBytes), dp = gpu.Rent(sBytes);

@@ -955,8 +955,12 @@ internal static class Checks
                 ok &= Close(type, $"attention fused{(a.Causal ? " causal" : "")}{(a.Spans is not null ? " spans" : "")}{(a.SpanStarts is not null ? " starts" : "")} {a.Heads}h {a.Lq}x{a.Lk} d{a.D}", where, o, want, (int)a.QValues, a.Lk + a.D);
             }
 
+            // The backward: the case it had, and the fused rows' cases (head-dimension capacities, tile edges, causal, spans
+            // with starts, rows that see no key); on the device the fused kernels and the composition each.
+            foreach (var a in fusedCases.Prepend(new AttentionArgs(2, 37, 53, 24, 0.2, true)))
+            foreach (bool? fusedBack in ops is null ? new bool?[] { null } : [null, false])
             {
-                var a = new AttentionArgs(2, 37, 53, 24, 0.2, true);
+                if (ops is not null) ops.FusedBackward = fusedBack;
                 var q = Bench.Registry.Make(type, (int)a.QValues, 41, -1, 1);
                 var k = Bench.Registry.Make(type, (int)a.KValues, 42, -1, 1);
                 var v = Bench.Registry.Make(type, (int)a.KValues, 43, -1, 1);
@@ -966,9 +970,11 @@ internal static class Checks
                 var dk = new byte[k.Length];
                 var dv = new byte[v.Length];
                 Bench.Registry.WithFloat(type, new AttentionRun(ops, a, q, k, v, dO, false, dq, dk, dv));
-                ok &= Close(type, "attention_bwd dQ", where, dq, wq, (int)a.QValues, 2 * (a.Lk + a.D));
-                ok &= Close(type, "attention_bwd dK", where, dk, wk, (int)a.KValues, 2 * (a.Lq + a.D));
-                ok &= Close(type, "attention_bwd dV", where, dv, wv, (int)a.KValues, a.Lq + a.D);
+                string tag = $"{(fusedBack == false ? " composed" : "")}{(a.Causal ? " causal" : "")}{(a.Spans is not null ? " spans" : "")}{(a.SpanStarts is not null ? " starts" : "")} {a.Heads}h {a.Lq}x{a.Lk} d{a.D}";
+                ok &= Close(type, "attention_bwd dQ" + tag, where, dq, wq, (int)a.QValues, 2 * (a.Lk + a.D));
+                ok &= Close(type, "attention_bwd dK" + tag, where, dk, wk, (int)a.KValues, 2 * (a.Lq + a.D));
+                ok &= Close(type, "attention_bwd dV" + tag, where, dv, wv, (int)a.KValues, a.Lq + a.D);
+                if (ops is not null) ops.FusedBackward = null;
             }
         }
 

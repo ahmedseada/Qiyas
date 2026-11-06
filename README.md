@@ -24,7 +24,8 @@ does best for it, chosen per operation from the data itself. No type is fixed an
   accepts (the measured choice, then the 4-bit kinds and the 32-deep 8-bit instruction forced on and off), and under
   every tensor-kernel configuration the device can run with every kind choice (k = 53 and 300, every integer and
   narrow-float type); attention rows by both the composition and the fused rows (causal, spans with starts, head
-  dimensions up to 128, rows that see no key); ctc's loss and gradient (the float64 reference's gradient checked
+  dimensions up to 128, rows that see no key), and the backward by both its fused kernels and its composition on the
+  same shapes; ctc's loss and gradient (the float64 reference's gradient checked
   against its own loss by central differences; short sequences, empty and repeated labels, another blank, a sequence
   no alignment fits); the thread
   team under 20 000 jobs of alternating chunk counts (every chunk within its job, every index once). The float64
@@ -131,7 +132,8 @@ checkout (files listed in `.gitignore`); a clone runs the other subjects.
 | `src/Conv.cs`, `src/GpuOps.Conv.cs` | convolution: the forward fused into the product's packing (implicit GEMM: the image read through the index map; on the device's plain lanes a measured choice against im2col), the backward as im2col / product / col2im compositions |
 | `src/Optimizers.cs`, `src/Ptx.Optimizers.cs`, `src/GpuOps.Optimizers.cs` | optimizer steps: sgd with momentum, adam, adamw |
 | `src/Attention.cs`, `src/Ptx.Attention.cs`, `src/GpuOps.Attention.cs` | attention: the measured choice, the composition in lane storage, the fused decode kernel, the backward composition; the lane-storage conversions |
-| `src/AttentionRows.cs`, `src/Ptx.AttentionRows.cs` | attention's fused rows (flash: keys in tiles, the softmax online, no scores in memory) on the CPU and the device |
+| `src/AttentionRows.cs`, `src/Ptx.AttentionRows.cs`, `src/Ptx.AttentionMma.cs` | attention's fused rows (flash: keys in tiles, the softmax online, no scores in memory) on the CPU and the device; on the device the tensor instructions for float16, bfloat16 and the 8-bit floats |
+| `src/Ptx.AttentionBackward.cs` | attention's fused backward on the device (dQ by the rows, dK and dV by the keys) |
 | `src/Products.cs`, `src/GpuOps.Products.cs` | products on views (transposed operands, batches) and the matmul backward: the product's packing reads the operands where they are stored (`Kernels.Operands`; the device's tensor and dot routes), otherwise through the strided copy |
 | `src/Layout.cs`, `src/Ptx.Layout.cs`, `src/GpuOps.Layout.cs`, `src/Bench/LayoutCases.cs` | layout and indexing: the references, the CPU kernels, the device kernels, the gate's and the bench's cases |
 | `src/Reduce.cs`, `src/Ptx.Reduce.cs` | reductions (sum, sum of squares, max, min, argmax: whole, rows, columns), row-vector broadcasts, transpose, gemv: the CPU kernels, the device kernels |
@@ -251,5 +253,5 @@ names the measured cells that are correct but below what the device allows.
 
 What the gates have not confirmed, or is not done, is in `COVERAGE.md` ("State" for the order, **todo** in the rows):
 the known-slow
-cells (among them the tensor lanes inside the fused attention kernel, which runs in the FMA lane). The README claims nothing beyond what the gates and the regression
+cells. The README claims nothing beyond what the gates and the regression
 comparison have confirmed.

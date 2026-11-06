@@ -4,7 +4,9 @@
 // row; the row's accumulator rescaled by exp(m_old − m_new) when the max moves), then O[r] += Σ_c p_c·V[c] along d.
 // Two rows at a time in registers: the scores of a row pair over four key vectors (eight accumulators, each key vector
 // loaded once for both rows), the context of a row pair over four dimension vectors (each value vector loaded once).
-// The keys a row sees are [Start(i), Limit(i)) as in the composition; a block's tiles span the union of its rows'.
+// The keys a row sees are [Start(i), Limit(i)) as in the composition; a block's tiles span the union of its rows',
+// starting at a whole tile. Kᵀ's tiles are laid once per call (a pass over K before the tasks, item 6i): every block of
+// a head reads the same tiles (before, each block of 16 rows transposed each tile again: 128 times a head at 2048).
 // A narrow type is widened to its float lane's storage once (Q, K, V) and O narrowed once, as the composition does.
 using System.Buffers;
 using System.Numerics;
@@ -46,12 +48,37 @@ internal static partial class Kernels
     {
         public void Run<TS, TLane, TL>() where TS : struct, IQiyasNumber<TS, TLane> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
         {
-            int blocks = (a.Lq + FusedRows - 1) / FusedRows;
-            Team.For(a.Heads * blocks, 1, (long)a.Heads * a.Lq * a.Lk * a.D, new FusedBody<TLane, TL>(a, q, k, v, o, blocks));
+            int blocks = (a.Lq + FusedRows - 1) / FusedRows, tiles = (a.Lk + FusedKeys - 1) / FusedKeys;
+            // Kᵀ's tiles: kt[(h·tiles + j)·d·bc + t·bc + c] = K[h][j·bc + c][t], zero past Lk.
+            var kt = Scratch.Get(Scratch.AttnKt, (long)a.Heads * tiles * a.D * FusedKeys * Unsafe.SizeOf<TLane>());
+            Team.For(a.Heads * tiles, 1, (long)a.Heads * a.Lk * a.D, new KeyTilesBody<TLane>(a, k, kt, tiles));
+            Team.For(a.Heads * blocks, 1, (long)a.Heads * a.Lq * a.Lk * a.D, new FusedBody<TLane, TL>(a, q, kt, v, o, blocks, tiles));
         }
     }
 
-    private readonly struct FusedBody<TLane, TL>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o, int blocks) : Team.IBody
+    // Kᵀ's tiles of the heads (a tile a task): each key row read once, its values written down the tile's columns.
+    private readonly struct KeyTilesBody<TLane>(AttentionArgs a, byte[] k, byte[] kt, int tiles) : Team.IBody where TLane : unmanaged
+    {
+        public void Run(int first, int last)
+        {
+            int d = a.D, bc = FusedKeys;
+            var K = MemoryMarshal.Cast<byte, TLane>(k.AsSpan());
+            var T = MemoryMarshal.Cast<byte, TLane>(kt.AsSpan());
+            for (int task = first; task < last; task++)
+            {
+                int h = task / tiles, t0 = task % tiles * bc, n = Math.Min(bc, a.Lk - t0);
+                var tile = T.Slice(task * d * bc, d * bc);
+                if (n < bc) tile.Clear();
+                for (int c = 0; c < n; c++)
+                {
+                    var row = K.Slice((int)((long)h * a.Lk * d + (long)(t0 + c) * d), d);
+                    for (int t = 0; t < d; t++) tile[t * bc + c] = row[t];
+                }
+            }
+        }
+    }
+
+    private readonly struct FusedBody<TLane, TL>(AttentionArgs a, byte[] q, byte[] kts, byte[] v, byte[] o, int blocks, int tiles) : Team.IBody
         where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -59,11 +86,10 @@ internal static partial class Kernels
         {
             int d = a.D, w = Vector<TLane>.Count, bc = FusedKeys, group = 4 * w;
             var Q = MemoryMarshal.Cast<byte, TLane>(q.AsSpan());
-            var K = MemoryMarshal.Cast<byte, TLane>(k.AsSpan());
+            var KT = MemoryMarshal.Cast<byte, TLane>(kts.AsSpan());
             var V = MemoryMarshal.Cast<byte, TLane>(v.AsSpan());
             var O = MemoryMarshal.Cast<byte, TLane>(o.AsSpan());
             var pool = ArrayPool<TLane>.Shared;
-            var kt = pool.Rent(d * bc);
             var s = pool.Rent(FusedRows * bc);
             var acc = pool.Rent(FusedRows * d);
             var m = new TLane[FusedRows];
@@ -81,16 +107,11 @@ internal static partial class Kernels
                     acc.AsSpan(0, rows * d).Clear();
                     Array.Clear(seen);
                     long kHead = (long)h * a.Lk * d, qHead = (long)h * a.Lq * d;
-                    for (int t0 = lo; t0 < hi; t0 += bc)
+                    for (int t0 = hi <= lo ? hi : lo / bc * bc; t0 < hi; t0 += bc)
                     {
+                        // Kᵀ's tile (zero past Lk, so the groups past n score 0: outside every row's keys).
                         int n = Math.Min(bc, hi - t0), ng = (n + group - 1) / group * group;
-                        // Kᵀ's tile: kt[t·bc + c] = K[t0 + c][t]; the groups' tail past n zero.
-                        if (ng > n) for (int t = 0; t < d; t++) kt.AsSpan(t * bc + n, ng - n).Clear();
-                        for (int c = 0; c < n; c++)
-                        {
-                            var row = K.Slice((int)(kHead + (long)(t0 + c) * d), d);
-                            for (int t = 0; t < d; t++) kt[t * bc + c] = row[t];
-                        }
+                        var kt = KT.Slice((h * tiles + t0 / bc) * d * bc, d * bc);
 
                         // Scores, two rows at a time; then each row's online softmax over its keys of the tile.
                         for (int r = 0; r < rows; r += 2)
@@ -139,16 +160,16 @@ internal static partial class Kernels
             }
             finally
             {
-                pool.Return(kt); pool.Return(s); pool.Return(acc);
+                pool.Return(s); pool.Return(acc);
             }
         }
 
         // s0[c], s1[c] = q0 · Kᵀ[·][c], q1 · Kᵀ[·][c] for c < ng (ng whole groups of four vectors).
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static void Scores(ReadOnlySpan<TLane> q0, ReadOnlySpan<TLane> q1, TLane[] kt, int bc, int ng, int d, Span<TLane> s0, Span<TLane> s1)
+        private static void Scores(ReadOnlySpan<TLane> q0, ReadOnlySpan<TLane> q1, ReadOnlySpan<TLane> kt, int bc, int ng, int d, Span<TLane> s0, Span<TLane> s1)
         {
             int w = Vector<TLane>.Count;
-            ref TLane rk = ref MemoryMarshal.GetArrayDataReference(kt);
+            ref TLane rk = ref MemoryMarshal.GetReference(kt);
             ref TLane rq0 = ref MemoryMarshal.GetReference(q0);
             ref TLane rq1 = ref MemoryMarshal.GetReference(q1);
             ref TLane r0 = ref MemoryMarshal.GetReference(s0);

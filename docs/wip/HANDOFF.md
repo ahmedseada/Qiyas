@@ -389,6 +389,33 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
   - Not done here: max / min / argmax along rows against sum (COVERAGE's next row: max:rows 0.96 against sum:rows
     0.34; `Extreme` keeps one accumulator through a sliced span) — a small cell for 6j.
 
+- 6i (attention: tensor lanes in the device fused rows, the device backward, the CPU fused rows): done, reported.
+  - Device tensor rows (`src/Ptx.AttentionMma.cs`, `GpuOps.AttentionRows` → `Ptx.AttentionKind`): float16 and the
+    8-bit floats in f16, bfloat16 in bf16 (their values exact). 4 warps per (head, 64 query rows), key tiles of 64.
+    Q's fragments by ldmatrix once into registers (Q loaded through V's tile space); S = Q·Kᵀ by m16n8k16 with K's
+    fragments by ldmatrix; scale, masks and the online softmax as the FMA rows (Codec.Exp; a row's scores on a quad:
+    two shuffles); P from the S accumulators as the A operand (an m16n8 pair is an m16k16 fragment), two slices of the
+    kind (hi = P rounded, lo = P − hi rounded); V's fragments by ldmatrix.trans. Loads: 'c' cp.async 16-byte runs
+    (16-bit type in its own kind, d % 8 = 0, pointers on 16 bytes; K and V in two groups, V landing while the scores
+    run), 'w' 32-bit words of four 8-bit values, 'v' value by value. `KeyRanges` shared by both rows kernels;
+    `GpuOps.MmaRows` (false: the FMA rows) for comparisons. Mutation (the lo slice dropped): the gate fails at 19 cells
+    by 80–416 steps (rows whose context nearly cancels): the two slices are needed.
+  - Device backward (`src/Ptx.AttentionBackward.cs`, `GpuOps.BackwardFused`, `QueryRanges`): a phase probe (temporary,
+    removed) put the composition's 4.75 ms at S 0.40, softmax 0.15, dV 1.24, dP 0.40, softmax_bwd 0.13, scale 0.11,
+    dQ 1.05, dK 1.25 — the k = 1024 products (1024 × 128 outputs: 8 tiles of Gemm2's 128 × 128 on 70 SMs, ~2 TFLOPS).
+    Two fused kernels in the lane (f32 / f64; other types widened as before): rows (dQ; stats m, 1/l, D per row in
+    a lane buffer) then keys (dK, dV). `GpuOps.FusedBackward` (false: the composition). Gate (`Checks.Attentions`):
+    the backward on six shapes, on the device fused and composed. Mutation (`QueryRanges` dropping a key block's last
+    row) fails at 20 cells.
+  - CPU fused rows (`src/AttentionRows.cs`): Kᵀ's tiles laid once per call by `KeyTilesBody` (a `Scratch` slot,
+    `AttnKt`), each task reading them (tiles from a whole multiple of 64; the rows' masks drop the keys before lo).
+  - Measured: see COVERAGE (four Known-slow rows). Errors equal throughout except float64 attention_bwd 1.1e-16 → 1.5e-16.
+  - Note for later sessions: Git Bash's `sed -i` here rewrites CRLF files with LF; a CRLF-aware edit script then
+    sees one line (6i lost GpuOps.Attention.cs's edits that way once and re-applied them). Normalize after sed.
+  - Not done here: a tensor backward for the 16-bit kinds; the f32 product kernel on few-tile shapes (split-k or
+    smaller tiles: matmul_bwd and the recurrent products would gain too); CPU attention_bwd (15.6 ms float32, the
+    composition) — candidates for 6j or later.
+
 ## Item 5 progress
 
 - Done, reported (uncommitted until the coordinator's go). What landed:
