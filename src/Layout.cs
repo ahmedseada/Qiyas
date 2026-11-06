@@ -360,7 +360,14 @@ internal static partial class Kernels
             var xl = Decoded<TN, TLane>(k);
             var at = WindowArgmax<TN, TLane>(k);
             var x2l = DecodedWeights<TN, TLane>(k);
-            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)k.Count, new MoveBody<TN, TLane, TL>(k, rows, cols, xl, at, x2l));
+            if (StridedTiled<TN, TLane>(k, cols, xl, out int dim))
+            {
+                int tile = Math.Max(16, 64 / System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>());
+                var p = k.P;
+                long groups = (long)p[0] * p[1] * p[2] / p[dim] * ((p[dim] + tile - 1) / tile);
+                Team.For((int)groups, Math.Max(1, (int)(groups / (Threads * 4))), (long)k.Count, new StridedTileBody<TN, TLane>(k, cols, dim, tile, xl));
+            }
+            else Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)k.Count, new MoveBody<TN, TLane, TL>(k, rows, cols, xl, at, x2l));
             if (xl is not null) ArrayPool<TLane>.Shared.Return(xl);
             if (x2l is not null) ArrayPool<TLane>.Shared.Return(x2l);
         }
@@ -424,6 +431,66 @@ internal static partial class Kernels
     }
 
     private static (int Rows, int Cols) OutputRows(LayoutArgs k) => LayoutArgs.OutputRows(k);
+
+    /// <summary>A strided copy whose output rows run across the input (the last dimension's stride not 1) while one of the
+    /// three outer dimensions has stride 1 (a transposition): taken by tiles of output rows along that dimension (see
+    /// StridedTileBody). Rows ending on whole bytes only (each row stored by one thread), values read in place or decoded.</summary>
+    private static bool StridedTiled<TN, TLane>(LayoutArgs k, int cols, TLane[]? xl, out int dim) where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged
+    {
+        dim = -1;
+        if (k.Name != "strided" || k.P[7] == 1 || (long)cols * TN.Bits % 8 != 0 || (!TN.Direct && xl is null)) return false;
+        for (int j = 2; j >= 0; j--) if (k.P[4 + j] == 1 && k.P[j] > 1) { dim = j; return true; }
+        return false;
+    }
+
+    /// <summary>The tiled strided copy: a group is `tile` output rows that differ only in dimension `dim` (whose input
+    /// stride is 1) at one index of the other two; for each output column the group's values lie side by side in the input
+    /// (a cache line read once, not a line a value), gathered into the group's rows (a tile × cols block in lane storage),
+    /// each row then stored whole. Groups are disjoint sets of whole rows.</summary>
+    private struct StridedTileBody<TN, TLane>(LayoutArgs k, int cols, int dim, int tile, TLane[]? xl) : Team.IBody
+        where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged
+    {
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public readonly void Run(int first, int last)
+        {
+            var p = k.P;
+            int d0 = p[0], d1 = p[1], d2 = p[2], dj = p[dim], blocks = (dj + tile - 1) / tile;
+            long s7 = p[7];
+            ReadOnlySpan<TLane> src = TN.Direct ? MemoryMarshal.Cast<byte, TLane>(k.X.AsSpan()) : xl.AsSpan();
+            var buffer = ArrayPool<TLane>.Shared.Rent(tile * cols);
+            try
+            {
+                for (int g = first; g < last; g++)
+                {
+                    // g = outer · blocks + block; outer enumerates the two other dimensions (in their order).
+                    int block = g % blocks, outer = g / blocks;
+                    int lo = block * tile, count = Math.Min(tile, dj - lo);
+                    int i0, i1, i2;
+                    if (dim == 0) { i2 = outer % d2; i1 = outer / d2; i0 = lo; }
+                    else if (dim == 1) { i2 = outer % d2; i0 = outer / d2; i1 = lo; }
+                    else { i1 = outer % d1; i0 = outer / d1; i2 = lo; }
+                    long b0 = p[8] + (long)i0 * p[4] + (long)i1 * p[5] + (long)i2 * p[6];  // value lo of the group (stride 1 in t)
+                    var t2 = buffer.AsSpan(0, tile * cols);
+                    for (int c = 0; c < cols; c++)
+                    {
+                        var line = src.Slice((int)(b0 + c * s7), count);
+                        for (int t = 0; t < count; t++) t2[t * cols + c] = line[t];
+                    }
+
+                    for (int t = 0; t < count; t++)
+                    {
+                        int r0 = dim == 0 ? i0 + t : i0, r1 = dim == 1 ? i1 + t : i1, r2 = dim == 2 ? i2 + t : i2;
+                        long r = ((long)r0 * d1 + r1) * d2 + r2;
+                        TN.Store(t2.Slice(t * cols, cols), k.Output, (int)(r * cols));
+                    }
+                }
+            }
+            finally
+            {
+                ArrayPool<TLane>.Shared.Return(buffer);
+            }
+        }
+    }
 
     /// <summary>The max-pool backward's first largest of every window of the forward input (x2), found once by the team
     /// (index into the input, -1 for an empty window): each input row then reads its windows' choice instead of scanning

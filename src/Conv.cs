@@ -8,7 +8,8 @@
 //
 // The forward is fused (item 4g, implicit GEMM): the product's packing builds each row of the columns from the image
 // itself, so no columns are in memory — the same packed values as the composition, so the same result bit for bit
-// (CPU: every type whose rows start on whole bytes; the device: GpuOps.Conv.cs). The backward keeps the composition.
+// (CPU: every type whose rows start on whole bytes; the device: GpuOps.Conv.cs). The backward keeps the composition for
+// dx; on the CPU dw's columns are read from the image the same way (the transposed packing, a k-range of a row a task).
 // The depthwise convolution is a layout operation (Layout.cs: a gather with weights).
 namespace Qiyas;
 
@@ -96,13 +97,24 @@ internal static partial class Kernels
         return TN.Bits == 64 ? "f64" : "f32";
     }
 
+    // dx = col2im(wᵀ · dy), the columns' gradient in a buffer the thread keeps (exact length, every value written by the
+    // product); dw = dy · colsᵀ with colsᵀ read from the image by the transposed packing (the implicit im2col: the same
+    // packed values as the columns', so the same result bit for bit), or the columns themselves where that does not apply.
     private static void BackwardIn<TS>(ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dx, byte[] dw) where TS : struct, IQiyasFloat<TS>
     {
-        var cols = new byte[BytesOf<TS>((long)a.Rows * a.Cols)];
-        Layout<TS>(new LayoutArgs { Name = "im2col", X = x, P = a.P, Output = cols, Count = a.Rows * a.Cols, InputCount = (int)a.XValues });
-        var dcols = new byte[cols.Length];
+        long bytes = BytesOf<TS>((long)a.Rows * a.Cols);
+        var dcols = Scratch.Get(Scratch.ConvDcols, bytes);
         MatMulView<TS>(new ProductView(a.Rows, a.Cols, a.OC, true, false), w, dy, dcols);                   // wᵀ · dy
         Layout<TS>(new LayoutArgs { Name = "col2im", X = dcols, P = a.P, Output = dx, Count = (int)a.XValues, InputCount = a.Rows * a.Cols });
+        if (FusedConv != false && ConvInPlace<TS>(a))
+        {
+            var product = new MatMulVisitor(dy, x, dw, a.OC, a.Rows, a.Cols) { Where = new Operands(TransB: true, ImageB: a) };
+            TS.Sum(ref product, new Bounds(0, 0, 0, 0, a.Cols));                                            // a float type's lane does not depend on them
+            return;
+        }
+
+        var cols = Scratch.Get(Scratch.ConvCols, bytes);
+        Layout<TS>(new LayoutArgs { Name = "im2col", X = x, P = a.P, Output = cols, Count = a.Rows * a.Cols, InputCount = (int)a.XValues });
         MatMulView<TS>(new ProductView(a.OC, a.Rows, a.Cols, false, true), dy, cols, dw);                   // dy · colsᵀ
     }
 }

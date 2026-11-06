@@ -55,6 +55,9 @@ public static class LayoutCases
                 yield return Make(name, type, 7 * 5 * 3 * 2, null, [2, 3, 5, 7, 1, 2, 6, 30, 0], 210, 61);
                 yield return Make(name, type, 37 * 11, null, [1, 5, 3, 11, 0, 0, 11, 1, 11 * 7], 165, 62);
                 yield return Make(name, type, 37 * 11, null, [1, 1, 9, 5, 0, 0, 11, 1, 11 * 3 + 2], 45, 63);
+                // Transpositions along the middle and the third dimension (stride 1 there, not last): the tiled copy, partial tiles.
+                yield return Make(name, type, 360, null, [3, 4, 5, 6, 120, 1, 24, 4, 0], 360, 66);
+                yield return Make(name, type, 360, null, [3, 4, 5, 6, 120, 30, 1, 5, 0], 360, 67);
                 break;
             case "one_hot":
                 yield return Make(name, type, 1, Indices(37, 17, 64), [37, 17], 37 * 17, 64);

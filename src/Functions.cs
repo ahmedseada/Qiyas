@@ -7,7 +7,9 @@
 //   Expm1    e^x − 1 with the constant term left out of the exp polynomial, so small x keep their bits
 //   Tanh     expm1(2x) / (expm1(2x) + 2); Sigmoid 1 / (1 + e^−x)
 //   Erf      the series Σ (−1)^k x^(2k+1) / (k! (2k+1)) · 2/√π for |x| below a bound, else 1 − erfc by the continued
-//            fraction erfc x = e^(−x²)/√π · 1/(x + ½/(x + 1/(x + 3/2/(x + …)))) evaluated bottom-up a fixed depth
+//            fraction erfc x = e^(−x²)/√π · 1/(x + ½/(x + 1/(x + 3/2/(x + …)))) evaluated bottom-up a fixed depth (the
+//            device; the CPU's f64 lane as a ratio of two recurrences); the CPU's f32 lane takes erfc's tail as
+//            e^(−x²)·t·S(t), t = 1/x, S a polynomial fitted to 3e-9 (ErfcTail32)
 using System.Numerics;
 
 namespace Qiyas;
@@ -41,6 +43,14 @@ public static class Funcs
     public const int ErfTerms32 = 16, ErfTerms64 = 30, ErfDepth32 = 48, ErfDepth64 = 100;
     public const float ErfBound32 = 1.0f;
     public const double ErfBound64 = 1.5;
+
+    /// <summary>erfc's tail on the CPU's f32 lane: S(t) = x·e^(x²)·erfc x, t = 1/x in [0, 4/3] (x ≥ 0.75), as a polynomial in
+    /// u = 1.5·t − 1 (coefficient k of u^k): S interpolated at the 17 Chebyshev nodes of the interval (S computed at 40 digits),
+    /// within 3.2e-9 of S everywhere in it; Horner in u keeps its f32 evaluation within about one rounding (the monomials
+    /// in t would cancel to 1e-4). erfc x = e^(−x²) · t · S: one division and 16 multiply-adds for the continued
+    /// fraction's 48 to 80 serial levels.</summary>
+    public static readonly double[] ErfcTail32 = [0.4823781246814764, -0.11422653907699147, 0.003084741801664283, 0.017759010812733424, -0.013435622651384071, 0.006117608127435746, -0.0013524073877195708, -0.0007986113371849265, 0.0012025644360486776, -0.0006279183665454736, 0.00031967429535662565, -0.0006445173610058078, 0.0003125770636888739, 0.000514276050142984, -0.0004131862318729763, -8.64806258308527e-05, 9.994421419212651e-05];
+    public const double ErfcTailSpan = 4.0 / 3.0;
 
     /// <summary>erfc keeps 1 − series only where the cancellation is mild (erf below 0.71), and takes the fraction deeper.</summary>
     public const int ErfcDepth32 = 80, ErfcDepth64 = 400;
@@ -173,6 +183,17 @@ public static class Funcs
 
     public static Vector<float> Sigmoid(Vector<float> x) => Vector<float>.One / (Vector<float>.One + Exps.Exp(-x));
 
+    // erfc |x| for |x| ≥ 0.75 on the f32 lane: e^(−x²) (x² carried with its rounding, x2lo) · t · S(u) (ErfcTail32).
+    private static Vector<float> ErfcTail(Vector<float> ax, Vector<float> x2)
+    {
+        var t = Vector<float>.One / ax;
+        var u = Vector.FusedMultiplyAdd(t, new Vector<float>((float)(2 / ErfcTailSpan)), -Vector<float>.One);
+        var sp = new Vector<float>((float)ErfcTail32[^1]);
+        for (int k = ErfcTail32.Length - 2; k >= 0; k--) sp = Vector.FusedMultiplyAdd(sp, u, new Vector<float>((float)ErfcTail32[k]));
+        var x2lo = Vector.FusedMultiplyAdd(ax, ax, -x2);
+        return Exps.Exp(-x2) * (Vector<float>.One - x2lo) * (t * sp);
+    }
+
     public static Vector<float> Erf(Vector<float> x)
     {
         var ax = Vector.Abs(x);
@@ -180,11 +201,7 @@ public static class Funcs
         var series = new Vector<float>((float)ErfSeries[ErfTerms32 - 1]);
         for (int k = ErfTerms32 - 2; k >= 0; k--) series = Vector.FusedMultiplyAdd(series, x2, new Vector<float>((float)ErfSeries[k]));
         series *= ax;
-        // erfc by the continued fraction, bottom-up: f = x + (depth/2) / f, …, down to f = x + ½ / f.
-        var f = ax;
-        for (int d = ErfDepth32; d >= 1; d--) f = ax + new Vector<float>(d * 0.5f) / f;
-        var x2lo = Vector.FusedMultiplyAdd(ax, ax, -x2);
-        var tail = Vector<float>.One - Exps.Exp(-x2) * (Vector<float>.One - x2lo) * new Vector<float>((float)InvSqrtPi) / f;
+        var tail = Vector<float>.One - ErfcTail(ax, x2);
         var y = Vector.ConditionalSelect(Vector.LessThan(ax, new Vector<float>(ErfBound32)), series, tail);
         y = Vector.Min(y, Vector<float>.One);
         y = Vector.ConditionalSelect(Vector.LessThan(x, Vector<float>.Zero), -y, y);
@@ -199,10 +216,7 @@ public static class Funcs
         var series = new Vector<float>((float)ErfSeries[ErfTerms32 - 1]);
         for (int k = ErfTerms32 - 2; k >= 0; k--) series = Vector.FusedMultiplyAdd(series, x2, new Vector<float>((float)ErfSeries[k]));
         series *= x;                                                       // erf(x), signed, for |x| < bound
-        var f = ax;
-        for (int d = ErfcDepth32; d >= 1; d--) f = ax + new Vector<float>(d * 0.5f) / f;
-        var x2lo = Vector.FusedMultiplyAdd(ax, ax, -x2);
-        var tail = Exps.Exp(-x2) * (Vector<float>.One - x2lo) * new Vector<float>((float)InvSqrtPi) / f;  // erfc(|x|)
+        var tail = ErfcTail(ax, x2);                                       // erfc(|x|)
         var y = Vector.ConditionalSelect(Vector.LessThan(ax, new Vector<float>(ErfcBound32)), Vector<float>.One - series,
             Vector.ConditionalSelect(Vector.LessThan(x, Vector<float>.Zero), new Vector<float>(2f) - tail, tail));
         return Vector.ConditionalSelect(Vector.Equals(x, x), y, x);
@@ -317,6 +331,26 @@ public static class Funcs
 
     public static Vector<double> Sigmoid(Vector<double> x) => Vector<double>.One / (Vector<double>.One + Exps.Exp(-x));
 
+    // The continued fraction f = x + (depth/2) / f, …, down to f = x + ½ / f (f starting at x), as a ratio P / Q: each level
+    // P' = x·P + (d/2)·Q, Q' = P — two multiply-adds, no division — the pair rescaled to (1, Q/P) every 16th level (one
+    // division, the magnitudes held far from overflow) and divided once at the end; x taken at most 28 (e^(−x²) is 0 in
+    // f64 past it: the fraction's value no longer counts).
+    private static Vector<double> Fraction(Vector<double> ax, int depth)
+    {
+        var a = Vector.Min(ax, new Vector<double>(28.0));
+        var p = a;
+        var q = Vector<double>.One;
+        for (int d = depth; d >= 1; d--)
+        {
+            var np = Vector.FusedMultiplyAdd(a, p, new Vector<double>(d * 0.5) * q);
+            q = p;
+            p = np;
+            if (d % 16 == 1 && d > 1) { q /= p; p = Vector<double>.One; }
+        }
+
+        return p / q;
+    }
+
     public static Vector<double> Erf(Vector<double> x)
     {
         var ax = Vector.Abs(x);
@@ -324,8 +358,7 @@ public static class Funcs
         var series = new Vector<double>(ErfSeries[ErfTerms64 - 1]);
         for (int k = ErfTerms64 - 2; k >= 0; k--) series = Vector.FusedMultiplyAdd(series, x2, new Vector<double>(ErfSeries[k]));
         series *= ax;
-        var f = ax;
-        for (int d = ErfDepth64; d >= 1; d--) f = ax + new Vector<double>(d * 0.5) / f;
+        var f = Fraction(ax, ErfDepth64);
         var x2lo = Vector.FusedMultiplyAdd(ax, ax, -x2);
         var tail = Vector<double>.One - Exps.Exp(-x2) * (Vector<double>.One - x2lo) * new Vector<double>(InvSqrtPi) / f;
         var y = Vector.ConditionalSelect(Vector.LessThan(ax, new Vector<double>(ErfBound64)), series, tail);
@@ -341,8 +374,7 @@ public static class Funcs
         var series = new Vector<double>(ErfSeries[ErfTerms64 - 1]);
         for (int k = ErfTerms64 - 2; k >= 0; k--) series = Vector.FusedMultiplyAdd(series, x2, new Vector<double>(ErfSeries[k]));
         series *= x;
-        var f = ax;
-        for (int d = ErfcDepth64; d >= 1; d--) f = ax + new Vector<double>(d * 0.5) / f;
+        var f = Fraction(ax, ErfcDepth64);
         var x2lo = Vector.FusedMultiplyAdd(ax, ax, -x2);
         var tail = Exps.Exp(-x2) * (Vector<double>.One - x2lo) * new Vector<double>(InvSqrtPi) / f;
         var y = Vector.ConditionalSelect(Vector.LessThan(ax, new Vector<double>(ErfcBound64)), Vector<double>.One - series,

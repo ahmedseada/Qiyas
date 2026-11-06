@@ -113,7 +113,8 @@ internal static partial class Kernels
     public readonly record struct Operands(int AOff = 0, bool TransA = false, int BOff = 0, bool TransB = false, int COff = 0, bool Viewed = true, ConvArgs? ImageB = null)
     {
         // ImageB (item 4g): B is the convolution's columns (C·kh·kw × OH·OW) read from the image itself, the stored b
-        // being the image (C × H × W): the packing builds each row of B from it (the implicit im2col).
+        // being the image (C × H × W): the packing builds each row of B from it (the implicit im2col); with TransB, Bᵀ
+        // is those columns (the convolution's dw = dy · colsᵀ), the transposed packing taking each row's k-range from it.
         /// <summary>The plain product (no view: C exactly m × n); any constructed Operands is a view, even batch 0's.</summary>
         public bool Plain => !Viewed;
     }
@@ -276,6 +277,7 @@ internal static partial class Kernels
             int g = Unsafe.SizeOf<TAcc>() / Unsafe.SizeOf<TIn>(), strips = (n + strip - 1) / strip, groups = last - first;
             int p0 = first * g, len = Math.Min(k, last * g) - p0;
             ReadOnlySpan<TIn> stored = Lanes.Direct<TN, TIn>() ? MemoryMarshal.Cast<byte, TIn>(b.AsSpan()) : default;
+            TIn[]? line = image is not null && stored.IsEmpty ? ArrayPool<TIn>.Shared.Rent(image.W) : null;
             int bytes = groups * g * Unsafe.SizeOf<TIn>();
             byte[]? rented = bytes <= 16384 ? null : ArrayPool<byte>.Shared.Rent(bytes);
             Span<byte> scratch = rented is null ? stackalloc byte[bytes] : rented.AsSpan(0, bytes);
@@ -292,12 +294,14 @@ internal static partial class Kernels
                     continue;
                 }
 
-                if (!stored.IsEmpty) stored.Slice(bOff + j * k + p0, len).CopyTo(row);
+                if (image is not null) ImageRange<TN, TIn>(b, stored, line, image, j, p0, row[..len]);   // Bᵀ's row j: the columns' row j
+                else if (!stored.IsEmpty) stored.Slice(bOff + j * k + p0, len).CopyTo(row);
                 else TN.Load(b, bOff + j * k + p0, row[..len]);
                 for (int q = 0; q < groups; q++) Unsafe.Add(ref dst, at + (nint)q * strip) = units[q];
             }
 
             if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
+            if (line is not null) ArrayPool<TIn>.Shared.Return(line);
         }
     }
 
@@ -424,6 +428,41 @@ internal static partial class Kernels
             {
                 int iw = ow * a.Sw + shift;
                 row[ow] = (uint)iw < (uint)a.W ? src[iw] : default;
+            }
+        }
+    }
+
+    // Columns from .. from + dst.Length of that row (dst[q − from] = the row's value q), for the transposed packing (a
+    // k-range of the row a thread packs): the run's whole and partial output rows each taken as ImageRow takes a whole one.
+    private static void ImageRange<TN, TIn>(byte[] x, ReadOnlySpan<TIn> stored, TIn[]? line, ConvArgs a, int p, int from, Span<TIn> dst)
+        where TN : struct, IQiyasNumber<TN, TIn> where TIn : unmanaged
+    {
+        int khw = a.Kh * a.Kw, c = p / khw, kh = p % khw / a.Kw, kw = p % a.Kw;
+        int ow1 = a.Out.OW;
+        int shift = kw * a.Dw - a.Pw;                                           // iw = ow·sw + shift
+        for (int q = from, end = from + dst.Length; q < end;)
+        {
+            int oh = q / ow1, ow0 = q % ow1, ow2 = Math.Min(ow1, ow0 + (end - q));
+            var row = dst.Slice(q - from, ow2 - ow0);
+            q += ow2 - ow0;
+            int ih = oh * a.Sh - a.Ph + kh * a.Dh;
+            if ((uint)ih >= (uint)a.H) { row.Clear(); continue; }
+            ReadOnlySpan<TIn> src;
+            if (!stored.IsEmpty) src = stored.Slice((c * a.H + ih) * a.W, a.W);
+            else { TN.Load(x, (c * a.H + ih) * a.W, line.AsSpan(0, a.W)); src = line.AsSpan(0, a.W); }
+            if (a.Sw == 1)
+            {
+                int lo = Math.Clamp(-shift, ow0, ow2), hi = Math.Clamp(a.W - shift, lo, ow2);
+                row[..(lo - ow0)].Clear();
+                src.Slice(lo + shift, hi - lo).CopyTo(row[(lo - ow0)..]);
+                row[(hi - ow0)..].Clear();
+                continue;
+            }
+
+            for (int ow = ow0; ow < ow2; ow++)
+            {
+                int iw = ow * a.Sw + shift;
+                row[ow - ow0] = (uint)iw < (uint)a.W ? src[iw] : default;
             }
         }
     }

@@ -337,6 +337,34 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
     compilation off for the bench, or a longer warm-up for a type's first row) is the coordinator's — not changed.
     Measured with the cache (one run): float16 lstm_step 18.9, gru_step 12.6–14.0, lstm_step_bwd 48.8, gru_step_bwd 36.1;
     bfloat16 17.5, 12.7, 50.9, 43.4 (baseline bfloat16 19.5, 12.4, 54.4, 45.1).
+  - The coordinator after 6f2: the float64 route keeps the measured choice (the 2e-15 is the f64 lane's rounding, noted
+    in COVERAGE); the first-row JIT is settled in the bench (6g), not by tiered compilation off or a fixed warm-up.
+
+- 6g (CPU conv backward, erf, strided copy; the bench's settle rule): done, reported.
+  - Settle rule (`Program.cs` `Time`): after the first run, warm until the runtime's compiled-method count
+    (`JitInfo.GetCompiledMethodCount`) is unchanged and no run gained more than 2 % for three runs in a row, at most 24
+    runs and 2 s; then the medians as before. Proof: bfloat16 lstm_step first in a run 50.7 → 22.3 ms (gru_step bfloat16
+    17.4, lstm_step float16 21.3, gru_step float16 13.7).
+  - erf (`src/Functions.cs`): a probe (one thread, 1M values) put the f32 fraction at 14–23 ms against exp 3.5 and the
+    series 3.1. The f32 lane's tail (|x| ≥ 0.75) is now `ErfcTail`: S(t) = x·e^(x²)·erfc x, t = 1/x in [0, 4/3], as the
+    degree-16 Chebyshev interpolant fitted at 40 digits (3.2e-9), evaluated by Horner in u = 1.5·t − 1 (`ErfcTail32`;
+    monomials in t cancel to 1e-4); erfc = e^(−x²)·(1 − x2lo)·t·S. The f64 lane's fraction as P/Q (P' = x·P + (d/2)·Q,
+    Q' = P, rescaled every 16 levels, x clamped at 28). The device keeps its fraction (`ErfDepth32` etc. stay for it).
+    Gates: `check erf f32 (ulps)` 2.13 unchanged; new `check erfc f32 / f64 (ulps)` (3.80 / 3.00). Measured: see COVERAGE.
+  - Strided copy (`src/Layout.cs` `StridedTiled`, `StridedTileBody`): an outer dimension of input stride 1 with the last
+    dimension's stride not 1 (a transposition); groups of `tile` output rows along it, each column's values gathered as a
+    contiguous line into a tile × cols lane buffer, each row stored whole (rows on whole bytes; values in place or
+    decoded). Gate cases added in `src/Bench/LayoutCases.cs` (the tiled dimension 0 and 1). Measured: see COVERAGE.
+  - Conv backward (`src/Conv.cs` `BackwardIn`): dw = dy·colsᵀ through `MatMulVisitor` with `Operands(TransB, ImageB)`;
+    the transposed packing (`PackBody.RunTransposed`) takes row j's k-range from the image by the new `ImageRange`
+    (whole and partial output rows; `ImageRow` unchanged). dcols (and the composition's cols) in `Scratch` slots.
+    Gate (`Checks.Convs`, CPU, every float type, the five fused shapes): dw within rounding of float64, dx and dw equal
+    bit for bit to the composition (`FusedConv = false`). Mutation (the output row from the range's offset instead of
+    the column) fails on the two larger shapes, float32 and float64. conv_bwd float32 16.1 → 8.7 ms, float16 17.6 → 12.8,
+    float64 30.1 → 16.3. The forward read 3.4 ms float32 against 2.3 in the baseline in the same run (code unchanged;
+    2.3–6.9 across runs): noted, not chased.
+  - Not done here: dx still goes through the columns' gradient and col2im (a fused col2im in the product's store is
+    the step if it matters).
 
 ## Item 5 progress
 

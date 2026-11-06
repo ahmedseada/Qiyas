@@ -114,6 +114,8 @@ internal static class Checks
         ok &= Function64("sigmoid f64", Funcs.Sigmoid, x => 1 / (1 + Math.Exp(-x)), -20, 20, 3, random);
         ok &= Function32("erf f32", Funcs.Erf, Funcs.ErfReference, -5, 5, 4, random);
         ok &= Function64("erf f64", Funcs.Erf, Funcs.ErfReference, -6, 6, 4, random);
+        ok &= Function32("erfc f32", Funcs.Erfc, Funcs.ErfcReference, -4, 9, 4, random);
+        ok &= Function64("erfc f64", Funcs.Erfc, Funcs.ErfcReference, -4, 26, 4, random);
         ok &= Maps(null);
         ok &= Group2(null);
         ok &= Rows(null);
@@ -668,7 +670,8 @@ internal static class Checks
     // ---------------------------------------------------------------- convolution on odd shapes
 
     /// <summary>Every type: a 3 × 7 × 9 image by 5 filters of 3 × 2 at stride 2 × 1, pad 1, dilation 1; and 2 × 5 × 5 by 3 of 3 × 3
-    /// dilated 2; forward and the backward pair against float64 within the products' rounding.</summary>
+    /// dilated 2; forward and the backward pair against float64 within the products' rounding. Then the fused forward on
+    /// five shapes, and on the CPU the backward with dw's columns read from the image on the same five.</summary>
     public static bool Convs(GpuOps? ops)
     {
         bool ok = true;
@@ -719,10 +722,25 @@ internal static class Checks
                     Console.WriteLine($"check {name} {where,-6} {type,-12} DIFFERS from the composition through the same kernel ({run.Lane})");
                     ok = false;
                 }
+
+                // The CPU's backward: dw with the columns read from the image (forced on) against float64, and dx and dw
+                // equal bit for bit to the composition's (the columns written, then the same kernel).
+                if (ops is not null || !Bench.Registry.IsFloat(type)) continue;
+                var dy = Bench.Registry.Make(type, (int)a.YValues, 66, -1, 1);
+                var (_, wantW) = a.ReferenceBackward(Bench.Registry.Values(type, x, (int)a.XValues), Bench.Registry.Values(type, w, (int)a.WValues), Bench.Registry.Values(type, dy, (int)a.YValues));
+                byte[] dxF = new byte[x.Length], dwF = new byte[w.Length], dxC = new byte[x.Length], dwC = new byte[w.Length];
+                Bench.Registry.WithFloat(type, new ConvBackwardModeRun(a, x, w, dy, dxF, dwF, dxC, dwC));
+                string back = $"conv_bwd fused {a.C}x{a.H}x{a.W}>{a.OC} {a.Kh}x{a.Kw} s{a.Sh} d{a.Dh}";
+                ok &= Close(type, back, where, dwF, wantW, (int)a.WValues, a.Cols);
+                if (!dxF.AsSpan().SequenceEqual(dxC) || !dwF.AsSpan().SequenceEqual(dwC))
+                {
+                    Console.WriteLine($"check {back} {where,-6} {type,-12} DIFFERS from the composition through the same kernel");
+                    ok = false;
+                }
             }
         }
 
-        if (ok) Console.WriteLine($"check convolution            {where,-6} every type: forward and the backward pair within the products' rounding; the fused forward equal to the composition through the same kernel");
+        if (ok) Console.WriteLine($"check convolution            {where,-6} every type: forward and the backward pair within the products' rounding; the fused forward equal to the composition through the same kernel{(ops is null ? ", and the backward with dw's columns from the image" : "")}");
         return ok;
     }
 
@@ -756,6 +774,20 @@ internal static class Checks
             Qiyas.Gpu.Download<byte>(dY, fused);
             Qiyas.Gpu.Download<byte>(dC, composed);
             gpu.Return(dX); gpu.Return(dW); gpu.Return(dY); gpu.Return(dC);
+            return true;
+        }
+    }
+
+    // The CPU's backward with dw's columns read from the image (into dxF, dwF), then by the composition (into dxC, dwC).
+    private sealed class ConvBackwardModeRun(ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dxF, byte[] dwF, byte[] dxC, byte[] dwC) : Bench.IFloatTypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float>
+        {
+            Kernels.FusedConv = null;
+            Kernels.ConvBackward<TN>(a, x, w, dy, dxF, dwF);
+            Kernels.FusedConv = false;
+            Kernels.ConvBackward<TN>(a, x, w, dy, dxC, dwC);
+            Kernels.FusedConv = null;
             return true;
         }
     }

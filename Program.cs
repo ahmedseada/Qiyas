@@ -776,11 +776,27 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
     private static Action Scoped(Device device, IBenchSubject subject, IBenchRun run) =>
         device == Device.Cuda && subject is QiyasSubject ? () => { using var scope = Devices.Ops.Scope(); run.Run(); } : run.Run;
 
-    // Median wall time (ms) after one warm-up: at least 7 runs and 300 ms of them (at most 201 runs; past 3 runs, at
-    // most 3 s), so a millisecond operation is timed over hundreds of runs and none by a handful.
+    // Median wall time (ms) of the steady state: warmed until settled (Measure.Faster's rule: on until the runtime has
+    // compiled nothing and the run has not got 2 % faster for three runs in a row; at most 24 warm runs and 2 s of them —
+    // a row timed first in a run otherwise measured code the runtime had not yet compiled to its final tier, 50 ms
+    // against 19), then at least 7 runs and 300 ms of them (at most 201 runs; past 3 runs, at most 3 s), so a millisecond
+    // operation is timed over hundreds of runs and none by a handful.
     public static double Time(Action run)
     {
         run();
+        double best = double.MaxValue, warm = 0;
+        for (int i = 0, still = 0; i < 24 && warm < 2000 && still < 3; i++)
+        {
+            long compiled = System.Runtime.JitInfo.GetCompiledMethodCount();
+            long t0 = Stopwatch.GetTimestamp();
+            run();
+            double ms = Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+            warm += ms;
+            bool gained = ms < best * 0.98 || System.Runtime.JitInfo.GetCompiledMethodCount() != compiled;
+            best = Math.Min(best, ms);
+            still = gained ? 0 : still + 1;
+        }
+
         var times = new List<double>();
         double total = 0;
         while (times.Count < 201 && (times.Count < 7 || total < 300) && !(times.Count >= 3 && total > 3000))

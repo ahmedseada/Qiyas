@@ -89,7 +89,8 @@ block-scaled integer dot (`s8dp blocks`).
 Every implementation in the assembly that implements `IBenchSubject` (`src/Bench/Contract.cs`) is found by reflection
 and becomes a column: `qiyas`, `number` (one implementation over .NET's `INumberBase<T>`, for the types .NET has a
 `T` for), and whatever you add. The harness makes the inputs (stored bytes of each type, from Qiyas's proven
-conversions, so every subject sees the same bits), times `Run` (medians over an adaptive number of runs), reads the
+conversions, so every subject sees the same bits), times `Run` (warmed until the runtime compiles nothing more and the
+time stops falling, then medians over an adaptive number of runs), reads the
 output after `Collect`, and scores it against float64 math on the same inputs. Results go to `results-qiyas-<devices>.md`.
 
 To add an implementation: one class with a parameterless constructor implementing the four methods (and `Map`, `Reduce`,
