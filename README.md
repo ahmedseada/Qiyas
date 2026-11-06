@@ -1,7 +1,8 @@
 # Qiyas
 
 Qiyas (قياس, "measure") is a generic number contract and the kernels over it: every stored type — float64, float32,
-float16, bfloat16, float8 (e4m3, e5m2), int64 down to int2, uint64 down to uint2 — computed in the lane the hardware
+float16, bfloat16, float8 (e4m3, e5m2), int64 down to int2, uint64 down to uint2, bool (one bit), and the block formats
+Q8_0, Q4_0, Q4_K, Q6_K (the GGUF layouts: values in blocks with shared f16 scales) — computed in the lane the hardware
 does best for it, chosen per operation from the data itself. No type is fixed anywhere: not for values, not for sums.
 
 - **One definition per type.** A type is one struct: its description (name, bits, range) and the lanes it offers, each
@@ -15,11 +16,26 @@ does best for it, chosen per operation from the data itself. No type is fixed an
   conversions — all from the type's description.
 - **Proven, not assumed.** Before anything is timed, every conversion is checked bit for bit against a scalar
   reference written from the format's definition, the dot lanes against scalar sums, exp against the runtime's, and
-  the device's conversions against the CPU's.
+  the device's conversions against the CPU's; then every operation of every family runs over every type it applies to
+  on both devices, on small odd shapes, against float64 references (`src/Checks.cs`); the block codecs against blocks
+  laid out by hand from the formats' specifications. The bench refuses to time while any gate fails.
+- **The operation surface.** `COVERAGE.md` is the list, one row per operation with the lane rule on each device:
+  element-wise formulas and their backward passes; reductions, broadcasts, transposes, gemv; the row family
+  (softmax, log_softmax, the norms and their backward passes, rope, masked softmax, cross-entropy's backward); layout
+  and indexing (strided copies, one-hot, gathers, scatter-add, im2col/col2im, interpolation, shift, pad, the pools and
+  their backward, depthwise convolution); products on views (transposed, batched) and the matmul backward; attention
+  (rows, causal, spans, decode, backward); convolution forward and backward; the optimizer steps; LSTM and GRU cells,
+  steps and sequences with their backward passes; top-k, pick, sampling, routing; and the block formats and bool
+  through all of it. What is still open is listed in COVERAGE.md's "State" and marked **todo** in its rows.
 
 ## The bench
 
-`Qiyas.dll [cpu|cuda|cuda,cpu] [--subjects a,b] [--types ...] [--ops add,matmul,softmax,rms_norm,map|reduce|rows|layout|products|attention|optimizers|conv|recurrent|routing|all] [--baseline name] [--shapes regular|odd] [--report]`
+`Qiyas.dll [cpu|cuda|cuda,cpu] [--subjects a,b] [--types ...] [--ops add,matmul,softmax,rms_norm,map|reduce|rows|layout|products|attention|optimizers|conv|recurrent|routing|all] [--baseline name] [--shapes regular|odd] [--report] [--repeat N]`
+
+`--subjects` picks the columns (`qiyas`, `number`, and what you add), `--types` the stored types (the seventeen plain
+ones, `bool`, `q8_0`, `q4_0`, `q4_k`, `q6_k`), `--ops` the rows, `--baseline` a named earlier results file to
+compare against. `--repeat N` repeats the matmul rows N times and raises the repetitions of the gates that once
+failed intermittently (the block transpose; 20 by default): a stress for schedule-dependent faults.
 
 `--shapes odd` runs every row at the nearest primes below its regular sizes (4093 × 4091 instead of 4096², 16M − 5,
 …) so no dimension ends on a tile, a word or a block: the padded, value-wise and segmented paths are what is timed.
@@ -44,7 +60,12 @@ pools and the depthwise convolution are layout operations (`layout:maxpool`, `la
 `layout:adaptive_maxpool`, `layout:adaptive_avgpool`, `layout:depthwise_conv`); `recurrent` adds `lstm_step`, `gru_step`
 and their `_bwd` (a batch of 1024, input 1024, hidden 1024), `lstm_seq` and `lstm_seq_bwd` (16 steps of 256 × 512 → 512); `routing` adds `topk_rows`, `pick_rows`, `sample_rows`
 (4096 rows of 32768), `route` (1M indices into 64 buckets) and `cross_entropy` (the loss by log_softmax, pick, neg).
-`COVERAGE.md` lists every operation with its lane rule on each device.
+`COVERAGE.md` lists every operation with its lane rule on each device. The block formats and bool run through every
+family: a block format's lane is float32, read a value at a time anywhere (both devices decode by index) and written a
+block at a time (the CPU re-encodes the blocks a store touches, tasks never sharing a block; the device computes
+value-wise stores in float32 storage and encodes by blocks — all four formats have device encoders, byte for byte the
+CPU's); bool is a one-bit packed type held to 0/1 (division is n/a). Products with a Q8_0 or Q4_0 operand take the
+block-scaled integer dot (`s8dp blocks`).
 
 Every implementation in the assembly that implements `IBenchSubject` (`src/Bench/Contract.cs`) is found by reflection
 and becomes a column: `qiyas`, `number` (one implementation over .NET's `INumberBase<T>`, for the types .NET has a
@@ -61,7 +82,9 @@ named type; `Run` must include your device synchronization; `Collect` writes the
 
 ## Building
 
-`dotnet build -c Release` (net10.0). `sh guard.sh` proves that no file in the repository names anything of the library
+`dotnet build -c Release` (net10.0). The gates run at the start of every bench invocation; the regression gate is
+`python docs/wip/compare.py docs/wip/baseline.md results-qiyas-cuda-cpu.md` after a full `cuda,cpu` run (a cell more
+than 5 % slower, or an error that grew, is a regression). `sh guard.sh` proves that no file in the repository names anything of the library
 Qiyas is measured against; run it before every build. That library's column (`lib`) exists only in the author's local
 checkout (files listed in `.gitignore`); a clone runs the other subjects.
 
@@ -71,6 +94,9 @@ checkout (files listed in `.gitignore`); a clone runs the other subjects.
 |---|---|
 | `src/Numbers.cs` | the contract: `IQiyasNumber<TSelf>`, lanes, dot lanes, the visitors; exp on vectors |
 | `src/Types.cs` | the seventeen stored types and their lane rules |
+| `src/Blocks.cs`, `src/Ptx.Blocks.cs`, `src/BlockProducts.cs` | the block formats Q8_0, Q4_0, Q4_K, Q6_K and bool: the codecs (CPU and device encoders, a thread per block), the block-scaled integer gemv |
+| `src/Report.cs` | `--report`: the facts and measured decisions of each device, the pool's rent/return cost |
+| `docs/wip/` | the regression comparer (`compare.py`) and the baseline run it compares against (`baseline.md`) |
 | `src/Convert.cs` | every load and store on vectors; `Widths`, any lane to any lane |
 | `src/Kernels.cs` | the CPU kernels: add, product (GotoBLAS-shaped, dot lanes in groups), softmax, rms_norm |
 | `src/Map.cs`, `src/Ptx.Map.cs` | the element-wise family: the catalogue of formulas (with float64 references), the CPU kernel, the device kernel |
@@ -146,3 +172,15 @@ to or below the library's on every row, and exact (0) wherever the lane is exact
 
 Where Qiyas is not ahead: the memory-bound adds of 32- and 64-bit types (the same bytes moved, within a few percent),
 and CUDA float64 matmul, which runs at the device's float64 rate and exact where the library computes it in float32.
+
+The tables above are the four core rows of the full `cuda,cpu` run the regression gate compares against
+(`docs/wip/baseline.md`); the other families' rows, the block formats and bool are in `results-qiyas-cuda-cpu.md` of
+the latest run, and `COVERAGE.md`'s "Known slow" names the measured cells that are correct but below what the device
+allows.
+
+## Open
+
+What the gates have not confirmed, or is not done, is in `COVERAGE.md` ("State" for the order, **todo** in the rows):
+the flash-fused attention rows, ctc, a GRU sequence bench row, the block-scaled tiled product, a bump-allocated scope
+past the buffer pool, and the known-slow cells. The README claims nothing beyond what the gates and the regression
+comparison have confirmed.

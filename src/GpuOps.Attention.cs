@@ -125,6 +125,15 @@ public sealed partial class GpuOps
         var rented = new List<ulong>();
         try
         {
+            if (f.IsBlock)
+            {
+                ulong lq = ToLane<TN>(q, a.QValues, rented), lk = ToLane<TN>(k, a.KValues, rented), lv = ToLane<TN>(v, a.KValues, rented), lo = gpu.Rent(a.QValues * 4);
+                rented.Add(lo);
+                AttentionDecode<Float32>(a, lq, lk, lv, lo);
+                FromLane<TN>(lo, o, a.QValues);
+                return "f32 (blocks through lane storage)";
+            }
+
             ulong limits = Limits(a, rented), starts = Starts(a, rented);
             var fn = gpu.Cached($"attention_decode:{f.Name}:{dCap}", (out string e) => Ptx.AttentionDecode(gpu, f, lane, dCap, out e));
             Gpu.Launch(fn, (uint)(a.Heads * a.Lq), 1, Ptx.DecodeThreads, 1, 0, q, k, v, o, limits, starts, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), lane.Wide ? Gpu.D(a.Scale) : Gpu.F((float)a.Scale));

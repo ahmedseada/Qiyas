@@ -609,7 +609,7 @@ internal static partial class Kernels
             if (rows % per != 0)
             {
                 // Output rows that do not end on a byte: one thread owns whole output rows (all the row blocks of a column block).
-                Team.For(colBlocks, 1, (long)rows * cols, new TransposeColumnsBody<TN, TLane>(x, output, rows, cols, B, rowBlocks));
+                Team.For(colBlocks, RowChunk<TN>(colBlocks, B * rows, 1), (long)rows * cols, new TransposeColumnsBody<TN, TLane>(x, output, rows, cols, B, rowBlocks));
                 return;
             }
 

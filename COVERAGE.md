@@ -8,10 +8,11 @@ anything is timed, and a bench row at a realistic shape.
 The type set: float64, float32, float16, bfloat16, float8 e4m3, float8 e5m2; int64, int32, int16, int8, int4, int2;
 uint64, uint32, uint16, uint8, uint2; bool (1 bit); the block formats Q8_0, Q4_0, Q4_K, Q6_K (the GGUF layouts: values
 in blocks with shared f16 scales). A block format's lane is float32; it is read a value at a time anywhere (both devices
-decode by index) and written a block at a time: on the CPU every store re-encodes the blocks it touches; on the device
-the operations that store value by value run in float32 storage and encode the result by blocks (Q8_0 and Q4_0 have
-device encoders; Q4_K and Q6_K are encoded on the CPU, so on the device they are inputs — products, reductions, the
-row statistics — with float32 or another type's outputs: their device encoders are todo).
+decode by index) and written a block at a time: on the CPU every store re-encodes the blocks it touches with the
+block's other values kept (tasks never share a block; the block's scale then covers the kept values, so an output buffer
+of a block format is one whose blocks the output covers whole or whose other values belong with it, not one holding stale
+values of another scale); on the device the operations that store value by value run in float32 storage and encode the
+result by blocks (all four formats have device encoders, byte for byte the CPU's).
 
 Lane rules, named once here and referred to below:
 
@@ -36,41 +37,35 @@ Device buffers come from a size-keyed pool: after a shape's first call no driver
 the cost of a rent/return pair (tens of nanoseconds). That pool is the arena the plan asked for; a bump-allocated scope
 per operation would save the remaining lookup and is the step past it.
 
-## State (2026-11-06, branch `coverage-wip`, commit "block formats, bool, …")
+## State (2026-11-06, branch `coverage-wip`)
 
 Written so the next session continues from the files alone. The tree builds (Release, 0 errors) and `guard.sh` reports
 zero hits.
 
-**Green, confirmed in a full run on both devices:** every gate in `Checks` for the 17 plain types (the groups
-element-wise, reductions, rows, layout, view products and backward, attention with spans, convolution, optimizers,
-recurrent incl. LSTM sequences, routing, argmax per column, adaptive-pool backward), the block specifications
-(`BlockSpecifications`: blocks laid out by hand decode by the formulas of all four formats) and the block round trips
-(`BlockFormats`) on both devices, the sliced f64 proofs, `--report` on both devices.
+**Green, confirmed in a full gate run on both devices for every type (the 17 plain types, bool, and Q8_0, Q4_0, Q4_K,
+Q6_K):** every gate in `Checks` — element-wise, reductions, rows (37 × 1001, 5 × 64, 3 × 17, 3 × 20011), layout,
+view products and the backward pair, attention with spans and decode, optimizers, convolution, recurrent incl. LSTM
+sequences, routing, argmax per column, adaptive-pool backward — the block specifications (`BlockSpecifications`: blocks
+laid out by hand decode by the formulas of all four formats), the block round trips, the core operations (add, softmax,
+rms_norm over 37 × 1001) on the block formats on both devices, and the device's decode and encode of all four formats
+byte for byte as the CPU's (`BlockFormats`), the sliced f64 proofs, `--report` on both devices. The
+transpose of a block format is repeated 20 times in the gate (`Checks.Stress`, raised by `--repeat N`): the schedule-
+dependent re-encode it once showed (reproduced at repetition 25 of 40 without the fix) is gone with the column tasks
+aligned to whole blocks; 100 repetitions × 4 formats are green.
 
-**Green on the CPU, in the last full-type CPU gate process:** every CPU gate over Q8_0, Q4_0, Q4_K, Q6_K and bool
-(reductions, rows, layouts, products incl. the block gemv fast path, attention, optimizers, conv, recurrent, routing).
+The drafted patch `docs/wip/k-block-encoders.py` of the previous state is applied and removed; `docs/wip/` keeps the
+regression comparer and the baseline run.
 
-**Unconfirmed / open:**
+**Open, in the order they are taken:**
 
-1. `check transpose cpu q6_k DIFFERS by 31.78 steps` — intermittent (one process of several): the CPU transpose's
-   column tasks store partial Q6_K blocks and re-encode them; which task re-encodes a block last depends on the schedule.
-   The fix drafted (not applied, not run) chunks the transpose's column tasks on whole storage units with
-   `RowChunk<TN>` as the row operations already do — see `docs/wip/k-block-encoders.py`, the `Reduce.cs` edit.
-2. Device encoders for Q4_K and Q6_K: `Ptx.LanesToBlock` throws `NotSupportedException` for them, so the device gates of
-   groups that store value by value into those two types stop at the first store (`GpuOps.MapRow → Back → LanesToBlock`);
-   on the device Q4_K and Q6_K are confirmed as inputs only. The drafted thread-per-block PTX encoders (ports of
-   `Blocks.EncodeQ4_K` / `EncodeQ6_K`, step for step, with the same f16 rounding of the scales) are in
-   `docs/wip/k-block-encoders.py`: a patch script run as `python docs/wip/k-block-encoders.py .` that edits
-   `src/Ptx.Blocks.cs`, `src/Reduce.cs`, `src/Checks.cs` (the device-encode equality check extended to the K formats)
-   and this file. It has not been built or run: after applying it, build, run `cpu` then `cuda` gates with
-   `--types q8_0,q4_0,q4_k,q6_k,bool,float32` and compare the device's bytes with the CPU's in `BlockFormats`.
-3. After 1 and 2 are green: the regression gate `python docs/wip/compare.py docs/wip/baseline.md <new run>` for the
-   core rows on `cuda,cpu` (> 5 % slower or error growth = regression); then bench rows over the block types and bool.
-4. The CPU int4 matmul `ArgumentOutOfRangeException` seen once in a full run, not reproduced in three targeted runs:
-   `--types int4 --ops matmul --repeat 20` is the stress option drafted for it; explain or reproduce before closing.
-5. The todo rows below: flash-fused attention rows, ctc, the GRU sequence bench row, the block-scaled tiled product,
-   fusing the transposition into the product's packing, the radix step of scatter-add, and a bump-allocated scope past
-   the pool.
+1. The CPU int4 matmul `ArgumentOutOfRangeException` seen once in a full run, not reproduced in three targeted runs:
+   `--repeat N` repeats the matmul rows; reproduce on odd shapes and in the full run's order, or document the attempt.
+2. The regression gate for the whole stretch: `python docs/wip/compare.py docs/wip/baseline.md <new run>` over a full
+   `cuda,cpu` run (> 5 % slower or error growth = regression).
+3. The todo rows below: flash-fused attention rows, ctc, the GRU sequence bench row, the block-scaled tiled product,
+   fusing the transposition into the product's packing, the radix step of scatter-add.
+4. A bump-allocated scope past the pool (buffers reserved once from the shapes; zero rents on the hot path).
+5. The known-slow list.
 
 ## Known slow
 
@@ -147,7 +142,7 @@ sum_axis, sumsq, max, min, argmax → the reductions; transpose; gemv_nn / gemv_
 | scale_mask_softmax (x, additive mask; scale a; causal when b ≠ 0: columns past the row's position, the index or the one given) | ✓ float | ✓ float | excluded values give 0, a fully excluded row too; the position per row makes a key span |
 | add_rms_norm, add_layer_norm (x, residual, g[, bt]) → y and h = x + residual | ✓ float | ✓ float | fused residual add + normalization, the sum written once |
 | the row family on integer types | n/a | n/a | the row formulas are float formulas: a stored integer type has no float lane here |
-| rows longer than 16 words a thread of 1024 (16384 float32 values) in the row family | ✓ | ✓ | the row in segments of the registers' span, reloaded in every phase (the per-value temporaries recomputed) |
+| rows longer than 16 words a thread of 1024 (16384 float32 values) in the row family | ✓ | ✓ | the row in segments of 256 threads × 8 words (or 8 values, for rows not ending on a word), reloaded in every phase (the per-value temporaries recomputed); the statistics kernel of norm_params_bwd the same |
 
 ## Reductions
 
@@ -209,8 +204,8 @@ sum_axis, sumsq, max, min, argmax → the reductions; transpose; gemv_nn / gemv_
 
 | operation | CPU | CUDA | note |
 |---|---|---|---|
-| Q8_0, Q4_0, Q4_K, Q6_K as types (Load decodes blocks into the f32 lane, Store encodes blocks) | ✓ | ✓ decode; encode Q8_0, Q4_0 | the GGUF layouts; every operation above runs on them (the device's value-wise stores through float32 storage and a block encode) |
-| products with a block-format operand | ✓ sum | ✓ sum | matmul through the f32 lane (the values decoded); gemv on Q8_0 / Q4_0 by the block-scaled integer dot (32-term s8 dots per block, the block scales' product in f32: the format's own fast path, `s8dp blocks`); the same for the tiled product: todo |
+| Q8_0, Q4_0, Q4_K, Q6_K as types (Load decodes blocks into the f32 lane, Store encodes blocks) | ✓ | ✓ | the GGUF layouts, the codecs proven against blocks laid out by hand; every operation above runs on them (the device's value-wise stores through float32 storage and a block encode) |
+| products with a block-format operand | ✓ sum | ✓ sum | matmul through the f32 lane on both devices (a block's values, an f16 scale times an integer, are exact in f32 and not in the f16 tensor lane); gemv on Q8_0 / Q4_0 by the block-scaled integer dot (32-term s8 dots per block, the block scales' product in f32: the format's own fast path, `s8dp blocks`); the same for the tiled product: todo |
 
 ## Masks
 
@@ -222,7 +217,7 @@ sum_axis, sumsq, max, min, argmax → the reductions; transpose; gemv_nn / gemv_
 
 | operation | CPU | CUDA | note |
 |---|---|---|---|
-| top-k per row (values as the type, indices s32; largest first, ties by the lower index) | ✓ own | ✓ own | k passes of the row's argmax (k ≤ 256 on the device; a partial sort is the step for large k) |
+| top-k per row (values as the type, indices s32; largest first, ties by the lower index) | ✓ own | ✓ own | k passes of the row's argmax (k ≤ 256 on the device; a partial sort is the step for large k); the CPU's row tasks chunked on whole storage units of the k values (bool, the packed integers), the device's block formats through lane storage |
 | pick per row (x[r][index[r]]) | ✓ own | ✓ own | |
 | sampling per row (the first column whose running sum reaches u·Σ) | ✓ float | ✓ float | chunk sums, their prefix, the least crossing |
 | route: counts, offsets, the sources ordered by bucket | ✓ | ✓ | the scatter-add's ordering kernels (deterministic; quadratic in the source count on the device: a radix step for millions) |

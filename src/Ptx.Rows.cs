@@ -23,10 +23,10 @@ internal static partial class Ptx
     }
 
     /// <summary>stats[2·row] = mean (0 when not centered), stats[2·row + 1] = 1/√(mean (x − mean)² + eps), lane values.</summary>
-    public static string NormStats(Gpu gpu, Fmt f, Lane lane, bool centered, int perThread, int threads, bool vector, bool valueWise, out string entry)
+    public static string NormStats(Gpu gpu, Fmt f, Lane lane, bool centered, int perThread, int threads, bool vector, bool valueWise, out string entry, bool segmented = false)
     {
-        entry = $"norm_stats_{(centered ? "c" : "r")}_{f.Name}_{lane.Name}_r{perThread}_t{threads}{(vector ? "_v" : "")}{(valueWise ? "_w" : "")}";
-        var c = new RowCtx(new PtxBuilder(), f, lane, perThread, threads, vector, valueWise);
+        entry = $"norm_stats_{(centered ? "c" : "r")}_{f.Name}_{lane.Name}_r{perThread}_t{threads}{(vector ? "_v" : "")}{(valueWise ? "_w" : "")}{(segmented ? "_seg" : "")}";
+        var c = new RowCtx(new PtxBuilder(), f, lane, perThread, threads, vector, valueWise, segmented);
         c.Prologue(false);
         var b = c.B;
         string n = c.Count();
@@ -167,7 +167,8 @@ internal static partial class Ptx
                     for (int q = 0; q < perThread; q++)
                     {
                         _present[q] = b.P(); _inWords[q] = b.R(); _x[q] = new string[f.Per]; _x2[q] = new string[f.Per]; _col[q] = new string[f.Per]; _pv[q] = _present[q];
-                        for (int i = 0; i < f.Per; i++) { _x[q][i] = lane.NewReg(b); _x2[q][i] = lane.NewReg(b); _col[q][i] = b.R(); }
+                        for (int i = 0; i < f.Per; i++) { _x[q][i] = lane.NewReg(b); if (second) _x2[q][i] = lane.NewReg(b); _col[q][i] = b.R(); }
+                        if (!second) _x2[q] = null!;                                        // X2 reads zero
                     }
 
                     return;
@@ -193,6 +194,21 @@ internal static partial class Ptx
             _base = b.R();
             b.L($"mul.lo.u32 {_base}, {Row}, {Cols};");
             _x2 = new string[perThread][];
+            if (segmented)
+            {
+                // The row in segments of perThread·threads values: the registers below are reloaded for each segment in every phase.
+                _segs = b.R(); _segBase = b.R(); _seg = b.R();
+                b.L($"add.u32 {_segs}, {Cols}, {perThread * threads - 1};");
+                b.L($"div.u32 {_segs}, {_segs}, {perThread * threads};");
+                _present = new string[perThread];
+                for (int q = 0; q < perThread; q++)
+                {
+                    _present[q] = b.P(); _pv[q] = _present[q]; _col[q] = [b.R()]; _x[q] = [lane.NewReg(b)]; if (second) _x2[q] = [lane.NewReg(b)];
+                }
+
+                return;
+            }
+
             for (int q = 0; q < perThread; q++)
             {
                 string c = b.R(), p = b.P(), idx = b.R();
@@ -294,6 +310,25 @@ internal static partial class Ptx
             b.L($"@{pEnd} bra {tag}_END;");
             b.L($"mul.lo.u32 {_segBase}, {_seg}, {perThread * threads};");
             _g = []; _bt = [];                                                 // the per-column vectors are read per segment
+            if (valueWise)
+            {
+                for (int q = 0; q < perThread; q++)
+                {
+                    string cs = b.R(), idx = b.R();
+                    b.L($"add.u32 {_col[q][0]}, {Tid}, {q * threads};");
+                    b.L($"add.u32 {_col[q][0]}, {_col[q][0]}, {_segBase};");
+                    b.L($"setp.lt.u32 {_present[q]}, {_col[q][0]}, {Cols};");
+                    b.L($"min.u32 {cs}, {_col[q][0]}, {ColsM1};");
+                    b.L($"add.u32 {idx}, {_base}, {cs};");
+                    string v = Codec.UnpackAt(b, f, Src, idx, lane);
+                    b.L($"mov.{lane.Reg} {_x[q][0]}, {v};");
+                    if (_second) { string v2 = Codec.UnpackAt(b, f, _src2, idx, lane); b.L($"mov.{lane.Reg} {_x2[q][0]}, {v2};"); }
+                }
+
+                _segTag = tag;
+                return;
+            }
+
             string wt = f.WordBits == 64 ? "b64" : "b32";
             for (int q = 0; q < perThread; q++)
             {
@@ -386,6 +421,7 @@ internal static partial class Ptx
             }
 
             string dst = second ? _dst2 : Dst;
+            BeginSegments();
             for (int q = 0; q < perThread; q++)
             {
                 string code = b.R(), idx = b.R(), addr = b.RD(), h = b.H();
@@ -397,6 +433,8 @@ internal static partial class Ptx
                 b.L($"cvt.u16.u32 {h}, {code};");
                 b.L($"@{Pred(q)} st.global.b{f.Bits} [{addr}], {h};");
             }
+
+            EndSegments();
         }
     }
 

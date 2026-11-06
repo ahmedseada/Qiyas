@@ -1,98 +1,440 @@
 # Qiyas bench
 
-2026-11-06 07:20. Median wall time (ms); `×` = lib ÷ subject (above 1: faster than lib). `err` = largest |result − float64 math on the same stored inputs|. `lane` = what the subject computed in.
+2026-11-06 11:54. Median wall time (ms); `×` = lib ÷ subject (above 1: faster than lib). `err` = largest |result − float64 math on the same stored inputs|. `lane` = what the subject computed in.
 
 | device | operation | type | shape | lib ms | lib × | lib lane | lib err | number ms | number × | number lane | number err | qiyas ms | qiyas × | qiyas lane | qiyas err |
 |---|---|---|---|---:|---:|---|---:|---:|---:|---|---:|---:|---:|---|---:|
-| cuda | add | float64 | 16777216 | 124.132 | — | add_f32; converted through the host | 5.96e-8 | 0.520 | 238.67 | add_f64 | 0e+0 | 0.520 | 238.62 | f64 | 0e+0 |
-| cuda | matmul | float64 | 2048x2048x2048 | 31.367 | — | gemm128_f32; converted through the host | 1.62e-4 | 22.644 | 1.39 | gemm64_f64 | 0e+0 | 4.167 | 7.53 | f64x | 2.59e-13 |
-| cuda | softmax | float64 | 4096x4096 | 88.423 | — | softmax_f32; converted through the host | 5.29e-10 | 0.394 | 224.54 | softmax_f64 | 1.88e-10 | 1.740 | 50.82 | f64 | 1.13e-17 |
-| cuda | rms_norm | float64 | 4096x4096 | 82.227 | — | rms_norm_f32; converted through the host | 3.1e-7 | 0.371 | 221.46 | rms_norm_f64 | 1.24e-14 | 0.550 | 149.56 | f64 | 1.07e-14 |
-| cuda | add | float32 | 16777216 | 0.263 | — | add_f32 | 5.96e-8 | 0.262 | 1.01 | add_f32 | 5.96e-8 | 0.263 | 1.00 | f32 | 5.96e-8 |
-| cuda | matmul | float32 | 2048x2048x2048 | 0.966 | — | gemm128_f32 | 1.62e-4 | 0.844 | 1.14 | gemm128_f32 | 1.62e-4 | 0.683 | 1.41 | f32 | 1.62e-4 |
-| cuda | softmax | float32 | 4096x4096 | 0.182 | — | softmax_f32 | 5.29e-10 | 0.181 | 1.00 | softmax_f32 | 5.11e-10 | 0.179 | 1.01 | f32 | 4.52e-10 |
-| cuda | rms_norm | float32 | 4096x4096 | 0.183 | — | rms_norm_f32 | 3.1e-7 | 0.182 | 1.00 | rms_norm_f32 | 2.93e-7 | 0.180 | 1.02 | f32 | 2.97e-7 |
-| cuda | add | float16 | 16777216 | 0.661 | — | add_f32; converted on the device | 4.88e-4 | 0.139 | 4.75 | add_f16 | 4.88e-4 | 0.125 | 5.30 | f32 | 4.88e-4 |
-| cuda | matmul | float16 | 2048x2048x2048 | 1.019 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.658 | 1.55 | gemm128_f16 | 1.51e+0 | 0.245 | 4.16 | f16mma | 3.09e-2 |
-| cuda | softmax | float16 | 4096x4096 | 0.443 | — | softmax_f32; converted on the device | 9.53e-7 | 0.089 | 4.95 | softmax_f16 | 3.3e-6 | 0.075 | 5.91 | f32 | 9.54e-7 |
-| cuda | rms_norm | float16 | 4096x4096 | 0.442 | — | rms_norm_f32; converted on the device | 4.88e-4 | 0.087 | 5.08 | rms_norm_f16 | 1.64e-3 | 0.077 | 5.77 | f32 | 4.88e-4 |
-| cuda | add | bfloat16 | 16777216 | 0.661 | — | add_f32; converted on the device | 3.91e-3 | — | — | — | — | 0.125 | 5.29 | f32 | 3.91e-3 |
-| cuda | matmul | bfloat16 | 2048x2048x2048 | 1.004 | — | gemm128_f32; converted on the device | 2.5e-1 | — | — | — | — | 0.243 | 4.14 | bf16mma | 2.5e-1 |
-| cuda | softmax | bfloat16 | 4096x4096 | 0.443 | — | softmax_f32; converted on the device | 7.63e-6 | — | — | — | — | 0.077 | 5.77 | f32 | 7.63e-6 |
-| cuda | rms_norm | bfloat16 | 4096x4096 | 0.440 | — | rms_norm_f32; converted on the device | 3.91e-3 | — | — | — | — | 0.076 | 5.81 | f32 | 3.91e-3 |
-| cuda | add | float8_e4m3 | 16777216 | 495.297 | — | add_f32; converted through the host | 6.25e-2 | — | — | — | — | 0.053 | 9310.09 | f32 | 6.25e-2 |
-| cuda | matmul | float8_e4m3 | 2048x2048x2048 | 137.725 | — | gemm64_f32; converted through the host | 3.99e+0 | — | — | — | — | 0.272 | 506.71 | f16mma | 3.99e+0 |
-| cuda | softmax | float8_e4m3 | 4096x4096 | 108.007 | — | softmax_f32; converted through the host | 9.76e-4 | — | — | — | — | 0.067 | 1624.16 | f32 | 9.76e-4 |
-| cuda | rms_norm | float8_e4m3 | 4096x4096 | 472.585 | — | rms_norm_f32; converted through the host | 6.25e-2 | — | — | — | — | 0.046 | 10273.58 | f32 | 6.25e-2 |
-| cuda | add | float8_e5m2 | 16777216 | 471.164 | — | add_f32; converted through the host | 1.25e-1 | — | — | — | — | 0.666 | 707.56 | f32 | 1.25e-1 |
-| cuda | matmul | float8_e5m2 | 2048x2048x2048 | 115.629 | — | gemm64_f32; converted through the host | 7.71e+0 | — | — | — | — | 0.265 | 436.99 | f16mma | 7.71e+0 |
-| cuda | softmax | float8_e5m2 | 4096x4096 | 305.112 | — | softmax_f32; converted through the host | 1.62e-4 | — | — | — | — | 0.070 | 4383.80 | f32 | 1.62e-4 |
-| cuda | rms_norm | float8_e5m2 | 4096x4096 | 375.077 | — | rms_norm_f32; converted through the host | 1.08e-1 | — | — | — | — | 0.050 | 7486.57 | f32 | 1.08e-1 |
-| cuda | add | int64 | 16777216 | 120.079 | — | add_f32; converted through the host | 0e+0 | 0.520 | 230.88 | add_s64 | 0e+0 | 0.520 | 230.83 | s64 | 0e+0 |
-| cuda | matmul | int64 | 2048x2048x2048 | 29.443 | — | gemm128_f32; converted through the host | 0e+0 | 4.424 | 6.66 | gemm64_s64 | 0e+0 | 0.359 | 82.04 | s8mma | 0e+0 |
-| cuda | add | int32 | 16777216 | 0.783 | — | add_f32; converted on the device | 0e+0 | 0.263 | 2.98 | add_s32 | 0e+0 | 0.263 | 2.98 | s32 | 0e+0 |
-| cuda | matmul | int32 | 2048x2048x2048 | 1.116 | — | gemm64_f32; converted on the device | 0e+0 | 1.086 | 1.03 | gemm128_s32 | 0e+0 | 0.218 | 5.12 | s8mma | 0e+0 |
-| cuda | add | int16 | 16777216 | 73.475 | — | add_f32; converted through the host | 0e+0 | 0.139 | 527.83 | add_s16 | 0e+0 | 0.124 | 593.02 | s16 | 0e+0 |
-| cuda | matmul | int16 | 2048x2048x2048 | 17.580 | — | gemm128_f32; converted through the host | 0e+0 | 1.586 | 11.08 | gemm128_s16 | 0e+0 | 0.177 | 99.32 | s8mma | 0e+0 |
-| cuda | add | int8 | 16777216 | 65.141 | — | add_f32; converted through the host | 0e+0 | 0.075 | 872.03 | add_s8 | 0e+0 | 0.023 | 2895.15 | s8 | 0e+0 |
-| cuda | matmul | int8 | 2048x2048x2048 | 22.431 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.550 | 14.48 | gemm128_s8 | 5.12e+2 | 0.093 | 240.67 | s8mma | 3.23e+2 |
-| cuda | add | int4 | 16777216 | 80.279 | — | add_f32; converted through the host | 0e+0 | — | — | — | — | 0.018 | 4362.98 | s8 | 0e+0 |
-| cuda | matmul | int4 | 2048x2048x2048 | 39.062 | — | gemm128_f32; converted through the host | 4.43e+2 | — | — | — | — | 0.103 | 377.77 | s8mma | 4.43e+2 |
-| cuda | add | int2 | 16777216 | 78.323 | — | add_f32; converted through the host | 0e+0 | — | — | — | — | 0.018 | 4256.67 | s8 | 0e+0 |
-| cuda | matmul | int2 | 2048x2048x2048 | 18.817 | — | gemm64_f32; converted through the host | 6.16e+2 | — | — | — | — | 0.112 | 168.16 | s8mma | 6.16e+2 |
-| cuda | add | uint64 | 16777216 | 136.900 | — | add_f32; converted through the host | 0e+0 | 0.521 | 262.86 | add_u64 | 0e+0 | 0.520 | 263.47 | u64 | 0e+0 |
-| cuda | matmul | uint64 | 2048x2048x2048 | 34.064 | — | gemm64_f32; converted through the host | 0e+0 | 4.359 | 7.82 | gemm64_u64 | 0e+0 | 0.357 | 95.31 | u8mma | 0e+0 |
-| cuda | add | uint32 | 16777216 | 101.415 | — | add_f32; converted through the host | 0e+0 | 0.263 | 385.46 | add_u32 | 0e+0 | 0.263 | 385.90 | u32 | 0e+0 |
-| cuda | matmul | uint32 | 2048x2048x2048 | 23.537 | — | gemm64_f32; converted through the host | 0e+0 | 1.099 | 21.41 | gemm128_u32 | 0e+0 | 0.215 | 109.42 | u8mma | 0e+0 |
-| cuda | add | uint16 | 16777216 | 68.893 | — | add_f32; converted through the host | 0e+0 | 0.139 | 496.35 | add_u16 | 0e+0 | 0.124 | 554.69 | u16 | 0e+0 |
-| cuda | matmul | uint16 | 2048x2048x2048 | 17.061 | — | gemm128_f32; converted through the host | 0e+0 | 1.327 | 12.86 | gemm128_u16 | 0e+0 | 0.173 | 98.62 | u8mma | 0e+0 |
-| cuda | add | uint8 | 16777216 | 64.411 | — | add_f32; converted through the host | 0e+0 | 0.096 | 669.55 | add_u8 | 0e+0 | 0.032 | 2031.90 | u8 | 0e+0 |
-| cuda | matmul | uint8 | 2048x2048x2048 | 17.035 | — | gemm128_f32; converted through the host | 4.96e+3 | 1.284 | 13.27 | gemm128_u8 | 5.12e+3 | 0.093 | 182.97 | u8mma | 4.96e+3 |
-| cuda | add | uint2 | 16777216 | 71.768 | — | add_f32; converted through the host | 0e+0 | — | — | — | — | 0.016 | 4376.12 | u8 | 0e+0 |
-| cuda | matmul | uint2 | 2048x2048x2048 | 17.723 | — | gemm128_f32; converted through the host | 6.11e+2 | — | — | — | — | 0.108 | 164.41 | u8mma | 6.11e+2 |
-| cpu | add | float64 | 16777216 | 7.064 | — | typed tile | 0e+0 | 6.752 | 1.05 | Vector<Double> | 0e+0 | 6.646 | 1.06 | f64 | 0e+0 |
-| cpu | matmul | float64 | 1024x1024x1024 | 6.243 | — | to f32 and back | 7.96e-5 | 15.909 | 0.39 | Vector<Double> | 0e+0 | 3.019 | 2.07 | f64 | 6.39e-14 |
-| cpu | softmax | float64 | 4096x4096 | 30.929 | — | to f32 and back | 6.21e-10 | 7.623 | 4.06 | Vector<Double> | 4.34e-19 | 5.093 | 6.07 | f64 | 1.08e-17 |
-| cpu | rms_norm | float64 | 4096x4096 | 30.874 | — | to f32 and back | 3.73e-6 | 4.061 | 7.60 | Vector<Double> | 1.33e-14 | 4.583 | 6.74 | f64 | 1.27e-14 |
-| cpu | add | float32 | 16777216 | 2.953 | — | f32 kernel | 5.96e-8 | 2.951 | 1.00 | Vector<Single> | 5.96e-8 | 2.909 | 1.02 | f32 | 5.96e-8 |
-| cpu | matmul | float32 | 1024x1024x1024 | 2.160 | — | f32 kernel | 7.96e-5 | 5.761 | 0.37 | Vector<Single> | 8.34e-5 | 1.361 | 1.59 | f32 | 7.96e-5 |
-| cpu | softmax | float32 | 4096x4096 | 2.432 | — | f32 kernel | 6.21e-10 | 4.202 | 0.58 | Vector<Single> | 5.91e-9 | 1.854 | 1.31 | f32 | 6.21e-10 |
-| cpu | rms_norm | float32 | 4096x4096 | 3.701 | — | f32 kernel | 3.73e-6 | 1.735 | 2.13 | Vector<Single> | 5.16e-7 | 1.624 | 2.28 | f32 | 3.68e-7 |
-| cpu | add | float16 | 16777216 | 2.383 | — | typed tile | 4.88e-4 | 6.715 | 0.35 | scalar | 4.88e-4 | 1.169 | 2.04 | f32 | 4.88e-4 |
-| cpu | matmul | float16 | 1024x1024x1024 | 6.771 | — | to f32 and back | 1.56e-2 | 817.620 | 0.01 | scalar | 6.08e-1 | 1.481 | 4.57 | f32 | 1.56e-2 |
-| cpu | softmax | float16 | 4096x4096 | 46.889 | — | to f32 and back | 9.54e-7 | 45.650 | 1.03 | scalar | 1.57e-4 | 2.222 | 21.10 | f32 | 9.54e-7 |
-| cpu | rms_norm | float16 | 4096x4096 | 45.695 | — | to f32 and back | 4.93e-4 | 20.710 | 2.21 | scalar | 7.06e-2 | 0.825 | 55.39 | f32 | 4.89e-4 |
-| cpu | add | bfloat16 | 16777216 | 1.085 | — | typed tile | 3.91e-3 | — | — | — | — | 0.908 | 1.20 | f32 | 3.91e-3 |
-| cpu | matmul | bfloat16 | 1024x1024x1024 | 4.846 | — | to f32 and back | 1.25e-1 | — | — | — | — | 1.162 | 4.17 | f32 | 1.25e-1 |
-| cpu | softmax | bfloat16 | 4096x4096 | 24.043 | — | to f32 and back | 7.63e-6 | — | — | — | — | 1.773 | 13.56 | f32 | 7.63e-6 |
-| cpu | rms_norm | bfloat16 | 4096x4096 | 23.810 | — | to f32 and back | 3.91e-3 | — | — | — | — | 0.402 | 59.30 | f32 | 3.91e-3 |
-| cpu | add | float8_e4m3 | 16777216 | 21.216 | — | typed tile | 6.25e-2 | — | — | — | — | 1.822 | 11.64 | f32 | 6.25e-2 |
-| cpu | matmul | float8_e4m3 | 1024x1024x1024 | 35.324 | — | to f32 and back | 2e+0 | — | — | — | — | 1.242 | 28.44 | f32 | 2e+0 |
-| cpu | softmax | float8_e4m3 | 4096x4096 | 91.311 | — | to f32 and back | 9.76e-4 | — | — | — | — | 3.076 | 29.68 | f32 | 9.76e-4 |
-| cpu | rms_norm | float8_e4m3 | 4096x4096 | 402.311 | — | to f32 and back | 6.25e-2 | — | — | — | — | 1.620 | 248.29 | f32 | 6.25e-2 |
-| cpu | add | float8_e5m2 | 16777216 | 17.483 | — | typed tile | 1.25e-1 | — | — | — | — | 1.995 | 8.77 | f32 | 1.25e-1 |
-| cpu | matmul | float8_e5m2 | 1024x1024x1024 | 30.426 | — | to f32 and back | 4e+0 | — | — | — | — | 1.780 | 17.10 | f32 | 4e+0 |
-| cpu | softmax | float8_e5m2 | 4096x4096 | 292.458 | — | to f32 and back | 1.62e-4 | — | — | — | — | 3.231 | 90.53 | f32 | 1.62e-4 |
-| cpu | rms_norm | float8_e5m2 | 4096x4096 | 320.714 | — | to f32 and back | 1.08e-1 | — | — | — | — | 1.701 | 188.53 | f32 | 1.08e-1 |
-| cpu | add | int64 | 16777216 | 21.918 | — | typed tile | 0e+0 | 6.747 | 3.25 | Vector<Int64> | 0e+0 | 6.708 | 3.27 | s64 | 0e+0 |
-| cpu | matmul | int64 | 1024x1024x1024 | 6.345 | — | to f32 and back | 0e+0 | 20.748 | 0.31 | Vector<Int64> | 0e+0 | 0.685 | 9.26 | s8dp | 0e+0 |
-| cpu | add | int32 | 16777216 | 26.485 | — | typed tile | 0e+0 | 2.955 | 8.96 | Vector<Int32> | 0e+0 | 2.940 | 9.01 | s32 | 0e+0 |
-| cpu | matmul | int32 | 1024x1024x1024 | 6.059 | — | to f32 and back | 0e+0 | 5.129 | 1.18 | Vector<Int32> | 0e+0 | 0.568 | 10.66 | s8dp | 0e+0 |
-| cpu | add | int16 | 16777216 | 1.341 | — | typed tile | 0e+0 | 1.253 | 1.07 | Vector<Int16> | 0e+0 | 0.775 | 1.73 | s16 | 0e+0 |
-| cpu | matmul | int16 | 1024x1024x1024 | 5.899 | — | to f32 and back | 0e+0 | 1.507 | 3.92 | Vector<Int16> | 0e+0 | 0.523 | 11.28 | s8dp | 0e+0 |
-| cpu | add | int8 | 16777216 | 1.865 | — | typed tile | 0e+0 | 0.514 | 3.63 | Vector<SByte> | 0e+0 | 0.129 | 14.51 | s8 | 0e+0 |
-| cpu | matmul | int8 | 1024x1024x1024 | 6.415 | — | to f32 and back | 1.76e+2 | 2.762 | 2.32 | Vector<SByte> | 2.56e+2 | 0.581 | 11.05 | s8dp | 1.76e+2 |
-| cpu | add | int4 | 16777216 | 2.933 | — | typed tile | 0e+0 | — | — | — | — | 0.143 | 20.48 | s8 | 0e+0 |
-| cpu | matmul | int4 | 1024x1024x1024 | 12.125 | — | to f32 and back | 2.96e+2 | — | — | — | — | 0.481 | 25.22 | s8dp | 2.96e+2 |
-| cpu | add | int2 | 16777216 | 2.868 | — | typed tile | 0e+0 | — | — | — | — | 0.275 | 10.44 | s8 | 0e+0 |
-| cpu | matmul | int2 | 1024x1024x1024 | 6.946 | — | to f32 and back | 3.26e+2 | — | — | — | — | 0.522 | 13.31 | s8dp | 3.26e+2 |
-| cpu | add | uint64 | 16777216 | 12.998 | — | typed tile | 0e+0 | 6.815 | 1.91 | Vector<UInt64> | 0e+0 | 6.719 | 1.93 | u64 | 0e+0 |
-| cpu | matmul | uint64 | 1024x1024x1024 | 6.852 | — | to f32 and back | 0e+0 | 33.086 | 0.21 | Vector<UInt64> | 0e+0 | 0.792 | 8.65 | u8dp | 0e+0 |
-| cpu | add | uint32 | 16777216 | 14.199 | — | typed tile | 0e+0 | 2.991 | 4.75 | Vector<UInt32> | 0e+0 | 3.013 | 4.71 | u32 | 0e+0 |
-| cpu | matmul | uint32 | 1024x1024x1024 | 6.167 | — | to f32 and back | 0e+0 | 5.202 | 1.19 | Vector<UInt32> | 0e+0 | 0.543 | 11.36 | u8dp | 0e+0 |
-| cpu | add | uint16 | 16777216 | 1.654 | — | typed tile | 0e+0 | 1.385 | 1.19 | Vector<UInt16> | 0e+0 | 0.913 | 1.81 | u16 | 0e+0 |
-| cpu | matmul | uint16 | 1024x1024x1024 | 5.350 | — | to f32 and back | 0e+0 | 3.418 | 1.57 | Vector<UInt16> | 0e+0 | 0.544 | 9.84 | u8dp | 0e+0 |
-| cpu | add | uint8 | 16777216 | 1.988 | — | typed tile | 0e+0 | 0.377 | 5.27 | Vector<Byte> | 0e+0 | 0.145 | 13.67 | u8 | 0e+0 |
-| cpu | matmul | uint8 | 1024x1024x1024 | 6.040 | — | to f32 and back | 2.48e+3 | 2.420 | 2.50 | Vector<Byte> | 2.56e+3 | 0.420 | 14.38 | u8dp | 2.48e+3 |
-| cpu | add | uint2 | 16777216 | 2.936 | — | typed tile | 0e+0 | — | — | — | — | 0.244 | 12.04 | u8 | 0e+0 |
-| cpu | matmul | uint2 | 1024x1024x1024 | 6.643 | — | to f32 and back | 3.18e+2 | — | — | — | — | 0.422 | 15.76 | u8dp | 3.18e+2 |
+| cuda | add | q8_0 | 16777216 | — | — | — | — | — | — | — | — | 0.983 | — | f32 | 7.87e-3 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.858 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.862 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.860 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.862 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.860 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.860 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.860 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | matmul | q8_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.861 | — | f32 | 3.09e-1 |
+| cuda | add | q4_0 | 16777216 | — | — | — | — | — | — | — | — | 0.660 | — | f32 | 2.34e-1 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.783 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.789 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.789 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.787 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.787 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.787 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.787 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.789 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.787 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.789 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.789 | — | f32 | 6.51e+0 |
+| cuda | matmul | q4_0 | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.788 | — | f32 | 6.51e+0 |
+| cuda | add | q4_k | 16777216 | — | — | — | — | — | — | — | — | 1.194 | — | f32 | 1.33e-1 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.867 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.874 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.871 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.872 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.871 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.872 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.868 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.868 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.870 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.871 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.869 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.872 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.872 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.869 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.873 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.872 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.874 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.873 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.872 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.875 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.874 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.874 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.875 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.874 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.874 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.876 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.873 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.876 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.874 | — | f32 | 3.83e+0 |
+| cuda | matmul | q4_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.876 | — | f32 | 3.83e+0 |
+| cuda | add | q6_k | 16777216 | — | — | — | — | — | — | — | — | 1.400 | — | f32 | 3.22e-2 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.955 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.957 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.957 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.958 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.956 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.957 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.956 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.958 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.956 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.958 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.955 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.958 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.956 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.958 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.957 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.957 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.957 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.957 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.957 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.958 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.957 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.958 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.957 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.959 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.956 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.957 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.958 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.957 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.957 | — | f32 | 1.25e+0 |
+| cuda | matmul | q6_k | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.958 | — | f32 | 1.25e+0 |
+| cuda | add | bool | 16777216 | — | — | — | — | — | — | — | — | 0.017 | — | u8 | 1e+0 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.123 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.123 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | matmul | bool | 2048x2048x2048 | — | — | — | — | — | — | — | — | 0.122 | — | u8mma | 1.27e+3 |
+| cuda | add | int8 | 16777216 | 62.770 | — | add_f32; converted through the host | 0e+0 | 0.076 | 828.10 | add_s8 | 0e+0 | 0.021 | 2974.89 | s8 | 0e+0 |
+| cuda | matmul | int8 | 2048x2048x2048 | 22.126 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.553 | 14.24 | gemm128_s8 | 5.12e+2 | 0.094 | 234.88 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.714 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 13.98 | gemm128_s8 | 5.12e+2 | 0.094 | 230.76 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.862 | — | gemm64_f32; converted through the host | 3.23e+2 | 1.553 | 14.07 | gemm128_s8 | 5.12e+2 | 0.094 | 232.33 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.562 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.553 | 13.88 | gemm128_s8 | 5.12e+2 | 0.094 | 229.13 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.348 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 13.73 | gemm128_s8 | 5.12e+2 | 0.094 | 226.87 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.640 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 13.93 | gemm128_s8 | 5.12e+2 | 0.094 | 229.96 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.592 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 13.90 | gemm128_s8 | 5.12e+2 | 0.094 | 229.94 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.787 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 14.02 | gemm128_s8 | 5.12e+2 | 0.094 | 231.29 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.768 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 14.00 | gemm128_s8 | 5.12e+2 | 0.093 | 233.56 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.591 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 13.89 | gemm128_s8 | 5.12e+2 | 0.094 | 229.45 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.426 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 13.79 | gemm128_s8 | 5.12e+2 | 0.094 | 227.69 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.637 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 13.92 | gemm128_s8 | 5.12e+2 | 0.094 | 230.42 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.786 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 14.02 | gemm128_s8 | 5.12e+2 | 0.094 | 231.52 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.633 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 13.92 | gemm128_s8 | 5.12e+2 | 0.094 | 229.89 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.599 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 13.90 | gemm128_s8 | 5.12e+2 | 0.094 | 229.29 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.771 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 14.01 | gemm128_s8 | 5.12e+2 | 0.094 | 231.36 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.711 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.555 | 13.96 | gemm128_s8 | 5.12e+2 | 0.094 | 230.72 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.912 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 14.10 | gemm128_s8 | 5.12e+2 | 0.094 | 232.61 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.452 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 13.81 | gemm128_s8 | 5.12e+2 | 0.094 | 229.44 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.439 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 13.80 | gemm128_s8 | 5.12e+2 | 0.093 | 230.03 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.651 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 13.93 | gemm128_s8 | 5.12e+2 | 0.094 | 229.84 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.633 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.555 | 13.91 | gemm128_s8 | 5.12e+2 | 0.094 | 231.13 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.498 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 13.83 | gemm128_s8 | 5.12e+2 | 0.094 | 228.21 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.625 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 13.92 | gemm128_s8 | 5.12e+2 | 0.094 | 231.29 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.882 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.555 | 14.08 | gemm128_s8 | 5.12e+2 | 0.093 | 234.79 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.649 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 13.93 | gemm128_s8 | 5.12e+2 | 0.094 | 230.06 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.586 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 13.89 | gemm128_s8 | 5.12e+2 | 0.094 | 229.15 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.591 | — | gemm128_f32; converted through the host | 3.23e+2 | 1.554 | 13.89 | gemm128_s8 | 5.12e+2 | 0.094 | 229.20 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.626 | — | gemm64_f32; converted through the host | 3.23e+2 | 1.554 | 13.91 | gemm128_s8 | 5.12e+2 | 0.094 | 229.82 | s8mma | 3.23e+2 |
+| cuda | matmul | int8 | 2048x2048x2048 | 21.579 | — | gemm64_f32; converted through the host | 3.23e+2 | 1.554 | 13.88 | gemm128_s8 | 5.12e+2 | 0.094 | 229.08 | s8mma | 3.23e+2 |
+| cuda | add | float16 | 16777216 | 0.662 | — | add_f32; converted on the device | 4.88e-4 | 0.139 | 4.76 | add_f16 | 4.88e-4 | 0.123 | 5.36 | f32 | 4.88e-4 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.023 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.660 | 1.55 | gemm128_f16 | 1.51e+0 | 0.243 | 4.21 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.028 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.660 | 1.56 | gemm128_f16 | 1.51e+0 | 0.243 | 4.23 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.108 | — | gemm64_f32; converted on the device | 3.09e-2 | 0.661 | 1.68 | gemm128_f16 | 1.51e+0 | 0.243 | 4.57 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.028 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.660 | 1.56 | gemm128_f16 | 1.51e+0 | 0.244 | 4.22 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.024 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.661 | 1.55 | gemm128_f16 | 1.51e+0 | 0.243 | 4.21 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.028 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.661 | 1.56 | gemm128_f16 | 1.51e+0 | 0.244 | 4.20 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.023 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.661 | 1.55 | gemm128_f16 | 1.51e+0 | 0.243 | 4.22 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.029 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.661 | 1.56 | gemm128_f16 | 1.51e+0 | 0.246 | 4.18 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.022 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.660 | 1.55 | gemm128_f16 | 1.51e+0 | 0.243 | 4.21 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.029 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.660 | 1.56 | gemm128_f16 | 1.51e+0 | 0.244 | 4.22 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.024 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.661 | 1.55 | gemm128_f16 | 1.51e+0 | 0.243 | 4.22 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.028 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.660 | 1.56 | gemm128_f16 | 1.51e+0 | 0.243 | 4.23 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.024 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.661 | 1.55 | gemm128_f16 | 1.51e+0 | 0.243 | 4.22 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.029 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.661 | 1.56 | gemm128_f16 | 1.51e+0 | 0.243 | 4.23 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.023 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.661 | 1.55 | gemm128_f16 | 1.51e+0 | 0.243 | 4.21 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.109 | — | gemm64_f32; converted on the device | 3.09e-2 | 0.660 | 1.68 | gemm128_f16 | 1.51e+0 | 0.245 | 4.53 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.024 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.661 | 1.55 | gemm128_f16 | 1.51e+0 | 0.243 | 4.22 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.030 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.661 | 1.56 | gemm128_f16 | 1.51e+0 | 0.245 | 4.20 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.023 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.661 | 1.55 | gemm128_f16 | 1.51e+0 | 0.243 | 4.21 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.110 | — | gemm64_f32; converted on the device | 3.09e-2 | 0.660 | 1.68 | gemm128_f16 | 1.51e+0 | 0.245 | 4.53 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.024 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.661 | 1.55 | gemm128_f16 | 1.51e+0 | 0.244 | 4.20 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.029 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.660 | 1.56 | gemm128_f16 | 1.51e+0 | 0.244 | 4.22 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.023 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.660 | 1.55 | gemm128_f16 | 1.51e+0 | 0.243 | 4.22 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.029 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.660 | 1.56 | gemm128_f16 | 1.51e+0 | 0.244 | 4.22 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.023 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.661 | 1.55 | gemm128_f16 | 1.51e+0 | 0.243 | 4.22 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.029 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.660 | 1.56 | gemm128_f16 | 1.51e+0 | 0.245 | 4.21 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.023 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.661 | 1.55 | gemm128_f16 | 1.51e+0 | 0.243 | 4.20 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.030 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.660 | 1.56 | gemm128_f16 | 1.51e+0 | 0.244 | 4.22 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.023 | — | gemm128_f32; converted on the device | 3.09e-2 | 0.661 | 1.55 | gemm128_f16 | 1.51e+0 | 0.244 | 4.20 | f16mma | 3.09e-2 |
+| cuda | matmul | float16 | 2048x2048x2048 | 1.110 | — | gemm64_f32; converted on the device | 3.09e-2 | 0.661 | 1.68 | gemm128_f16 | 1.51e+0 | 0.244 | 4.55 | f16mma | 3.09e-2 |
+| cpu | add | q8_0 | 16777216 | — | — | — | — | — | — | — | — | 5.149 | — | f32 | 7.87e-3 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.837 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.849 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.852 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.844 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.853 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.844 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.851 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.842 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.851 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.850 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.856 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.853 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.837 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.842 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.850 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.846 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.838 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.845 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.849 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.845 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.851 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.854 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.841 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.849 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.840 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.839 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.848 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.850 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.840 | — | f32 | 2.03e-1 |
+| cpu | matmul | q8_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.850 | — | f32 | 2.03e-1 |
+| cpu | add | q4_0 | 16777216 | — | — | — | — | — | — | — | — | 3.567 | — | f32 | 2.34e-1 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.140 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.561 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.586 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.585 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.585 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.584 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.585 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.605 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.577 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.587 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.576 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.581 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.584 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.578 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.584 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.583 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.585 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.581 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.584 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.587 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.576 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.579 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.609 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.586 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.583 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.585 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.586 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.581 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.586 | — | f32 | 4.06e+0 |
+| cpu | matmul | q4_0 | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.589 | — | f32 | 4.06e+0 |
+| cpu | add | q4_k | 16777216 | — | — | — | — | — | — | — | — | 5.041 | — | f32 | 1.33e-1 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.961 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.922 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.929 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.895 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.948 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.890 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.891 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.955 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.895 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.971 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.891 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.917 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.986 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.953 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.910 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.899 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.841 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.644 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.952 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.907 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.913 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.885 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.896 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.892 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.931 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.887 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.847 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.914 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.955 | — | f32 | 2.71e+0 |
+| cpu | matmul | q4_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 8.928 | — | f32 | 2.71e+0 |
+| cpu | add | q6_k | 16777216 | — | — | — | — | — | — | — | — | 8.045 | — | f32 | 3.22e-2 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.565 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.892 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.852 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.832 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.864 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.848 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.844 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.862 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.848 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.838 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.854 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.845 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.842 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.850 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.844 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.830 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.843 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.889 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.847 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.867 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.851 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.860 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.866 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.856 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.852 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.868 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.869 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.852 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.835 | — | f32 | 8.19e-1 |
+| cpu | matmul | q6_k | 1024x1024x1024 | — | — | — | — | — | — | — | — | 9.861 | — | f32 | 8.19e-1 |
+| cpu | add | bool | 16777216 | — | — | — | — | — | — | — | — | 4.619 | — | u8 | 1e+0 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 1.578 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 1.310 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.013 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.269 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 1.428 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 1.429 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 1.869 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.017 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.175 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.147 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.081 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 1.989 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.023 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.150 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.132 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.076 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 1.761 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.067 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.246 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.150 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.066 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.003 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.098 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.086 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 1.426 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 1.559 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 1.427 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.036 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 2.078 | — | f32 | 6.46e+2 |
+| cpu | matmul | bool | 1024x1024x1024 | — | — | — | — | — | — | — | — | 1.789 | — | f32 | 6.46e+2 |
+| cpu | add | int8 | 16777216 | 1.919 | — | typed tile | 0e+0 | 0.326 | 5.88 | Vector<SByte> | 0e+0 | 0.196 | 9.78 | s8 | 0e+0 |
+| cpu | matmul | int8 | 1024x1024x1024 | 6.080 | — | to f32 and back | 1.76e+2 | 4.949 | 1.23 | Vector<SByte> | 2.56e+2 | 0.528 | 11.52 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.735 | — | to f32 and back | 1.76e+2 | 2.148 | 2.67 | Vector<SByte> | 2.56e+2 | 0.347 | 16.53 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.737 | — | to f32 and back | 1.76e+2 | 2.131 | 2.69 | Vector<SByte> | 2.56e+2 | 0.344 | 16.68 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.616 | — | to f32 and back | 1.76e+2 | 2.132 | 2.63 | Vector<SByte> | 2.56e+2 | 0.343 | 16.37 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.727 | — | to f32 and back | 1.76e+2 | 2.129 | 2.69 | Vector<SByte> | 2.56e+2 | 0.343 | 16.71 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.794 | — | to f32 and back | 1.76e+2 | 2.127 | 2.72 | Vector<SByte> | 2.56e+2 | 0.344 | 16.83 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.258 | — | to f32 and back | 1.76e+2 | 2.145 | 2.45 | Vector<SByte> | 2.56e+2 | 0.344 | 15.29 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.701 | — | to f32 and back | 1.76e+2 | 2.124 | 2.68 | Vector<SByte> | 2.56e+2 | 0.344 | 16.56 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.607 | — | to f32 and back | 1.76e+2 | 2.123 | 2.64 | Vector<SByte> | 2.56e+2 | 0.346 | 16.22 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.503 | — | to f32 and back | 1.76e+2 | 2.131 | 2.58 | Vector<SByte> | 2.56e+2 | 0.345 | 15.97 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.527 | — | to f32 and back | 1.76e+2 | 3.223 | 1.71 | Vector<SByte> | 2.56e+2 | 0.514 | 10.75 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 6.059 | — | to f32 and back | 1.76e+2 | 5.550 | 1.09 | Vector<SByte> | 2.56e+2 | 0.513 | 11.80 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 6.093 | — | to f32 and back | 1.76e+2 | 5.075 | 1.20 | Vector<SByte> | 2.56e+2 | 0.500 | 12.18 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.977 | — | to f32 and back | 1.76e+2 | 4.738 | 1.26 | Vector<SByte> | 2.56e+2 | 0.507 | 11.79 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 6.039 | — | to f32 and back | 1.76e+2 | 2.405 | 2.51 | Vector<SByte> | 2.56e+2 | 0.393 | 15.36 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.886 | — | to f32 and back | 1.76e+2 | 2.241 | 2.63 | Vector<SByte> | 2.56e+2 | 0.352 | 16.74 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.553 | — | to f32 and back | 1.76e+2 | 2.366 | 2.35 | Vector<SByte> | 2.56e+2 | 0.350 | 15.88 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.546 | — | to f32 and back | 1.76e+2 | 2.258 | 2.46 | Vector<SByte> | 2.56e+2 | 0.349 | 15.87 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.637 | — | to f32 and back | 1.76e+2 | 2.248 | 2.51 | Vector<SByte> | 2.56e+2 | 0.388 | 14.53 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 6.267 | — | to f32 and back | 1.76e+2 | 2.353 | 2.66 | Vector<SByte> | 2.56e+2 | 0.509 | 12.31 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 6.118 | — | to f32 and back | 1.76e+2 | 2.876 | 2.13 | Vector<SByte> | 2.56e+2 | 0.509 | 12.03 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 6.005 | — | to f32 and back | 1.76e+2 | 2.680 | 2.24 | Vector<SByte> | 2.56e+2 | 0.508 | 11.81 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 6.027 | — | to f32 and back | 1.76e+2 | 2.674 | 2.25 | Vector<SByte> | 2.56e+2 | 0.509 | 11.83 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 6.151 | — | to f32 and back | 1.76e+2 | 2.842 | 2.16 | Vector<SByte> | 2.56e+2 | 0.510 | 12.07 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 6.163 | — | to f32 and back | 1.76e+2 | 2.131 | 2.89 | Vector<SByte> | 2.56e+2 | 0.552 | 11.16 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.811 | — | to f32 and back | 1.76e+2 | 2.138 | 2.72 | Vector<SByte> | 2.56e+2 | 0.552 | 10.54 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.796 | — | to f32 and back | 1.76e+2 | 2.127 | 2.72 | Vector<SByte> | 2.56e+2 | 0.557 | 10.41 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.682 | — | to f32 and back | 1.76e+2 | 2.135 | 2.66 | Vector<SByte> | 2.56e+2 | 0.553 | 10.28 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.931 | — | to f32 and back | 1.76e+2 | 2.135 | 2.78 | Vector<SByte> | 2.56e+2 | 0.552 | 10.75 | s8dp | 1.76e+2 |
+| cpu | matmul | int8 | 1024x1024x1024 | 5.760 | — | to f32 and back | 1.76e+2 | 2.134 | 2.70 | Vector<SByte> | 2.56e+2 | 0.552 | 10.44 | s8dp | 1.76e+2 |
+| cpu | add | float16 | 16777216 | 3.538 | — | typed tile | 4.88e-4 | 7.638 | 0.46 | scalar | 4.88e-4 | 1.753 | 2.02 | f32 | 4.88e-4 |
+| cpu | matmul | float16 | 1024x1024x1024 | 7.333 | — | to f32 and back | 1.56e-2 | 873.040 | 0.01 | scalar | 6.08e-1 | 1.917 | 3.83 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.900 | — | to f32 and back | 1.56e-2 | 765.758 | 0.01 | scalar | 6.08e-1 | 1.235 | 5.59 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.619 | — | to f32 and back | 1.56e-2 | 694.738 | 0.01 | scalar | 6.08e-1 | 1.645 | 4.02 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 7.331 | — | to f32 and back | 1.56e-2 | 894.723 | 0.01 | scalar | 6.08e-1 | 1.721 | 4.26 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.762 | — | to f32 and back | 1.56e-2 | 676.648 | 0.01 | scalar | 6.08e-1 | 1.328 | 5.09 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.704 | — | to f32 and back | 1.56e-2 | 883.964 | 0.01 | scalar | 6.08e-1 | 1.724 | 3.89 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.629 | — | to f32 and back | 1.56e-2 | 695.168 | 0.01 | scalar | 6.08e-1 | 1.731 | 3.83 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.908 | — | to f32 and back | 1.56e-2 | 871.916 | 0.01 | scalar | 6.08e-1 | 1.718 | 4.02 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 7.071 | — | to f32 and back | 1.56e-2 | 863.211 | 0.01 | scalar | 6.08e-1 | 1.724 | 4.10 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.698 | — | to f32 and back | 1.56e-2 | 872.945 | 0.01 | scalar | 6.08e-1 | 1.722 | 3.89 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.480 | — | to f32 and back | 1.56e-2 | 702.926 | 0.01 | scalar | 6.08e-1 | 1.334 | 4.86 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.964 | — | to f32 and back | 1.56e-2 | 875.379 | 0.01 | scalar | 6.08e-1 | 1.718 | 4.05 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.969 | — | to f32 and back | 1.56e-2 | 873.540 | 0.01 | scalar | 6.08e-1 | 1.717 | 4.06 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 7.107 | — | to f32 and back | 1.56e-2 | 872.477 | 0.01 | scalar | 6.08e-1 | 1.722 | 4.13 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.832 | — | to f32 and back | 1.56e-2 | 873.282 | 0.01 | scalar | 6.08e-1 | 1.219 | 5.60 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 7.385 | — | to f32 and back | 1.56e-2 | 850.409 | 0.01 | scalar | 6.08e-1 | 1.467 | 5.03 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 7.103 | — | to f32 and back | 1.56e-2 | 693.812 | 0.01 | scalar | 6.08e-1 | 1.265 | 5.62 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 7.231 | — | to f32 and back | 1.56e-2 | 872.735 | 0.01 | scalar | 6.08e-1 | 1.726 | 4.19 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.924 | — | to f32 and back | 1.56e-2 | 874.530 | 0.01 | scalar | 6.08e-1 | 1.483 | 4.67 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 7.026 | — | to f32 and back | 1.56e-2 | 873.647 | 0.01 | scalar | 6.08e-1 | 1.723 | 4.08 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.829 | — | to f32 and back | 1.56e-2 | 697.387 | 0.01 | scalar | 6.08e-1 | 1.852 | 3.69 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.740 | — | to f32 and back | 1.56e-2 | 946.178 | 0.01 | scalar | 6.08e-1 | 1.218 | 5.53 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 7.052 | — | to f32 and back | 1.56e-2 | 694.851 | 0.01 | scalar | 6.08e-1 | 1.353 | 5.21 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 7.317 | — | to f32 and back | 1.56e-2 | 882.008 | 0.01 | scalar | 6.08e-1 | 1.738 | 4.21 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.826 | — | to f32 and back | 1.56e-2 | 875.086 | 0.01 | scalar | 6.08e-1 | 1.714 | 3.98 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.693 | — | to f32 and back | 1.56e-2 | 875.533 | 0.01 | scalar | 6.08e-1 | 1.723 | 3.88 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.924 | — | to f32 and back | 1.56e-2 | 857.876 | 0.01 | scalar | 6.08e-1 | 1.712 | 4.04 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.898 | — | to f32 and back | 1.56e-2 | 873.240 | 0.01 | scalar | 6.08e-1 | 1.723 | 4.00 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 7.221 | — | to f32 and back | 1.56e-2 | 873.339 | 0.01 | scalar | 6.08e-1 | 1.729 | 4.18 | f32 | 1.56e-2 |
+| cpu | matmul | float16 | 1024x1024x1024 | 6.897 | — | to f32 and back | 1.56e-2 | 872.551 | 0.01 | scalar | 6.08e-1 | 1.293 | 5.34 | f32 | 1.56e-2 |

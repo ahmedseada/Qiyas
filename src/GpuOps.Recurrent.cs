@@ -8,6 +8,26 @@ public sealed partial class GpuOps
     {
         var f = Fmt.Of<TN>();
         var lane = RowLane(f);
+        if (f.IsBlock)
+        {
+            // A block format's cell: the inputs decoded into float32 storage, the cell there, the outputs encoded by blocks.
+            long gates = a.GateValues, bh = (long)a.B * a.H;
+            long o1n = backward ? gates : bh, o2n = backward && a.Gates == 3 ? gates : bh;
+            var r = new List<ulong>();
+            ulong In(ulong x, long count) => x == 0 ? 0 : Lanes(f, Lane.F32, x, count, r);
+            ulong Out(ulong x, long count) { if (x == 0) return 0; ulong l = gpu.Rent(count * 4); r.Add(l); return l; }
+            try
+            {
+                ulong lg = In(g, gates), lg2 = In(g2, gates), ls = In(state, bh), ld1 = In(d1, bh), ld2 = In(d2, bh), lo1 = Out(o1, o1n), lo2 = Out(o2, o2n), lo3 = Out(o3, bh);
+                LaunchCell<Float32>(a, backward, lg, lg2, ls, ld1, ld2, lo1, lo2, lo3);
+                if (o1 != 0) Back(f, Lane.F32, lo1, o1, o1n);
+                if (o2 != 0) Back(f, Lane.F32, lo2, o2, o2n);
+                if (o3 != 0) Back(f, Lane.F32, lo3, o3, bh);
+                return;
+            }
+            finally { foreach (var q in r) gpu.Return(q); }
+        }
+
         var fn = gpu.Cached($"cell:{a.Kind}:{backward}:{f.Name}", (out string e) => Ptx.Cell(gpu, f, lane, a.Kind, backward, out e));
         Gpu.Launch(fn, Grid(f.Words((long)a.B * a.H), 256), 1, 256, 1, 0, g, g2, state, d1, d2, o1, o2, o3, Gpu.U(a.B), Gpu.U(a.H));
     }

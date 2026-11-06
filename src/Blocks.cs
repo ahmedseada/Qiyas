@@ -226,7 +226,9 @@ internal static class Blocks
         }
     }
 
-    /// <summary>float32 values into the blocks at first .. first + count (a partial block re-encoded with its other values kept).</summary>
+    /// <summary>float32 values into the blocks at first .. first + count (a partial block re-encoded with its other values kept:
+    /// the block's scale then covers the kept values too, so an output of a block format goes into a buffer whose blocks it
+    /// covers whole or whose other values belong with it — not one holding stale values of another scale).</summary>
     public static void Store(ReadOnlySpan<float> l, Span<byte> s, int first, int blockValues, int blockBytes, Action<ReadOnlySpan<byte>, Span<float>> decode, Action<ReadOnlySpan<float>, Span<byte>> encode)
     {
         Span<float> block = stackalloc float[256];

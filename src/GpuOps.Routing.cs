@@ -8,6 +8,21 @@ public sealed partial class GpuOps
     {
         var f = Fmt.Of<TN>();
         var lane = f.Natural;
+        if (f.IsBlock)
+        {
+            // A block format's rows decoded into float32 storage, the top-k there, the values encoded by blocks.
+            var r = new List<ulong>();
+            try
+            {
+                ulong lx = Lanes(f, Lane.F32, x, (long)rows * cols, r), lv = gpu.Rent((long)rows * k * 4);
+                r.Add(lv);
+                TopK<Float32>(lx, rows, cols, k, lv, indices);
+                Back(f, Lane.F32, lv, values, (long)rows * k);
+                return "f32 (blocks through lane storage)";
+            }
+            finally { foreach (var q in r) gpu.Return(q); }
+        }
+
         if (k > 256) throw new NotSupportedException($"top-k: k = {k} exceeds the kernel's passes (256); a partial sort is the step");
         var fn = gpu.Cached($"topk:{f.Name}", (out string e) => Ptx.TopKRows(gpu, f, lane, out e));
         if (f.Bits < 8) Gpu.Clear(values, f.Words((long)rows * k) * 4);           // sub-byte values are OR-ed into their words
@@ -19,6 +34,20 @@ public sealed partial class GpuOps
     public string Pick<TN>(ulong x, int rows, int cols, ulong index, ulong output) where TN : struct, IQiyasNumber<TN>
     {
         var f = Fmt.Of<TN>();
+        if (f.IsBlock)
+        {
+            var r = new List<ulong>();
+            try
+            {
+                ulong lx = Lanes(f, Lane.F32, x, (long)rows * cols, r), lo = gpu.Rent(rows * 4L);
+                r.Add(lo);
+                Pick<Float32>(lx, rows, cols, index, lo);
+                Back(f, Lane.F32, lo, output, rows);
+                return "f32 (blocks through lane storage)";
+            }
+            finally { foreach (var q in r) gpu.Return(q); }
+        }
+
         var fn = gpu.Cached($"pick:{f.Name}", (out string e) => Ptx.PickRows(gpu, f, f.Natural, out e));
         if (f.Bits < 8) Gpu.Clear(output, f.Words(rows) * 4);
         Gpu.Launch(fn, Grid(rows, 256), 1, 256, 1, 0, x, index, output, Gpu.U(rows), Gpu.U(cols));

@@ -144,7 +144,7 @@ internal sealed class Options
                 case "--baseline": o.Baseline = args[++i]; break;
                 case "--shapes": o.Shapes = args[++i]; if (o.Shapes is not ("regular" or "odd")) throw new ArgumentException($"--shapes takes regular or odd, not {o.Shapes}"); break;
                 case "--report": o.Report = true; break;
-                case "--repeat": o.Repeat = int.Parse(args[++i]); break;
+                case "--repeat": o.Repeat = int.Parse(args[++i]); Qiyas.Checks.Stress = Math.Max(Qiyas.Checks.Stress, o.Repeat); break;
                 case "profile" or "gpuprofile" or "team": o.Mode = a; break;
                 default:
                     o.Devices = [.. a.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)

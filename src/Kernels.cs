@@ -456,7 +456,8 @@ internal static partial class Kernels
 
             if (cl is not null && !storeTiles)
             {
-                Team.For(m * n, Math.Max(4096, m * n / (Threads * 2)) / 64 * 64, m * n, new StoreBody<TN, TAcc>(cl, c));
+                int unit = Math.Max(64, TN.Granularity);                          // chunks of whole storage units: two tasks never share a block
+                Team.For(m * n, Math.Max(4096, m * n / (Threads * 2)) / unit * unit, m * n, new StoreBody<TN, TAcc>(cl, c));
             }
 
             Mark(t0, 3);
@@ -475,7 +476,7 @@ internal static partial class Kernels
     public struct SoftmaxVisitor(byte[] x, byte[] y, int rows, int cols) : IFloatLaneVisitor
     {
         public void Run<TN, TLane, TL>() where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane> =>
-            Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)rows * cols * 8, new SoftmaxBody<TN, TLane, TL>(x, y, cols));
+            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)rows * cols * 8, new SoftmaxBody<TN, TLane, TL>(x, y, cols));
     }
 
     private struct SoftmaxBody<TN, TLane, TL>(byte[] x, byte[] y, int cols) : Team.IBody
@@ -576,7 +577,7 @@ internal static partial class Kernels
     public struct RmsNormVisitor(byte[] x, byte[] y, int rows, int cols, double eps) : IFloatLaneVisitor
     {
         public void Run<TN, TLane, TL>() where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane> =>
-            Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)rows * cols * 2, new RmsBody<TN, TLane, TL>(x, y, cols, TL.From(eps)));
+            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)rows * cols * 2, new RmsBody<TN, TLane, TL>(x, y, cols, TL.From(eps)));
     }
 
     private struct RmsBody<TN, TLane, TL>(byte[] x, byte[] y, int cols, TLane eps) : Team.IBody

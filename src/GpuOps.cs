@@ -29,6 +29,21 @@ public sealed partial class GpuOps(Gpu gpu)
     public void Add<TN>(ulong a, ulong b, ulong c, int n) where TN : struct, IQiyasNumber<TN>
     {
         var f = Fmt.Of<TN>();
+        if (f.IsBlock)
+        {
+            // A block format: the sum in float32 storage, the result encoded by blocks.
+            var r = new List<ulong>();
+            try
+            {
+                ulong la = Lanes(f, Lane.F32, a, n, r), lb = Lanes(f, Lane.F32, b, n, r), lc = gpu.Rent(n * 4L);
+                r.Add(lc);
+                Add<Float32>(la, lb, lc, n);
+                Back(f, Lane.F32, lc, c, n);
+                return;
+            }
+            finally { foreach (var p in r) gpu.Return(p); }
+        }
+
         var fn = gpu.Cached($"add:{f.Name}", (out string e) => Ptx.Add(gpu, f, out e));
         long words = f.Words(n);
         int perThread = f.WordBits == 64 ? 2 : 4;
@@ -361,7 +376,7 @@ public sealed partial class GpuOps(Gpu gpu)
         if (f.IsFloat)
         {
             if (f.Bits == 64) return "f64";
-            if (f.Bits == 32) return "f32";
+            if (f.Bits == 32 || f.IsBlock) return "f32";                     // a block's values (an f16 scale times an integer) are exact in f32, not in f16
             var kind = f.Is("bfloat16") ? Ptx.Kind.BF16 : Ptx.Kind.F16;
             return MmaSupported(kind) ? kind.Name + "mma" : "f32";
         }
@@ -840,9 +855,26 @@ public sealed partial class GpuOps(Gpu gpu)
         if ((long)cols * f.Bits % f.WordBits != 0) throw new NotSupportedException($"{f.Name}: a row of {cols} values does not end on a word; the device's row kernels take whole words.");
     }
 
+    /// <summary>A block format's row operation: the rows in float32 storage, the result encoded by blocks.</summary>
+    private string RowsThroughLanes(Fmt f, ulong x, ulong y, int rows, int cols, Func<ulong, ulong, string> run)
+    {
+        var r = new List<ulong>();
+        try
+        {
+            long n = (long)rows * cols;
+            ulong lx = Lanes(f, Lane.F32, x, n, r), ly = gpu.Rent(n * 4);
+            r.Add(ly);
+            run(lx, ly);
+            Back(f, Lane.F32, ly, y, n);
+            return "f32 (blocks through lane storage)";
+        }
+        finally { foreach (var p in r) gpu.Return(p); }
+    }
+
     public string Softmax<TN>(ulong x, ulong y, int rows, int cols) where TN : struct, IQiyasNumber<TN>
     {
         var f = Fmt.Of<TN>();
+        if (f.IsBlock) return RowsThroughLanes(f, x, y, rows, cols, (lx, ly) => Softmax<Float32>(lx, ly, rows, cols));
         CheckRows(f, cols);
         var lane = RowLane(f);
         var (threads, perThread) = RowShape(f, cols);
@@ -857,6 +889,7 @@ public sealed partial class GpuOps(Gpu gpu)
     public string RmsNorm<TN>(ulong x, ulong y, int rows, int cols, double eps) where TN : struct, IQiyasNumber<TN>
     {
         var f = Fmt.Of<TN>();
+        if (f.IsBlock) return RowsThroughLanes(f, x, y, rows, cols, (lx, ly) => RmsNorm<Float32>(lx, ly, rows, cols, eps));
         CheckRows(f, cols);
         var lane = RowLane(f);
         var (threads, perThread) = RowShape(f, cols);

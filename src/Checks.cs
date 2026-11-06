@@ -157,6 +157,27 @@ internal static class Checks
             }
 
             if (worst > 1.5) { Console.WriteLine($"check block {type,-6} round trip   cpu    DIFFERS by {worst:0.##} block steps"); ok = false; }
+            // The core operations the bench times first (add over 1001 values; softmax and rms_norm over 37 × 1001) against the references.
+            {
+                const int R = 37, C = 1001;
+                var a = Bench.Registry.Make(type, R * C, 61, -2, 2);
+                var bb = Bench.Registry.Make(type, R * C, 62, -2, 2);
+                var va = Bench.Registry.Values(type, a, R * C);
+                var vb = Bench.Registry.Values(type, bb, R * C);
+                var sum = new double[R * C];
+                for (int i = 0; i < R * C; i++) sum[i] = va[i] + vb[i];
+                // A fresh output each (a block format's partial-block store keeps the buffer's other values in the block's scale).
+                var output = new byte[a.Length];
+                Bench.Registry.WithFloat(type, new CoreRun(ops, "add", a, bb, output, R, C));
+                ok &= Close(type, "add", where, output, sum, R * C);
+                output = new byte[a.Length];
+                Bench.Registry.WithFloat(type, new CoreRun(ops, "softmax", a, null, output, R, C));
+                ok &= Close(type, "softmax", where, output, References.Softmax(va, R, C), R * C, terms: C);
+                output = new byte[a.Length];
+                Bench.Registry.WithFloat(type, new CoreRun(ops, "rms_norm", a, null, output, R, C));
+                ok &= Close(type, "rms_norm", where, output, References.RmsNorm(va, R, C, 1e-5), R * C, terms: C);
+            }
+
             if (ops is null) continue;
             var gpu = ops.Gpu;
             // The device decodes every value as the CPU does (its Widen kernel), and encodes Q8_0 / Q4_0 as the CPU does.
@@ -169,7 +190,6 @@ internal static class Checks
             int bad = 0;
             for (int i = 0; i < n; i++) if (lane[i] != (float)back[i]) bad++;
             if (bad > 0) { Console.WriteLine($"check block {type,-6} decode       device DIFFERS at {bad} values"); ok = false; }
-            if (type is "q8_0" or "q4_0")
             {
                 var f32 = new float[n];
                 for (int i = 0; i < n; i++) f32[i] = (float)values[i];
@@ -188,7 +208,7 @@ internal static class Checks
             gpu.Return(d); gpu.Return(lanes);
         }
 
-        if (ok) Console.WriteLine($"check block formats          {where,-6} Q8_0, Q4_0, Q4_K, Q6_K: round trips within the block's step; the device's codecs as the CPU's");
+        if (ok) Console.WriteLine($"check block formats          {where,-6} Q8_0, Q4_0, Q4_K, Q6_K: round trips within the block's step; add, softmax, rms_norm as the references{(ops is null ? "" : "; the device's codecs as the CPU's")}");
         return ok;
     }
 
@@ -284,6 +304,36 @@ internal static class Checks
 
         if (ok) Console.WriteLine("check block specifications   cpu    Q8_0, Q4_0, Q4_K, Q6_K blocks laid out by hand decode by the formats' formulas");
         return ok;
+    }
+
+    private sealed class CoreRun(GpuOps? ops, string what, byte[] x, byte[]? x2, byte[] output, int rows, int cols) : Bench.IFloatTypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float>
+        {
+            int n = rows * cols;
+            if (ops is null)
+            {
+                if (what == "add") { var add = new Kernels.AddVisitor(x, x2!, output, n); TN.Elementwise(ref add); }
+                else if (what == "softmax") { var s = new Kernels.SoftmaxVisitor(x, output, rows, cols); TN.Float(ref s); }
+                else { var r = new Kernels.RmsNormVisitor(x, output, rows, cols, 1e-5); TN.Float(ref r); }
+                return true;
+            }
+
+            var gpu = ops.Gpu;
+            ulong dx = gpu.Rent(x.Length), dx2 = x2 is null ? 0 : gpu.Rent(x2.Length), dy = gpu.Rent(output.Length);
+            try
+            {
+                Qiyas.Gpu.Upload<byte>(x, dx);
+                if (x2 is not null) Qiyas.Gpu.Upload<byte>(x2, dx2);
+                if (what == "add") ops.Add<TN>(dx, dx2, dy, n);
+                else if (what == "softmax") ops.Softmax<TN>(dx, dy, rows, cols);
+                else ops.RmsNorm<TN>(dx, dy, rows, cols, 1e-5);
+                Qiyas.Gpu.Synchronize();
+                Qiyas.Gpu.Download<byte>(dy, output);
+                return true;
+            }
+            finally { gpu.Return(dx); if (dx2 != 0) gpu.Return(dx2); gpu.Return(dy); }
+        }
     }
 
     private sealed class WidenRun(GpuOps ops, ulong stored, ulong lanes, int n) : Bench.IFloatTypeVisitor<bool>
@@ -929,6 +979,9 @@ internal static class Checks
     /// <summary>Every type, 37 × 1001 (rows and columns that end on no word for the packed types): reductions against float64
     /// sums (exact in the lane by the rule: integer results must match exactly, float ones within the lane's rounding),
     /// broadcasts and transposes against the type's rounding, gemv against float64 within the type's step.</summary>
+    /// <summary>Repetitions of the gates that once failed intermittently (a schedule-dependent store): raised by --repeat.</summary>
+    public static int Stress = 20;
+
     public static bool Group2(GpuOps? ops)
     {
         bool ok = true;
@@ -977,10 +1030,12 @@ internal static class Checks
                 ok &= Close(type, $"maprow:{opName}", where, output, want, R * C);
             }
 
+            // The transpose of a block format repeated: its column tasks once shared blocks and re-encoded them in schedule order.
+            for (int rep = 0, reps = Bench.Registry.IsBlock(type) ? Stress : 1; rep < reps; rep++)
             {
                 var output = new byte[data.Length];
                 Bench.Registry.With(type, new TransposeRun(ops, data, output, R, C));
-                ok &= Close(type, "transpose", where, output, References.Transpose(values, R, C), R * C);
+                if (!Close(type, rep == 0 ? "transpose" : $"transpose (repetition {rep + 1})", where, output, References.Transpose(values, R, C), R * C)) { ok = false; break; }
             }
 
             foreach (bool t in new[] { false, true })
@@ -1035,7 +1090,11 @@ internal static class Checks
                 double btol = 2 * bstep + 4 * Math.Abs(reference[i]) * Math.Pow(2, -laneMant);
                 if (Math.Abs(v - want) > btol)
                 {
-                    if (debug && worst == 0) Console.WriteLine($"  {what} {type} [{i}] got {v:R} want {want:R} ref {reference[i]:R} block max {blockMax[i / blockValues]:R}");
+                    if (debug && worst == 0)
+                    {
+                        Console.WriteLine($"  {what} {type} [{i}] got {v:R} want {want:R} ref {reference[i]:R} block max {blockMax[i / blockValues]:R}");
+                        for (int j = Math.Max(0, i - 12); j < Math.Min(n, i + 36); j++) Console.WriteLine($"    [{j}] got {got[j]:R} want {expected[j]:R}");
+                    }
                     worst = Math.Max(worst, Math.Abs(v - want) / bstep);
                 }
 
