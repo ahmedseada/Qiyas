@@ -416,6 +416,36 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
     smaller tiles: matmul_bwd and the recurrent products would gain too); CPU attention_bwd (15.6 ms float32, the
     composition) — candidates for 6j or later.
 
+- 6j part 1 (the f32 product on few-tile shapes; the 16-bit epilogue; operands read in place by the mma kernel): done,
+  reported (uncommitted until go).
+  - Split-k (`Ptx.Gemm2(split: true)`, `Ptx.SumSlices`, `GpuOps.SplitK`): a staged f32 / lane product whose 128 × 128
+    tiles are fewer than the device's multiprocessors and k ≥ 1024 takes min(k / 256, ⌈2·SMs / tiles⌉) slices in grid
+    y, each slice's partial C in its own buffer, then the slices summed in slice order (deterministic, no atomics).
+    `GpuOps.SplitSlices` forces a count for the gate. Gate: `Products` on the device also at 37 × 29 × 1100, by the
+    rule and forced to 5 slices. Mutation (SumSlices dropping the last slice) fails at 66 cells.
+  - The 16-bit epilogue (`Ptx.GemmMma(store:)`, `GpuOps.Epilogue16`): float16 / bfloat16 products on the tensor
+    route store C as the type in the kernel by `Codec.Pack` (the conversion pass's own bits), two values a 32-bit
+    store; no f32 C, no conversion pass.
+  - Operands read in place (`Ptx.GemmMma(kMajorA:, kMajorB:)`, `GpuOps.InPlace16`): a 16-bit float type in its own
+    kind at whole tiles is no longer packed. Aᵀ (k × m) and B (k × n) are read k-major: each k-block's tile copied as
+    its k-rows, the rows' 16-byte chunks XOR-swizzled by the row mod 8 (the same shared bytes as a packed tile, so
+    every configuration fits as before), the fragments by ldmatrix.trans; Bᵀ is read as its rows (it is the packed
+    layout). Gate (`Checks.Epilogues`): every tensor configuration forced, float16 and bfloat16, nn / nt / tn / tt at
+    256 × 512 × 256, padded 37 × 29 × 53, batched nt and tn (B shared): the default route equal bit for bit to the
+    operands packed and C stored in f32 and converted after. Mutation (the k-major copies without the swizzle) fails
+    at 384 cells.
+  - WDDM: the epilogue first made float16 matmul_bwd slower (0.50 → 1.1–1.28 ms) while each product was faster; a
+    synchronize between the two products restored it. Windows batches launches and submitted the second product late
+    (the removed conversion launch had happened to push the queue). `Gpu.Flush` (a non-blocking `cuStreamQuery`) after
+    each product launch submits it now.
+  - A probe (temporary, removed) timed the kernel alone at 2048³ under every configuration, packed against k-major:
+    on the 256-wide configurations a k-major operand costs about 4 % of the kernel (0.213 → 0.220–0.225 ms), on some
+    128-wide ones it is faster (64 B × 3 × 128: 0.253 → 0.217 with Aᵀ k-major). A pack is a fixed cost per operand,
+    the k-major read a share of the product: nn at 2048³ breaks even (0.227 → 0.229), smaller m gains (batched
+    16 × 512³ 0.615 → 0.520). The configuration stays measured once per kind on packed operands; measuring it per
+    orientation would gain tt about 0.008 ms — not done.
+  - Measured: see COVERAGE (the Aᵀ products row, the attention backward row, the GRU row). Errors unchanged.
+
 ## Item 5 progress
 
 - Done, reported (uncommitted until the coordinator's go). What landed:

@@ -1160,9 +1160,20 @@ internal static class Checks
             ok &= ProductsWith(null, where, 64, 48, 320, " [in place]");
         }
         else ok &= ProductsWith(ops, where, 128, 256, 128, " [in place]");
+        if (ops is not null)
+        {
+            // Split-k (item 6j): one tile of C (37 × 29 padded to 128 × 256) with k = 1100 (1152 padded): the rule's 4 slices,
+            // then 5 forced (the last slice shorter).
+            ok &= ProductsWith(ops, where, 37, 29, 1100, " [split-k]");
+            ops.SplitSlices = 5;
+            ok &= ProductsWith(ops, where, 37, 29, 1100, " [split-k 5]");
+            ops.SplitSlices = null;
+        }
+
+        if (ops is not null) ok &= Epilogues(ops);
         if (ops is not null) ok &= TensorConfigs(ops);
         ok &= BlockProducts(ops, where);
-        if (ok) Console.WriteLine($"check products               {where,-6} every type at 37 x 29 x 53, transposed, batched, and the backward pair{(ops is null ? "" : ", under every tensor kind")}; read in place at {(ops is null ? "64 x 40 x 330 and 64 x 48 x 320" : "128 x 256 x 128")}: within the product's rounding");
+        if (ok) Console.WriteLine($"check products               {where,-6} every type at 37 x 29 x 53, transposed, batched, and the backward pair{(ops is null ? "" : ", under every tensor kind")}; read in place at {(ops is null ? "64 x 40 x 330 and 64 x 48 x 320" : "128 x 256 x 128; split-k at 37 x 29 x 1100")}: within the product's rounding{(ops is null ? "" : "; the 16-bit epilogue and in-place operands equal bit for bit to packed operands and C converted after, every tensor configuration")}");
         return ok;
     }
 
@@ -1284,6 +1295,47 @@ internal static class Checks
             }
         }
 
+        return ok;
+    }
+
+    /// <summary>The 16-bit epilogue and the in-place operand reads (item 6j): float16 and bfloat16 products with C stored by
+    /// the tensor kernel and the operands read as stored (Aᵀ and B k-major, Bᵀ as rows) equal bit for bit to the operands
+    /// packed and C stored in f32 and converted after: every tensor configuration, all four orientations, padded and
+    /// batched.</summary>
+    private static bool Epilogues(GpuOps ops)
+    {
+        bool ok = true;
+        var views = new List<ProductView>();
+        foreach (bool ta in new[] { false, true }) foreach (bool tb in new[] { false, true }) views.Add(new ProductView(256, 512, 256, ta, tb));
+        views.Add(new ProductView(37, 29, 53, false, false));
+        views.Add(new ProductView(128, 256, 128, false, true, 3, 128 * 128, 256 * 128, 128 * 256));
+        views.Add(new ProductView(128, 256, 128, true, false, 3, 128 * 128, 0, 128 * 256));
+        foreach (var cfg in GpuOps.MmaConfigs)
+        {
+            ops.ForcedShape = cfg;
+            foreach (var type in new[] { "float16", "bfloat16" })
+            {
+                foreach (var v in views)
+                {
+                    var a = Bench.Registry.Make(type, (int)v.ValuesA, 51, -1, 1);
+                    var b = Bench.Registry.Make(type, (int)v.ValuesB, 52, -1, 1);
+                    var stored = new byte[Bench.Registry.Bytes(type, v.ValuesC)];
+                    var converted = new byte[stored.Length];
+                    ops.Epilogue16 = null; ops.InPlace16 = null;
+                    Bench.Registry.With(type, new ProductRun(ops, v, a, b, stored, null, null));
+                    ops.Epilogue16 = false; ops.InPlace16 = false;
+                    Bench.Registry.With(type, new ProductRun(ops, v, a, b, converted, null, null));
+                    ops.Epilogue16 = null; ops.InPlace16 = null;
+                    if (!stored.AsSpan().SequenceEqual(converted))
+                    {
+                        Console.WriteLine($"check product epilogue {v.M}x{v.N}x{v.K}{(v.TransA ? " At" : "")}{(v.TransB ? " Bt" : "")}{(v.Batch > 1 ? $" batch {v.Batch}" : "")} [rows {cfg.RowBytes} B x {cfg.Stages} stages x {cfg.Bn} wide{(cfg.Swizzle ? " swizzled" : "")}] device {type,-12} DIFFERS from the operands packed and C converted after");
+                        ok = false;
+                    }
+                }
+            }
+        }
+
+        ops.ForcedShape = null;
         return ok;
     }
 

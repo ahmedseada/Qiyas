@@ -47,6 +47,7 @@ internal static unsafe partial class Driver
     [LibraryImport(Library)] public static partial int cuDevicePrimaryCtxRetain(out IntPtr context, int device);
     [LibraryImport(Library)] public static partial int cuCtxSetCurrent(IntPtr context);
     [LibraryImport(Library)] public static partial int cuCtxSynchronize();
+    [LibraryImport(Library)] public static partial int cuStreamQuery(IntPtr stream);
     [LibraryImport(Library)] public static partial int cuModuleLoadDataEx(out IntPtr module, byte* image, uint options, int* keys, void** values);
     [LibraryImport(Library)] public static partial int cuModuleGetFunction(out IntPtr function, IntPtr module, byte* name);
     [LibraryImport(Library)] public static partial int cuModuleUnload(IntPtr module);
@@ -255,6 +256,11 @@ public sealed unsafe partial class Gpu : IDisposable
     public static void Clear(ulong destination, long bytes) => Driver.Check(Driver.cuMemsetD8(destination, 0, (nuint)bytes), "cuMemsetD8");
 
     public static void Synchronize() => Driver.Check(Driver.cuCtxSynchronize(), "cuCtxSynchronize");
+
+    /// <summary>Hands the launches queued so far to the device without waiting for them (a query of the default stream:
+    /// on Windows (WDDM) the driver batches launches and submits them late otherwise — item 6j: a 4096³ float16 product
+    /// whose launches waited queued read 1.1 ms for 0.5). Its answer (done or still running) is not used.</summary>
+    public static void Flush() => _ = Driver.cuStreamQuery(IntPtr.Zero);
 
     /// <summary>The most threads a block of <paramref name="function"/> can be launched with, as the driver reports for this
     /// device (the kernel's registers per thread against the multiprocessor's, and the device's own limit).</summary>

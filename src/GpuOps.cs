@@ -504,13 +504,23 @@ public sealed partial class GpuOps(Gpu gpu)
         return (k + chunk - 1) / chunk * chunk;
     }
 
-    private IntPtr MmaFunction(Ptx.Kind kind, out uint shared, out int bn)
+    private IntPtr MmaFunction(Ptx.Kind kind, out uint shared, out int bn, Fmt? store = null, bool kMajorA = false, bool kMajorB = false)
     {
         var cfg = MmaShape(kind) ?? throw new InvalidOperationException($"{kind.Name}: no tensor kernel on this device");
         shared = Dynamic(Ptx.MmaShared(cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle));
         bn = cfg.Bn;
-        return gpu.Cached($"mma:{kind.Tag}:{cfg}", (out string e) => Ptx.GemmMma(gpu, kind, cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle, out e));
+        var fn = gpu.Cached($"mma:{kind.Tag}:{cfg}:{store?.Name}:{kMajorA}:{kMajorB}", (out string e) => Ptx.GemmMma(gpu, kind, cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle, out e, store, kMajorA, kMajorB));
+        gpu.AllowShared(fn, Ptx.MmaShared(cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle));
+        return fn;
     }
+
+    /// <summary>The gate's override: false stores a 16-bit float product's C in f32 and converts it after (the pass the
+    /// epilogue replaces).</summary>
+    public bool? Epilogue16;
+
+    /// <summary>The gate's override: false packs a 16-bit float product's operands even where the tensor kernel reads them
+    /// as stored (the passes the in-place reads replace).</summary>
+    public bool? InPlace16;
 
     // Shared bytes to ask for at launch: only what a kernel declares as extern (beyond the static limit).
     private static uint Dynamic(int bytes) => bytes > Ptx.StaticShared ? (uint)bytes : 0;
@@ -611,22 +621,38 @@ public sealed partial class GpuOps(Gpu gpu)
                 // A's rows as stored already have the kind's layout when the type is the kind and k is whole blocks.
                 bool aAsIs = f.Bits == kind.Bits && kp == k && (f.IsFloat == kind.IsFloat) && (!f.IsFloat || f.Is(kind == Ptx.Kind.F16 ? "float16" : "bfloat16"));
                 long t0 = Phases is null ? 0 : Stopwatch.GetTimestamp();
-                ulong pa = aAsIs && !transA ? a : Pack(f, kind, a, m, k, kp, transposed: transA, rented);
+                // A 16-bit float type in its own kind at whole k-blocks: the tensor kernel reads both operands as stored (Aᵀ and
+                // B k-major by ldmatrix.trans, Bᵀ as its packed rows), no packing pass.
+                bool inPlace = InPlace16 != false && aAsIs && kind.Bits == 16 && laneName.EndsWith("mma", StringComparison.Ordinal);
+                bool kMajorA = inPlace && transA, kMajorB = inPlace && !transB;
+                ulong pa = (aAsIs && !transA) || kMajorA ? a : Pack(f, kind, a, m, k, kp, transposed: transA, rented);
                 t0 = Mark(t0, 0);
-                ulong pb = Pack(f, kind, b, n, k, kp, transposed: !transB, rented);
+                ulong pb = inPlace ? b : Pack(f, kind, b, n, k, kp, transposed: !transB, rented);
                 t0 = Mark(t0, 1);
                 bool cAsIs = f.Bits == 32 && f.IsFloat == lane.IsFloat;
+                if (laneName.EndsWith("mma", StringComparison.Ordinal) && Epilogue16 != false && (f.Is("float16") || f.Is("bfloat16")))
+                {
+                    // The 16-bit epilogue: C stored as the type by the kernel (no f32 C, no conversion pass).
+                    var fe = MmaFunction(kind, out uint sharedE, out int bnE, f, kMajorA, kMajorB);
+                    Gpu.Launch(fe, Grid(n, bnE), Grid(m, 128), Ptx.GemmThreads, 1, sharedE, pa, pb, c, Gpu.U(m), Gpu.U(n), Gpu.U(kp), Gpu.U(kp));
+                    Gpu.Flush();                                       // the product submitted now, not batched behind later launches
+                    Mark(Mark(t0, 2), 3);
+                    return laneName;
+                }
+
                 ulong lc = cAsIs ? c : gpu.Rent((long)m * n * 4);
                 if (!cAsIs) rented.Add(lc);
                 if (laneName.EndsWith("mma", StringComparison.Ordinal))
                 {
-                    var fn = MmaFunction(kind, out uint shared, out int bn);
+                    var fn = MmaFunction(kind, out uint shared, out int bn, null, kMajorA, kMajorB);
                     Gpu.Launch(fn, Grid(n, bn), Grid(m, 128), Ptx.GemmThreads, 1, shared, pa, pb, lc, Gpu.U(m), Gpu.U(n), Gpu.U(kp), Gpu.U(kp));
+                    Gpu.Flush();
                 }
                 else
                 {
                     var fn = gpu.Cached($"dp4a:{f.Signed}", (out string e) => Ptx.GemmDot(gpu, f.Signed, out e));
                     Gpu.Launch(fn, Grid(n, 128), Grid(m, 128), Ptx.GemmThreads, 1, 0, pa, pb, lc, Gpu.U(m), Gpu.U(n), Gpu.U(kp / 4));
+                    Gpu.Flush();
                 }
 
                 t0 = Mark(t0, 2);
@@ -646,9 +672,26 @@ public sealed partial class GpuOps(Gpu gpu)
             {
                 // The staged kernel: its pipeline depth measured on the device once per lane.
                 int stages = Gemm2Stages(lane, la, lb, lcl, m, n, k);
-                var g2 = gpu.Cached($"gemm2:{lane.Name}:{stages}", (out string e) => Ptx.Gemm2(gpu, lane, stages, out e));
-                gpu.AllowShared(g2, Ptx.Gemm2Shared(stages));
-                Gpu.Launch(g2, Grid(n, 128), Grid(m, 128), Ptx.GemmThreads, 1, Dynamic(Ptx.Gemm2Shared(stages)), la, lb, lcl, Gpu.U(m), Gpu.U(n), Gpu.U(k));
+                int slices = SplitK(m, n, k, out int sliceBlocks);
+                if (slices > 1)
+                {
+                    // Split-k: too few tiles of C to fill the device; the slices' partial C joined in order.
+                    var gk = gpu.Cached($"gemm2:{lane.Name}:{stages}:k", (out string e) => Ptx.Gemm2(gpu, lane, stages, out e, split: true));
+                    gpu.AllowShared(gk, Ptx.Gemm2Shared(stages));
+                    ulong parts = gpu.Rent((long)slices * m * n * lane.Size);
+                    rented.Add(parts);
+                    Gpu.Launch(gk, Grid(n, 128), Grid(m, 128) * (uint)slices, Ptx.GemmThreads, 1, Dynamic(Ptx.Gemm2Shared(stages)), la, lb, parts, Gpu.U(m), Gpu.U(n), Gpu.U(k), Gpu.U((int)Grid(m, 128)), Gpu.U(sliceBlocks));
+                    Gpu.Flush();
+                    var join = gpu.Cached($"sum_slices:{lane.Name}", (out string e) => Ptx.SumSlices(gpu, lane, out e));
+                    Gpu.Launch(join, Grid((long)m * n / 4, 256), 1, 256, 1, 0, parts, lcl, Gpu.U(m * n), Gpu.U(slices));
+                }
+                else
+                {
+                    var g2 = gpu.Cached($"gemm2:{lane.Name}:{stages}", (out string e) => Ptx.Gemm2(gpu, lane, stages, out e));
+                    gpu.AllowShared(g2, Ptx.Gemm2Shared(stages));
+                    Gpu.Launch(g2, Grid(n, 128), Grid(m, 128), Ptx.GemmThreads, 1, Dynamic(Ptx.Gemm2Shared(stages)), la, lb, lcl, Gpu.U(m), Gpu.U(n), Gpu.U(k));
+                    Gpu.Flush();
+                }
             }
             else
             {
@@ -656,6 +699,7 @@ public sealed partial class GpuOps(Gpu gpu)
                 var g = gpu.Cached($"gemm:{lane.Name}:{micro}", (out string e) => Ptx.Gemm(gpu, lane, micro, out e));
                 int tile = micro * 16;
                 Gpu.Launch(g, Grid(n, tile), Grid(m, tile), Ptx.GemmThreads, 1, 0, la, lb, lcl, Gpu.U(m), Gpu.U(n), Gpu.U(k));
+                Gpu.Flush();
             }
             if (!direct) Back(f, lane, lcl, c, (long)m * n);
             return laneName;
@@ -664,6 +708,22 @@ public sealed partial class GpuOps(Gpu gpu)
         {
             foreach (var p in rented) gpu.Return(p);
         }
+    }
+
+    /// <summary>The gate's override of split-k's slice count (null: SplitK's rule).</summary>
+    public int? SplitSlices;
+
+    /// <summary>Split-k's slices for a staged product (item 6j): 1 unless C's 128 × 128 tiles are fewer than the device's
+    /// multiprocessors and k is at least 1024; then enough slices for two tiles a multiprocessor, each at least 256 of k
+    /// (whole 16-value blocks: sliceBlocks a slice).</summary>
+    private int SplitK(int m, int n, int k, out int sliceBlocks)
+    {
+        int tiles = (int)(Grid(n, 128) * Grid(m, 128)), kBlocks = (k + 15) / 16, sms = gpu.Multiprocessors;
+        int slices = SplitSlices ?? (tiles >= sms || k < 1024 ? 1 : Math.Min(k / 256, (2 * sms + tiles - 1) / tiles));
+        slices = Math.Clamp(slices, 1, kBlocks);
+        sliceBlocks = (kBlocks + slices - 1) / slices;
+        slices = (kBlocks + sliceBlocks - 1) / sliceBlocks;
+        return slices;
     }
 
     // The tensor or dot kind of a packed lane ("s8mma", "u8dp", …) at k terms.
