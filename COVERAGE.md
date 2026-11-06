@@ -36,6 +36,42 @@ Device buffers come from a size-keyed pool: after a shape's first call no driver
 the cost of a rent/return pair (tens of nanoseconds). That pool is the arena the plan asked for; a bump-allocated scope
 per operation would save the remaining lookup and is the step past it.
 
+## State (2026-11-06, branch `coverage-wip`, commit "block formats, bool, …")
+
+Written so the next session continues from the files alone. The tree builds (Release, 0 errors) and `guard.sh` reports
+zero hits.
+
+**Green, confirmed in a full run on both devices:** every gate in `Checks` for the 17 plain types (the groups
+element-wise, reductions, rows, layout, view products and backward, attention with spans, convolution, optimizers,
+recurrent incl. LSTM sequences, routing, argmax per column, adaptive-pool backward), the block specifications
+(`BlockSpecifications`: blocks laid out by hand decode by the formulas of all four formats) and the block round trips
+(`BlockFormats`) on both devices, the sliced f64 proofs, `--report` on both devices.
+
+**Green on the CPU, in the last full-type CPU gate process:** every CPU gate over Q8_0, Q4_0, Q4_K, Q6_K and bool
+(reductions, rows, layouts, products incl. the block gemv fast path, attention, optimizers, conv, recurrent, routing).
+
+**Unconfirmed / open:**
+
+1. `check transpose cpu q6_k DIFFERS by 31.78 steps` — intermittent (one process of several): the CPU transpose's
+   column tasks store partial Q6_K blocks and re-encode them; which task re-encodes a block last depends on the schedule.
+   The fix drafted (not applied, not run) chunks the transpose's column tasks on whole storage units with
+   `RowChunk<TN>` as the row operations already do — see `docs/wip/k-block-encoders.py`, the `Reduce.cs` edit.
+2. Device encoders for Q4_K and Q6_K: `Ptx.LanesToBlock` throws `NotSupportedException` for them, so the device gates of
+   groups that store value by value into those two types stop at the first store (`GpuOps.MapRow → Back → LanesToBlock`);
+   on the device Q4_K and Q6_K are confirmed as inputs only. The drafted thread-per-block PTX encoders (ports of
+   `Blocks.EncodeQ4_K` / `EncodeQ6_K`, step for step, with the same f16 rounding of the scales) are in
+   `docs/wip/k-block-encoders.py`: a patch script run as `python docs/wip/k-block-encoders.py .` that edits
+   `src/Ptx.Blocks.cs`, `src/Reduce.cs`, `src/Checks.cs` (the device-encode equality check extended to the K formats)
+   and this file. It has not been built or run: after applying it, build, run `cpu` then `cuda` gates with
+   `--types q8_0,q4_0,q4_k,q6_k,bool,float32` and compare the device's bytes with the CPU's in `BlockFormats`.
+3. After 1 and 2 are green: the regression gate `python docs/wip/compare.py docs/wip/baseline.md <new run>` for the
+   core rows on `cuda,cpu` (> 5 % slower or error growth = regression); then bench rows over the block types and bool.
+4. The CPU int4 matmul `ArgumentOutOfRangeException` seen once in a full run, not reproduced in three targeted runs:
+   `--types int4 --ops matmul --repeat 20` is the stress option drafted for it; explain or reproduce before closing.
+5. The todo rows below: flash-fused attention rows, ctc, the GRU sequence bench row, the block-scaled tiled product,
+   fusing the transposition into the product's packing, the radix step of scatter-add, and a bump-allocated scope past
+   the pool.
+
 ## Known slow
 
 Measured cells that are correct but below what the device or the lanes allow; each is addressed at a natural point
