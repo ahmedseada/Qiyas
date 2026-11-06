@@ -74,10 +74,12 @@ internal static partial class Kernels
         var outLanes = MemoryMarshal.Cast<byte, TAcc>(result.AsSpan());
         if (axis == Axis.Cols)
         {
-            // Columns across the team; each takes all rows, g at a time (one word of g values per column).
-            int chunk = Math.Max(Vector<TAcc>.Count * 4, (cols + Threads - 1) / Threads / Vector<TAcc>.Count * Vector<TAcc>.Count);
-            var body = new ColumnSumBody<TN, TIn, TAcc, TL>(x, result, rows, cols, g, squares);
-            Team.For(cols, chunk, (long)rows * cols, body);
+            // Tiles of a strip of columns by a block of rows (ColumnPlan), g rows at a time (one word of g values per
+            // column); the blocks' sums joined in block order.
+            var plan = ColumnPlan.Of<TAcc>(rows, cols, g);
+            var dst = plan.Blocks == 1 ? result : plan.Partials<TAcc>(cols);
+            Team.For(plan.Tasks, 1, (long)rows * cols, new ColumnTiles<ColumnSumTile<TN, TIn, TAcc, TL>>(new(x, dst, cols, g, squares), plan, rows, cols));
+            if (plan.Blocks > 1) Join<TAcc, TL>(dst, plan.Blocks, cols, result, JoinOp.Add);
             return result;
         }
 
@@ -203,53 +205,143 @@ internal static partial class Kernels
         }
     }
 
-    private struct ColumnSumBody<TN, TIn, TAcc, TL>(byte[] x, byte[] result, int rows, int cols, int g, bool squares) : Team.IBody
-        where TN : struct, IQiyasNumber<TN, TIn>, IQiyasNumber<TN, TAcc> where TIn : unmanaged where TAcc : unmanaged where TL : struct, IQiyasLane<TL, TAcc>
+    // ---------------------------------------------------------------- column passes (6h)
+
+    /// <summary>A pass down the columns as tiles: a strip of columns (about 8 KB of accumulators, in L1, each row's part
+    /// read as one contiguous run) by a block of rows (whole words of g rows), at least four tiles a thread when the
+    /// shape allows (cores of unequal speed balance through the team's counter); each block's results in its own slot,
+    /// joined in block order (the same result whatever the schedule).</summary>
+    private readonly record struct ColumnPlan(int Strip, int Strips, int RowBlock, int Blocks)
+    {
+        public int Tasks => Strips * Blocks;
+
+        public static ColumnPlan Of<TAcc>(int rows, int cols, int g) where TAcc : unmanaged
+        {
+            int w = Vector<TAcc>.Count;
+            int strip = Math.Max(1, Math.Min(cols, Math.Max(4 * w, 8192 / Unsafe.SizeOf<TAcc>() / w * w)));
+            int strips = (cols + strip - 1) / strip;
+            int minRows = Math.Max(16, g) / g * g;                              // a block at least 16 rows (partials ≤ 1/16 of the input)
+            int blocks = Math.Clamp((Threads * 4 + strips - 1) / Math.Max(1, strips), 1, Math.Max(1, (rows + minRows - 1) / minRows));
+            int rowBlock = Math.Max(g, ((rows + blocks - 1) / blocks + g - 1) / g * g);
+            blocks = Math.Max(1, (rows + rowBlock - 1) / rowBlock);
+            return new ColumnPlan(strip, strips, rowBlock, blocks);
+        }
+
+        /// <summary>Blocks × cols lanes for the blocks' results (every value written by its tile).</summary>
+        public byte[] Partials<TAcc>(int cols) where TAcc : unmanaged => new byte[checked((long)Blocks * cols * Unsafe.SizeOf<TAcc>())];
+    }
+
+    private interface IColumnTile
+    {
+        /// <summary>Rows [r0, r1) of columns [c0, c1) into the block's slot (values block·cols + c0 ..).</summary>
+        void Tile(int r0, int r1, int c0, int c1, int block);
+    }
+
+    private struct ColumnTiles<TB>(TB tile, ColumnPlan plan, int rows, int cols) : Team.IBody where TB : struct, IColumnTile
+    {
+        public readonly void Run(int first, int last)
+        {
+            for (int t = first; t < last; t++)
+            {
+                int s = t % plan.Strips, b = t / plan.Strips, c0 = s * plan.Strip, r0 = b * plan.RowBlock;
+                tile.Tile(r0, Math.Min(rows, r0 + plan.RowBlock), c0, Math.Min(cols, c0 + plan.Strip), b);
+            }
+        }
+    }
+
+    private enum JoinOp { Add, Max, Min }
+
+    // The blocks' results joined in block order into dst (cols lanes): the sums added, the extremes compared as the rows were.
+    private static void Join<TAcc, TL>(byte[] partials, int blocks, int cols, byte[] dst, JoinOp op) where TAcc : unmanaged where TL : struct, IQiyasLane<TL, TAcc>
+    {
+        int w = Vector<TAcc>.Count, chunk = Math.Max(16 * w, cols / (Threads * 2) / w * w);
+        Team.For(cols, chunk, (long)blocks * cols, new JoinBody<TAcc, TL>(partials, blocks, cols, dst, op));
+    }
+
+    private struct JoinBody<TAcc, TL>(byte[] partials, int blocks, int cols, byte[] dst, JoinOp op) : Team.IBody
+        where TAcc : unmanaged where TL : struct, IQiyasLane<TL, TAcc>
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public readonly void Run(int first, int last)
         {
-            int n = last - first, w = Vector<TAcc>.Count;
-            var outLanes = MemoryMarshal.Cast<byte, TAcc>(result.AsSpan()).Slice(first, n);
-            var pool = ArrayPool<TIn>.Shared;
-            var rowsIn = pool.Rent(g * n);
-            var accPool = ArrayPool<TAcc>.Shared;
-            var units = accPool.Rent(n);
-            var acc = accPool.Rent(n);
-            try
+            int w = Vector<TAcc>.Count;
+            var p = MemoryMarshal.Cast<byte, TAcc>(partials.AsSpan());
+            var o = MemoryMarshal.Cast<byte, TAcc>(dst.AsSpan());
+            ref TAcc rp = ref MemoryMarshal.GetReference(p);
+            ref TAcc ro = ref MemoryMarshal.GetReference(o);
+            int i = first;
+            for (; i + w <= last; i += w)
             {
-                acc.AsSpan(0, n).Clear();
-                var ones = new Vector<TAcc>(Ones<TIn, TAcc>());
-                for (int r0 = 0; r0 < rows; r0 += g)
+                var v = Vector.LoadUnsafe(ref rp, (nuint)i);
+                for (int b = 1; b < blocks; b++)
                 {
-                    int have = Math.Min(g, rows - r0);
+                    var u = Vector.LoadUnsafe(ref rp, (nuint)((long)b * cols + i));
+                    v = op == JoinOp.Add ? TL.Add(v, u) : op == JoinOp.Max ? TL.Max(v, u) : TL.Min(v, u);
+                }
+
+                v.StoreUnsafe(ref ro, (nuint)i);
+            }
+
+            for (; i < last; i++)
+            {
+                TAcc v = p[i];
+                for (int b = 1; b < blocks; b++)
+                {
+                    TAcc u = p[b * cols + i];
+                    v = op == JoinOp.Add ? TL.Add(v, u) : op == JoinOp.Max ? (Widths.Compare(u, v) > 0 ? u : v) : (Widths.Compare(u, v) < 0 ? u : v);
+                }
+
+                o[i] = v;
+            }
+        }
+    }
+
+    // Column sums (or sums of squares) of a tile: g rows a word (loaded and interleaved), or in place where the stored
+    // values are the lane's (g = 1).
+    private readonly struct ColumnSumTile<TN, TIn, TAcc, TL>(byte[] x, byte[] dst, int cols, int g, bool squares) : IColumnTile
+        where TN : struct, IQiyasNumber<TN, TIn>, IQiyasNumber<TN, TAcc> where TIn : unmanaged where TAcc : unmanaged where TL : struct, IQiyasLane<TL, TAcc>
+    {
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public void Tile(int r0, int r1, int c0, int c1, int block)
+        {
+            int n = c1 - c0, w = Vector<TAcc>.Count;
+            var acc = MemoryMarshal.Cast<byte, TAcc>(dst.AsSpan()).Slice(block * cols + c0, n);
+            acc.Clear();
+            var ones = new Vector<TAcc>(Ones<TIn, TAcc>());
+            bool direct = g == 1 && Lanes.Direct<TN, TIn>();
+            var rowsIn = direct ? null : ArrayPool<TIn>.Shared.Rent(g * n);
+            var units = direct ? null : ArrayPool<TAcc>.Shared.Rent(n);
+            ref TAcc ra = ref MemoryMarshal.GetReference(acc);
+            for (int r = r0; r < r1; r += g)
+            {
+                ReadOnlySpan<TAcc> u;
+                if (direct) u = MemoryMarshal.Cast<byte, TAcc>(x.AsSpan()).Slice(r * cols + c0, n);
+                else
+                {
+                    int have = Math.Min(g, r1 - r);
                     for (int t = 0; t < g; t++)
                     {
-                        var dst = rowsIn.AsSpan(t * n, n);
-                        if (t < have) TN.Load(x, (r0 + t) * cols + first, dst); else dst.Clear();
+                        var d = rowsIn.AsSpan(t * n, n);
+                        if (t < have) TN.Load(x, (r + t) * cols + c0, d); else d.Clear();
                     }
 
                     Interleave<TIn, TAcc>(rowsIn.AsSpan(0, g * n), units.AsSpan(0, n), n);
-                    ref TAcc ru = ref MemoryMarshal.GetArrayDataReference(units);
-                    ref TAcc ra = ref MemoryMarshal.GetArrayDataReference(acc);
-                    int i = 0;
-                    for (; i + w <= n; i += w)
-                    {
-                        var u = Vector.LoadUnsafe(ref ru, (nuint)i);
-                        TL.Fma(u, squares ? u : ones, Vector.LoadUnsafe(ref ra, (nuint)i)).StoreUnsafe(ref ra, (nuint)i);
-                    }
-
-                    for (; i < n; i++) acc[i] = TL.Fma(units[i], squares ? units[i] : ones[0], acc[i]);
+                    u = units.AsSpan(0, n);
                 }
 
-                acc.AsSpan(0, n).CopyTo(outLanes);
+                ref TAcc ru = ref MemoryMarshal.GetReference(u);
+                int i = 0;
+                for (; i + w <= n; i += w)
+                {
+                    var v = Vector.LoadUnsafe(ref ru, (nuint)i);
+                    TL.Fma(v, squares ? v : ones, Vector.LoadUnsafe(ref ra, (nuint)i)).StoreUnsafe(ref ra, (nuint)i);
+                }
+
+                for (; i < n; i++) acc[i] = TL.Fma(u[i], squares ? u[i] : ones[0], acc[i]);
             }
-            finally
-            {
-                pool.Return(rowsIn);
-                accPool.Return(units);
-                accPool.Return(acc);
-            }
+
+            if (rowsIn is not null) ArrayPool<TIn>.Shared.Return(rowsIn);
+            if (units is not null) ArrayPool<TAcc>.Shared.Return(units);
         }
     }
 
@@ -268,18 +360,26 @@ internal static partial class Kernels
             if (axis == Axis.Whole) { r = 1; c = rows * cols; }
             if (axis == Axis.Cols && op == "argmax")
             {
+                // Tiles (ColumnPlan): each block's first largest and its row, then the blocks in order (a later block's
+                // only when strictly larger: the first row holding the column's largest, as the rows read in order).
                 Result = new byte[c * 4];
                 Lane = "s32 index";
-                var body = new ColumnArgmaxBody<TN, TLane>(x, Result, r, c);
-                Team.For(c, Math.Max(64, (c + Threads - 1) / Threads), (long)r * c, body);
+                var plan = ColumnPlan.Of<TLane>(r, c, 1);
+                var values = plan.Partials<TLane>(c);
+                var rowsAt = plan.Partials<int>(c);
+                Team.For(plan.Tasks, 1, (long)r * c, new ColumnTiles<ColumnArgmaxTile<TN, TLane, TL>>(new(x, values, rowsAt, c), plan, r, c));
+                Team.For(c, Math.Max(256, c / (Threads * 2)), (long)plan.Blocks * c, new ArgmaxJoinBody<TLane>(values, rowsAt, plan.Blocks, c, Result));
                 return;
             }
 
             if (axis == Axis.Cols)
             {
+                // Tiles (ColumnPlan), the blocks' extremes joined in block order.
                 Result = new byte[c * Unsafe.SizeOf<TLane>()];
-                var body = new ColumnCompareBody<TN, TLane, TL>(x, Result, r, c, max);
-                Team.For(c, Math.Max(Vector<TLane>.Count * 4, (c + Threads - 1) / Threads), (long)r * c, body);
+                var plan = ColumnPlan.Of<TLane>(r, c, 1);
+                var dst = plan.Blocks == 1 ? Result : plan.Partials<TLane>(c);
+                Team.For(plan.Tasks, 1, (long)r * c, new ColumnTiles<ColumnCompareTile<TN, TLane, TL>>(new(x, dst, c, max), plan, r, c));
+                if (plan.Blocks > 1) Join<TLane, TL>(dst, plan.Blocks, c, Result, max ? JoinOp.Max : JoinOp.Min);
                 return;
             }
 
@@ -417,69 +517,114 @@ internal static partial class Kernels
         }
     }
 
-    /// <summary>The first largest value's row index of each column (s32), the rows read in order.</summary>
-    private struct ColumnArgmaxBody<TN, TLane>(byte[] x, byte[] result, int rows, int cols) : Team.IBody
-        where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged
+    /// <summary>A tile's first largest value of each column and its row, the rows read in order: a row's value taken
+    /// only when the type's order puts it strictly above the column's best so far (float: CompareTo, NaN below every
+    /// number, ±0 equal). A vector compare a row gives exactly those lanes (above by the lane's compare, or the best a
+    /// NaN and the value not): 4-byte lanes take value and row by it; other lanes take the vectors it marks by the type's
+    /// order, value by value. In place where the stored values are the lane's.</summary>
+    private readonly struct ColumnArgmaxTile<TN, TLane, TL>(byte[] x, byte[] values, byte[] rowsAt, int cols) : IColumnTile
+        where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasLane<TL, TLane>
     {
-        public readonly void Run(int first, int last)
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public void Tile(int r0, int r1, int c0, int c1, int block)
         {
-            int n = last - first;
-            var pool = ArrayPool<TLane>.Shared;
-            var row = pool.Rent(n);
-            var best = pool.Rent(n);
-            var at = ArrayPool<int>.Shared.Rent(n);
-            try
+            int n = c1 - c0, w = Vector<TLane>.Count;
+            var best = MemoryMarshal.Cast<byte, TLane>(values.AsSpan()).Slice(block * cols + c0, n);
+            var at = MemoryMarshal.Cast<byte, int>(rowsAt.AsSpan()).Slice(block * cols + c0, n);
+            var row = TN.Direct ? null : ArrayPool<TLane>.Shared.Rent(n);
+            ReadOnlySpan<TLane> stored = TN.Direct ? MemoryMarshal.Cast<byte, TLane>(x.AsSpan()) : default;
+            if (TN.Direct) stored.Slice(r0 * cols + c0, n).CopyTo(best); else TN.Load(x, r0 * cols + c0, best);
+            at.Fill(r0);
+            ref TLane rb = ref MemoryMarshal.GetReference(best);
+            for (int r = r0 + 1; r < r1; r++)
             {
-                for (int r = 0; r < rows; r++)
+                ReadOnlySpan<TLane> s;
+                if (TN.Direct) s = stored.Slice(r * cols + c0, n);
+                else { TN.Load(x, r * cols + c0, row.AsSpan(0, n)); s = row.AsSpan(0, n); }
+                ref TLane rs = ref MemoryMarshal.GetReference(s);
+                int i = 0;
+                if (Unsafe.SizeOf<TLane>() == 4)
                 {
-                    TN.Load(x, r * cols + first, row.AsSpan(0, n));
-                    for (int i = 0; i < n; i++)
+                    // 4-byte lanes: the rows beside the values (a lane of int each), both taken by the mask, no branch.
+                    ref int ra = ref MemoryMarshal.GetReference(at);
+                    var rv = new Vector<int>(r);
+                    for (; i + w <= n; i += w)
                     {
-                        if (r == 0 || Widths.Compare(row[i], best[i]) > 0) { best[i] = row[i]; at[i] = r; }
+                        var v = Vector.LoadUnsafe(ref rs, (nuint)i);
+                        var b = Vector.LoadUnsafe(ref rb, (nuint)i);
+                        var above = TL.Greater(v, b) | Vector.AndNot(TL.Equal(v, v), TL.Equal(b, b));
+                        Vector.ConditionalSelect(above, v, b).StoreUnsafe(ref rb, (nuint)i);
+                        Vector.ConditionalSelect(Vector.As<TLane, int>(above), rv, Vector.LoadUnsafe(ref ra, (nuint)i)).StoreUnsafe(ref ra, (nuint)i);
                     }
                 }
 
-                MemoryMarshal.Cast<byte, int>(result.AsSpan()).Slice(first, n).Clear();
-                at.AsSpan(0, n).CopyTo(MemoryMarshal.Cast<byte, int>(result.AsSpan()).Slice(first, n));
+                for (; i + w <= n; i += w)
+                {
+                    var v = Vector.LoadUnsafe(ref rs, (nuint)i);
+                    var b = Vector.LoadUnsafe(ref rb, (nuint)i);
+                    // Above, or the best not equal to itself (a NaN) where the value is: exactly the lanes CompareTo puts
+                    // above (an integer lane equals itself: only the first term).
+                    var above = TL.Greater(v, b) | Vector.AndNot(TL.Equal(v, v), TL.Equal(b, b));
+                    if (above == Vector<TLane>.Zero) continue;
+                    for (int l = i; l < i + w; l++) if (Widths.Compare(s[l], best[l]) > 0) { best[l] = s[l]; at[l] = r; }
+                }
+
+                for (; i < n; i++) if (Widths.Compare(s[i], best[i]) > 0) { best[i] = s[i]; at[i] = r; }
             }
-            finally
+
+            if (row is not null) ArrayPool<TLane>.Shared.Return(row);
+        }
+    }
+
+    // The blocks' first largest joined in block order: a later block's only when strictly larger.
+    private struct ArgmaxJoinBody<TLane>(byte[] values, byte[] rowsAt, int blocks, int cols, byte[] result) : Team.IBody where TLane : unmanaged
+    {
+        public readonly void Run(int first, int last)
+        {
+            var v = MemoryMarshal.Cast<byte, TLane>(values.AsSpan());
+            var a = MemoryMarshal.Cast<byte, int>(rowsAt.AsSpan());
+            var o = MemoryMarshal.Cast<byte, int>(result.AsSpan());
+            for (int c = first; c < last; c++)
             {
-                pool.Return(row); pool.Return(best); ArrayPool<int>.Shared.Return(at);
+                TLane best = v[c];
+                int at = a[c];
+                for (int b = 1; b < blocks; b++)
+                {
+                    if (Widths.Compare(v[b * cols + c], best) > 0) { best = v[b * cols + c]; at = a[b * cols + c]; }
+                }
+
+                o[c] = at;
             }
         }
     }
 
-    private struct ColumnCompareBody<TN, TLane, TL>(byte[] x, byte[] result, int rows, int cols, bool max) : Team.IBody
+    // A tile's column extremes: TL.Max / TL.Min on whole vectors, the type's order on the rest (as the rows' pass), in
+    // place where the stored values are the lane's.
+    private readonly struct ColumnCompareTile<TN, TLane, TL>(byte[] x, byte[] dst, int cols, bool max) : IColumnTile
         where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasLane<TL, TLane>
     {
-        public readonly void Run(int first, int last)
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public void Tile(int r0, int r1, int c0, int c1, int block)
         {
-            int n = last - first, w = Vector<TLane>.Count;
-            var o = MemoryMarshal.Cast<byte, TLane>(result.AsSpan()).Slice(first, n);
-            var pool = ArrayPool<TLane>.Shared;
-            var row = pool.Rent(n);
-            try
+            int n = c1 - c0, w = Vector<TLane>.Count;
+            var o = MemoryMarshal.Cast<byte, TLane>(dst.AsSpan()).Slice(block * cols + c0, n);
+            var row = TN.Direct ? null : ArrayPool<TLane>.Shared.Rent(n);
+            ReadOnlySpan<TLane> stored = TN.Direct ? MemoryMarshal.Cast<byte, TLane>(x.AsSpan()) : default;
+            if (TN.Direct) stored.Slice(r0 * cols + c0, n).CopyTo(o); else TN.Load(x, r0 * cols + c0, o);
+            ref TLane ro = ref MemoryMarshal.GetReference(o);
+            for (int r = r0 + 1; r < r1; r++)
             {
-                TN.Load(x, first, row.AsSpan(0, n));
-                row.AsSpan(0, n).CopyTo(o);
-                for (int r = 1; r < rows; r++)
-                {
-                    TN.Load(x, r * cols + first, row.AsSpan(0, n));
-                    int i = 0;
-                    for (; i + w <= n; i += w)
-                    {
-                        var a = new Vector<TLane>(o[i..]);
-                        var v = new Vector<TLane>(row.AsSpan(i));
-                        (max ? TL.Max(a, v) : TL.Min(a, v)).CopyTo(o[i..]);
-                    }
+                ReadOnlySpan<TLane> s;
+                if (TN.Direct) s = stored.Slice(r * cols + c0, n);
+                else { TN.Load(x, r * cols + c0, row.AsSpan(0, n)); s = row.AsSpan(0, n); }
+                ref TLane rs = ref MemoryMarshal.GetReference(s);
+                int i = 0;
+                if (max) for (; i + w <= n; i += w) TL.Max(Vector.LoadUnsafe(ref ro, (nuint)i), Vector.LoadUnsafe(ref rs, (nuint)i)).StoreUnsafe(ref ro, (nuint)i);
+                else for (; i + w <= n; i += w) TL.Min(Vector.LoadUnsafe(ref ro, (nuint)i), Vector.LoadUnsafe(ref rs, (nuint)i)).StoreUnsafe(ref ro, (nuint)i);
+                for (; i < n; i++) if (max ? Widths.Compare(s[i], o[i]) > 0 : Widths.Compare(s[i], o[i]) < 0) o[i] = s[i];
+            }
 
-                    for (; i < n; i++) if (max ? Widths.Compare(row[i], o[i]) > 0 : Widths.Compare(row[i], o[i]) < 0) o[i] = row[i];
-                }
-            }
-            finally
-            {
-                pool.Return(row);
-            }
+            if (row is not null) ArrayPool<TLane>.Shared.Return(row);
         }
     }
 
@@ -728,8 +873,13 @@ internal static partial class Kernels
             }
             else
             {
-                int chunk = Math.Max(Vector<TAcc>.Count * 4, (cols + Threads - 1) / Threads / Vector<TAcc>.Count * Vector<TAcc>.Count);
-                Team.For(cols, chunk, (long)rows * cols, new GemvColumnBody<TN, TIn, TAcc, TL>(a, xw, yl, rows, cols, g));
+                // Tiles (ColumnPlan), the blocks' sums joined in block order.
+                var plan = ColumnPlan.Of<TAcc>(rows, cols, g);
+                var sums = new byte[cols * Unsafe.SizeOf<TAcc>()];
+                var dst = plan.Blocks == 1 ? sums : plan.Partials<TAcc>(cols);
+                Team.For(plan.Tasks, 1, (long)rows * cols, new ColumnTiles<GemvColumnTile<TN, TIn, TAcc, TL>>(new(a, xw, dst, cols, g), plan, rows, cols));
+                if (plan.Blocks > 1) Join<TAcc, TL>(dst, plan.Blocks, cols, sums, JoinOp.Add);
+                MemoryMarshal.Cast<byte, TAcc>(sums.AsSpan()).CopyTo(yl);
             }
 
             TN.Store(yl.AsSpan(0, yn), y, 0);
@@ -793,45 +943,48 @@ internal static partial class Kernels
         }
     }
 
-    private struct GemvColumnBody<TN, TIn, TAcc, TL>(byte[] a, TAcc[] xw, TAcc[] yl, int rows, int cols, int g) : Team.IBody
+    // y's columns of a tile: Σ over the tile's rows of A's row (g rows a word) times x's word, in place where the stored
+    // values are the lane's (g = 1).
+    private readonly struct GemvColumnTile<TN, TIn, TAcc, TL>(byte[] a, TAcc[] xw, byte[] dst, int cols, int g) : IColumnTile
         where TN : struct, IQiyasNumber<TN, TIn>, IQiyasNumber<TN, TAcc> where TIn : unmanaged where TAcc : unmanaged where TL : struct, IQiyasLane<TL, TAcc>
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-        public readonly void Run(int first, int last)
+        public void Tile(int r0, int r1, int c0, int c1, int block)
         {
-            int n = last - first, w = Vector<TAcc>.Count;
-            var inPool = ArrayPool<TIn>.Shared;
-            var accPool = ArrayPool<TAcc>.Shared;
-            var rowsIn = inPool.Rent(g * n);
-            var units = accPool.Rent(n);
-            var acc = accPool.Rent(n);
-            try
+            int n = c1 - c0, w = Vector<TAcc>.Count;
+            var acc = MemoryMarshal.Cast<byte, TAcc>(dst.AsSpan()).Slice(block * cols + c0, n);
+            acc.Clear();
+            bool direct = g == 1 && Lanes.Direct<TN, TIn>();
+            var rowsIn = direct ? null : ArrayPool<TIn>.Shared.Rent(g * n);
+            var units = direct ? null : ArrayPool<TAcc>.Shared.Rent(n);
+            ref TAcc ra = ref MemoryMarshal.GetReference(acc);
+            for (int r = r0; r < r1; r += g)
             {
-                acc.AsSpan(0, n).Clear();
-                for (int r0 = 0; r0 < rows; r0 += g)
+                ReadOnlySpan<TAcc> u;
+                if (direct) u = MemoryMarshal.Cast<byte, TAcc>(a.AsSpan()).Slice(r * cols + c0, n);
+                else
                 {
-                    int have = Math.Min(g, rows - r0);
+                    int have = Math.Min(g, r1 - r);
                     for (int t = 0; t < g; t++)
                     {
-                        var dst = rowsIn.AsSpan(t * n, n);
-                        if (t < have) TN.Load(a, (r0 + t) * cols + first, dst); else dst.Clear();
+                        var d = rowsIn.AsSpan(t * n, n);
+                        if (t < have) TN.Load(a, (r + t) * cols + c0, d); else d.Clear();
                     }
 
                     Interleave<TIn, TAcc>(rowsIn.AsSpan(0, g * n), units.AsSpan(0, n), n);
-                    var xv = new Vector<TAcc>(xw[r0 / g]);
-                    int i = 0;
-                    for (; i + w <= n; i += w) TL.Fma(new Vector<TAcc>(units.AsSpan(i)), xv, new Vector<TAcc>(acc.AsSpan(i))).CopyTo(acc.AsSpan(i));
-                    for (; i < n; i++) acc[i] = TL.Fma(units[i], xw[r0 / g], acc[i]);
+                    u = units.AsSpan(0, n);
                 }
 
-                acc.AsSpan(0, n).CopyTo(yl.AsSpan(first, n));
+                TAcc xs = xw[r / g];
+                var xv = new Vector<TAcc>(xs);
+                ref TAcc ru = ref MemoryMarshal.GetReference(u);
+                int i = 0;
+                for (; i + w <= n; i += w) TL.Fma(Vector.LoadUnsafe(ref ru, (nuint)i), xv, Vector.LoadUnsafe(ref ra, (nuint)i)).StoreUnsafe(ref ra, (nuint)i);
+                for (; i < n; i++) acc[i] = TL.Fma(u[i], xs, acc[i]);
             }
-            finally
-            {
-                inPool.Return(rowsIn);
-                accPool.Return(units);
-                accPool.Return(acc);
-            }
+
+            if (rowsIn is not null) ArrayPool<TIn>.Shared.Return(rowsIn);
+            if (units is not null) ArrayPool<TAcc>.Shared.Return(units);
         }
     }
 }

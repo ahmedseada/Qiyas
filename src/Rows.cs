@@ -711,8 +711,16 @@ internal static partial class Kernels
             // The rows' statistics (mean, rstd), then the columns across the team.
             var stats = new TLane[rows * 2];
             Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)rows * cols, new RowStatsBody<TN, TLane, TL>(x, stats, cols, TL.From(eps), centered));
-            int chunk = Math.Max(Vector<TLane>.Count * 4, (cols + Threads - 1) / Threads / Vector<TLane>.Count * Vector<TLane>.Count);
-            Team.For(cols, chunk, (long)rows * cols * 2, new NormParamsBody<TN, TLane, TL>(x, dy, stats, dgamma, dbeta, rows, cols));
+            // The columns as tiles (Reduce.cs ColumnPlan), the blocks' sums joined in block order.
+            var plan = ColumnPlan.Of<TLane>(rows, cols, 1);
+            var dg = plan.Blocks == 1 ? dgamma : plan.Partials<TLane>(cols);
+            var db = plan.Blocks == 1 ? dbeta : plan.Partials<TLane>(cols);
+            Team.For(plan.Tasks, 1, (long)rows * cols * 2, new ColumnTiles<NormParamsTile<TN, TLane, TL>>(new(x, dy, stats, dg, db, cols), plan, rows, cols));
+            if (plan.Blocks > 1)
+            {
+                Join<TLane, TL>(dg, plan.Blocks, cols, dgamma, JoinOp.Add);
+                Join<TLane, TL>(db, plan.Blocks, cols, dbeta, JoinOp.Add);
+            }
         }
     }
 
@@ -743,54 +751,61 @@ internal static partial class Kernels
         }
     }
 
-    private struct NormParamsBody<TN, TLane, TL>(byte[] x, byte[] dy, TLane[] stats, byte[] dgamma, byte[] dbeta, int rows, int cols) : Team.IBody
+    // dgamma and dbeta of a tile: Σ dy·(x − mean)·rstd and Σ dy over its rows, in place where the stored values are the lane's.
+    private readonly struct NormParamsTile<TN, TLane, TL>(byte[] x, byte[] dy, TLane[] stats, byte[] dgamma, byte[] dbeta, int cols) : IColumnTile
         where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-        public readonly void Run(int first, int last)
+        public void Tile(int r0, int r1, int c0, int c1, int block)
         {
-            int n = last - first, w = Vector<TLane>.Count;
+            int n = c1 - c0, w = Vector<TLane>.Count;
+            var ag = MemoryMarshal.Cast<byte, TLane>(dgamma.AsSpan()).Slice(block * cols + c0, n);
+            var ab = MemoryMarshal.Cast<byte, TLane>(dbeta.AsSpan()).Slice(block * cols + c0, n);
+            ag.Clear();
+            ab.Clear();
             var pool = ArrayPool<TLane>.Shared;
-            var xl = pool.Rent(n);
-            var dl = pool.Rent(n);
-            var ag = pool.Rent(n);
-            var ab = pool.Rent(n);
-            try
+            var xl = TN.Direct ? null : pool.Rent(n);
+            var dl = TN.Direct ? null : pool.Rent(n);
+            ref TLane rg = ref MemoryMarshal.GetReference(ag);
+            ref TLane rb = ref MemoryMarshal.GetReference(ab);
+            for (int r = r0; r < r1; r++)
             {
-                ag.AsSpan(0, n).Clear();
-                ab.AsSpan(0, n).Clear();
-                for (int r = 0; r < rows; r++)
+                ReadOnlySpan<TLane> xs, ds;
+                if (TN.Direct)
                 {
-                    TN.Load(x, r * cols + first, xl.AsSpan(0, n));
-                    TN.Load(dy, r * cols + first, dl.AsSpan(0, n));
-                    Vector<TLane> mu = new(stats[2 * r]), rstd = new(stats[2 * r + 1]);
-                    int i = 0;
-                    for (; i + w <= n; i += w)
-                    {
-                        var d = new Vector<TLane>(dl.AsSpan(i));
-                        var h = (new Vector<TLane>(xl.AsSpan(i)) - mu) * rstd;
-                        TL.Fma(d, h, new Vector<TLane>(ag.AsSpan(i))).CopyTo(ag.AsSpan(i));
-                        (new Vector<TLane>(ab.AsSpan(i)) + d).CopyTo(ab.AsSpan(i));
-                    }
-
-                    for (; i < n; i++)
-                    {
-                        TLane h = TL.Mul(TL.Sub(xl[i], stats[2 * r]), stats[2 * r + 1]);
-                        ag[i] = TL.Fma(dl[i], h, ag[i]);
-                        ab[i] = TL.Add(ab[i], dl[i]);
-                    }
+                    xs = MemoryMarshal.Cast<byte, TLane>(x.AsSpan()).Slice(r * cols + c0, n);
+                    ds = MemoryMarshal.Cast<byte, TLane>(dy.AsSpan()).Slice(r * cols + c0, n);
+                }
+                else
+                {
+                    TN.Load(x, r * cols + c0, xl.AsSpan(0, n));
+                    TN.Load(dy, r * cols + c0, dl.AsSpan(0, n));
+                    xs = xl.AsSpan(0, n);
+                    ds = dl.AsSpan(0, n);
                 }
 
-                ag.AsSpan(0, n).CopyTo(MemoryMarshal.Cast<byte, TLane>(dgamma.AsSpan()).Slice(first, n));
-                ab.AsSpan(0, n).CopyTo(MemoryMarshal.Cast<byte, TLane>(dbeta.AsSpan()).Slice(first, n));
+                ref TLane rx = ref MemoryMarshal.GetReference(xs);
+                ref TLane rd = ref MemoryMarshal.GetReference(ds);
+                Vector<TLane> mu = new(stats[2 * r]), rstd = new(stats[2 * r + 1]);
+                int i = 0;
+                for (; i + w <= n; i += w)
+                {
+                    var d = Vector.LoadUnsafe(ref rd, (nuint)i);
+                    var h = (Vector.LoadUnsafe(ref rx, (nuint)i) - mu) * rstd;
+                    TL.Fma(d, h, Vector.LoadUnsafe(ref rg, (nuint)i)).StoreUnsafe(ref rg, (nuint)i);
+                    (Vector.LoadUnsafe(ref rb, (nuint)i) + d).StoreUnsafe(ref rb, (nuint)i);
+                }
+
+                for (; i < n; i++)
+                {
+                    TLane h = TL.Mul(TL.Sub(xs[i], stats[2 * r]), stats[2 * r + 1]);
+                    ag[i] = TL.Fma(ds[i], h, ag[i]);
+                    ab[i] = TL.Add(ab[i], ds[i]);
+                }
             }
-            finally
-            {
-                pool.Return(xl);
-                pool.Return(dl);
-                pool.Return(ag);
-                pool.Return(ab);
-            }
+
+            if (xl is not null) pool.Return(xl);
+            if (dl is not null) pool.Return(dl);
         }
     }
 }

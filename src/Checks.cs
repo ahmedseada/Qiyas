@@ -1702,13 +1702,14 @@ internal static class Checks
             var data = Bench.Registry.Make(type, R * C, 41, -1, 1);
             var values = Bench.Registry.Values(type, data, R * C);
             bool integer = !Bench.Registry.IsFloat(type);
-            // Whole reductions also over a long odd length (97 × 4099: more parts than the team, parts not ending on a word).
+            // Whole reductions also over a long odd length (97 × 4099: more parts than the team, parts not ending on a word);
+            // its columns too (several strips and row blocks of the column tiles, the last of each partial).
             const int LR = 97, LC = 4099;
             var longData = Bench.Registry.Make(type, LR * LC, 44, -1, 1);
             var longValues = Bench.Registry.Values(type, longData, LR * LC);
             foreach (string op in new[] { "sum", "sumsq", "max", "min", "argmax" })
             {
-                foreach (var (axis, r, c, d, vals) in new[] { (Axis.Whole, R, C, data, values), (Axis.Rows, R, C, data, values), (Axis.Cols, R, C, data, values), (Axis.Whole, LR, LC, longData, longValues) })
+                foreach (var (axis, r, c, d, vals) in new[] { (Axis.Whole, R, C, data, values), (Axis.Rows, R, C, data, values), (Axis.Cols, R, C, data, values), (Axis.Whole, LR, LC, longData, longValues), (Axis.Cols, LR, LC, longData, longValues) })
                 {
 
                     int count = axis == Axis.Whole ? 1 : axis == Axis.Rows ? r : c;

@@ -366,6 +366,29 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
   - Not done here: dx still goes through the columns' gradient and col2im (a fused col2im in the product's store is
     the step if it matters).
 
+- 6h (CPU columns: column reductions, gemv_t, norm_params_bwd): done, reported.
+  - Cause: every column pass gave each thread one strip of cols / threads columns (170 at 4096) down all rows: a row's
+    part a 680-byte run at a 16 KB stride, copied through a buffer even for types stored as the lane, one task a
+    thread (the slowest core sets the time).
+  - `src/Reduce.cs` "column passes (6h)": `ColumnPlan` (a strip of about 8 KB of accumulators by a block of rows in
+    whole words of g, at least 16 rows, at least Threads·4 tiles where the shape allows), `ColumnTiles` (the team body
+    over tiles), `Join` / `JoinBody` (the blocks' slots in block order: sums added, extremes by TL.Max / TL.Min on
+    vectors and the type's order on the rest, as the rows were), and the tiles `ColumnSumTile`, `ColumnCompareTile`,
+    `ColumnArgmaxTile` (+ `ArgmaxJoinBody`), `GemvColumnTile`; `src/Rows.cs` `NormParamsTile`. Values read in place
+    where stored as the lane (g = 1), else loaded (and interleaved for dot lanes) as before.
+  - argmax:cols keeps the old rule exactly (the first row strictly above by the type's order: float CompareTo, NaN
+    below every number, ±0 equal): a vector compare a row gives exactly those lanes (TL.Greater, or the best a NaN and
+    the value not); 4-byte lanes select value and row by it, other lanes resolve the marked vectors value by value.
+    Tried and dropped: the extremes then a scan for the first equal row (a second read of every tile, and NaN taken
+    as TL.Max gives it: a different rule), and tiles capped at 256 KB (slower).
+  - Gate: `Checks.Group2` also reduces 97 × 4099 along the columns (several strips and blocks, the last of each
+    partial); every type, every op, green on both devices. Mutation (the argmax join taking a later block on ties)
+    fails at 39 cells (float16, bfloat16, the 8-bit floats, the integers; both shapes).
+  - Measured: see COVERAGE (the three rows). Errors of the float sums fell (blocks of ~86 rows summed, then joined);
+    float64 gemv_t 0 → 6.0e-13 (the baseline matched the reference's row order exactly; gemv reads 6.1e-13).
+  - Not done here: max / min / argmax along rows against sum (COVERAGE's next row: max:rows 0.96 against sum:rows
+    0.34; `Extreme` keeps one accumulator through a sliced span) — a small cell for 6j.
+
 ## Item 5 progress
 
 - Done, reported (uncommitted until the coordinator's go). What landed:
@@ -710,7 +733,7 @@ Each: measure against the baseline cell, change, re-measure (the full run or the
   bodies (lines ~270–300, `Team.For(c, …)` with `PartCompareBody`/`PartBody`): a column pass currently walks rows per
   column chunk; tile it as the row-wise kernels do — a task owns a strip of columns and sweeps all rows with vectors
   along the columns (the strided loads become contiguous), accumulators in registers per vector of columns. Same for
-  `norm_params_bwd`'s column sums (`src/Rows.cs` `NormParamsBody`) and `gemv_t`.
+  `norm_params_bwd`'s column sums (`src/Rows.cs` `NormParamsBody`) and `gemv_t`. Done in 6h (see there).
 - CPU attention by the composition (and CUDA 6.1 ms): item 4a's fused rows are the fix; measure the Known-slow rows
   against the fused rows.
 - Device `lstm_step` 5.1 ms anomaly vs `gru_step`: `src/GpuOps.Recurrent.cs` `LstmStep<TN>` → `CellGates` (two view
