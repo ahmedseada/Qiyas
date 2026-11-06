@@ -44,13 +44,8 @@ public sealed partial class GpuOps
                 aux = gpu.Rent((targets + 1 + n) * 4L);
                 try
                 {
-                    Gpu.Clear(counts, targets * 4L);
-                    var count = gpu.Cached("scatter_count", (out string e) => Ptx.ScatterCount(gpu, out e));
-                    var scan = gpu.Cached("scatter_scan", (out string e) => Ptx.ScatterScan(gpu, out e));
-                    var place = gpu.Cached("scatter_place", (out string e) => Ptx.ScatterPlace(gpu, out e));
-                    Gpu.Launch(count, Grid(n, 256), 1, 256, 1, 0, idx, counts, Gpu.U(n));
-                    Gpu.Launch(scan, 1, 1, 32, 1, 0, counts, aux, Gpu.U(targets));
-                    Gpu.Launch(place, Grid(n, 256), 1, 256, 1, 0, idx, aux, aux + (ulong)((targets + 1) * 4L), Gpu.U(n));
+                    // The rows' offsets and the sources in order of their row (stable): the radix ordering (GpuOps.Radix.cs).
+                    OrderByTarget(idx, n, targets, counts, aux, aux + (ulong)((targets + 1) * 4L));
                 }
                 finally
                 {

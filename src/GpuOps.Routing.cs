@@ -64,15 +64,7 @@ public sealed partial class GpuOps
         return lane.Name;
     }
 
-    /// <summary>counts[b], offsets[b + 1] and the sources' order by bucket, from n indices into `buckets` (the scatter-add's ordering kernels).</summary>
-    public void Route(ulong index, int n, int buckets, ulong counts, ulong offsets, ulong order)
-    {
-        Gpu.Clear(counts, buckets * 4L);
-        var count = gpu.Cached("scatter_count", (out string e) => Ptx.ScatterCount(gpu, out e));
-        var scan = gpu.Cached("scatter_scan", (out string e) => Ptx.ScatterScan(gpu, out e));
-        var place = gpu.Cached("scatter_place", (out string e) => Ptx.ScatterPlace(gpu, out e));
-        Gpu.Launch(count, Grid(n, 256), 1, 256, 1, 0, index, counts, Gpu.U(n));
-        Gpu.Launch(scan, 1, 1, 32, 1, 0, counts, offsets, Gpu.U(buckets));
-        Gpu.Launch(place, Grid(n, 256), 1, 256, 1, 0, index, offsets, order, Gpu.U(n));
-    }
+    /// <summary>counts[b], offsets[b + 1] and the sources' order by bucket, from n indices into `buckets` (scatter-add's
+    /// ordering: the radix sort of GpuOps.Radix.cs).</summary>
+    public void Route(ulong index, int n, int buckets, ulong counts, ulong offsets, ulong order) => OrderByTarget(index, n, buckets, counts, offsets, order);
 }

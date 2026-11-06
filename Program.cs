@@ -109,7 +109,7 @@ internal sealed class Options
     public static readonly string[] Group7 = [.. OptimizerArgs.Names.Select(n => "optimizer:" + n)];
     public static readonly string[] Group6 = ["conv", "conv_bwd"];
     public static readonly string[] Group8 = ["lstm_step", "gru_step", "lstm_step_bwd", "gru_step_bwd", "lstm_seq", "lstm_seq_bwd", "gru_seq"];
-    public static readonly string[] Group9 = ["topk_rows", "pick_rows", "sample_rows", "route", "cross_entropy", "ctc", "ctc_bwd"];
+    public static readonly string[] Group9 = ["topk_rows", "pick_rows", "sample_rows", "route", "route_wide", "cross_entropy", "ctc", "ctc_bwd"];
     public List<string>? Subjects;
     public string? Baseline;
 
@@ -384,9 +384,10 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             }
 
             case "route":
+            case "route_wide":                                               // 4f: many targets (two radix passes)
             {
                 if (type != Registry.Names[0]) return;                       // no type: once
-                const int n = 1 << 20, buckets = 64;
+                int n = 1 << 20, buckets = name == "route" ? 64 : 65_536;
                 var index = Enumerable.Range(0, n).Select(_ => random.Next(buckets)).ToArray();
                 var (wantCounts, wantOffsets, wantOrder) = Routing.RouteReference(index, buckets);
                 var counts = new int[buckets];

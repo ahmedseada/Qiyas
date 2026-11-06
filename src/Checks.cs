@@ -440,7 +440,29 @@ internal static class Checks
             if (!counts.SequenceEqual(wc) || !offsets.SequenceEqual(wo) || !order.SequenceEqual(worder)) { Console.WriteLine($"check route         {where,-6} DIFFERS"); ok = false; }
         }
 
-        if (ok) Console.WriteLine($"check routing                {where,-6} every type: top-k, pick, sampling (float types) and the route as the references");
+        // The ordering at size (item 4f: the device's radix sort and multi-block scan): order, counts and offsets equal to
+        // the stable reference — many sources into few targets, into many (three radix passes, a scan over 98 blocks),
+        // all into one, and descending indices (every tile's pairs reversed).
+        // Under --repeat the device's cases run Stress / 20 passes (the radix place's barriers and shared counts: a race shows).
+        for (int pass = 0, passes = ops is null ? 1 : Math.Max(1, Stress / 20); pass < passes && ok; pass++)
+        foreach (var (n, buckets, kind) in new[] { (1 << 20, 64, "random"), (1_000_003, 100_000, "random"), (5_000, 1, "one"), (70_001, 65_536, "descending") })
+        {
+            var index = kind switch
+            {
+                "one" => new int[n],
+                "descending" => Enumerable.Range(0, n).Select(i => (n - 1 - i) % buckets).ToArray(),
+                _ => Enumerable.Range(0, n).Select(_ => random.Next(buckets)).ToArray(),
+            };
+            var (wc, wo, worder) = Routing.RouteReference(index, buckets);
+            var counts = new int[buckets];
+            var offsets = new int[buckets + 1];
+            var order = new int[n];
+            using var run = new Bench.QiyasSubject().Route(ops is null ? Bench.Device.Cpu : Bench.Device.Cuda, index, buckets, counts, offsets, order)!;
+            run.Run(); run.Collect();
+            if (!counts.SequenceEqual(wc) || !offsets.SequenceEqual(wo) || !order.SequenceEqual(worder)) { Console.WriteLine($"check route {n} into {buckets} ({kind}) {where,-6} DIFFERS"); ok = false; }
+        }
+
+        if (ok) Console.WriteLine($"check routing                {where,-6} every type: top-k, pick, sampling (float types) and the route as the references (also 1M into 64, 1 000 003 into 100 000, all into one, descending into 65 536)");
         return ok;
     }
 

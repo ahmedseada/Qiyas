@@ -154,11 +154,34 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
     left the build without it unchanged, so the gap is within this laptop's swing or a real ~10 % — re-check at item 4's
     full run.
 - 4d committed as a784145 (the coordinator: keep AggressiveOptimization; the full run settles the ~10 %).
-- 4 pieces left in item 4 after 4e: 4f, 4g, then the GRU sequence backward (below), then item 4's full run.
+- 3 pieces left in item 4 after 4f: 4g, then the GRU sequence backward (below), then item 4's full run.
+- 4f: done, reported as its own boundary (uncommitted until the coordinator's go). What landed:
+  - `src/Ptx.Radix.cs`: `ScanTile` (a block of 256 scans 1024 values: shuffles within a warp, the warps' sums in shared
+    memory; writes the block's total) and `ScanAdd`; `RadixCount` (per tile of 2048 sources, item-major, the digit
+    counts by shared atomics into table[digit][tile]) and `RadixPlace` (the same tile in order: a warp's peers with the
+    same digit from eight `vote.sync.ballot`s, the rank among earlier peers by popc of the lanemask, the earlier warps'
+    counts through shared memory, a running count per digit across items; stable, any card).
+  - `src/GpuOps.Radix.cs`: `ExclusiveScan` (recursive over the blocks' totals; in place allowed), `RadixOrder` (passes =
+    ⌈bits(targets − 1) / 8⌉, ping-pong buffers, the last pass's values written into the caller's order), and
+    `OrderByTarget` (counts by `ScatterCount`, offsets by the scan, offsets[targets] = n, the order by the radix sort),
+    used by `scatter_add_rows` (GpuOps.Layout.cs) and `Route`. `ScatterScan` / `ScatterPlace` stay in Ptx.Layout.cs,
+    unused.
+  - gate (`Checks.Routings`): also 1M into 64, 1 000 003 into 100 000 (three passes, a scan over 98 blocks), all into
+    one, descending into 65 536 — order, counts, offsets equal to the stable reference, both devices. Mutations: the
+    scan's totals not added back fails the three multi-block cases; the earlier warps' share dropped corrupts the
+    order, which the layouts gate's scatter-add then reads as source indices (an illegal-address fault: the run stops).
+    Under `--repeat` the device runs these cases Stress / 20 passes (fresh indices each); `--repeat 400` (20 passes): equal.
+  - bench: new row `route_wide` (1M into 65 536) in Group9. Measured against fd60205 (a worktree): device route 1M into 64
+    216.7 → 0.274 ms; route_wide 0.186 (fewer atomics per counter than 64 buckets: the counts' contention is the larger
+    part of `route` now — the radix table's totals could give the counts instead, not taken); device scatter_add_rows
+    (4096 into 4096 × 4096) 0.15 ms less on every type (float32 0.457 → 0.306, int8 0.325 → 0.172); int64 read 0.827 →
+    1.163 once, A/B the other order 0.675 new vs 0.826 old: swing. CPU unchanged (route 1.05 → 0.99; route_wide 2.22).
+  - also in 4f's edits (the owner's rule for open timing questions): the CPU sub-byte products after 4e as a Known slow
+    row in COVERAGE and under item 6 here.
 - The two open timing questions (the CPU block product with AggressiveOptimization; device float64 non-causal attention,
   the composition timed at 89 ms by the helper) moved to item 6 by the owner: COVERAGE Known slow rows, and below
   under item 6. Item 4's full run only records them.
-- 4e: done, reported as its own boundary (uncommitted until the coordinator's go). What landed:
+- 4e: done, committed as fd60205. What landed:
   - CPU `Kernels.Operands(AOff, TransA, BOff, TransB, COff, Viewed)` and `MatMul<TN, TIn, TAcc, TL>(…, Operands)` (the old
     signature calls it with `default`, a plain product): `PackBody` takes Bᵀ by `RunTransposed` (a task reads each Bᵀ
     row's span of its k-groups once — a unit of g values is contiguous there — and lays the units into the strips,
@@ -422,6 +445,11 @@ Each: measure against the baseline cell, change, re-measure (the full run or the
 - Device float64 non-causal attention (the owner's, from 4d): 62.6 ms on the fused rows now, 59 by the composition at
   4a, and `Measure.Faster` timed the composition at 89. Re-measure both paths (the `attention` row; the composition
   forced through `AttentionComposed`); if the composition is really faster, explain the 89 and fix the measurement.
+- CPU sub-byte products on views (the owner's rule for open timing questions, from 4e): int4 matmul_tn, int2 matmul_nt,
+  uint2 matmul_nt slower by 7–26 % after 4e in one A/B (uint2 mixed); the coordinator's run read int4 tn 1.88 ms, int2 nt
+  2.22. They keep the copy route (`MatMulViewCopies`); the shared kernel gained offsets (`Operands`, `Micro`'s cOff,
+  `PackBody`'s transB branch). Re-measure both orders against fd60205's parent a784145; if it holds, give sub-byte types
+  the in-place route (loads at even indices: `TN.Load` at whole bytes) or remove what the offsets cost them.
 - CPU recurrent sequences (the coordinator's observation at 4c): gru_seq 65–71 ms, lstm_seq 83 ms against ~15–20 ms
   implied by the f32 product rate (COVERAGE Known slow).
 

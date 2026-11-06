@@ -59,7 +59,7 @@ regression comparer and the baseline run.
 **Open, in the order they are taken:**
 
 1. The todo rows below (item 4, in this order: fused attention rows — done, ctc — done, the GRU sequence bench row — done, the block-scaled
-   tiled product — done, the transposition fused into the product's packing — done, the radix step of scatter-add, the fused direct
+   tiled product — done, the transposition fused into the product's packing — done, the radix step of scatter-add — done, the fused direct
    convolution); the designs and the progress are in `docs/wip/HANDOFF.md`.
 2. A bump-allocated scope past the pool (buffers reserved once from the shapes; zero rents on the hot path).
 3. The known-slow list.
@@ -126,6 +126,7 @@ and measured against the baseline when it is.
 | CPU | the convolution backward | 33 ms against 6.9 forward (64 × 128 × 128 by 128 of 3 × 3): three passes in lane storage |
 | CUDA | attention rows | 3.8 ms (causal 2.1) for 16 heads of 2048² at d = 128 by the fused rows in the FMA lane, from 6.1 by the composition (since item 4a); the tensor lanes inside the fused kernel are the step. float64: see the next row |
 | CUDA | float64 non-causal attention: which path | 62.6 ms on the fused rows since item 4d, against 59 by the composition at 4a; the shared measurement (`Measure.Faster`) timed the composition at 89 this time and chose the fused rows. To re-measure both paths in item 6 (the `attention` row, the composition forced); if the composition is really faster, explain the 89 |
+| CPU | sub-byte products on views after item 4e | int4 matmul_tn, int2 matmul_nt, uint2 matmul_nt slower by 7–26 % after 4e in one A/B (both orders; uint2 mixed); the coordinator's run read int4 tn 1.88 ms, int2 nt 2.22 (1024³). These types keep the copy route; the shared product kernel gained offsets. To re-measure in item 6; if it holds, give sub-byte types the in-place route or remove what the offsets cost them |
 | CPU | the block-scaled product with AggressiveOptimization | steady 3.5–3.65 ms with the attribute against 3.15–3.18 without in one A/B (1024³ q8_0, item 4d); the attribute keeps the first calls off the runtime's first tier. To re-measure in item 6 in both orders; if the gap holds, keep first-call optimization without the steady-state cost |
 | CPU | attention rows | 60–80 ms float32 (causal 33–38) for 16 heads of 2048² at d = 128 by the fused rows, from 100–148 by the composition (since item 4a) |
 | CUDA | attention backward by the composition | 4.0 ms for 8 heads of 1024² |
@@ -204,7 +205,7 @@ sum_axis, sumsq, max, min, argmax → the reductions; transpose; gemv_nn / gemv_
 | transpose | ✓ own | ✓ own | 32 × 32 tiles through shared memory; rows not ending on a word written value-wise |
 | strided copy (permute, transposed and sliced views, broadcasts with a zero stride; up to 4 dims) | ✓ own | ✓ own | `Layout`: a thread per output word, every value gathered by index: no atomics in any format |
 | one_hot, gather rows, gather columns, shift (zero fill), pad2d (rows widened with zeros) | ✓ own | ✓ own | exact moves; pad2d also pads a product's operands to the kernels' alignment |
-| scatter-add rows (the embedding gradient) | ✓ sum | ✓ sum | each target row sums its sources in source order (deterministic); the device orders sources by counts, offsets and ranks (quadratic in the source count: a radix step for millions is todo) |
+| scatter-add rows (the embedding gradient) | ✓ sum | ✓ sum | each target row sums its sources in source order (deterministic); the device orders sources by counts (integer atomics), offsets (a multi-block exclusive scan) and a stable LSD radix sort of the (target, source) pairs, 8-bit digits, a pass per byte of the target count (`GpuOps.OrderByTarget`, `src/Ptx.Radix.cs`; ranks within a warp from eight ballots, so no instruction a card may lack): linear in the sources, the same order as the CPU's |
 | im2col / col2im | ✓ own / ✓ sum | ✓ own / ✓ sum | strides, pads, dilations; col2im gathers each input pixel's column entries in kernel order |
 | interpolate: nearest, bilinear (half-pixel centers) | ✓ own / ✓ float | ✓ own / ✓ float | nearest by integer arithmetic (exact); bilinear in the float lane |
 
@@ -265,7 +266,7 @@ sum_axis, sumsq, max, min, argmax → the reductions; transpose; gemv_nn / gemv_
 | top-k per row (values as the type, indices s32; largest first, ties by the lower index) | ✓ own | ✓ own | k passes of the row's argmax (k ≤ 256 on the device; a partial sort is the step for large k); the CPU's row tasks chunked on whole storage units of the k values (bool, the packed integers), the device's block formats through lane storage |
 | pick per row (x[r][index[r]]) | ✓ own | ✓ own | |
 | sampling per row (the first column whose running sum reaches u·Σ) | ✓ float | ✓ float | chunk sums, their prefix, the least crossing |
-| route: counts, offsets, the sources ordered by bucket | ✓ | ✓ | the scatter-add's ordering kernels (deterministic; quadratic in the source count on the device: a radix step for millions) |
+| route: counts, offsets, the sources ordered by bucket | ✓ | ✓ | the scatter-add's ordering (deterministic): on the device the radix sort above — 1M into 64 buckets 0.27 ms (216.7 by the quadratic ranks before item 4f), 1M into 65 536 0.19 (`route_wide`). Gate: also 1M into 64, 1 000 003 into 100 000, all into one, descending into 65 536, each equal to the stable reference |
 | cross-entropy rows: the loss (log_softmax → pick → neg), its backward (softmax − one_hot, a row operation) | ✓ float | ✓ float | |
 | expert products (a product per bucket over the routed rows) | ✓ | ✓ | gather_rows by the order, the batched product on views, scatter-add rows back: the composition |
 | ctc: the loss per sequence and its gradient with respect to the logits (T × B × C; log_softmax inside; per sequence its frames and labels, any blank class) | ✓ float | ✓ float | log-space α/β recursions over the 2L + 1 extended states; the gradient y − Σ exp(α + β − log y − log P) per class; a sequence no alignment fits: loss +∞, gradient 0. CPU: a task per sequence, the states a vector at a time (the lane's exp and log), float32/float64 rows in place, narrower floats a row at a time in the task, block formats through float32 storage. CUDA: a warp per (frame, sequence) row for the log-sum-exp and the softmax row, then a block per sequence: the states over its threads, a barrier per frame, each class's states summed by the class's first state (no atomics). Gate: the reference's gradient against its own loss by central differences; odd shapes with short sequences, empty and repeated labels, a blank other than 0, no alignment; the gradient of each frame sums to 0. float8_e4m3 cannot hold a loss past 448 (the bench row's ≈ 1800 store as NaN, its error column ∞); its gradient row is within the type |
