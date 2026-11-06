@@ -30,6 +30,8 @@ One bench at a time (they share the GPU and the CPU team; timings are meaningles
 background and wait for the notification. Patch scripts with quotes inside heredocs break the Bash tool: write the
 script to a file and run `python script.py .` from the repository root.
 
+Cool-down (the coordinator, 6j): `--report` runs (the full runs that become the baseline and the README) idle 20 s after the gates before the first timed row, and the results header says so; per-piece runs keep no pause (the gates' ~20 s on every core spend the processor's boost budget: CPU int8 sum:rows 0.25 ms right after them, 0.07 after an idle).
+
 ## Pitfalls already known
 
 - Block formats (Q8_0, Q4_0, Q4_K, Q6_K): the lane is float32; `Blocks.Store` re-encodes a partial block keeping its

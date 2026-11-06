@@ -74,6 +74,16 @@ foreach (var device in options.Devices)
         if (s.Describe(device) is { } line) Console.WriteLine(line);
     }
 
+    if (options.Report && bench.CoolDownSeconds == 0)
+    {
+        // The full runs (--report: the baseline and the README) idle once after the gates before the first timed row: the
+        // gates' ~20 s on every core spend the processor's boost budget, and the first cells would otherwise be timed at
+        // its sustained clocks (item 6j: CPU int8 sum 0.25 ms against 0.07 after an idle). Per-piece runs keep no pause.
+        bench.CoolDownSeconds = 20;
+        Console.WriteLine($"cool-down: {bench.CoolDownSeconds} s idle after the gates before the first timed row");
+        Thread.Sleep(bench.CoolDownSeconds * 1000);
+    }
+
     foreach (var type in options.Types) bench.Run(device, type);
 }
 
@@ -196,6 +206,9 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
     public static int AddCount => Odd ? (1 << 24) - 5 : 1 << 24;
     // The regular sizes; --shapes odd takes the nearest primes below (4093, 4091; 16M − 5; …) so no size ends on a tile, a word or a block.
     public static bool Odd;
+
+    /// <summary>Seconds idled after the gates before the first timed row (--report runs; 0: none), stated in the header.</summary>
+    public int CoolDownSeconds;
     public static int Rows => Odd ? 4093 : 4096;
     public static int Cols => Odd ? 4091 : 4096;
     public static int Prime(int n) => Odd ? NearestPrimeBelow(n) : n;
@@ -837,7 +850,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         sb.AppendLine("# Qiyas bench");
         sb.AppendLine();
         sb.AppendLine(string.Create(CultureInfo.InvariantCulture,
-            $"{DateTime.Now:yyyy-MM-dd HH:mm}. Median wall time (ms); `×` = {_baseline} ÷ subject (above 1: faster than {_baseline}). `err` = largest |result − float64 math on the same stored inputs|. `lane` = what the subject computed in."));
+            $"{DateTime.Now:yyyy-MM-dd HH:mm}. Median wall time (ms); `×` = {_baseline} ÷ subject (above 1: faster than {_baseline}). `err` = largest |result − float64 math on the same stored inputs|. `lane` = what the subject computed in.{(CoolDownSeconds > 0 ? $" Timed after {CoolDownSeconds} s idle following the gates (the processor's boost budget recovered)." : "")}"));
         sb.AppendLine();
         var names = subjects.Select(s => s.Name).ToList();
         sb.Append("| device | operation | type | shape |");
