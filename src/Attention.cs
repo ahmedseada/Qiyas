@@ -182,8 +182,46 @@ internal static partial class Kernels
 
     // ---------------------------------------------------------------- the composition, in lane storage
 
-    /// <summary>O for rows of queries: the composition in lane storage; returns the lane's name.</summary>
+    private static readonly Dictionary<string, bool> s_fusedFaster = [];
+
+    /// <summary>O for rows of queries: the fused rows or the composition, whichever this processor measures faster at this
+    /// shape and type (once); returns the lane's name.</summary>
     public static string Attention<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) where TN : struct, IQiyasFloat<TN>
+    {
+        string key = $"{TN.Name}:{a.Heads}x{a.Lq}x{a.Lk}x{a.D}:{a.Causal}:{a.Spans is not null}:{a.SpanStarts is not null}";
+        bool fused;
+        lock (s_fusedFaster)
+        {
+            if (!s_fusedFaster.TryGetValue(key, out fused))
+            {
+                double Time(Func<string> run)
+                {
+                    long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    run();
+                    return System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+                }
+
+                // Both warmed, then timed in alternating rounds, the minimum of each kept (a processor raising its clocks
+                // slows both alike instead of the one timed first).
+                AttentionRows<TN>(a, q, k, v, o);
+                AttentionComposed<TN>(a, q, k, v, o);
+                double tf = double.MaxValue, tc = double.MaxValue;
+                for (int round = 0; round < 2; round++)
+                {
+                    tf = Math.Min(tf, Time(() => AttentionRows<TN>(a, q, k, v, o)));
+                    tc = Math.Min(tc, Time(() => AttentionComposed<TN>(a, q, k, v, o)));
+                }
+
+                fused = s_fusedFaster[key] = tf <= tc;
+                Note($"attention {key}: fused rows {tf:0.000} ms, composition {tc:0.000} ms: {(fused ? "fused rows" : "composition")}");
+            }
+        }
+
+        return fused ? AttentionRows<TN>(a, q, k, v, o) : AttentionComposed<TN>(a, q, k, v, o);
+    }
+
+    /// <summary>O for rows of queries: the composition in lane storage; returns the lane's name.</summary>
+    public static string AttentionComposed<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) where TN : struct, IQiyasFloat<TN>
     {
         if (Wide<TN>()) { AttentionIn<Float64>(a, ToLane<TN>(q, a.QValues), ToLane<TN>(k, a.KValues), ToLane<TN>(v, a.KValues), o, TN.Name == "float64" ? null : (bytes => FromLane<TN>(bytes, o, a.QValues))); return "f64"; }
         AttentionIn<Float32>(a, ToLane<TN>(q, a.QValues), ToLane<TN>(k, a.KValues), ToLane<TN>(v, a.KValues), o, TN.Name == "float32" ? null : (bytes => FromLane<TN>(bytes, o, a.QValues)));

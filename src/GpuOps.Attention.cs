@@ -1,3 +1,4 @@
+using System.Diagnostics;
 // The device's attention (Attention.cs): the composition in lane storage for rows of queries (widen once, the view
 // products and the scaled masked softmax per head, narrow once), the fused decode kernel for a few queries against a
 // long cache, the backward composition.
@@ -52,10 +53,96 @@ public sealed partial class GpuOps
         return d;
     }
 
-    // ---- rows of queries: the composition
+    // ---- rows of queries: the fused rows, or the composition where the device measures it faster
 
-    /// <summary>O for rows of queries; returns the lane's name.</summary>
+    private readonly Dictionary<string, bool> _fusedFaster = [];
+
+    /// <summary>O for rows of queries: the fused rows (no scores in memory) or the composition, whichever this device
+    /// measures faster at this shape and type (once); the composition for head dimensions past the fused kernel's 128.
+    /// Returns the lane's name.</summary>
     public string Attention<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IQiyasNumber<TN>
+    {
+        var f = Fmt.Of<TN>();
+        if (a.D > FusedHeadMax) return AttentionComposed<TN>(a, q, k, v, o);
+        string key = $"{f.Name}:{a.Heads}x{a.Lq}x{a.Lk}x{a.D}:{a.Causal}:{a.Spans is not null}:{a.SpanStarts is not null}";
+        if (!_fusedFaster.TryGetValue(key, out bool fused))
+        {
+            double Time(Action run)
+            {
+                long t0 = Stopwatch.GetTimestamp();
+                run();
+                Gpu.Synchronize();
+                return Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+            }
+
+            // Both warmed, then timed in alternating rounds, the minimum of each kept: a device still raising its clocks
+            // (the first timings of a run) slows both alike instead of the one timed first.
+            AttentionRows<TN>(a, q, k, v, o);
+            AttentionComposed<TN>(a, q, k, v, o);
+            Gpu.Synchronize();
+            double tf = double.MaxValue, tc = double.MaxValue;
+            for (int round = 0; round < 3; round++)
+            {
+                tf = Math.Min(tf, Time(() => AttentionRows<TN>(a, q, k, v, o)));
+                tc = Math.Min(tc, Time(() => AttentionComposed<TN>(a, q, k, v, o)));
+            }
+
+            fused = _fusedFaster[key] = tf <= tc;
+            Note($"attention {key}: fused rows {tf:0.000} ms, composition {tc:0.000} ms: {(fused ? "fused rows" : "composition")}");
+        }
+
+        return fused ? AttentionRows<TN>(a, q, k, v, o) : AttentionComposed<TN>(a, q, k, v, o);
+    }
+
+    /// <summary>The fused kernel's largest head dimension.</summary>
+    public const int FusedHeadMax = 128;
+
+    /// <summary>O for rows of queries by the fused rows: a block per (head, query tile), the keys in tiles through shared
+    /// memory, the softmax online; no scores in memory. d ≤ 128. Returns the lane's name.</summary>
+    public string AttentionRows<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IQiyasNumber<TN>
+    {
+        var f = Fmt.Of<TN>();
+        var lane = RowLane(f);
+        if (a.D > FusedHeadMax) throw new NotSupportedException($"attention rows: a head dimension of {a.D} exceeds the fused kernel's {FusedHeadMax}");
+        int dCap = a.D <= 32 ? 32 : a.D <= 64 ? 64 : 128;
+        var rented = new List<ulong>();
+        try
+        {
+            if (f.IsBlock)
+            {
+                ulong bq = ToLane<TN>(q, a.QValues, rented), bk = ToLane<TN>(k, a.KValues, rented), bv = ToLane<TN>(v, a.KValues, rented), bo = gpu.Rent(a.QValues * 4);
+                rented.Add(bo);
+                AttentionRows<Float32>(a, bq, bk, bv, bo);
+                FromLane<TN>(bo, o, a.QValues);
+                return "f32 (blocks through lane storage)";
+            }
+
+            var (br, _) = Ptx.AttentionTile(lane);
+            int blocks = (a.Lq + br - 1) / br;
+            var range = new int[2 * blocks];
+            for (int qb = 0; qb < blocks; qb++)
+            {
+                int lo = int.MaxValue, hi = 0;
+                for (int i = qb * br; i < Math.Min(a.Lq, qb * br + br); i++) { lo = Math.Min(lo, a.Start(i)); hi = Math.Max(hi, a.Limit(i)); }
+                if (hi <= lo) lo = hi = 0;
+                range[2 * qb] = lo; range[2 * qb + 1] = hi;
+            }
+
+            ulong limits = Limits(a, rented), starts = Starts(a, rented), ranges = gpu.Rent(range.Length * 4L);
+            rented.Add(ranges);
+            Gpu.Upload<int>(range, ranges);
+            var fn = gpu.Cached($"attention_rows:{f.Name}:{dCap}", (out string e) => Ptx.AttentionRows(gpu, f, lane, dCap, out e));
+            Gpu.Launch(fn, (uint)blocks, (uint)a.Heads, Ptx.RowsThreads, 1, 0, q, k, v, o, limits, starts, ranges, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), lane.Wide ? Gpu.D(a.Scale) : Gpu.F((float)a.Scale));
+            return lane.Name;
+        }
+        finally
+        {
+            foreach (var p in rented) gpu.Return(p);
+        }
+    }
+
+    /// <summary>O for rows of queries by the composition in lane storage; returns the lane's name.</summary>
+    public string AttentionComposed<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IQiyasNumber<TN>
     {
         var f = Fmt.Of<TN>();
         var rented = new List<ulong>();

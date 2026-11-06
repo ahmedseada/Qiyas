@@ -1,7 +1,8 @@
 # Handoff: items 4–6 of the coverage stretch
 
-Written 2026-11-06 at the end of item 3, for a session with none of this one's context. Read `CLAUDE.md`,
-`COVERAGE.md` ("State" first) and `README.md` before anything. Standing rules: Idrak is an application of Qiyas, never
+Written 2026-11-06 at the end of item 3 and kept current through item 4, for a session with none of this one's
+context. Read `COVERAGE.md` ("State" first) and `README.md` before anything (the repository has no CLAUDE.md; the
+standing rules are the next sentence). Standing rules: Idrak is an application of Qiyas, never
 its guide (nothing from `Lib/` in repository files; `sh guard.sh` zero hits); card-agnostic; no fixed type; every
 operation written once over `<TN, TLane, TL>` on both devices with a float64 reference, an error column and a gate in
 `src/Checks.cs`; nothing removed, renamed or weakened; the tree builds and the gates are green at every stop; no commits
@@ -15,7 +16,7 @@ Release build 0 errors — then stop editing and wait for "go".
 |---|---|
 | Build | `dotnet build -c Release` (from `D:\Projects\Qiyas`); `sh guard.sh` before every build. A build fails while a bench process holds the dll. |
 | Full run (both devices' gates, then the core rows of every type) | `dotnet bin/Release/net10.0/Qiyas.dll cuda,cpu --report` (~25 min; writes `results-qiyas-cuda-cpu.md`). `cuda` alone also runs the CPU gates first. |
-| Regression gate | `python docs/wip/compare.py docs/wip/baseline.md results-qiyas-cuda-cpu.md` — prints every cell with base/new ms, ratio, lanes, errors; flags `SLOWER` (> 5 %) and `ERR UP`; "new row" for rows the baseline lacks. `baseline.md` is the run of 2026-11-06 00:51 (the state before the coverage work; no block/bool rows). Re-time a flagged cell several times before calling it swing: this laptop's sub-2 ms cells move ±20–40 % run to run; an A/B against a build of the baseline commit (`git worktree add <dir> c73a251`, build it, run both dlls back to back) separates code from machine state. |
+| Regression gate | `python docs/wip/compare.py docs/wip/baseline.md results-qiyas-cuda-cpu.md` — prints every cell with base/new ms, ratio, lanes, errors; flags `SLOWER` (> 5 %) and `ERR UP`; "new row" for rows the baseline lacks. `baseline.md` is the full `cuda,cpu --report` run of item 4a (128 rows: the core rows of every type incl. the block formats and bool; committed with 4a). An earlier commit (c68ef15) held a matmul re-timing run there by mistake; the 12:38 run of item 3 survives only as the README Results tables, which `python docs/wip/compare_readme.py README.md results-qiyas-cuda-cpu.md <an older full run for the error column>` compares against cell by cell. Some CPU cells of the 4a run caught this laptop's slow level; re-time before calling a cell slower. Re-time a flagged cell several times before calling it swing: this laptop's sub-2 ms cells move ±20–40 % run to run; an A/B against a build of the baseline commit (`git worktree add <dir> c73a251`, build it, run both dlls back to back) separates code from machine state. |
 | README Results tables | `python docs/wip/readme_results.py results-qiyas-cuda-cpu.md > tables.md` — the two tables (lib / number / qiyas / ×). The script sets stdout to UTF-8; redirect to a file and splice (the Bash console's code page mangles — × ³ otherwise). |
 | Gate-only quick runs | `Qiyas.dll cpu --types int8 --ops add` (every CPU gate, one row); `Qiyas.dll cuda --types float32 --ops add` (every gate on both devices). `--types` only limits the bench rows; the gates always cover every type. |
 | Stress | `--repeat N`: repeats the matmul rows N times and raises `Checks.Stress` (default 20) to N: the block-format transpose is repeated `Stress` times in Group2, the team gate runs `Stress × 500` jobs, the device products gate runs `Stress / 20` passes under every tensor kind. Used: `cpu --types q6_k,q4_k,q4_0,q8_0 --ops reduce --repeat 100` (the transpose race), `cpu --types int4 --ops matmul --repeat 30` ×5 (the team race), `cuda --types uint16 --ops matmul --repeat 600` (30 passes of the device products gate). |
@@ -46,6 +47,33 @@ script to a file and run `python script.py .` from the repository root.
 - `References.MatMul` (Program.cs) is double-double: an exact lane reads 0; a float64 lane shows ~1e-13 at 2048³.
 - The open intermittent (COVERAGE.md State, item 4 there): `matmul_bwd dB device` unsigned types wrong by 138 steps,
   seen once, not reproduced in 150 gate passes. If it shows again, `QIYAS_MAP_DEBUG=1` on the run captures the values.
+
+## Item 4 progress (update as it moves)
+
+Item 4 = every remaining **todo** in COVERAGE.md gone: 4a fused attention rows, 4b ctc, then 4c the GRU sequence bench
+row, 4d the block-scaled tiled product, 4e the transposition fused into the product's packing, 4f the radix step of
+scatter-add, 4g the fused direct convolution. Each may be reported as its own boundary.
+
+- 4a: done, reported as its own boundary (uncommitted until the coordinator's go). What landed:
+  - device kernel `Ptx.AttentionRows` (`src/Ptx.AttentionRows.cs`): a block of 256 threads per (head, Br query rows),
+    Br = Bc = 32 in f32 and 16 in f64 (`Ptx.AttentionTile`), dCap ∈ {32, 64, 128}; K and V tiles through one shared
+    buffer (`AttentionRowsShared`), 16-byte shared loads, group max/sum by `shfl.sync.bfly`, P through shared memory;
+    per-block key ranges [lo, hi) computed on the host (`p_range`), so causal and span tiles outside are skipped.
+    FMA lane: the tensor lanes inside it are the known-slow step.
+  - CPU `Kernels.AttentionRows` (`src/AttentionRows.cs`): tasks of 16 query rows, key tiles of 64 laid transposed,
+    row pairs in register accumulators.
+  - `Attention<TN>` on both devices is now the measured choice between `AttentionRows<TN>` and `AttentionComposed<TN>`
+    (the old body, renamed) per shape and type: both warmed, then alternating rounds, the minimum of each (a first run
+    while the GPU raises its clocks timed the fused rows at 23 ms against 3.8 warm and chose wrong before that).
+    Decisions: `GpuOps.Note` / `Kernels.Note` (new, static); `--report` prints them again at the end of the run
+    (`Kernels.Measured`, `GpuOps.Measured`).
+  - gate: `Checks.Attentions` runs every case composed and fused, plus d 17 / 64 / 128, causal, spans with starts, a
+    block whose rows see no key; bench rows `attention_fused`, `attention_fused_causal` (`IBench.AttentionFused`).
+  - also in 4a: the device products intermittent settled (`GpuOps.KPadded`, gate `Checks.TensorConfigs`; COVERAGE
+    "Settled").
+  - measured (16 heads, 2048², d 128): device f32 3.79 ms (causal 2.12) from 6.1 by the composition; f16 3.82, fp8
+    4.72, q8_0 3.95; f64 non-causal keeps the composition (59 vs 61), causal fused 31.7 vs 59. CPU f32 60–80 ms (causal
+    33–38) from 100–148.
 
 ## Item 4a — flash-fused attention rows
 
@@ -109,6 +137,83 @@ Design intended:
   `src/Bench/QiyasSubject.cs` (the lib has no ctc kernel: lib column —; the `number` subject may skip: null).
 - Bench rows: `ctc` and `ctc_bwd` (T 256, B 32, C 1024, labels 64) in a new `Program.Group10` (`--ops routing` or a
   new `--ops losses`), the README options paragraph updated; COVERAGE "ctc" row → ✓ float / ✓ float.
+
+## Item 4c — the GRU sequence bench row
+
+Today: `GruSequence<TN>` exists on both devices (`src/Recurrent.cs` ~453, `src/GpuOps.Recurrent.cs` ~255) and the gate
+covers LSTM sequences only; the bench has `lstm_seq`, `lstm_seq_bwd` (`Program.Group8`, `Program.cs` ~449).
+Design: a float64 reference `RecurrentCase.GruSequenceReference(a, T, x, h0, w, u, b, bh)` in
+`src/Bench/RecurrentCases.cs` (the step reference looped, as `LstmSequenceReference`); `Checks.Recurrents` adds GRU
+sequences (T 3, the gate's odd shapes) on both devices; the contract gets `IBenchSubject.GruSequence(...)` (default
+null) implemented in `QiyasSubject.cs`; bench row `gru_seq` (16 steps of 256 × 512 → 512, as `lstm_seq`) in Group8.
+The device's narrow types need the lane-storage wrapper `LstmSequence` has (the `!OwnLane(f) && !f.IsBlock` branch):
+copy it for GRU; block formats go through it too (remove the `f.IsBlock` throw by routing blocks through the wrapper).
+A GRU sequence backward is not asked for (the step backward exists); say so in the COVERAGE row.
+
+## Item 4d — the block-scaled tiled product
+
+Today: a product with a Q8_0/Q4_0 operand decodes to f32 and multiplies in f32 (both devices); gemv has the
+block-scaled integer dot (`src/BlockProducts.cs`: `Kernels.GemvBlocks`, `Ptx.GemvBlocks`, `GpuOps.GemvBlocks<TN>`).
+Design: for C = A·B with A in Q8_0/Q4_0 (weights) and B any float type: quantize B's columns per 32-block of k to s8
+with an f32 scale (the activation side, as GGUF's Q8_1-style dot does), then C[i][j] = Σ_blocks dA_ib · dB_bj · (s8 dot
+of 32 terms) — exact integer dots, the scales' product in f32. CPU: `Kernels.MatMulBlocks` — the product's tiling
+(`ProductBody` pattern: tiles of 6 rows × strips) with the inner kernel an `S8Dot` lane dot per block
+(`Vector`-widened multiply-add of sbyte pairs into int32, then one f32 FMA with the two scales); device:
+`Ptx.MatMulBlocks` with dp4a per 4 values (a 32-block = 8 dp4a) per (row, column) tile from shared memory, or the s8
+tensor kind (`s8mma`) per 32-block with the per-block scale applied to the int32 tile before the f32 accumulate.
+Lane name `s8dp blocks` (as gemv). Note the error: B's quantization adds B's block step — the reference is A's decoded
+values times B's stored values, so the gate's tolerance must include B's quantization step (or quantize B in the
+reference too and say so); keep the f32 route as the exact one and choose between them only where the caller allows the
+activation quantization (an option, default off: the plain product stays exact as today). Gate: `Checks.Products`
+block types with the option on, against the reference with B quantized. Bench row `matmul_blocks` (q8_0, q4_0;
+2048³ cuda / 1024³ cpu). Q4_K/Q6_K: their sub-block scales make the same scheme work per 32 values (Q4_K's scale × min
+term needs the column sums of B per block: Σ dB·sum(qB)); do Q8_0/Q4_0 first, K formats if time allows, and say which.
+
+## Item 4e — the transposition fused into the product's packing
+
+Today: `MatMulView` makes each transposed or batched operand contiguous by the strided copy, then the product
+(`src/Products.cs` CPU; `src/GpuOps.Products.cs` device). Design: pass the operand's layout into the packing instead.
+CPU: `Kernels.MatMul` packs B by groups of k rows (`PackBody`) and reads A by rows (`ProductBody`): add a `transB`
+flag so `PackBody` reads B's column j of row p from Bᵀ storage (the strip is then a contiguous read of Bᵀ's rows —
+cheaper than today), and a `transA` flag so the A-panel load reads Aᵀ's columns (gather into `rowsIn`); the batch's
+offsets passed as base indices (no copy). Device: `Pack(f, kind, …, transposed)` already exists for B in both
+orientations (`Ptx.PackRows` with `transposed`, `Ptx.PackTransposed`): call it with the view's orientation and the
+batch offset on the stored pointer (byte offset = values · bits / 8 when whole bytes; sub-byte offsets keep the copy);
+the plain-lane kernels (`Gemm`, `Gemm2`) need a strided A/B variant or the lane conversion (`Lanes`) done strided — the
+`to:` kernel with a stride. Gate: `Checks.Products` already covers Aᵀ, Bᵀ, AᵀBᵀ, batched — unchanged, must stay green;
+bench rows `matmul_nt`, `matmul_tn`, `matmul_tt`, `matmul_batched` show the gain (compare.py on `--ops products`).
+
+## Item 4f — the radix step of scatter-add
+
+Today: the device orders scatter-add sources by `scatter_count` (atomic counts) → `scatter_scan` (one warp scans the
+counts) → `scatter_place` (each source's rank = the number of earlier sources with the same target: a loop over all
+earlier sources — quadratic in n) (`src/Ptx.Layout.cs` ~727–794, `GpuOps.Layout.cs` ~40, the same three kernels in
+`GpuOps.Route`). Design: a stable counting sort by blocks: (1) per block of 256 sources, per-target counts in shared
+memory is too large for many targets, so instead: each block computes its sources' local ranks among equal targets
+inside the block (a block-wide match: sort the 256 (target, index) pairs in shared memory by a bitonic sort, which is
+stable when the index is the tie key), writes block-local counts per target as (target, block, count) runs; (2) a scan
+over blocks per target gives each block's base offset per target (`blockBase[target][block]` is too big for many
+targets — use the sorted runs: an exclusive scan of run counts in (target, block) order via a segmented scan, i.e.
+sort the runs by target with a device radix sort on the target key (LSD, 8 bits a pass, stable)); simplest correct
+version: a full LSD radix sort of the (target, sourceIndex) pairs — 8-bit digits, per pass a block-local histogram,
+a scan of histograms across blocks (digit-major), a stable scatter — giving `order` directly; `counts`/`offsets` from
+the sorted targets by a boundary scan. The scan kernel must be multi-block for large target counts (`scatter_scan`
+today is one warp: also linear in targets). Gate: `Checks.Layouts` scatter_add cases + `Checks.Routings` route, plus a
+case with 1M sources into 64 and into 100 000 targets (exact order equality with the CPU's stable order). Bench rows
+`layout:scatter_add_rows` and `route` (1M into 64 buckets) show it; add `route` at 1M into 65 536.
+
+## Item 4g — the fused direct convolution
+
+Today: conv forward = im2col → product (both devices; `src/Conv.cs`, `src/GpuOps.Conv.cs`), the im2col matrix
+(C·KH·KW × OH·OW) materialized. Design: an implicit-GEMM product — the product kernel reads B (the im2col matrix)
+through an index map instead of from memory. CPU: in `Kernels.MatMul`'s `PackBody`, a mode where row p of B (one
+(c, kh, kw)) and column j (one output pixel) are read from the image at (c, oh·sh − ph + kh·dh, ow·sw − pw + kw·dw) or
+0 outside — the packing is the only reader of B, so the micro-kernel is untouched and the im2col buffer disappears.
+Device: the same in the packing kernel for the tensor kinds (`Ptx.PackTransposed` for B: the index map in place of
+the load) and in the plain lanes' B load. Lanes and bounds: the product's (the image's range bounds the im2col's).
+Gate: `Checks.Convs` (strides, pads, dilations; forward and backward) unchanged and green; a check that the fused path
+equals the composition bit for bit (same products, same order). Bench row `conv` shows the gain; COVERAGE conv row:
+"im2col fused into the product's packing (implicit GEMM)".
 
 ## Item 5 — the buffer arena
 

@@ -8,6 +8,19 @@ namespace Qiyas;
 
 internal static partial class Kernels
 {
+    private static readonly List<string> s_decisions = [];
+
+    /// <summary>A decision taken from a measurement on the CPU, kept for the report.</summary>
+    internal static void Note(string decision) { lock (s_decisions) if (!s_decisions.Contains(decision)) s_decisions.Add(decision); }
+
+    /// <summary>The CPU decisions taken from measurements so far (the bench takes most of them after the report is printed).</summary>
+    public static string Measured()
+    {
+        var sb = new StringBuilder();
+        lock (s_decisions) foreach (var d in s_decisions) sb.AppendLine($"  measured cpu: {d}");
+        return sb.ToString();
+    }
+
     public static string Report()
     {
         var sb = new StringBuilder();
@@ -17,6 +30,7 @@ internal static partial class Kernels
         sb.AppendLine($"  dot lanes: s8 {(S8Dot.IsSupported ? "yes" : "no")}, u8 {(U8Dot.IsSupported ? "yes" : "no")}, s16 {(S16Dot.IsSupported ? "yes" : "no")}, u16 {(U16Dot.IsSupported ? "yes" : "no")} (the runtime's report; a lane not supported is not used)");
         sb.AppendLine("  lane rules: own (element-wise), float (f32 for narrow floats, f64 for float64), sum (dot lanes → f32 ≤ 2^24 → s32/u32 → f64 ≤ 2^53 → s64/u64, by the bounds measured on the data)");
         sb.AppendLine("  block formats: Q8_0, Q4_0, Q4_K, Q6_K read a value at a time, written a block at a time; bool at 1 bit");
+        lock (s_decisions) foreach (var d in s_decisions) sb.AppendLine($"  measured: {d}");
         return sb.ToString();
     }
 }
@@ -27,6 +41,14 @@ public sealed partial class GpuOps
 
     /// <summary>A decision taken from a measurement or a refusal, kept for the report.</summary>
     internal void Note(string decision) { if (!_decisions.Contains(decision)) _decisions.Add(decision); }
+
+    /// <summary>The device decisions taken from measurements so far (the bench takes most of them after the report is printed).</summary>
+    public string Measured()
+    {
+        var sb = new StringBuilder();
+        foreach (var d in _decisions) sb.AppendLine($"  measured device: {d}");
+        return sb.ToString();
+    }
 
     public string Report()
     {

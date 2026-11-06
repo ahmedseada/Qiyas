@@ -85,6 +85,9 @@ public interface IBenchSubject
     /// <summary>O = softmax(scale·Q·Kᵀ, masked)·V per head for rows of queries (AttentionArgs); decode: a few queries against a long cache.</summary>
     IBenchRun? Attention(Device device, string type, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o, bool decode) => null;
 
+    /// <summary>O for rows of queries by a fused kernel (no Lq × Lk scores in memory), when the subject has one.</summary>
+    IBenchRun? AttentionFused(Device device, string type, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) => null;
+
     /// <summary>dQ, dK, dV from dO.</summary>
     IBenchRun? AttentionBackward(Device device, string type, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] dO, byte[] dq, byte[] dk, byte[] dv) => null;
 

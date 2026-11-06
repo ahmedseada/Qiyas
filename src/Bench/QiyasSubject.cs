@@ -131,6 +131,9 @@ public sealed class QiyasSubject : IBenchSubject
     public IBenchRun? Attention(Device device, string type, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o, bool decode) =>
         Registry.IsFloat(type) ? Registry.WithFloat(type, new AttentionVisitor(device, a, q, k, v, o, decode, null, null, null)) : null;
 
+    public IBenchRun? AttentionFused(Device device, string type, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) =>
+        Registry.IsFloat(type) && a.D <= GpuOps.FusedHeadMax ? Registry.WithFloat(type, new AttentionVisitor(device, a, q, k, v, o, false, null, null, null, fused: true)) : null;
+
     public IBenchRun? AttentionBackward(Device device, string type, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] dO, byte[] dq, byte[] dk, byte[] dv) =>
         Registry.IsFloat(type) ? Registry.WithFloat(type, new AttentionVisitor(device, a, q, k, v, dO, false, dq, dk, dv)) : null;
 
@@ -356,7 +359,7 @@ public sealed class QiyasSubject : IBenchSubject
         }
     }
 
-    private sealed class AttentionVisitor(Device device, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o, bool decode, byte[]? dq, byte[]? dk, byte[]? dv) : IFloatTypeVisitor<IBenchRun?>
+    private sealed class AttentionVisitor(Device device, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o, bool decode, byte[]? dq, byte[]? dk, byte[]? dv, bool fused = false) : IFloatTypeVisitor<IBenchRun?>
     {
         public IBenchRun? Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float>
         {
@@ -364,7 +367,7 @@ public sealed class QiyasSubject : IBenchSubject
             bool backward = dq is not null;
             if (device == Device.Cpu)
             {
-                return new BenchRun(() => lane = backward ? Kernels.AttentionBackward<TN>(a, q, k, v, o, dq!, dk!, dv!) : decode ? Kernels.AttentionDecode<TN>(a, q, k, v, o) : Kernels.Attention<TN>(a, q, k, v, o), lane: () => lane);
+                return new BenchRun(() => lane = backward ? Kernels.AttentionBackward<TN>(a, q, k, v, o, dq!, dk!, dv!) : decode ? Kernels.AttentionDecode<TN>(a, q, k, v, o) : fused ? Kernels.AttentionRows<TN>(a, q, k, v, o) : Kernels.Attention<TN>(a, q, k, v, o), lane: () => lane);
             }
 
             var ops = Devices.Ops;
@@ -375,7 +378,7 @@ public sealed class QiyasSubject : IBenchSubject
             if (backward) { Gpu.Upload<byte>(o, dO); gq = gpu.Rent(dq!.Length); gk = gpu.Rent(dk!.Length); gv = gpu.Rent(dv!.Length); }
             return new BenchRun(() =>
             {
-                lane = backward ? ops.AttentionBackward<TN>(a, dQ, dK, dV, dO, gq, gk, gv) : decode ? ops.AttentionDecode<TN>(a, dQ, dK, dV, dO) : ops.Attention<TN>(a, dQ, dK, dV, dO);
+                lane = backward ? ops.AttentionBackward<TN>(a, dQ, dK, dV, dO, gq, gk, gv) : decode ? ops.AttentionDecode<TN>(a, dQ, dK, dV, dO) : fused ? ops.AttentionRows<TN>(a, dQ, dK, dV, dO) : ops.Attention<TN>(a, dQ, dK, dV, dO);
                 Gpu.Synchronize();
             }, () => { if (backward) { Gpu.Download<byte>(gq, dq!); Gpu.Download<byte>(gk, dk!); Gpu.Download<byte>(gv, dv!); } else Gpu.Download<byte>(dO, o); },
                 () => { gpu.Return(dQ); gpu.Return(dK); gpu.Return(dV); gpu.Return(dO); if (backward) { gpu.Return(gq); gpu.Return(gk); gpu.Return(gv); } }, () => lane);

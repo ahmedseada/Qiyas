@@ -78,6 +78,12 @@ foreach (var device in options.Devices)
 }
 
 bench.Write(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", $"results-qiyas-{string.Join('-', options.Devices.Select(d => d.ToString().ToLowerInvariant()))}.md"));
+if (options.Report)
+{
+    Console.WriteLine("measured during the run");
+    Console.Write(Qiyas.Kernels.Measured());
+    if (options.Devices.Contains(Device.Cuda) && Devices.HasCuda) Console.Write(Devices.Ops.Measured());
+}
 return 0;
 
 // ---------------------------------------------------------------------------------------------- the command line
@@ -99,7 +105,7 @@ internal sealed class Options
     public static readonly string[] Group3 = [.. RowOps.All.Select(o => "row:" + o.Name), "norm_params_bwd:rms", "norm_params_bwd:layer"];
     public static readonly string[] Group4 = [.. LayoutArgs.Names.Select(n => "layout:" + n)];
     public static readonly string[] Group4b = ["matmul_nt", "matmul_tn", "matmul_tt", "matmul_batched", "matmul_bwd"];
-    public static readonly string[] Group5 = ["attention", "attention_causal", "attention_decode", "attention_bwd"];
+    public static readonly string[] Group5 = ["attention", "attention_causal", "attention_fused", "attention_fused_causal", "attention_decode", "attention_bwd"];
     public static readonly string[] Group7 = [.. OptimizerArgs.Names.Select(n => "optimizer:" + n)];
     public static readonly string[] Group6 = ["conv", "conv_bwd"];
     public static readonly string[] Group8 = ["lstm_step", "gru_step", "lstm_step_bwd", "gru_step_bwd", "lstm_seq", "lstm_seq_bwd"];
@@ -541,8 +547,8 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         if (!Registry.IsFloat(type)) return;
         AttentionArgs a = name switch
         {
-            "attention" => new(16, Prime(2048), Prime(2048), Prime(128), 1 / Math.Sqrt(128), false),
-            "attention_causal" => new(16, Prime(2048), Prime(2048), Prime(128), 1 / Math.Sqrt(128), true),
+            "attention" or "attention_fused" => new(16, Prime(2048), Prime(2048), Prime(128), 1 / Math.Sqrt(128), false),
+            "attention_causal" or "attention_fused_causal" => new(16, Prime(2048), Prime(2048), Prime(128), 1 / Math.Sqrt(128), true),
             "attention_decode" => new(32, 1, Prime(4096), Prime(128), 1 / Math.Sqrt(128), false),
             _ => new(8, Prime(1024), Prime(1024), Prime(128), 1 / Math.Sqrt(128), true),
         };
@@ -564,6 +570,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         }
 
         var want = a.Reference(qv, kv, vv);
+        if (name.StartsWith("attention_fused", StringComparison.Ordinal)) { Measure(device, name, type, shape, want, (s, o) => s.AttentionFused(device, type, a, q, k, v, o), q.Length); return; }
         Measure(device, name, type, shape, want, (s, o) => s.Attention(device, type, a, q, k, v, o, name == "attention_decode"), q.Length);
     }
 

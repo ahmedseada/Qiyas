@@ -735,6 +735,25 @@ internal static class Checks
                 ok &= Close(type, $"attention{(decode ? " decode" : "")}{(a.Causal ? " causal" : "")}{(a.Spans is not null ? " spans" : "")} d{a.D}", where, o, want, (int)a.QValues, a.Lk + a.D);
             }
 
+            // The fused rows forced, at every head-dimension capacity (32, 64, 128) and tile edge: queries and keys not in
+            // whole tiles, causal, spans with starts, a row block whose rows see no key.
+            var fusedCases = new List<AttentionArgs>
+            {
+                new(2, 37, 53, 24, 0.2, false), new(2, 37, 53, 17, 0.2, true), new(3, 37, 100, 64, 0.1, false), new(2, 33, 71, 128, 0.08, true),
+                new(2, 37, 53, 120, 0.1, false, Enumerable.Range(0, 37).Select(i => 20 + i % 30).ToArray(), Enumerable.Range(0, 37).Select(i => i % 25).ToArray()),
+                new(2, 40, 53, 24, 0.2, false, Enumerable.Range(0, 40).Select(i => i < 16 ? 0 : 1 + i).ToArray()),
+            };
+            foreach (var a in fusedCases)
+            {
+                var q = Bench.Registry.Make(type, (int)a.QValues, 41, -1, 1);
+                var k = Bench.Registry.Make(type, (int)a.KValues, 42, -1, 1);
+                var v = Bench.Registry.Make(type, (int)a.KValues, 43, -1, 1);
+                var o = new byte[q.Length];
+                var want = a.Reference(Bench.Registry.Values(type, q, (int)a.QValues), Bench.Registry.Values(type, k, (int)a.KValues), Bench.Registry.Values(type, v, (int)a.KValues));
+                Bench.Registry.WithFloat(type, new AttentionRun(ops, a, q, k, v, o, false, null, null, null, fused: true));
+                ok &= Close(type, $"attention fused{(a.Causal ? " causal" : "")}{(a.Spans is not null ? " spans" : "")}{(a.SpanStarts is not null ? " starts" : "")} {a.Heads}h {a.Lq}x{a.Lk} d{a.D}", where, o, want, (int)a.QValues, a.Lk + a.D);
+            }
+
             {
                 var a = new AttentionArgs(2, 37, 53, 24, 0.2, true);
                 var q = Bench.Registry.Make(type, (int)a.QValues, 41, -1, 1);
@@ -752,11 +771,11 @@ internal static class Checks
             }
         }
 
-        if (ok) Console.WriteLine($"check attention              {where,-6} every float type: rows, causal, spans, decode and the backward pass within the lane's rounding");
+        if (ok) Console.WriteLine($"check attention              {where,-6} every float type: rows (composed and fused), causal, spans, decode and the backward pass within the lane's rounding");
         return ok;
     }
 
-    private sealed class AttentionRun(GpuOps? ops, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o, bool decode, byte[]? dq, byte[]? dk, byte[]? dv) : Bench.IFloatTypeVisitor<bool>
+    private sealed class AttentionRun(GpuOps? ops, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o, bool decode, byte[]? dq, byte[]? dk, byte[]? dv, bool fused = false) : Bench.IFloatTypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IQiyasFloat<TN>, IQiyasNumber<TN, float>
         {
@@ -765,6 +784,7 @@ internal static class Checks
             {
                 if (backward) Kernels.AttentionBackward<TN>(a, q, k, v, o, dq!, dk!, dv!);
                 else if (decode) Kernels.AttentionDecode<TN>(a, q, k, v, o);
+                else if (fused) Kernels.AttentionRows<TN>(a, q, k, v, o);
                 else Kernels.Attention<TN>(a, q, k, v, o);
                 return true;
             }
@@ -783,7 +803,7 @@ internal static class Checks
             }
             else
             {
-                if (decode) ops.AttentionDecode<TN>(a, dQ, dK, dV, dO); else ops.Attention<TN>(a, dQ, dK, dV, dO);
+                if (decode) ops.AttentionDecode<TN>(a, dQ, dK, dV, dO); else if (fused) ops.AttentionRows<TN>(a, dQ, dK, dV, dO); else ops.Attention<TN>(a, dQ, dK, dV, dO);
                 Qiyas.Gpu.Synchronize();
                 Qiyas.Gpu.Download<byte>(dO, o);
             }
@@ -816,7 +836,45 @@ internal static class Checks
         }
 
         if (ops is not null) { ops.FourBit = null; ops.K32 = null; }
+        if (ops is not null) ok &= TensorConfigs(ops);
         if (ok) Console.WriteLine($"check products               {where,-6} every type at 37 x 29 x 53, transposed, batched, and the backward pair{(ops is null ? "" : ", under every tensor kind")}: within the product's rounding");
+        return ok;
+    }
+
+    /// <summary>Every tensor configuration the device accepts, forced in turn, under every tensor kind: the product of every
+    /// type a tensor kind takes at k = 53 and k = 300 (neither a whole 128 nor 256 values) against float64.</summary>
+    private static bool TensorConfigs(GpuOps ops)
+    {
+        bool ok = true;
+        int tried = 0;
+        var kinds = new (bool four, bool k32, string name)[] { (true, true, "4-bit, k32"), (true, false, "4-bit, k16"), (false, true, "8-bit, k32"), (false, false, "8-bit, k16") };
+        foreach (var cfg in GpuOps.MmaConfigs)
+        {
+            ops.ForcedShape = cfg;
+            foreach (var (four, k32, kindName) in kinds)
+            {
+                ops.FourBit = four; ops.K32 = k32;
+                foreach (var type in Bench.Registry.Names)
+                {
+                    if (Bench.Registry.IsBlock(type) || type is "float32" or "float64") continue;
+                    foreach (int K in new[] { 53, 300 })
+                    {
+                        const int M = 37, N = 29;
+                        var v = new ProductView(M, N, K, false, false);
+                        var a = Bench.Registry.Make(type, M * K, 34, -1, 1);
+                        var b = Bench.Registry.Make(type, K * N, 35, -1, 1);
+                        var c = new byte[Bench.Registry.Bytes(type, M * N)];
+                        var want = v.Reference(Bench.Registry.Values(type, a, M * K), Bench.Registry.Values(type, b, K * N));
+                        Bench.Registry.With(type, new ProductRun(ops, v, a, b, c, null, null));
+                        ok &= Close(type, $"product k{K} [{kindName}; rows {cfg.RowBytes} B x {cfg.Stages} stages x {cfg.Bn} wide{(cfg.Swizzle ? " swizzled" : "")}]", "device", c, want, M * N, K);
+                        tried++;
+                    }
+                }
+            }
+        }
+
+        ops.ForcedShape = null; ops.FourBit = null; ops.K32 = null;
+        if (ok) Console.WriteLine($"check tensor configurations  device {GpuOps.MmaConfigs.Length} configurations x 4 kind choices: {tried} products at k = 53 and 300 as the references");
         return ok;
     }
 

@@ -58,21 +58,23 @@ regression comparer and the baseline run.
 
 **Open, in the order they are taken:**
 
-1. The todo rows below: flash-fused attention rows, ctc, the GRU sequence bench row, the block-scaled tiled product,
-   fusing the transposition into the product's packing, the radix step of scatter-add.
+1. The todo rows below (item 4, in this order: fused attention rows — done, ctc, the GRU sequence bench row, the block-scaled
+   tiled product, the transposition fused into the product's packing, the radix step of scatter-add, the fused direct
+   convolution); the designs and the progress are in `docs/wip/HANDOFF.md`.
 2. A bump-allocated scope past the pool (buffers reserved once from the shapes; zero rents on the hot path).
 3. The known-slow list.
-4. An intermittent seen once, open: in one full `cuda,cpu --report` run (2026-11-06, the run after the product
-   reference became double-double) the device products gate reported `matmul_bwd dB device uint64 / uint32 / uint16
-   DIFFERS by 138 steps`, `uint2 by 3`, `bool by 1` — every unsigned type but uint8, the dB product only (Aᵀ·dC,
-   53 × 29 × 37, padded to 128 × 256 × 128), all by the same amount; that run's third tensor-kind timing had picked the
-   4-bit kind (`u4k32 kept`) where every other run picks `u8k32`. Not reproduced by: the same command twice; the 4-bit
-   kind forced for k = 37 (that run's choice); 30 passes of the device products gate under every tensor kind forced
-   (`--repeat 600`, the gate's pass repetition); the full run that followed. What is in place against it: the products
-   gate now runs on the device under every tensor kind the device accepts (the measured choice, then the 4-bit kinds
-   and the 32-deep 8-bit instruction forced on and off — `GpuOps.FourBit`, `GpuOps.K32`), and repeats under
-   `--repeat`. Suspected site, unproven: the unsigned pack of A (`Ptx.PackRows`, every failing type packs A; uint8 is
-   used as stored) or the padded buffers' history (`MatMulPadded`: cleared, padded, used — on one stream).
+
+**Settled — the device products intermittent** (`matmul_bwd dB device uint64 / uint32 / uint16 DIFFERS by 138 steps`,
+seen once in item 3's first full run; again in item 4 as `matmul_bwd dA … by 123` and, under the forced 4-bit kind,
+every product of the types whose values fit 4 bits). Cause: the tensor kernel's configuration is measured per kind at
+2048³ (`GpuOps.MmaShape`), and a configuration with 128-byte rows walks k in chunks of 128 bytes — 256 values of a
+4-bit kind — while the product padded k to whole 128 values only; at a k of 128 (any padded k below 256) each row's
+chunk read the next row's values. The 4-bit kinds' timing picks a 128-byte configuration on some runs only (`u4k32 ->
+rows 128 B x 3 stages x 128 wide swizzled` in both failing runs; `rows 64 B …` in the passing ones), hence the
+intermittence. Fixed: k is padded to whole chunks of the configuration chosen (`GpuOps.KPadded`), in the product and in
+the kinds' timing. Gate: `check tensor configurations` forces each of the 9 configurations in turn under each of the
+4 kind choices and runs the product of every type a tensor kind takes at k = 53 and k = 300 (1152 products); with the
+fix reverted it fails 102 of them, all under the three 128-byte configurations with a 4-bit kind.
 
 **Settled — the regression gate for the stretch (items 1–3).** The full `cuda,cpu --report` run of 2026-11-06 12:38
 (every type, every gate green on both devices, 128 rows) against `docs/wip/baseline.md` (00:51): 36 new rows (the block
@@ -122,7 +124,8 @@ and measured against the baseline when it is.
 | CPU | the strided copy (a 3-d permutation of 16M values) | 16.2 ms float32, 7.3 int8 against 1.8 for a plain copy: a value-at-a-time gather (tiling by the source's rows is the step) |
 | CPU | the pools and the depthwise convolution | maxpool_bwd 5.1 ms, adaptive_maxpool 5.8, depthwise_conv 4.8 (float32, 64 × 256 × 256); int8 adaptive_maxpool 18.6, depthwise 24.4 (value-at-a-time loads of a packed type) |
 | CPU | the convolution backward | 33 ms against 6.9 forward (64 × 128 × 128 by 128 of 3 × 3): three passes in lane storage |
-| CUDA | attention by the composition | 6.1 ms for 16 heads of 2048² at d = 128 (the scores through memory; a fused tile kernel through the tensor lanes is the step) |
+| CUDA | attention rows | 3.8 ms (causal 2.1) for 16 heads of 2048² at d = 128 by the fused rows in the FMA lane, from 6.1 by the composition (since item 4a); the tensor lanes inside the fused kernel are the step. float64 4.6 % apart either way (61 fused, 59 composition): the measurement keeps the composition there |
+| CPU | attention rows | 60–80 ms float32 (causal 33–38) for 16 heads of 2048² at d = 128 by the fused rows, from 100–148 by the composition (since item 4a) |
 | CUDA | attention backward by the composition | 4.0 ms for 8 heads of 1024² |
 | CUDA | int8 adaptive_maxpool | 0.265 ms against float32 0.079 (per-value unpacking of 4 values a word in the window loop) |
 | CPU | top-k per row | 113 ms float32, 305 int8 for top-8 of 4096 × 32768: k passes over the row (a partial sort is the step) |
@@ -204,10 +207,10 @@ sum_axis, sumsq, max, min, argmax → the reductions; transpose; gemv_nn / gemv_
 
 | operation | CPU | CUDA | note |
 |---|---|---|---|
-| rows of queries: O = softmax(scale·Q·Kᵀ, causal or spans)·V per head | ✓ float | ✓ float | the composition of Qiyas's own operations in lane storage (a narrow type widened once, O narrowed once): the view product, scale_mask_softmax with the key limit per row, the view product |
+| rows of queries: O = softmax(scale·Q·Kᵀ, causal or spans)·V per head | ✓ float | ✓ float | the fused rows or the composition, whichever the device measures faster at the shape and type (once; both warmed, then timed in alternating rounds, the minimum of each; the decision in `--report`); the composition for d > 128. The composition: Qiyas's own operations in lane storage (a narrow type widened once, O narrowed once): the view product, scale_mask_softmax with the key limit per row, the view product |
 | decode: a few queries over a long cache | ✓ float | ✓ float | the device's fused kernel: a block per query, keys in chunks, the softmax online, K and V read once; the CPU per query in the lane |
 | backward: dQ, dK, dV | ✓ float | ✓ float | the composition: P recomputed, dV = Pᵀ·dO, dP = dO·Vᵀ, dS = softmax_bwd, dQ = scale·dS·K, dK = scale·dSᵀ·Q |
-| fused rows (flash: tiles of keys through the tensor lanes without the scores in memory) | todo | todo | the composition keeps Lq × Lk scores per head in lane storage |
+| fused rows (flash: tiles of keys without the scores in memory), d ≤ 128 | ✓ float | ✓ float | the softmax online (running max and sum, the context rescaled when the max rises); block formats through lane storage. CPU: tasks of 16 query rows, keys in tiles of 64 laid transposed for vector scores, row pairs in registers. CUDA: a block of 256 threads per (head, 32 query rows; 16 in f64), keys in tiles of 32 (16) through shared memory with 16-byte loads, group reductions by shuffles, causal and span tiles skipped per block; FMA lane (the tensor lanes inside: the known-slow step). Gate: the composition's cases plus d 17 / 64 / 128, causal, spans with starts, rows that see no key; bench rows `attention_fused`, `attention_fused_causal` |
 | spans as a key range per query: [start, limit) | ✓ | ✓ | the limit by scale_mask_softmax's position, the start by an additive mask row (the composition) or the decode kernel's first chunk |
 
 ## Convolution and pooling

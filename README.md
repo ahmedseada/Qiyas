@@ -19,7 +19,10 @@ does best for it, chosen per operation from the data itself. No type is fixed an
   the device's conversions against the CPU's; then every operation of every family runs over every type it applies to
   on both devices, on small odd shapes, against float64 references (`src/Checks.cs`); the block codecs against blocks
   laid out by hand from the formats' specifications; the products on the device under every tensor kind the device
-  accepts (the measured choice, then the 4-bit kinds and the 32-deep 8-bit instruction forced on and off); the thread
+  accepts (the measured choice, then the 4-bit kinds and the 32-deep 8-bit instruction forced on and off), and under
+  every tensor-kernel configuration the device can run with every kind choice (k = 53 and 300, every integer and
+  narrow-float type); attention rows by both the composition and the fused rows (causal, spans with starts, head
+  dimensions up to 128, rows that see no key); the thread
   team under 20 000 jobs of alternating chunk counts (every chunk within its job, every index once). The float64
   reference of every product is accumulated in double-double, so an exact lane reads 0. The bench refuses to time while
   any gate fails.
@@ -28,7 +31,7 @@ does best for it, chosen per operation from the data itself. No type is fixed an
   (softmax, log_softmax, the norms and their backward passes, rope, masked softmax, cross-entropy's backward); layout
   and indexing (strided copies, one-hot, gathers, scatter-add, im2col/col2im, interpolation, shift, pad, the pools and
   their backward, depthwise convolution); products on views (transposed, batched) and the matmul backward; attention
-  (rows, causal, spans, decode, backward); convolution forward and backward; the optimizer steps; LSTM and GRU cells,
+  (rows by the composition or the fused rows, whichever is measured faster; causal, spans, decode, backward); convolution forward and backward; the optimizer steps; LSTM and GRU cells,
   steps and sequences with their backward passes; top-k, pick, sampling, routing; and the block formats and bool
   through all of it. What is still open is listed in COVERAGE.md's "State" and marked **todo** in its rows.
 
@@ -56,7 +59,10 @@ its backward, weight_norm, rope, scale_mask_softmax, add_rms_norm, add_layer_nor
 one_hot, gather_rows, gather_cols, scatter_add_rows, im2col, col2im, interpolate_nearest, interpolate_bilinear, shift).
 `products` adds the products on views (`matmul_nt`, `matmul_tn`, `matmul_tt` at 4096³, `matmul_batched`: 16 × 1024³,
 `matmul_bwd`: dA and dB at 4096³); `attention` adds `attention`, `attention_causal` (16 heads, 2048 × 2048, d = 128),
-`attention_decode` (32 heads, one query over 4096 keys) and `attention_bwd` (8 heads of 1024). A single name works too
+`attention_fused`, `attention_fused_causal` (the same shapes, the fused rows alone, for comparing with the measured
+choice), `attention_decode` (32 heads, one query over 4096 keys) and `attention_bwd` (8 heads of 1024). The decisions
+taken from measurements during a run (attention's fused-or-composed choice per shape and type, among others) are printed
+at its end with `--report`. A single name works too
 (`--ops map:erf,sum:rows,row:rope,layout:im2col,attention_decode`); `optimizers` adds `optimizer:sgd_momentum`,
 `optimizer:adam`, `optimizer:adamw` over 16M parameters (the moments in lane storage; each run restores p, m, v first,
 named in the lane column); `conv` adds `conv` and `conv_bwd` (a 64 × 128 × 128 image by 128 filters of 3 × 3); the
@@ -109,7 +115,8 @@ checkout (files listed in `.gitignore`); a clone runs the other subjects.
 | `src/Recurrent.cs`, `src/Ptx.Recurrent.cs`, `src/GpuOps.Recurrent.cs`, `src/Bench/RecurrentCases.cs` | LSTM and GRU cells and steps, forward and backward |
 | `src/Conv.cs`, `src/GpuOps.Conv.cs` | convolution forward and backward as im2col / product / col2im compositions |
 | `src/Optimizers.cs`, `src/Ptx.Optimizers.cs`, `src/GpuOps.Optimizers.cs` | optimizer steps: sgd with momentum, adam, adamw |
-| `src/Attention.cs`, `src/Ptx.Attention.cs`, `src/GpuOps.Attention.cs` | attention: the composition in lane storage, the fused decode kernel, the backward composition; the lane-storage conversions |
+| `src/Attention.cs`, `src/Ptx.Attention.cs`, `src/GpuOps.Attention.cs` | attention: the measured choice, the composition in lane storage, the fused decode kernel, the backward composition; the lane-storage conversions |
+| `src/AttentionRows.cs`, `src/Ptx.AttentionRows.cs` | attention's fused rows (flash: keys in tiles, the softmax online, no scores in memory) on the CPU and the device |
 | `src/Products.cs`, `src/GpuOps.Products.cs` | products on views (transposed operands, batches) and the matmul backward, through the strided copy and the product kernel |
 | `src/Layout.cs`, `src/Ptx.Layout.cs`, `src/GpuOps.Layout.cs`, `src/Bench/LayoutCases.cs` | layout and indexing: the references, the CPU kernels, the device kernels, the gate's and the bench's cases |
 | `src/Reduce.cs`, `src/Ptx.Reduce.cs` | reductions (sum, sum of squares, max, min, argmax: whole, rows, columns), row-vector broadcasts, transpose, gemv: the CPU kernels, the device kernels |
@@ -193,14 +200,16 @@ Where Qiyas is not ahead: the memory-bound adds of 32- and 64-bit types (the sam
 The CUDA float64 product is exact where the library computes it in float32 (its error 1.6e-4), through the sliced
 8-bit tensor route where the device measures it faster than its float64 lane.
 
-The tables above are the four core rows of the full `cuda,cpu` run the regression gate compares against
-(`docs/wip/baseline.md`); the other families' rows, the block formats and bool are in `results-qiyas-cuda-cpu.md` of
+The tables above are the four core rows of the full `cuda,cpu` run of 12:38, which the regression gate compares
+against (`docs/wip/compare_readme.py` compares a run with these tables); the regression baseline `docs/wip/baseline.md` is the
+full `cuda,cpu --report` run of item 4a (128 rows, every type); the other families' rows, the block formats and bool are in `results-qiyas-cuda-cpu.md` of
 the latest run, and `COVERAGE.md`'s "Known slow" names the measured cells that are correct but below what the device
 allows.
 
 ## Open
 
 What the gates have not confirmed, or is not done, is in `COVERAGE.md` ("State" for the order, **todo** in the rows):
-the flash-fused attention rows, ctc, a GRU sequence bench row, the block-scaled tiled product, a bump-allocated scope
-past the buffer pool, and the known-slow cells. The README claims nothing beyond what the gates and the regression
+ctc, a GRU sequence bench row, the block-scaled tiled product, the transposition fused into the product's packing, the
+radix step of scatter-add, a fused direct convolution, a bump-allocated scope past the buffer pool, and the known-slow
+cells (among them the tensor lanes inside the fused attention kernel, which runs in the FMA lane). The README claims nothing beyond what the gates and the regression
 comparison have confirmed.

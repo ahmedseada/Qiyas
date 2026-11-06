@@ -408,8 +408,32 @@ public sealed partial class GpuOps(Gpu gpu)
 
     /// <summary>The tensor kernel's shape for a kind: of the row widths, pipeline depths and block widths the device's
     /// shared memory takes and its JIT accepts, the one it runs fastest (measured once, on a 2048³ product); null when it has none.</summary>
+    /// <summary>The tensor kernel's configurations the device measures (rows of k bytes a stage, stages, columns a block, swizzle).</summary>
+    public static readonly MmaConfig[] MmaConfigs =
+    [
+        new(64, 3, 128, false), new(64, 4, 128, false), new(128, 2, 128, false), new(64, 3, 256, false),
+        new(64, 3, 256, true), new(64, 4, 256, true), new(128, 2, 256, true), new(128, 3, 128, true), new(64, 6, 128, true),
+    ];
+
+    /// <summary>The gate's override of the measured configuration (null: measured): every configuration is checked, not only
+    /// the one a timing picked (a configuration chosen by one run's timing once read past k: see KPadded).</summary>
+    internal MmaConfig? ForcedShape;
+
+    private readonly Dictionary<string, bool> _accepted = [];
+
+    private bool Usable(Ptx.Kind kind, MmaConfig cfg)
+    {
+        string key = $"{kind.Tag}:{cfg}";
+        if (_accepted.TryGetValue(key, out bool known)) return known;
+        int shared = Ptx.MmaShared(cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle);
+        bool ok = shared <= gpu.SharedOptIn && gpu.Accepts(Ptx.GemmMma(gpu, kind, cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle, out string entry), entry);
+        if (ok) gpu.AllowShared(gpu.Cached($"mma:{kind.Tag}:{cfg}", (out string e) => Ptx.GemmMma(gpu, kind, cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle, out e)), shared);
+        return _accepted[key] = ok;
+    }
+
     private MmaConfig? MmaShape(Ptx.Kind kind)
     {
+        if (ForcedShape is { } forced && _shapes.TryGetValue(kind.Tag, out var measured) && measured is not null && Usable(kind, forced)) return forced;
         if (_shapes.TryGetValue(kind.Tag, out var known)) return known;
         MmaConfig? best = null;
         double bestMs = double.MaxValue;
@@ -417,11 +441,7 @@ public sealed partial class GpuOps(Gpu gpu)
         const int Size = 2048;
         int kp = Ptx.Padded(Size);
         ulong x = gpu.Rent((long)Size * kp * kind.Bits / 8), y = gpu.Rent((long)Size * kp * kind.Bits / 8), z = gpu.Rent((long)Size * Size * 4);
-        foreach (var cfg in new MmaConfig[]
-        {
-            new(64, 3, 128, false), new(64, 4, 128, false), new(128, 2, 128, false), new(64, 3, 256, false),
-            new(64, 3, 256, true), new(64, 4, 256, true), new(128, 2, 256, true), new(128, 3, 128, true), new(64, 6, 128, true),
-        })
+        foreach (var cfg in MmaConfigs)
         {
             int shared = Ptx.MmaShared(cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle);
             if (shared > gpu.SharedOptIn) continue;
@@ -437,6 +457,16 @@ public sealed partial class GpuOps(Gpu gpu)
         gpu.Return(x); gpu.Return(y); gpu.Return(z);
         if (best is { } shape) Console.WriteLine($"device measured {kind.Tag} tensor kernel at {Size}³: {string.Join(", ", report)}: rows {shape.RowBytes} B × {shape.Stages} stages × {shape.Bn} wide{(shape.Swizzle ? " swizzled" : "")} kept");
         return _shapes[kind.Tag] = best;
+    }
+
+    /// <summary>k padded for a tensor kind's kernel: whole 128-value tiles and whole k-chunks of the configuration the device
+    /// chose (a chunk is RowBytes of a row: 256 values for a 4-bit kind at 128 bytes — a k padded to 128 only would read a
+    /// row's chunk into the next row's values).</summary>
+    private int KPadded(Ptx.Kind kind, int k)
+    {
+        int rowBytes = _shapes.ContainsKey(kind.Tag) && MmaShape(kind) is { } c ? c.RowBytes : 64;       // a kind not measured has no kernel chosen yet
+        int chunk = Math.Max(128, rowBytes * 8 / kind.Bits);
+        return (k + chunk - 1) / chunk * chunk;
     }
 
     private IntPtr MmaFunction(Ptx.Kind kind, out uint shared, out int bn)
@@ -480,7 +510,7 @@ public sealed partial class GpuOps(Gpu gpu)
     {
         string key = $"{a.Tag}<{b.Tag}:{terms}";
         if (_faster.TryGetValue(key, out bool faster)) return faster;
-        int size = (int)Math.Clamp(terms, 256, 2048), kp = Ptx.Padded(size);     // at least the kernels' widest tile
+        int size = (int)Math.Clamp(terms, 256, 2048), kp = Math.Max(KPadded(a, size), KPadded(b, size));     // at least the kernels' widest tile
         int bits = Math.Max(a.Bits, b.Bits);
         ulong x = gpu.Rent((long)size * kp * bits / 8), y = gpu.Rent((long)size * kp * bits / 8), z = gpu.Rent((long)size * size * 4);
         var fa = MmaFunction(a, out uint sa, out int bna);
@@ -535,7 +565,7 @@ public sealed partial class GpuOps(Gpu gpu)
                     "u8" => laneName.EndsWith("mma", StringComparison.Ordinal) ? EightBitKind(false, k) : Ptx.Kind.U8,
                     "s4" => Ptx.Kind.S4, "u4" => Ptx.Kind.U4, "f16" => Ptx.Kind.F16, _ => Ptx.Kind.BF16,
                 };
-                int kp = Ptx.Padded(k);
+                int kp = KPadded(kind, k);
                 // A's rows as stored already have the kind's layout when the type is the kind and k is whole blocks.
                 bool aAsIs = f.Bits == kind.Bits && kp == k && (f.IsFloat == kind.IsFloat) && (!f.IsFloat || f.Is(kind == Ptx.Kind.F16 ? "float16" : "bfloat16"));
                 long t0 = Phases is null ? 0 : Stopwatch.GetTimestamp();
