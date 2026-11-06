@@ -933,6 +933,8 @@ public sealed partial class GpuOps(Gpu gpu)
         var fn = perThread <= 16
             ? gpu.Cached($"softmax:{f.Name}:{perThread}:{threads}:{vector}", (out string e) => Ptx.SoftmaxRegs(gpu, f, lane, perThread, threads, vector, out e))
             : gpu.Cached($"softmaxloop:{f.Name}:{threads}", (out string e) => Ptx.Softmax(gpu, f, lane, threads, out e));
+        if (threads > Gpu.MaxThreads(fn)) fn = gpu.Cached($"softmaxloop:{f.Name}:{threads}", (out string e) => Ptx.Softmax(gpu, f, lane, threads, out e));
+        if (threads > Gpu.MaxThreads(fn)) { threads = 256; fn = gpu.Cached($"softmaxloop:{f.Name}:{threads}", (out string e) => Ptx.Softmax(gpu, f, lane, threads, out e)); }
         Gpu.Launch(fn, (uint)rows, 1, (uint)threads, 1, 0, x, y, Gpu.U(cols));
         return lane.Name;
     }
@@ -948,6 +950,8 @@ public sealed partial class GpuOps(Gpu gpu)
         var fn = perThread <= 16
             ? gpu.Cached($"rms:{f.Name}:{perThread}:{threads}:{vector}", (out string e) => Ptx.RmsNormRegs(gpu, f, lane, perThread, threads, vector, out e))
             : gpu.Cached($"rmsloop:{f.Name}:{threads}", (out string e) => Ptx.RmsNorm(gpu, f, lane, threads, out e));
+        if (threads > Gpu.MaxThreads(fn)) fn = gpu.Cached($"rmsloop:{f.Name}:{threads}", (out string e) => Ptx.RmsNorm(gpu, f, lane, threads, out e));
+        if (threads > Gpu.MaxThreads(fn)) { threads = 256; fn = gpu.Cached($"rmsloop:{f.Name}:{threads}", (out string e) => Ptx.RmsNorm(gpu, f, lane, threads, out e)); }
         Gpu.Launch(fn, (uint)rows, 1, (uint)threads, 1, 0, x, y, Gpu.U(cols), lane.Wide ? Gpu.D(eps) : Gpu.F((float)eps));
         return lane.Name;
     }

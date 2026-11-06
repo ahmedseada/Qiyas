@@ -442,8 +442,16 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
                     var a = s.RowOp(device, op, type, x, null, null, null, null, null, logp, null, rows, cols, 0, 0);
                     var b = s.Pick(device, type, logp, rows, cols, targets, o);
                     var c = s.Map(device, neg, type, o, null, null, o, rows, 0, 0);
-                    if (a is null || b is null || c is null) return null;
-                    return new BenchRun(() => { a.Run(); a.Collect(); b.Run(); b.Collect(); c.Run(); c.Collect(); }, null, () => { a.Dispose(); b.Dispose(); c.Dispose(); }, () => a.Lane + " (log_softmax, pick, neg)");
+                    b?.Dispose(); c?.Dispose();
+                    if (a is null || b is null || c is null) { a?.Dispose(); return null; }
+                    // The pick and the negation are prepared after the step before them has collected: a device subject uploads
+                    // its inputs when a run is prepared, so runs prepared up front read logp and o before log_softmax wrote them.
+                    return new BenchRun(() =>
+                    {
+                        a.Run(); a.Collect();
+                        using (var pick = s.Pick(device, type, logp, rows, cols, targets, o)!) { pick.Run(); pick.Collect(); }
+                        using (var negate = s.Map(device, neg, type, o, null, null, o, rows, 0, 0)!) { negate.Run(); negate.Collect(); }
+                    }, null, () => a.Dispose(), () => a.Lane + " (log_softmax, pick, neg)");
                 }, (int)Registry.Bytes(type, rows));
                 return;
             }

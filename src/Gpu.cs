@@ -59,6 +59,8 @@ internal static unsafe partial class Driver
     [LibraryImport(Library)] public static partial int cuLaunchKernel(IntPtr function, uint gridX, uint gridY, uint gridZ, uint blockX, uint blockY, uint blockZ, uint sharedBytes, IntPtr stream, void** parameters, void** extra);
     [LibraryImport(Library)] public static partial int cuGetErrorString(int error, out IntPtr text);
     [LibraryImport(Library)] public static partial int cuFuncSetAttribute(IntPtr function, int attribute, int value);
+    [LibraryImport(Library)] public static partial int cuFuncGetAttribute(out int value, int attribute, IntPtr function);
+    public const int FunctionAttributeMaxThreadsPerBlock = 0;
 
     public const int AttributeMultiprocessors = 16, AttributeMajor = 75, AttributeMinor = 76, AttributeSharedPerBlock = 8, AttributeSharedOptIn = 97;
     public const int FunctionAttributeMaxDynamicShared = 8;
@@ -242,6 +244,22 @@ public sealed unsafe class Gpu : IDisposable
     public static void Clear(ulong destination, long bytes) => Driver.Check(Driver.cuMemsetD8(destination, 0, (nuint)bytes), "cuMemsetD8");
 
     public static void Synchronize() => Driver.Check(Driver.cuCtxSynchronize(), "cuCtxSynchronize");
+
+    /// <summary>The most threads a block of <paramref name="function"/> can be launched with, as the driver reports for this
+    /// device (the kernel's registers per thread against the multiprocessor's, and the device's own limit).</summary>
+    public static int MaxThreads(IntPtr function)
+    {
+        lock (s_maxThreads)
+        {
+            // Asked of the driver once per function (a launch path asks every call).
+            if (s_maxThreads.TryGetValue(function, out int known)) return known;
+            Driver.Check(Driver.cuFuncGetAttribute(out int value, Driver.FunctionAttributeMaxThreadsPerBlock, function), "cuFuncGetAttribute");
+            s_maxThreads[function] = value;
+            return value;
+        }
+    }
+
+    private static readonly Dictionary<IntPtr, int> s_maxThreads = [];
 
     public static void Launch(IntPtr function, uint gridX, uint gridY, uint blockX, uint blockY, uint sharedBytes, params ReadOnlySpan<ulong> args)
     {

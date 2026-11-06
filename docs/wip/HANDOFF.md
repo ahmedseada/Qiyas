@@ -16,7 +16,10 @@ Release build 0 errors — then stop editing and wait for "go".
 |---|---|
 | Build | `dotnet build -c Release` (from `D:\Projects\Qiyas`); `sh guard.sh` before every build. A build fails while a bench process holds the dll. |
 | Full run (both devices' gates, then the core rows of every type) | `dotnet bin/Release/net10.0/Qiyas.dll cuda,cpu --report` (~25 min; writes `results-qiyas-cuda-cpu.md`). `cuda` alone also runs the CPU gates first. |
-| Regression gate | per item (from 4c on): the gates plus only the rows of the family the item changed, qiyas only (e.g. `dotnet bin/Release/net10.0/Qiyas.dll cuda,cpu --subjects qiyas --ops recurrent` for the GRU row; every gate runs at startup), then `python docs/wip/compare.py docs/wip/baseline.md results-qiyas-cuda-cpu.md` — compare.py finds each subject's columns by the header's names, so a qiyas-only file compares with the full baseline; the full `cuda,cpu --report` run with every column only at the end of each whole item (after item 4, after item 5, after item 6; never after a piece inside an item): the README Results tables are regenerated from it (`docs/wip/readme_results.py`) and it becomes `docs/wip/baseline.md`. compare.py prints every cell with base/new ms, ratio, lanes, errors; flags `SLOWER` (> 5 %) and `ERR UP`; "new row" for rows the baseline lacks. `baseline.md` is the full `cuda,cpu --report` run of item 4a (128 rows: the core rows of every type incl. the block formats and bool; committed with 4a). An earlier commit (c68ef15) held a matmul re-timing run there by mistake; the 12:38 run of item 3 survives only as the README Results tables, which `python docs/wip/compare_readme.py README.md results-qiyas-cuda-cpu.md <an older full run for the error column>` compares against cell by cell. Some CPU cells of the 4a run caught this laptop's slow level; re-time before calling a cell slower. Re-time a flagged cell several times before calling it swing: this laptop's sub-2 ms cells move ±20–40 % run to run; an A/B against a build of the baseline commit (`git worktree add <dir> c73a251`, build it, run both dlls back to back) separates code from machine state. |
+| Regression gate | per item (from 4c on): the gates plus only the rows of the family the item changed, qiyas only (e.g. `dotnet bin/Release/net10.0/Qiyas.dll cuda,cpu --subjects qiyas --ops recurrent` for the GRU row; every gate runs at startup), then `python docs/wip/compare.py docs/wip/baseline.md results-qiyas-cuda-cpu.md` — compare.py finds each subject's columns by the header's names, so a qiyas-only file compares with the full baseline; the full `cuda,cpu --report` run with every column only at the end of each whole item (after item 4, after item 5, after item 6; never after a piece inside an item): the README Results tables are regenerated from it (`docs/wip/readme_results.py`) and it becomes `docs/wip/baseline.md`. compare.py prints every cell with base/new ms, ratio, lanes, errors; flags `SLOWER` (> 5 %) and `ERR UP`; "new row" for rows the baseline lacks. `baseline.md` is item 4's `cuda,cpu --report --ops all` run of
+19:11 (4216 rows, every family, every column; stopped during the CPU's q4_k rows, so the CPU's q6_k and bool rows are
+missing; converted from the console lines by the scratchpad script `log2results.py`: no shape column except where the
+4a baseline had the row). Until item 4 it was the run of item 4a (128 core rows). An earlier commit (c68ef15) held a matmul re-timing run there by mistake; the 12:38 run of item 3 survives only as the README Results tables, which `python docs/wip/compare_readme.py README.md results-qiyas-cuda-cpu.md <an older full run for the error column>` compares against cell by cell. Some CPU cells of the 4a run caught this laptop's slow level; re-time before calling a cell slower. Re-time a flagged cell several times before calling it swing: this laptop's sub-2 ms cells move ±20–40 % run to run; an A/B against a build of the baseline commit (`git worktree add <dir> c73a251`, build it, run both dlls back to back) separates code from machine state. |
 | README Results tables | `python docs/wip/readme_results.py results-qiyas-cuda-cpu.md > tables.md` — the two tables (lib / number / qiyas / ×). The script sets stdout to UTF-8; redirect to a file and splice (the Bash console's code page mangles — × ³ otherwise). |
 | Gate-only quick runs | `Qiyas.dll cpu --types int8 --ops add` (every CPU gate, one row); `Qiyas.dll cuda --types float32 --ops add` (every gate on both devices). `--types` only limits the bench rows; the gates always cover every type. |
 | Stress | `--repeat N`: repeats the matmul rows N times and raises `Checks.Stress` (default 20) to N: the block-format transpose is repeated `Stress` times in Group2, the team gate runs `Stress × 500` jobs, the device products gate runs `Stress / 20` passes under every tensor kind. Used: `cpu --types q6_k,q4_k,q4_0,q8_0 --ops reduce --repeat 100` (the transpose race), `cpu --types int4 --ops matmul --repeat 30` ×5 (the team race), `cuda --types uint16 --ops matmul --repeat 600` (30 passes of the device products gate). |
@@ -65,6 +68,15 @@ Do not overuse bench runs: run one only when it is needed, and as small as the q
    README Results tables and becomes `docs/wip/baseline.md`. Never after a piece inside an item (4b, the GRU row, the
    tiled product, ...): a piece gets only the gates plus its own family's rows (rule 1).
 5. No bench to check a doc or a script change.
+6. The full runs at the end of items 5 and 6 (the coordinator, after item 4's run took over 92 minutes against a
+   one-hour limit): every family with the qiyas and lib columns, the number column on the core ops only, under 40
+   minutes in total. The CLI cannot split columns per family, so two invocations if needed, e.g.
+   `cuda,cpu --report --subjects qiyas,lib --ops all` and `cuda,cpu --report --subjects number` (core ops), the two
+   results files merged into the one baseline. Measure before launching: time a slice (one float, one integer and one
+   block type per device, `--ops all`) and scale it by the type count; if the estimate exceeds 40 minutes, say what
+   to cut and ask before running. Note: number implements the core ops only (src/Bench/NumberSubject.cs), so the run's
+   length is qiyas and lib across the families; item 4's run had CUDA about 45 minutes (the map family's formulas on
+   every type are most of the rows).
 
 ## Item 4 progress (update as it moves)
 
@@ -157,6 +169,39 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
 - 2 steps left in item 4 after 4g: the GRU sequence backward (below), then item 4's full run.
 - GRU sequence backward: done, reported as its own boundary (uncommitted until the coordinator's go). See its entry
   below. 1 step left in item 4: the full run.
+- GRU sequence backward committed as 1606800 (verified by the coordinator, pushed, main fast-forwarded).
+- Item 4's full run (the coordinator: `cuda,cpu --report --ops all`, every column, the baseline for every family). The
+  number subject implements the four core ops only (src/Bench/NumberSubject.cs) and the lib subject add, matmul,
+  softmax, rms_norm, map, row, reduce, transpose, so `--ops all` gives every family qiyas (and lib where it has the op)
+  and the number column on the core ops only, as the coordinator's fallback would. Two faults the first launch hit:
+  - the device row kernels: `cross_entropy` float16 (log_softmax over 4096 × 32768: 1024 threads × 16 words) failed to
+    launch ("too many resources requested": the row in registers needs more of them than a block of 1024 has on this
+    card; float64 at 16384 the same). Fixed card-agnostically: `Gpu.MaxThreads(function)` (cuFuncGetAttribute,
+    CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK) is asked once the kernel is compiled; past it `RowOp` and the norm
+    statistics (GpuOps.Rows.cs) take the segmented shape (256 × 8, as rows past 16 words do), `Softmax` and `RmsNorm`
+    (GpuOps.cs) their looping kernel. Gate `Checks.Rows` gains 2 × 16384 and 2 × 32768 for the row family and softmax,
+    rms_norm. Mutations: the fallback off in the row ops → the gate crashes at float64 log_softmax 2 × 16384; off in
+    softmax / rms_norm only → the gate crashes too.
+  - the `cross_entropy` bench row on the device read err 16 (the CPU 2e-6): it prepared the pick and neg runs before
+    log_softmax ran, and a device subject uploads its inputs when a run is prepared, so pick read stale logp. Fixed in
+    Program.cs: pick and neg prepared inside the timed run after the step before collected (the device time is now the
+    host round trips: a Known slow row and item 6 below).
+  - the run: 19:11:48 to the coordinator's stop at 20:44 (92 minutes; CUDA about 45, the CPU about 47 up to q4_k);
+    0 crash, 0 failed check (the gates and the 4216 rows). The coordinator stopped it for its length and closed item
+    4 with it: the rows became `docs/wip/baseline.md` (partial on the CPU: q6_k and bool missing), the README Results
+    regenerated from them (the CPU q6_k and bool core rows kept from the earlier tables, marked "earlier run") with
+    the per-family table `readme_results.py` now prints.
+  - compare.py against the 4a baseline: 122 cells compared, 4096 new rows, 0 error grown, 13 slower: in code item 4
+    did not change (swing, listed only) CUDA add float8_e5m2 1.35, int16 1.79, int8 1.52, int2 1.06, uint8 1.83, CPU
+    add int8 1.09, rms_norm float16 1.49, q8_0 1.19; in code item 4 changed (not re-timed, the coordinator's order:
+    item 6) CPU matmul float64 1.16, float16 1.38, float8_e5m2 1.41 (4e's kernel), CUDA matmul int4 1.15 (4e), CUDA
+    softmax float16 1.12 (the launch-limit query, a driver call per launch: now asked once per kernel, cached in
+    `Gpu.MaxThreads`).
+  - the README's error sentence was wrong across the families: ten CUDA rows have a larger error than the lib's
+    (float32 sin, cos, gelu, silu, add_rms_norm up to 1.4×; float16 softmax 9.54e-7 vs 9.53e-7; sum:whole float32
+    5.98e-4 vs 1.95e-4, float8_e5m2 3.66e-4 vs 6.1e-5; sum:rows float16, bfloat16 up to 1.3×). The README now says so;
+    item 6 below.
+- Item 4: done (closed by the coordinator with the stopped run). Next: item 5, the arena, on the coordinator's go.
 - 4g: done, committed as d9939ff. What landed:
   - CPU: `Kernels.Operands.ImageB` (a ConvArgs): `PackBody` builds each row of the columns from the image
     (`ImageRow`: row p = (c, kh, kw), an image row read in place or loaded once, stride 1 by a contiguous copy with the
@@ -516,6 +561,18 @@ Each: measure against the baseline cell, change, re-measure (the full run or the
 - CPU recurrent sequences (the coordinator's observation at 4c): gru_seq 65–71 ms, lstm_seq 83 ms against ~15–20 ms
   implied by the f32 product rate (COVERAGE Known slow). The GRU sequence backward piece's runs read CPU gru_seq float32
   at 20.7 and 22.1 ms (after 4e's in-place products): re-measure lstm_seq too; the row may be done.
+- Item 4's full run, slower cells in code item 4 changed (not re-timed at the coordinator's order): CPU matmul
+  float64 1.16×, float16 1.38×, float8_e5m2 1.41× (4e's product kernel: `Operands`, `Micro`'s cOff, the in-place
+  route), CUDA matmul int4 1.15× (4e), CUDA softmax float16 1.12× (the launch-limit query, cached since). Re-time
+  each once, both orders, against a build of d9939ff's parent where the change landed; fix what holds.
+- Item 4's full run, errors above the lib's (accuracy, not time): CUDA float32 sum:whole 5.98e-4 against the lib's
+  1.95e-4 and float8_e5m2 3.66e-4 against 6.1e-5 (the order of the device's whole-array sum: pairwise or compensated
+  partials are the step); float32 sin, cos, gelu, silu, add_rms_norm up to 1.4×; float16 softmax and sum:rows float16,
+  bfloat16 up to 1.3×. Find each one's cause; bring them to the lib's or below, and the README sentence with them.
+- Device cross_entropy bench row (from item 4's full run): 46 ms float16, 95 float32 against the CPU's 18–23 at 4096 ×
+  32768 — the row chains three subject runs through host arrays (`Program.cs` RoutingRow "cross_entropy"), so the
+  device time is the 512 MB upload of logp and the downloads, not the kernels (log_softmax alone 0.075 ms float16).
+  Give the contract a device-resident chaining (or a fused cross-entropy loss row on both devices) and re-measure.
 - GRU sequence backward (the owner's rule for open timing questions, from its piece): 4.5–6× the forward on both
   devices where the products imply ~4× (float32 device 12.4–15.8 ms vs 2.55–2.76; CPU 102–114 vs 21–22; two runs).
   Per step `GruStepBackward` recomputes gx, gh that the forward recompute already made, and dW, dU, db, dbh are summed by

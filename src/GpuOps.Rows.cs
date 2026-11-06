@@ -49,6 +49,14 @@ public sealed partial class GpuOps
         var (threads, perThread, vector, valueWise) = RowKernelShape(f, cols, op.Name);
         bool second = x2 != 0, segmented = Segmented(f, cols, perThread, threads, valueWise);
         var fn = gpu.Cached($"row:{op.Name}:{f.Name}:{perThread}:{threads}:{vector}:{valueWise}:{second}:{segmented}", (out string e) => Ptx.RowOp(gpu, f, lane, op, perThread, threads, vector, valueWise, second, out e, segmented));
+        if (threads > Gpu.MaxThreads(fn))
+        {
+            // The row in registers needs more of them than a block of this many threads has on this device: the segmented shape.
+            (threads, perThread, vector) = (256, 8, false);
+            segmented = Segmented(f, cols, perThread, threads, valueWise);
+            fn = gpu.Cached($"row:{op.Name}:{f.Name}:{perThread}:{threads}:{vector}:{valueWise}:{second}:{segmented}", (out string e) => Ptx.RowOp(gpu, f, lane, op, perThread, threads, vector, valueWise, second, out e, segmented));
+        }
+
         try { Gpu.Launch(fn, (uint)rows, 1, (uint)threads, 1, 0, x, x2, g, bt, s, pos, y, y2, Gpu.U(rows), Gpu.U(cols), lane.Wide ? Gpu.D(a) : Gpu.F((float)a), lane.Wide ? Gpu.D(b) : Gpu.F((float)b)); }
         catch (InvalidOperationException e) { throw new InvalidOperationException($"{op.Name} {f.Name} {rows} x {cols}: {threads} threads x {perThread} values, vector {vector}, value-wise {valueWise}, segmented {segmented}: {e.Message}", e); }
         return lane.Name;
@@ -64,6 +72,13 @@ public sealed partial class GpuOps
         var (threads, perThread, vector, valueWise) = RowKernelShape(f, cols, "norm_params_bwd");
         bool segmented = Segmented(f, cols, perThread, threads, valueWise);
         var stats = gpu.Cached($"norm_stats:{centered}:{f.Name}:{perThread}:{threads}:{vector}:{valueWise}:{segmented}", (out string e) => Ptx.NormStats(gpu, f, lane, centered, perThread, threads, vector, valueWise, out e, segmented));
+        if (threads > Gpu.MaxThreads(stats))
+        {
+            (threads, perThread, vector) = (256, 8, false);
+            segmented = Segmented(f, cols, perThread, threads, valueWise);
+            stats = gpu.Cached($"norm_stats:{centered}:{f.Name}:{perThread}:{threads}:{vector}:{valueWise}:{segmented}", (out string e) => Ptx.NormStats(gpu, f, lane, centered, perThread, threads, vector, valueWise, out e, segmented));
+        }
+
         var cols2 = gpu.Cached($"norm_params_cols:{f.Name}:{lane.Name}", (out string e) => Ptx.NormParamsCols(gpu, f, lane, out e));
         ulong st = gpu.Rent((long)rows * 2 * lane.Size);
         int splits = Splits(rows, cols), per = (rows + splits - 1) / splits;

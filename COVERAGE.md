@@ -139,6 +139,8 @@ and measured against the baseline when it is.
 | CPU | ctc | 1.8 ms forward, 3.6–3.8 backward (float32, the same shape): a task per sequence (32 sequences on 24 threads, the recursion serial within one); moving the rows' work into a pass over all rows measured slower (single-value loads of the emissions), so it was not kept |
 | CPU | LSTM / GRU sequences | gru_seq 65–71 ms, lstm_seq 83 ms float32 (16 steps of 256 × 512 → 512, about 13 GFLOP of products) where the CPU's float32 product rate implies 15–20 ms: per step the gate products, the cell and the copies go through separate passes and allocations |
 | CUDA, CPU | GRU sequence backward | 4.5–6× the forward on both devices (16 steps of 256 × 512 → 512, float32: device 12.4–15.8 ms against 2.55–2.76, CPU 102–114 against 21–22) where the products imply about 4×: the step's backward recomputes the gates the forward's recompute already made, and each step's dW, dU, db, dbh are summed by separate adds (on the CPU into fresh arrays). To re-measure in item 6; keeping the recomputed gates and accumulating into the sums in place are the steps |
+| CPU, CUDA | item 4's full run: slower cells in changed code | CPU matmul float64 1.16×, float16 1.38×, float8_e5m2 1.41×, CUDA matmul int4 1.15× against item 4a's baseline (4e changed the product kernels); CUDA softmax float16 1.12× (the launch-limit query, cached since). Not re-timed: item 6 re-times each once, both orders |
+| CUDA | the cross_entropy bench row | 46 ms float16, 95 float32 (4096 × 32768) against 18–23 on the CPU: the row composes three subject runs through host arrays (the contract has no device-resident chaining), so the device timing is the upload of logp (512 MB float32) and the downloads. To measure in item 6 as a device-resident composition (or a fused loss row) |
 | CPU | LSTM / GRU steps | 20–31 ms forward, 56–84 backward at B = D = H = 1024: the products dominate (four gates, two operands); a fused gates product is the step |
 
 ## Element-wise (map)
@@ -192,6 +194,7 @@ sum_axis, sumsq, max, min, argmax → the reductions; transpose; gemv_nn / gemv_
 | add_rms_norm, add_layer_norm (x, residual, g[, bt]) → y and h = x + residual | ✓ float | ✓ float | fused residual add + normalization, the sum written once |
 | the row family on integer types | n/a | n/a | the row formulas are float formulas: a stored integer type has no float lane here |
 | rows longer than 16 words a thread of 1024 (16384 float32 values) in the row family | ✓ | ✓ | the row in segments of 256 threads × 8 words (or 8 values, for rows not ending on a word), reloaded in every phase (the per-value temporaries recomputed); the statistics kernel of norm_params_bwd the same |
+| a row kernel whose registers a block of its planned threads cannot hold (on this card: 1024 threads × 16 words, e.g. float16 log_softmax of 32768 or float64 of 16384) | n/a | ✓ | the driver's per-kernel limit (`Gpu.MaxThreads`: the kernel's maximum threads per block) is asked once the kernel is compiled; past it the row operation and the norm statistics take the segmented shape, softmax and rms_norm their looping kernel; gate: the row family, softmax and rms_norm at 2 × 16384 and 2 × 32768, every float type |
 
 ## Reductions
 

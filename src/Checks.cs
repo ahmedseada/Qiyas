@@ -1339,7 +1339,7 @@ internal static class Checks
         foreach (var type in Bench.Registry.Names)
         {
             if (!Bench.Registry.IsFloat(type) || Bench.Registry.IsBlock(type)) continue;
-            foreach (var (rows, cols) in new[] { (37, 1001), (5, 64), (3, 17), (3, 20011) })
+            foreach (var (rows, cols) in new[] { (37, 1001), (5, 64), (3, 17), (3, 20011), (2, 16384), (2, 32768) })
             {
                 foreach (var op in RowOps.All)
                 {
@@ -1365,10 +1365,23 @@ internal static class Checks
                     for (int i = 0; i < 2 * cols; i++) { double want = i < cols ? dgamma[i] : dbeta[i - cols]; if (Math.Abs(g[i] - want) > tol) worst = Math.Max(worst, Math.Abs(g[i] - want) / tol); }
                     if (worst > 0) { Console.WriteLine($"check norm_params_bwd:{(centered ? "layer" : "rms"),-6} {where,-6} {type,-12} DIFFERS by {worst:0.##} tolerances ({rows} x {cols}, lane {lane})"); ok = false; }
                 }
+
+                if (cols is 16384 or 32768)
+                {
+                    // The core softmax and rms_norm at the wide rows too: their row-in-registers kernels past a block's registers loop instead.
+                    var x = Bench.Registry.Make(type, rows * cols, 61, -2, 2);
+                    var vx = Bench.Registry.Values(type, x, rows * cols);
+                    var output = new byte[x.Length];
+                    Bench.Registry.WithFloat(type, new CoreRun(ops, "softmax", x, null, output, rows, cols));
+                    ok &= Close(type, "softmax", where, output, References.Softmax(vx, rows, cols), rows * cols, terms: cols);
+                    output = new byte[x.Length];
+                    Bench.Registry.WithFloat(type, new CoreRun(ops, "rms_norm", x, null, output, rows, cols));
+                    ok &= Close(type, "rms_norm", where, output, References.RmsNorm(vx, rows, cols, 1e-5), rows * cols, terms: cols);
+                }
             }
         }
 
-        if (ok) Console.WriteLine($"check rows                   {where,-6} every float type at 37 x 1001, 5 x 64, 3 x 17: within the lane's rounding of the references");
+        if (ok) Console.WriteLine($"check rows                   {where,-6} every float type at 37 x 1001, 5 x 64, 3 x 17, 3 x 20011, 2 x 16384, 2 x 32768 (rows of 16 words a thread past a block's registers take the segmented shape): within the lane's rounding of the references");
         return ok;
     }
 
