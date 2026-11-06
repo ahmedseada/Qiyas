@@ -378,6 +378,8 @@ internal static partial class Ptx
         public string Fma(string x, string y, string z) { string d = lane.NewReg(b); b.L(lane.Fma(d, x, y, z)); return d; }
         public string Div(string x, string y) { string d = lane.NewReg(b); b.L($"div.rn.{lane.Op} {d}, {x}, {y};"); return d; }
         public string Rcp(string x) => Div(Lit(1), x);
+        /// <summary>x / y from y's rounded reciprocal r: q = x·r, then q + (x − q·y)·r (the residual exact by fma).</summary>
+        public string Quotient(string x, string y, string r) { string q = Mul(x, r); return Fma(Fma(Neg(q), y, x), r, q); }
         public string Neg(string x) { string d = lane.NewReg(b); b.L($"neg.{lane.Op} {d}, {x};"); return d; }
         public string Max(string x, string y) { string d = lane.NewReg(b); b.L($"max.{lane.Op} {d}, {x}, {y};"); return d; }
         public string Exp(string x) => Codec.Exp(b, lane, x);
@@ -576,8 +578,10 @@ internal static partial class Ptx
             {
                 string H(int q, int i) => c.Add(c.X(q, i), c.X2(q, i));
                 c.Store(H, second: true);
-                string rstd = Rstd(c, c.Reduce("add", (q, i) => { string h = H(q, i); return c.Mul(h, h); }), n, c.A);
-                c.Store((q, i) => c.Mul(c.Mul(H(q, i), rstd), c.G(q, i)));
+                // y = h·g / s, s = √(mean h² + eps): the quotient by its reciprocal and one residual step (h·g − y·s, exact
+                // by fma) — near-correctly rounded, two roundings fewer than h · (1/s) · g.
+                string s = c.Sqrt(c.Add(c.Div(c.Reduce("add", (q, i) => { string h = H(q, i); return c.Mul(h, h); }), n), c.A)), rstd = c.Rcp(s);
+                c.Store((q, i) => c.Quotient(c.Mul(H(q, i), c.G(q, i)), s, rstd));
                 return;
             }
 

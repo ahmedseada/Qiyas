@@ -135,6 +135,18 @@ public sealed partial class GpuOps(Gpu gpu)
             return lane.Name;
         }
 
+        if (axis == Axis.Rows && f.IsFloat && !lane.Wide)
+        {
+            // A narrow float type's row sums: the compensated pass, a block a row, the threads' sums joined as exact f32 pairs
+            // and rounded once (a float64 join per row ran at the device's f64 rate: float16 rows 0.040 ms against 0.023).
+            // Whole words a row (cols a multiple of the values a word holds): one load for every value of the word.
+            var rowsKahan = !f.IsBlock && f.WordBits == 32 && cols % f.Per == 0
+                ? gpu.Cached($"sum_rows_words:{op == "sumsq"}:{f.Name}", (out string e) => Ptx.SumRowsWords(gpu, f, op == "sumsq", out e))
+                : gpu.Cached($"reduce_rows:sum:{op == "sumsq"}:{f.Name}:f32:kahan:f32", (out string e) => Ptx.ReduceRows(gpu, f, Lane.F32, "sum", op == "sumsq", out e, compensated: true, storeF32: true));
+            Gpu.Launch(rowsKahan, (uint)rows, 1, Ptx.ReduceThreads, 1, 0, x, output, Gpu.U(cols), Gpu.U(0));
+            return lane.Name;
+        }
+
         Launch(f, lane, "sum", op == "sumsq", axis, x, rows, cols, output);
         return lane.Name;
     }

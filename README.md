@@ -154,8 +154,11 @@ subject's lane and error is `results-qiyas-cuda-cpu.md`; the three columns are t
 (`lib`, present only in the author's checkout), the `INumberBase<T>` version (`number`, — where .NET has no such type)
 and Qiyas. Times are medians in ms. Every subject's error against float64 math (products in double-double) is in the
 full table (`docs/wip/baseline.md`); Qiyas's is equal to or below the library's on every row the two share except
-eight CUDA rows of item 4's run: float32 sin, cos, gelu, silu and add_rms_norm (up to 1.4× the library's), float16
-softmax (9.54e-7 against 9.53e-7), and sum:rows float16 and bfloat16 (up to 1.3×). The CUDA whole sums of the narrow
+one CUDA row: float16 softmax (9.54e-7 against 9.53e-7, both at float16's half step: an output near a rounding
+midpoint whose f32 value lands about one f32 step off). Seven rows of item 4's run are now below it: float32 sin
+6.77e-8 against 7.09e-8, cos 6.78e-8 against 7.07e-8, gelu 2.42e-7 against 3.13e-7, silu 2.47e-7 against 4.57e-7,
+add_rms_norm 9.44e-7 against 1.11e-6, sum:rows float16 and bfloat16 3.81e-6 against 1.04e-5 and 7.63e-6 (row sums
+compensated per thread and joined as exact f32 pairs, gated within one f32 step of the exact sum). The CUDA whole sums of the narrow
 float types now sum each thread's values compensated and join the partials in float64 (float32 4.87e-5 against the
 library's 1.95e-4, float8_e5m2 0 against 6.1e-5; a gate holds them within one f32 step of the exact sum). It is exact (0) wherever the lane is exact — the
 CUDA float64 product now takes the sliced 8-bit tensor route (`f64x`, proven exact, 4.18 ms against 23.1 in the

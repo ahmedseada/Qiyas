@@ -96,16 +96,48 @@ internal static partial class Ptx
             return (r, ki);
         }
 
+        // x − k·π/2 as an unevaluated pair r + lo: the first part's product exact (π/2's leading part has trailing zeros),
+        // the second's sum with it split exactly (two-sum), the third part's product added to the low part.
+        private static (string R, string Lo, string K) ReduceHalfPiPair(PtxBuilder b, Lane lane, string x)
+        {
+            bool w = lane.Wide;
+            string op = lane.Op, k = lane.NewReg(b), r1 = lane.NewReg(b), p2 = lane.NewReg(b), r = lane.NewReg(b), bv = lane.NewReg(b), t = lane.NewReg(b), lo = lane.NewReg(b), ki = b.R();
+            b.L($"mul.rn.{op} {k}, {x}, {L(lane, 0.63661977236758134)};");
+            b.L($"cvt.rni.{op}.{op} {k}, {k};");
+            b.L($"fma.rn.{op} {r1}, {k}, {L(lane, w ? -Funcs.PiHalf1 : -Funcs.PiHalf1F)}, {x};");
+            b.L($"mul.rn.{op} {p2}, {k}, {L(lane, w ? -Funcs.PiHalf2 : -Funcs.PiHalf2F)};");
+            b.L($"add.rn.{op} {r}, {r1}, {p2};");
+            // lo = (r1 − (r − bv)) + (p2 − bv), bv = r − r1: the sum's rounding error exactly.
+            b.L($"sub.rn.{op} {bv}, {r}, {r1};");
+            b.L($"sub.rn.{op} {t}, {r}, {bv};");
+            b.L($"sub.rn.{op} {t}, {r1}, {t};");
+            b.L($"sub.rn.{op} {lo}, {p2}, {bv};");
+            b.L($"add.rn.{op} {lo}, {lo}, {t};");
+            b.L($"fma.rn.{op} {lo}, {k}, {L(lane, w ? -Funcs.PiHalf3 : -Funcs.PiHalf3F)}, {lo};");
+            b.L($"cvt.rni.s32.{op} {ki}, {k};");
+            return (r, lo, ki);
+        }
+
         private static string Trig(PtxBuilder b, Lane lane, string x, bool sine)
         {
             bool w = lane.Wide;
             string op = lane.Op;
-            var (r, k) = ReduceHalfPi(b, lane, x);
+            var (r, lo, k) = ReduceHalfPiPair(b, lane, x);
             string r2 = lane.NewReg(b);
             b.L($"mul.rn.{op} {r2}, {r}, {r};");
             int terms = w ? Funcs.SinTerms64 : Funcs.SinTerms32;
-            string s = Poly(b, lane, r2, Funcs.SinSeries, terms, 0), c = Poly(b, lane, r2, Funcs.CosSeries, terms, 0);
-            b.L($"mul.rn.{op} {s}, {s}, {r};");
+            // sin(r + lo) = r + (lo·(1 − r²/2) + r³·(−1/6 + r²/120 − …)) and cos(r + lo) = 1 + (r²·(−1/2 + r²/24 − …) − r·lo):
+            // the leading term exact, one rounding of a small correction that carries the reduction's low part.
+            string s = Poly(b, lane, r2, Funcs.SinSeries, terms, 1), c = Poly(b, lane, r2, Funcs.CosSeries, terms, 1), r3 = lane.NewReg(b), m = lane.NewReg(b), rl = lane.NewReg(b);
+            b.L($"mul.rn.{op} {r3}, {r2}, {r};");
+            b.L($"mul.rn.{op} {m}, {r2}, {L(lane, -0.5)};");
+            b.L($"fma.rn.{op} {m}, {m}, {lo}, {lo};");
+            b.L($"fma.rn.{op} {s}, {s}, {r3}, {m};");
+            b.L($"add.rn.{op} {s}, {s}, {r};");
+            b.L($"mul.rn.{op} {rl}, {r}, {lo};");
+            b.L($"neg.{op} {rl}, {rl};");
+            b.L($"fma.rn.{op} {c}, {c}, {r2}, {rl};");
+            b.L($"add.rn.{op} {c}, {c}, {L(lane, 1)};");
             string q = b.R(), odd = b.P(), neg = b.P(), y = lane.NewReg(b), ns = lane.NewReg(b), ny = lane.NewReg(b), bad = b.P(), ax = lane.NewReg(b);
             b.L($"and.b32 {q}, {k}, 3;");
             b.L($"and.b32 {q}, {q}, 3;");
@@ -386,8 +418,28 @@ internal static partial class Ptx
         public string Gelu(string x)
         {
             string x2 = Mul(x, x);
-            string u2 = Mul(C(2 * 0.7978845608028654), Fma(Mul(C(0.044715), x2), x, x));
-            return Mul(x, Sigmoid(u2));
+            if (lane.Wide) return Mul(x, Sigmoid(Mul(C(2 * 0.7978845608028654), Fma(Mul(C(0.044715), x2), x, x))));
+            // t = c·x + c·0.044715·x³ as a pair t + lo: c split into its lane value and remainder, the leading product
+            // taken by fma, its rounding error recovered exactly by a second fma.
+            const double c = 2 * 0.7978845608028654;
+            double ch = (float)c;
+            string p = Fma(Mul(C(c * 0.044715), x2), x, Mul(C(c - ch), x));
+            string t = Fma(C(ch), x, p);
+            string lo = Add(Fma(C(ch), x, Neg(t)), p);
+            return XSigmoid(x, t, lo);
+        }
+
+        /// <summary>x·σ(t + lo) as x / (1 + e^(−t)·(1 − lo)), the denominator's sum split exactly and its low part
+        /// folded into the quotient: one rounding fewer than x times the rounded σ(t).</summary>
+        public string XSigmoid(string x, string t, string lo = null)
+        {
+            if (lane.Wide) return Mul(x, Sigmoid(t));
+            string e = Exp(Neg(t));
+            if (lo != null) e = Fma(e, Neg(lo), e);
+            string one = C(1), d = Add(e, one), bv = Sub(d, e);
+            string dlo = Add(Sub(e, Sub(d, bv)), Sub(one, bv));
+            string q = Div(x, d);
+            return Fma(Neg(q), Bin($"div.approx.{_op}", dlo, d), q);
         }
 
         public string GeluGrad(string x)
@@ -463,7 +515,7 @@ internal static partial class Ptx
             case "erf": return e.Erf(x);
             case "gelu": return e.Gelu(x);
             case "gelu_erf": return e.Mul(x, e.Phi(x));
-            case "silu": return e.Mul(x, e.Sigmoid(x));
+            case "silu": return e.XSigmoid(x, x);
             case "leaky_relu": return e.Select(e.Greater(x, e.C(0)), x, e.Mul(a, x));
             case "pow": return e.Pow(x, a);
             case "dropout": return e.Select(e.NotZero(y), e.Mul(x, a), e.C(0));

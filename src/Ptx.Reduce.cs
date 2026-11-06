@@ -32,9 +32,12 @@ internal static partial class Ptx
     /// block's chunk when p_chunk > 0: row r covers values [r·chunk, min(n, (r+1)·chunk)) of one long row.</summary>
     /// <param name="compensated">A float sum's chunk pass (lane f32): each thread's running sum compensated (Kahan: the
     /// rounding lost by every add kept and taken back), the threads' sums joined in float64 and stored as f64 partials.</param>
-    public static string ReduceRows(Gpu gpu, Fmt f, Lane lane, string op, bool squares, out string entry, bool compensated = false)
+    /// <param name="storeF32">With <paramref name="compensated"/>: the threads' sums joined as exact f32 pairs (no f64) and
+    /// rounded once to the f32 lane (a row's sum, not a partial).</param>
+    public static string ReduceRows(Gpu gpu, Fmt f, Lane lane, string op, bool squares, out string entry, bool compensated = false, bool storeF32 = false)
     {
-        entry = $"reduce_rows_{op}{(squares ? "sq" : "")}_{f.Name}_{lane.Name}{(compensated ? "_kahan" : "")}";
+        entry = $"reduce_rows_{op}{(squares ? "sq" : "")}_{f.Name}_{lane.Name}{(compensated ? "_kahan" : "")}{(storeF32 ? "_f32" : "")}";
+        if (storeF32 && !compensated) throw new ArgumentException("the f32 store is the compensated pass's");
         if (compensated && (lane.Name != "f32" || op != "sum")) throw new ArgumentException("the compensated pass is a float sum in the f32 lane");
         var b = new PtxBuilder();
         string tid = b.R(), row = b.R();
@@ -80,6 +83,24 @@ internal static partial class Ptx
         b.L("bra LOOP;");
         b.Label("DONE");
         _ = end;
+        if (storeF32)
+        {
+            // A row's sum: the threads' pairs acc − c joined exactly in f32 pairs, rounded once to f32.
+            string negComp = b.F();
+            b.L($"neg.f32 {negComp}, {comp};");
+            var (ph, pl) = BlockReducePair(b, tid, acc, negComp, ReduceThreads);
+            string rowSum = b.F(), pz = b.P(), rAddr = b.RD();
+            b.L($"add.rn.f32 {rowSum}, {ph}, {pl};");
+            b.L($"setp.ne.u32 {pz}, {tid}, 0;");
+            b.L($"@{pz} bra OUT;");
+            b.L($"mul.wide.u32 {rAddr}, {row}, 4;");
+            b.L($"add.u64 {rAddr}, {dst}, {rAddr};");
+            b.L($"st.global.f32 [{rAddr}], {rowSum};");
+            b.Label("OUT");
+            b.L("ret;");
+            return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_out, .param .u32 p_cols, .param .u32 p_chunk", ReduceBytes);
+        }
+
         if (compensated)
         {
             // The thread's sum in float64: acc − c, then the block's sum in float64, stored as an f64 partial.
@@ -98,6 +119,66 @@ internal static partial class Ptx
         b.L($"mul.wide.u32 {oAddr}, {row}, {lane.Size};");
         b.L($"add.u64 {oAddr}, {dst}, {oAddr};");
         b.L($"st.global.{lane.Mem} [{oAddr}], {total};");
+        b.Label("OUT");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_out, .param .u32 p_cols, .param .u32 p_chunk", ReduceBytes);
+    }
+
+    /// <summary>out[row] = the sum (of squares) of row `row` of a float format in 32-bit words, cols a whole number of words:
+    /// a block a row, each thread over whole words (one load for every value the word holds), its running sum compensated
+    /// (Kahan), the threads' sums joined as exact f32 pairs and rounded once to f32.</summary>
+    public static string SumRowsWords(Gpu gpu, Fmt f, bool squares, out string entry)
+    {
+        entry = $"sum_rows_words_{(squares ? "sq" : "")}_{f.Name}";
+        if (!f.IsFloat || f.IsBlock || f.WordBits != 32) throw new ArgumentException("a plain float format in 32-bit words");
+        var b = new PtxBuilder();
+        string tid = b.R(), row = b.R();
+        b.L($"mov.u32 {tid}, %tid.x;");
+        b.L($"mov.u32 {row}, %ctaid.x;");
+        string src = Param64(b, "p_x"), dst = Param64(b, "p_out"), cols = Param32(b, "p_cols");
+        _ = Param32(b, "p_chunk");
+        string words = b.R(), w = b.R(), pEnd = b.P(), rowBase = b.RD(), off = b.RD();
+        b.L($"div.u32 {words}, {cols}, {f.Per};");
+        b.L($"mul.wide.u32 {rowBase}, {row}, {words};");
+        b.L($"shl.b64 {rowBase}, {rowBase}, 2;");
+        b.L($"add.u64 {rowBase}, {src}, {rowBase};");
+        string acc = b.F(), comp = b.F(), ky = b.F(), kt = b.F();
+        b.L($"mov.f32 {acc}, 0f00000000;");
+        b.L($"mov.f32 {comp}, 0f00000000;");
+        b.L($"mov.u32 {w}, {tid};");
+        b.Label("LOOP");
+        b.L($"setp.ge.u32 {pEnd}, {w}, {words};");
+        b.L($"@{pEnd} bra DONE;");
+        string word = b.R();
+        b.L($"mul.wide.u32 {off}, {w}, 4;");
+        b.L($"add.u64 {off}, {rowBase}, {off};");
+        b.L($"ld.global.b32 {word}, [{off}];");
+        for (int i = 0; i < f.Per; i++)
+        {
+            string v = Codec.Unpack(b, f, word, i, Lane.F32);
+            // y = term − c; t = acc + y; c = (t − acc) − y; acc = t.
+            if (squares) b.L($"mul.rn.f32 {ky}, {v}, {v};");
+            else b.L($"mov.f32 {ky}, {v};");
+            b.L($"sub.rn.f32 {ky}, {ky}, {comp};");
+            b.L($"add.rn.f32 {kt}, {acc}, {ky};");
+            b.L($"sub.rn.f32 {comp}, {kt}, {acc};");
+            b.L($"sub.rn.f32 {comp}, {comp}, {ky};");
+            b.L($"mov.f32 {acc}, {kt};");
+        }
+
+        b.L($"add.u32 {w}, {w}, {ReduceThreads};");
+        b.L("bra LOOP;");
+        b.Label("DONE");
+        string negComp = b.F();
+        b.L($"neg.f32 {negComp}, {comp};");
+        var (ph, pl) = BlockReducePair(b, tid, acc, negComp, ReduceThreads);
+        string rowSum = b.F(), pz = b.P(), rAddr = b.RD();
+        b.L($"add.rn.f32 {rowSum}, {ph}, {pl};");
+        b.L($"setp.ne.u32 {pz}, {tid}, 0;");
+        b.L($"@{pz} bra OUT;");
+        b.L($"mul.wide.u32 {rAddr}, {row}, 4;");
+        b.L($"add.u64 {rAddr}, {dst}, {rAddr};");
+        b.L($"st.global.f32 [{rAddr}], {rowSum};");
         b.Label("OUT");
         b.L("ret;");
         return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_out, .param .u32 p_cols, .param .u32 p_chunk", ReduceBytes);

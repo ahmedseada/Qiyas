@@ -1330,18 +1330,24 @@ internal static class Checks
 
     // ---------------------------------------------------------------- whole sums of float types on the device
 
-    /// <summary>The device's whole sum and sum of squares of a narrow float type over 2^20 + 3 values: within one f32 lane step
-    /// of the exact sum (the chunks' compensated sums joined in float64, rounded once). The plain f32 lane drifts past it.</summary>
+    /// <summary>The device's whole sum and sum of squares of a narrow float type over 2^20 + 3 values, and its row sums over
+    /// 3 rows of 2^18 + 5 and 2 rows of 2^18 + 4 (whole words a row: the word kernel): each within one f32 lane step of the exact sum (compensated sums joined in float64, rounded once).
+    /// The plain f32 lane drifts past it.</summary>
     private static bool WholeSums(GpuOps ops)
     {
         bool ok = true;
-        const int rows = 1, cols = (1 << 20) + 3;
+        foreach (var (axis, rows, cols) in new[] { (Axis.Whole, 1, (1 << 20) + 3), (Axis.Rows, 3, (1 << 18) + 5), (Axis.Rows, 2, (1 << 18) + 4) })
         foreach (var type in new[] { "float32", "float16", "bfloat16", "q8_0" })
         {
-            var x = Bench.Registry.Make(type, cols, 41, -1, 1);
-            var v = Bench.Registry.Values(type, x, cols);
+            var x = Bench.Registry.Make(type, rows * cols, 41, -1, 1);
+            var all = Bench.Registry.Values(type, x, rows * cols);
             foreach (var op in new[] { "sum", "sumsq" })
             {
+                var (got, lane) = Bench.Registry.With(type, new ReduceRun(ops, op, axis, x, rows, cols));
+                var values = Bench.LaneValues.Decode(lane, got, rows);
+                for (int r = 0; r < rows; r++)
+                {
+                var v = all.AsSpan(r * cols, cols);
                 double exact = 0, c = 0;
                 foreach (double t in v)
                 {
@@ -1352,14 +1358,14 @@ internal static class Checks
                 }
 
                 exact += c;
-                var (got, lane) = Bench.Registry.With(type, new ReduceRun(ops, op, Axis.Whole, x, rows, cols));
-                double value = Bench.LaneValues.Decode(lane, got, 1)[0];
+                double value = values[r];
                 double step = Math.Pow(2, Math.Floor(Math.Log2(Math.Abs(exact))) - 23);
-                if (Math.Abs(value - exact) > step) { Console.WriteLine($"check whole {op} {type} device: {value:R} against {exact:R} ({Math.Abs(value - exact) / step:0.##} f32 steps, lane {lane})"); ok = false; }
+                if (Math.Abs(value - exact) > step) { Console.WriteLine($"check {axis} {op} {type} device row {r}: {value:R} against {exact:R} ({Math.Abs(value - exact) / step:0.##} f32 steps, lane {lane})"); ok = false; }
+                }
             }
         }
 
-        if (ok) Console.WriteLine("check whole sums             device float32, float16, bfloat16, q8_0: sum and sum of squares of 2^20 + 3 values within one f32 step of the exact sum");
+        if (ok) Console.WriteLine("check whole sums             device float32, float16, bfloat16, q8_0: sum and sum of squares of 2^20 + 3 values, and of rows of 2^18 + 5 and 2^18 + 4, within one f32 step of the exact sum");
         return ok;
     }
 

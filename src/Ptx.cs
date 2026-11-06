@@ -2377,7 +2377,7 @@ internal static partial class Ptx
             string d = lane.NewReg(b);
             b.L($"sub.rn.{lane.Op} {d}, {v}, {max};");
             string e = Codec.Exp(b, lane, d);
-            b.L(lane.Mul(outReg, e, scale));
+            Quotient(b, lane, outReg, e, sum, scale);
         }, threads);
         b.L("ret;");
         return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_y, .param .u32 p_cols", ReduceBytes);
@@ -2405,6 +2405,17 @@ internal static partial class Ptx
         RowPass(b, f, lane, tid, wordsPerRow, rowSrc, rowDst, "OUT", (v, outReg) => b.L(lane.Mul(outReg, v, scale)), threads);
         b.L("ret;");
         return b.Finish(Header(gpu), entry, $".param .u64 p_x, .param .u64 p_y, .param .u32 p_cols, .param .{(lane.Wide ? "f64" : "f32")} p_eps", ReduceBytes);
+    }
+
+    // d = x / y from y's rounded reciprocal r: x·r, then one residual step (x − q·y exact by fma) — near-correctly rounded,
+    // one rounding fewer than x·r alone.
+    private static void Quotient(PtxBuilder b, Lane lane, string d, string x, string y, string r)
+    {
+        string q = lane.NewReg(b), res = lane.NewReg(b);
+        b.L(lane.Mul(q, x, r));
+        b.L($"neg.{lane.Op} {res}, {q};");
+        b.L(lane.Fma(res, res, y, x));
+        b.L(lane.Fma(d, res, r, q));
     }
 
     /// <summary>Softmax with the row in registers: each thread's wordsPerThread words (tid, tid + 256, …) loaded once, exp once.</summary>
@@ -2439,7 +2450,7 @@ internal static partial class Ptx
         RowStore(b, f, lane, present, inWords, rowDst, wordsPerThread, (q, i) =>
         {
             string o = lane.NewReg(b);
-            b.L(lane.Mul(o, exps[q][i], scale));
+            Quotient(b, lane, o, exps[q][i], sum, scale);
             return o;
         }, words, vector);
         b.L("ret;");
@@ -2670,6 +2681,69 @@ internal static partial class Ptx
         string result = lane.NewReg(b);
         b.L($"ld.shared.{lane.Mem} {result}, [{smem}+256];");
         return result;
+    }
+
+    // A block's sum of f32 pairs hi + lo (the same butterflies and shared slots as BlockReduce): each step's hi sum split
+    // exactly (two-sum), its error added to the low parts, the pair renormalized. All in the f32 rate, where a float64 join
+    // runs at the device's f64 rate. The result read by all.
+    private static (string Hi, string Lo) BlockReducePair(PtxBuilder b, string tid, string hi, string lo, int threads)
+    {
+        int warps = threads / 32;
+        string tag = $"REDP{b.P().TrimStart('%')}";
+        string h = b.F(), l = b.F();
+        b.L($"mov.f32 {h}, {hi};");
+        b.L($"mov.f32 {l}, {lo};");
+        void Add(string oh, string ol)
+        {
+            string s = b.F(), bv = b.F(), e = b.F(), t = b.F();
+            b.L($"add.rn.f32 {s}, {h}, {oh};");
+            b.L($"sub.rn.f32 {bv}, {s}, {h};");
+            b.L($"sub.rn.f32 {t}, {s}, {bv};");
+            b.L($"sub.rn.f32 {t}, {h}, {t};");
+            b.L($"sub.rn.f32 {e}, {oh}, {bv};");
+            b.L($"add.rn.f32 {e}, {e}, {t};");
+            b.L($"add.rn.f32 {l}, {l}, {ol};");
+            b.L($"add.rn.f32 {l}, {l}, {e};");
+            b.L($"add.rn.f32 {h}, {s}, {l};");
+            b.L($"sub.rn.f32 {t}, {h}, {s};");
+            b.L($"sub.rn.f32 {l}, {l}, {t};");
+        }
+
+        void Warp()
+        {
+            for (int off = 16; off >= 1; off /= 2)
+            {
+                string oh = b.F(), ol = b.F();
+                b.L($"shfl.sync.bfly.b32 {oh}, {h}, {off}, 0x1f, 0xffffffff;");
+                b.L($"shfl.sync.bfly.b32 {ol}, {l}, {off}, 0x1f, 0xffffffff;");
+                Add(oh, ol);
+            }
+        }
+
+        Warp();
+        string smem = b.R(), laneId = b.R(), warp = b.R(), slot = b.R(), p0 = b.P();
+        b.L($"mov.u32 {smem}, smem;");
+        b.L($"and.b32 {laneId}, {tid}, 31;");
+        b.L($"shr.u32 {warp}, {tid}, 5;");
+        b.L($"mad.lo.u32 {slot}, {warp}, 8, {smem};");
+        b.L($"setp.ne.u32 {p0}, {laneId}, 0;");
+        b.L($"@!{p0} st.shared.v2.f32 [{slot}], {{{h}, {l}}};");
+        b.L("bar.sync 0;");
+        string pw = b.P(), pl = b.P(), mine = b.R();
+        b.L($"setp.ne.u32 {pw}, {warp}, 0;");
+        b.L($"@{pw} bra {tag}_SKIP;");
+        b.L($"setp.lt.u32 {pl}, {laneId}, {warps};");
+        b.L($"mad.lo.u32 {mine}, {laneId}, 8, {smem};");
+        b.L($"mov.f32 {h}, 0f00000000;");
+        b.L($"mov.f32 {l}, 0f00000000;");
+        b.L($"@{pl} ld.shared.v2.f32 {{{h}, {l}}}, [{mine}];");
+        Warp();
+        b.L($"@!{p0} st.shared.v2.f32 [{smem}+256], {{{h}, {l}}};");
+        b.Label($"{tag}_SKIP");
+        b.L("bar.sync 0;");
+        string rh = b.F(), rl = b.F();
+        b.L($"ld.shared.v2.f32 {{{rh}, {rl}}}, [{smem}+256];");
+        return (rh, rl);
     }
 
     /// <summary>The value a reduction starts from: −∞ / the smallest value for max, +∞ / the largest for min, zero for sums.</summary>

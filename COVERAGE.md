@@ -166,7 +166,7 @@ Backward formulas are formulas. Lane: **own** for the formulas every lane has, *
 | add, sub, mul, div, max, min, axpy, muladd, where | ✓ own | ✓ own | `where`: x ≠ 0 takes y, else z; integer div truncates |
 | square_bwd, abs_bwd, relu_bwd, clamp_bwd, where_bwd | ✓ own | ✓ own | (x, dy) → dx |
 | sqrt, inv_sqrt, exp, expm1, log, sin, cos, tanh, sigmoid, erf | ✓ float | ✓ float | functions proven ≤ 4 ulp (exp 1, log 2, sin/cos 2, tanh/sigmoid 3, erf 4) |
-| gelu (tanh form), gelu_erf, silu, leaky_relu, pow, dropout, gated_silu, gated_gelu | ✓ float | ✓ float | gelu as x·σ(2u), gelu_erf as x·Φ(x) by erfc: no cancellation |
+| gelu (tanh form), gelu_erf, silu, leaky_relu, pow, dropout, gated_silu, gated_gelu | ✓ float | ✓ float | gelu as x·σ(2u), gelu_erf as x·Φ(x) by erfc: no cancellation; on the device's f32 lane gelu and silu as x / (1 + e^(−t)) (gelu's t carried as an exact pair), sin / cos on the reduced argument as a pair |
 | sqrt_bwd, inv_sqrt_bwd, exp_bwd, log_bwd, sin_bwd, cos_bwd, tanh_bwd, sigmoid_bwd, silu_bwd, gelu_bwd, gelu_erf_bwd, leaky_relu_bwd, pow_bwd | ✓ float | ✓ float | sech² and σ(x)σ(−x) forms |
 | gated_silu_bwd_x/y, gated_gelu_bwd_x/y | ✓ float | ✓ float | (x, y, dz) → dx or dy |
 | row-vector broadcast: output[r][c] = op(x[r][c], v[c]) for add, sub, mul, div, max, min | ✓ own | ✓ own | `MapRow` |

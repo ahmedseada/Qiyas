@@ -241,6 +241,28 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
   232 → 10.9; matmul_nt q4_k 9.4 → 2.5; conv q8_0 7.8 → 4.6. Untouched cells read slower in the same run (CPU sum:whole
   int8 0.104 → 0.22, CUDA topk_rows q4_k 5.5 → 7.3): swing.
 
+- 6c (the CUDA rows above the lib's error): done, reported. `Ptx.Map.cs`: sin / cos reduce x − k·π/2 to a pair r + lo
+  (`ReduceHalfPiPair`: two-sum after the second part, the third part into lo) and evaluate sin = r + (lo·(1 − r²/2) +
+  r³·S(r²)), cos = 1 + (r²·C(r²) − r·lo); `XSigmoid` (f32 lanes) x·σ(t) = x / (1 + e^(−t)) with the denominator's sum
+  split exactly and folded into the quotient, gelu's t = c·x + c·0.044715·x³ carried as an exact pair (c split in two,
+  the low part corrects e^(−t)); float64 lanes keep x·σ(t). `Ptx.Rows.cs` add_rms_norm: y = h·g / s through
+  `RowCtx.Quotient` (q = x·r, then one fma residual step); softmax (both kernels in `Ptx.cs`) the same quotient step.
+  Device row sums of the f32-lane float types (`GpuOps.Reduce`, Axis.Rows): `Ptx.SumRowsWords` when a row is whole
+  32-bit words (one load per word, Kahan per thread, the threads' sums joined as exact f32 pairs by `BlockReducePair`,
+  rounded once), else `ReduceRows(…, compensated, storeF32)` (the same join per value). A float64 join per row first
+  cost float16 rows 0.023 → 0.040 ms (the device's f64 rate), the pair join 0.027, the word loads 0.024. Gate
+  `Checks.WholeSums` extended to rows (3 × 2^18 + 5, the value kernel; 2 × 2^18 + 4, the word kernel), within one f32
+  step; mutation (rows path off): float32 17.8 steps, float16 1.7, fails. Measured CUDA (qiyas err against lib's err;
+  time against item 4's baseline): float32 sin 6.77e-8 / 7.09e-8, cos 6.78e-8 / 7.07e-8, gelu 2.42e-7 / 3.13e-7, silu
+  2.47e-7 / 4.57e-7 (map times 0.175–0.182 ms, unchanged); add_rms_norm 9.44e-7 / 1.11e-6 (0.359 ms against 0.357);
+  softmax float32 3.68e-10 (was 4.52e-10) / 5.29e-10, 0.175 ms; sum:rows float32 5.64e-6 / 3.58e-5 (was 1.77e-5),
+  0.089 ms unchanged; float16 3.81e-6 / 1.04e-5, 0.024 (0.023); bfloat16 3.81e-6 / 7.63e-6, 0.024 (0.023);
+  float8_e4m3 0.034 (0.037). float64 map rows unchanged (sin 1.11e-16, gelu 8.88e-16). Open: float16 softmax 9.54e-7
+  against 9.53e-7 — both at float16's half step; the gap is one output near a rounding midpoint where the f32 value
+  (exp's ~1 ulp) lands on the other side; closing it needs exp as a pair through the quotient (noted, not done).
+  Possible later: the whole sums' chunk pass with word loads too (6b's float16 0.025 → 0.032 is the same per-value
+  load cost).
+
 ## Item 5 progress
 
 - Done, reported (uncommitted until the coordinator's go). What landed:
@@ -643,6 +665,7 @@ Each: measure against the baseline cell, change, re-measure (the full run or the
   1.95e-4 and float8_e5m2 3.66e-4 against 6.1e-5 (the order of the device's whole-array sum: pairwise or compensated
   partials are the step); float32 sin, cos, gelu, silu, add_rms_norm up to 1.4×; float16 softmax and sum:rows float16,
   bfloat16 up to 1.3×. Find each one's cause; bring them to the lib's or below, and the README sentence with them.
+  Done in 6b (whole sums) and 6c (the rest) except float16 softmax (see 6c).
 - Device cross_entropy bench row (from item 4's full run): 46 ms float16, 95 float32 against the CPU's 18–23 at 4096 ×
   32768 — the row chains three subject runs through host arrays (`Program.cs` RoutingRow "cross_entropy"), so the
   device time is the 512 MB upload of logp and the downloads, not the kernels (log_softmax alone 0.075 ms float16).
