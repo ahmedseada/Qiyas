@@ -264,8 +264,33 @@ internal static partial class Kernels
         return r;
     }
 
-    /// <summary>dQ, dK, dV: the composition in lane storage; returns the lane's name.</summary>
+    private static readonly Dictionary<string, bool> s_backFusedFaster = [];
+
+    /// <summary>The gate's override of the backward's measured choice (null: measured; true: the fused passes; false: the composition).</summary>
+    internal static bool? FusedBackwardCpu;
+
+    /// <summary>dQ, dK, dV: the fused rows and keys passes or the composition, whichever this processor measures faster at
+    /// this shape and type (once, as the forward's rows); returns the lane's name.</summary>
     public static string AttentionBackward<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] dO, byte[] dq, byte[] dk, byte[] dv) where TN : struct, IQiyasFloat<TN>
+    {
+        if (FusedBackwardCpu is bool forced) return forced ? AttentionBackwardRows<TN>(a, q, k, v, dO, dq, dk, dv) : AttentionBackwardComposed<TN>(a, q, k, v, dO, dq, dk, dv);
+        string key = $"{TN.Name}:{a.Heads}x{a.Lq}x{a.Lk}x{a.D}:{a.Causal}:{a.Spans is not null}:{a.SpanStarts is not null}";
+        bool fused;
+        lock (s_backFusedFaster)
+        {
+            if (!s_backFusedFaster.TryGetValue(key, out fused))
+            {
+                var (tf, tc) = Measure.Faster(() => AttentionBackwardRows<TN>(a, q, k, v, dO, dq, dk, dv), () => AttentionBackwardComposed<TN>(a, q, k, v, dO, dq, dk, dv));
+                fused = s_backFusedFaster[key] = tf <= tc;
+                Note($"attention_bwd {key}: fused passes {tf:0.000} ms, composition {tc:0.000} ms: {(fused ? "fused passes" : "composition")}");
+            }
+        }
+
+        return fused ? AttentionBackwardRows<TN>(a, q, k, v, dO, dq, dk, dv) : AttentionBackwardComposed<TN>(a, q, k, v, dO, dq, dk, dv);
+    }
+
+    /// <summary>dQ, dK, dV: the composition in lane storage; returns the lane's name.</summary>
+    public static string AttentionBackwardComposed<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] dO, byte[] dq, byte[] dk, byte[] dv) where TN : struct, IQiyasFloat<TN>
     {
         if (Wide<TN>())
         {

@@ -164,6 +164,15 @@ internal static partial class Kernels
             }
         }
 
+        // The backward's rows and keys passes (AttentionBackRows.cs) take the same two routines.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static void ScoresOf(ReadOnlySpan<TLane> q0, ReadOnlySpan<TLane> q1, ReadOnlySpan<TLane> kt, int bc, int ng, int d, Span<TLane> s0, Span<TLane> s1) =>
+            Scores(q0, q1, kt, bc, ng, d, s0, s1);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static void ContextOf(ReadOnlySpan<TLane> p0, ReadOnlySpan<TLane> p1, TLane alpha0, TLane alpha1, ReadOnlySpan<TLane> V, long vBase, int cLo, int cHi, int d,
+            Span<TLane> o0, Span<TLane> o1, bool single) => Context(p0, p1, alpha0, alpha1, V, vBase, cLo, cHi, d, o0, o1, single);
+
         // s0[c], s1[c] = q0 · Kᵀ[·][c], q1 · Kᵀ[·][c] for c < ng (ng whole groups of four vectors).
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static void Scores(ReadOnlySpan<TLane> q0, ReadOnlySpan<TLane> q1, ReadOnlySpan<TLane> kt, int bc, int ng, int d, Span<TLane> s0, Span<TLane> s1)

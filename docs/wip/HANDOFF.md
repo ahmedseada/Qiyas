@@ -446,6 +446,21 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
     orientation would gain tt about 0.008 ms — not done.
   - Measured: see COVERAGE (the Aᵀ products row, the attention backward row, the GRU row). Errors unchanged.
 
+- 6j part 2 (CPU attention backward): done, reported (uncommitted until go).
+  - `src/AttentionBackRows.cs`: `Kernels.AttentionBackwardRows`, two passes per group of heads (Pᵀ and dSᵀ of the group
+    within 32 MB). Rows: a task per head and 16 query rows; the rows' scores over the keys they see (Kᵀ's tiles laid
+    once, as the fused forward), P exactly (max and sum over the whole row, not online), dP = dO·Vᵀ by Vᵀ's tiles
+    (`Scratch.AttnVt`), dS = P·(dP − Σ P·dP)·scale, dQ = dS·K by the forward's `Context`; P and dS written transposed
+    for the block's keys widened to whole runs of 16, zero where a row does not see the key. Keys: a task per head and
+    16 keys, dV = Pᵀ·dO and dK = dSᵀ·Q over the row blocks whose columns cover the run (a block's columns are whole runs,
+    so a run is covered by a block entirely or not at all; the uncovered blocks' Pᵀ is never written nor read).
+    `FusedBody.ScoresOf` / `ContextOf` (internal, the forward's routines unchanged). `Kernels.AttentionBackward`
+    measures the fused passes against the composition once per shape and type (`Measure.Faster`, as the forward's rows)
+    and keeps the faster; the composition is `AttentionBackwardComposed`. `Kernels.FusedBackwardCpu` forces either.
+  - Gate (`Checks.Attentions`): the CPU backward's seven shapes run fused and composed each. Mutation (the keys pass
+    dropping each run's last query row) fails at 126 cells.
+  - Measured: see COVERAGE (the backward row). float32 error 1.47e-7 → 1.72e-7 (dK, dV summed in another order).
+
 ## Item 5 progress
 
 - Done, reported (uncommitted until the coordinator's go). What landed:

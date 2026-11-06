@@ -586,7 +586,8 @@ internal static partial class Kernels
     {
         public const int Gx = 0, StepG = 1, StepG2 = 2, H0 = 3, H1 = 4, C0 = 5, C1 = 6, Prev = 7, Hs = 8, Cs = 9, Gates = 10, Dg = 11, Dg2 = 12,
             Dh = 13, BackG = 14, BackG2 = 15, BackDg = 16, BackDg2 = 17, PrevState = 18, Dh0 = 19, Dh1 = 20, Dc0 = 21, Dc1 = 22, DhCell = 23,
-            ConvDcols = 24, ConvCols = 25, AttnKt = 26, Count = 27;         // the convolution's backward (Conv.cs), the fused rows' Kᵀ (AttentionRows.cs) too
+            ConvDcols = 24, ConvCols = 25, AttnKt = 26, Count = 30;         // the convolution's backward (Conv.cs), the fused rows' Kᵀ (AttentionRows.cs) too
+        public const int AttnVt = 27, AttnPt = 28, AttnDst = 29;           // the fused attention backward's Vᵀ, Pᵀ, dSᵀ (AttentionBackRows.cs)
 
         [ThreadStatic] private static byte[]?[]? s_slots;
 
