@@ -60,7 +60,7 @@ regression comparer and the baseline run.
 
 1. The todo rows below (item 4, in this order: fused attention rows — done, ctc — done, the GRU sequence bench row — done, the block-scaled
    tiled product — done, the transposition fused into the product's packing — done, the radix step of scatter-add — done, the fused direct
-   convolution); the designs and the progress are in `docs/wip/HANDOFF.md`.
+   convolution — done); the designs and the progress are in `docs/wip/HANDOFF.md`.
 2. A bump-allocated scope past the pool (buffers reserved once from the shapes; zero rents on the hot path).
 3. The known-slow list.
 
@@ -123,9 +123,12 @@ and measured against the baseline when it is.
 | CUDA | three-stream row operations in float32 in a full run | scale_mask_softmax 0.50 ms in the group's run, 0.26 alone (a run-order effect also seen on add float8_e5m2) |
 | CPU | the strided copy (a 3-d permutation of 16M values) | 16.2 ms float32, 7.3 int8 against 1.8 for a plain copy: a value-at-a-time gather (tiling by the source's rows is the step) |
 | CPU | the pools and the depthwise convolution | maxpool_bwd 5.1 ms, adaptive_maxpool 5.8, depthwise_conv 4.8 (float32, 64 × 256 × 256); int8 adaptive_maxpool 18.6, depthwise 24.4 (value-at-a-time loads of a packed type) |
+| CUDA | float64 conv: which path | the composition through the sliced float64 tensor route 2.55 ms against the fused plain kernel 3.40 (item 4g); in one full products run the sliced product's own measurement (`SlicedFaster`: one warm call, three timed) read 3.56 ms instead of 2.15, the conv choice took the fused path and the row read 3.41. To time `SlicedFaster` by `Measure.Faster` in item 6, and to consider the image packed into the sliced route's digits (the fused path for the sliced lane) |
 | CPU | the convolution backward | 33 ms against 6.9 forward (64 × 128 × 128 by 128 of 3 × 3): three passes in lane storage |
 | CUDA | attention rows | 3.8 ms (causal 2.1) for 16 heads of 2048² at d = 128 by the fused rows in the FMA lane, from 6.1 by the composition (since item 4a); the tensor lanes inside the fused kernel are the step. float64: see the next row |
 | CUDA | float64 non-causal attention: which path | 62.6 ms on the fused rows since item 4d, against 59 by the composition at 4a; the shared measurement (`Measure.Faster`) timed the composition at 89 this time and chose the fused rows. To re-measure both paths in item 6 (the `attention` row, the composition forced); if the composition is really faster, explain the 89 |
+| CUDA | route with few targets | 0.275 ms for 1M into 64 against 0.185 into 65 536 (item 4f): the counts' 1M atomics on 64 counters dominate. To take the counts from the radix table's totals (item 6) |
+| CPU | scatter_add_rows on block formats | q8_0 83.9 ms (the coordinator's run; 92.5 in 4f's) against float32 1.94 on the same shape (4096 into 4096 × 4096): probably a per-row re-encode or a serial path. To find and fix in item 6 |
 | CPU | sub-byte products on views after item 4e | int4 matmul_tn, int2 matmul_nt, uint2 matmul_nt slower by 7–26 % after 4e in one A/B (both orders; uint2 mixed); the coordinator's run read int4 tn 1.88 ms, int2 nt 2.22 (1024³). These types keep the copy route; the shared product kernel gained offsets. To re-measure in item 6; if it holds, give sub-byte types the in-place route or remove what the offsets cost them |
 | CPU | the block-scaled product with AggressiveOptimization | steady 3.5–3.65 ms with the attribute against 3.15–3.18 without in one A/B (1024³ q8_0, item 4d); the attribute keeps the first calls off the runtime's first tier. To re-measure in item 6 in both orders; if the gap holds, keep first-call optimization without the steady-state cost |
 | CPU | attention rows | 60–80 ms float32 (causal 33–38) for 16 heads of 2048² at d = 128 by the fused rows, from 100–148 by the composition (since item 4a) |
@@ -223,7 +226,7 @@ sum_axis, sumsq, max, min, argmax → the reductions; transpose; gemv_nn / gemv_
 
 | operation | CPU | CUDA | note |
 |---|---|---|---|
-| conv forward (one image; strides, pads, dilations) | ✓ sum | ✓ sum | the composition im2col → product: the product's lanes and bounds; a fused direct convolution: todo |
+| conv forward (one image; strides, pads, dilations) | ✓ sum | ✓ sum | im2col fused into the product's packing (implicit GEMM; item 4g): no columns in memory; the product's lanes, bounds (the image's range with 0) and kernels. CPU: the packing builds each row of the columns from the image (every type whose rows start on whole bytes; otherwise the composition im2col → product). Device: the tensor and dot routes pack the image straight into the kind's rows (the composition's padding, kernel and C path: the same result bit for bit); the plain lanes (f32, f64, the integer lanes, block formats through f32) run the plain product kernel with its B tile gathered from the image, or the composition where measured faster (once per shape and type, `Measure.Faster`, in `--report`): float64 at 64 × 128 × 128 by 128 of 3 × 3 keeps the composition through the sliced float64 tensor route (2.55 ms against 3.40 fused), float32 and the block formats take the fused path (0.14 ms against 0.35). Block formats: the fused path reads the image's values where the composition re-encoded the columns into blocks. Gate: the fused path forced, equal bit for bit to the composition through the same kernel on both devices, five shapes (strided, dilated, padded and whole tiles) |
 | conv backward input, backward weight | ✓ float | ✓ float | the composition in the float lane's storage (the columns' gradient is a sum of products no narrow type holds between the passes); integer types: n/a, a gradient needs a wider type |
 | depthwise convolution | ✓ sum | ✓ sum | a layout operation: a gather with the channel's weights |
 | maxpool, avgpool (strides, pads: a window's count excludes the pads), their backward passes | ✓ own / ✓ float | ✓ own / ✓ float | layout operations; maxpool backward recomputes each window's first largest (deterministic) |

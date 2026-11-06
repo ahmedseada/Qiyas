@@ -110,8 +110,10 @@ internal static partial class Kernels
     /// <summary>Where a product's operands are stored (in values): A from AOff, stored k × m (Aᵀ) when TransA; B from BOff,
     /// stored n × k (Bᵀ) when TransB; C from COff. The packing reads them there: no copy of a transposed or batched
     /// operand. Each offset on whole storage units, and every row starting on a whole byte.</summary>
-    public readonly record struct Operands(int AOff = 0, bool TransA = false, int BOff = 0, bool TransB = false, int COff = 0, bool Viewed = true)
+    public readonly record struct Operands(int AOff = 0, bool TransA = false, int BOff = 0, bool TransB = false, int COff = 0, bool Viewed = true, ConvArgs? ImageB = null)
     {
+        // ImageB (item 4g): B is the convolution's columns (C·kh·kw × OH·OW) read from the image itself, the stored b
+        // being the image (C × H × W): the packing builds each row of B from it (the implicit im2col).
         /// <summary>The plain product (no view: C exactly m × n); any constructed Operands is a view, even batch 0's.</summary>
         public bool Plain => !Viewed;
     }
@@ -213,7 +215,7 @@ internal static partial class Kernels
     // and interleaved into units, then scattered into the strips: the load and the packing one pass.
     // Bᵀ stored (TransB): column j of B is row j of Bᵀ, so a group's unit of column j is g values contiguous there; a task
     // reads each Bᵀ row's span of its groups once and lays the units into the strips.
-    private struct PackBody<TN, TIn, TAcc>(byte[] b, TIn[]? bLanes, TAcc[] packed, int n, int k, int strip, int kg, int bOff = 0, bool transB = false) : Team.IBody
+    private struct PackBody<TN, TIn, TAcc>(byte[] b, TIn[]? bLanes, TAcc[] packed, int n, int k, int strip, int kg, int bOff = 0, bool transB = false, ConvArgs? image = null) : Team.IBody
         where TN : struct, IQiyasNumber<TN, TIn> where TIn : unmanaged where TAcc : unmanaged
     {
         public readonly void Run(int first, int last)
@@ -228,11 +230,21 @@ internal static partial class Kernels
             var rowsBuffer = MemoryMarshal.Cast<byte, TIn>(scratch[..rowsBytes]);
             var units = MemoryMarshal.Cast<byte, TAcc>(scratch[rowsBytes..]);
             ReadOnlySpan<TIn> stored = direct ? MemoryMarshal.Cast<byte, TIn>(b.AsSpan()) : bLanes;
+            TIn[]? line = image is not null && !direct ? ArrayPool<TIn>.Shared.Rent(image.W) : null;
             for (int grp = first; grp < last; grp++)
             {
                 int row0 = grp * g, rows = Math.Min(g, k - row0);
                 ReadOnlySpan<TIn> group = rowsBuffer;
-                if (rows == g && !stored.IsEmpty) group = stored.Slice(bOff + row0 * n, g * n);
+                if (image is not null)
+                {
+                    for (int t = 0; t < g; t++)
+                    {
+                        var dst = rowsBuffer.Slice(t * n, n);
+                        if (t >= rows) dst.Clear();
+                        else ImageRow<TN, TIn>(b, direct ? stored : default, line, image, row0 + t, dst);
+                    }
+                }
+                else if (rows == g && !stored.IsEmpty) group = stored.Slice(bOff + row0 * n, g * n);
                 else
                 {
                     for (int t = 0; t < g; t++)
@@ -255,6 +267,7 @@ internal static partial class Kernels
             }
 
             if (rented is not null) pool.Return(rented);
+            if (line is not null) ArrayPool<TIn>.Shared.Return(line);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -379,6 +392,39 @@ internal static partial class Kernels
 
             ArrayPool<TAcc>.Shared.Return(panel);
             if (kRows is not null) ArrayPool<TIn>.Shared.Return(kRows);
+        }
+    }
+
+    // Row p = (c, kh, kw) of the convolution's columns from the image (C × H × W): dst[oh·OW + ow] =
+    // x[c][oh·sh − ph + kh·dh][ow·sw − pw + kw·dw], 0 off the image; an image row read in place (lanes) or loaded once.
+    private static void ImageRow<TN, TIn>(byte[] x, ReadOnlySpan<TIn> stored, TIn[]? line, ConvArgs a, int p, Span<TIn> dst)
+        where TN : struct, IQiyasNumber<TN, TIn> where TIn : unmanaged
+    {
+        int khw = a.Kh * a.Kw, c = p / khw, kh = p % khw / a.Kw, kw = p % a.Kw;
+        var (oh1, ow1) = a.Out;
+        int shift = kw * a.Dw - a.Pw;                                           // iw = ow·sw + shift
+        for (int oh = 0; oh < oh1; oh++)
+        {
+            var row = dst.Slice(oh * ow1, ow1);
+            int ih = oh * a.Sh - a.Ph + kh * a.Dh;
+            if ((uint)ih >= (uint)a.H) { row.Clear(); continue; }
+            ReadOnlySpan<TIn> src;
+            if (!stored.IsEmpty) src = stored.Slice((c * a.H + ih) * a.W, a.W);
+            else { TN.Load(x, (c * a.H + ih) * a.W, line.AsSpan(0, a.W)); src = line.AsSpan(0, a.W); }
+            if (a.Sw == 1)
+            {
+                int lo = Math.Clamp(-shift, 0, ow1), hi = Math.Clamp(a.W - shift, lo, ow1);
+                row[..lo].Clear();
+                src.Slice(lo + shift, hi - lo).CopyTo(row[lo..]);
+                row[hi..].Clear();
+                continue;
+            }
+
+            for (int ow = 0; ow < ow1; ow++)
+            {
+                int iw = ow * a.Sw + shift;
+                row[ow] = (uint)iw < (uint)a.W ? src[iw] : default;
+            }
         }
     }
 
@@ -531,14 +577,14 @@ internal static partial class Kernels
                 Team.For(m * k, Math.Max(4096, m * k / (Threads * 2)) / 64 * 64, m * k, new LoadBody<TN, TIn>(a, al));
             }
 
-            if (!nRows)
+            if (!nRows && o.ImageB is null)
             {
                 bl = inPool.Rent(k * n);
                 Team.For(k * n, Math.Max(4096, k * n / (Threads * 2)) / 64 * 64, k * n, new LoadBody<TN, TIn>(b, bl));
             }
 
             t0 = Mark(t0, 0);
-            Team.For(kg, Math.Max(1, kg / (Threads * 2)), (long)k * n, new PackBody<TN, TIn, TAcc>(b, bl, packed, n, k, strip, kg, o.BOff, o.TransB));
+            Team.For(kg, Math.Max(1, kg / (Threads * 2)), (long)k * n, new PackBody<TN, TIn, TAcc>(b, bl, packed, n, k, strip, kg, o.BOff, o.TransB, o.ImageB));
             t0 = Mark(t0, 1);
 
             // C in lanes (the stored bytes themselves when they are lanes).

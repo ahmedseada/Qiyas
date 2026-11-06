@@ -1504,10 +1504,13 @@ internal static partial class Ptx
     public const int GemmThreads = 256;
 
     /// <summary>Tiles of micro·16 × micro·16 values of C per block of 256 threads (micro² per thread), k in steps of 8 through shared memory.</summary>
-    public static string Gemm(Gpu gpu, Lane lane, int micro, out string entry)
+    /// <summary>With conv (item 4g) B is the convolution's columns read from the image at p_b (C × H × W, in the lane's
+    /// storage): the B tile's loads gather x[c][oh·sh − ph + kh·dh][ow·sw − pw + kw·dw] (0 off the image) for row
+    /// kk = (c, kh, kw) and column j = (oh, ow) — the implicit im2col; the rest of the kernel unchanged.</summary>
+    public static string Gemm(Gpu gpu, Lane lane, int micro, out string entry, bool conv = false)
     {
         int tile = micro * 16, bk = 16, e = lane.Size;
-        entry = $"gemm{tile}_{lane.Name}";
+        entry = conv ? $"gemmconv{tile}_{lane.Name}" : $"gemm{tile}_{lane.Name}";
         var b = new PtxBuilder();
         string tid = b.R(), bx = b.R(), by = b.R(), tx = b.R(), ty = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
@@ -1516,6 +1519,7 @@ internal static partial class Ptx
         b.L($"and.b32 {tx}, {tid}, 15;");
         b.L($"shr.u32 {ty}, {tid}, 4;");
         string pa = Param64(b, "p_a"), pb = Param64(b, "p_b"), pc = Param64(b, "p_c"), m = Param32(b, "p_m"), n = Param32(b, "p_n"), k = Param32(b, "p_k");
+        string[] g = conv ? [.. new[] { "h", "w", "kh", "kw", "sh", "sw", "ph", "pw", "dh", "dw", "ow" }.Select(name => Param32(b, "p_" + name))] : [];
         string row0 = b.R(), col0 = b.R();
         b.L($"mul.lo.u32 {row0}, {by}, {tile};");
         b.L($"mul.lo.u32 {col0}, {bx}, {tile};");
@@ -1602,6 +1606,58 @@ internal static partial class Ptx
         }
 
         // B's tile: row k0 + bRow, perThread consecutive columns at col0 + bCol, stored Bs[bRow][col].
+        if (conv)
+        {
+            // The implicit im2col: row kk = (c, kh, kw), column = (oh, ow), each value gathered from the image or 0.
+            string kk = b.R(), pk = b.P(), khw = b.R(), c = b.R(), r = b.R(), kh = b.R(), kw = b.R(), dih = b.R(), diw = b.R();
+            b.L($"add.u32 {kk}, {k0}, {bRow};");
+            b.L($"setp.lt.u32 {pk}, {kk}, {k};");
+            b.L($"mul.lo.u32 {khw}, {g[2]}, {g[3]};");
+            b.L($"div.u32 {c}, {kk}, {khw};");
+            b.L($"rem.u32 {r}, {kk}, {khw};");
+            b.L($"div.u32 {kh}, {r}, {g[3]};");
+            b.L($"rem.u32 {kw}, {r}, {g[3]};");
+            b.L($"mul.lo.s32 {dih}, {kh}, {g[8]};");
+            b.L($"sub.s32 {dih}, {dih}, {g[6]};");
+            b.L($"mul.lo.s32 {diw}, {kw}, {g[9]};");
+            b.L($"sub.s32 {diw}, {diw}, {g[7]};");
+            string cBase = b.R();
+            b.L($"mul.lo.u32 {cBase}, {c}, {g[0]};");
+            var bv0 = new string[perThread];
+            for (int q = 0; q < perThread; q++)
+            {
+                bv0[q] = lane.NewReg(b);
+                b.L($"mov.{lane.Reg} {bv0[q]}, {lane.Zero};");
+                string colq = b.R(), pq = b.P(), oh = b.R(), ow = b.R(), ih = b.R(), iw = b.R(), pin = b.P(), idx = b.R(), addr = b.RD();
+                b.L($"add.u32 {colq}, {gColB}, {q};");
+                b.L($"setp.lt.u32 {pq}, {colq}, {n};");
+                b.L($"and.pred {pq}, {pq}, {pk};");
+                b.L($"div.u32 {oh}, {colq}, {g[10]};");
+                b.L($"rem.u32 {ow}, {colq}, {g[10]};");
+                b.L($"mad.lo.s32 {ih}, {oh}, {g[4]}, {dih};");
+                b.L($"mad.lo.s32 {iw}, {ow}, {g[5]}, {diw};");
+                b.L($"setp.lt.u32 {pin}, {ih}, {g[0]};");                       // a negative index reads as a large one
+                b.L($"and.pred {pq}, {pq}, {pin};");
+                b.L($"setp.lt.u32 {pin}, {iw}, {g[1]};");
+                b.L($"and.pred {pq}, {pq}, {pin};");
+                b.L($"add.u32 {idx}, {cBase}, {ih};");
+                b.L($"mad.lo.u32 {idx}, {idx}, {g[1]}, {iw};");
+                b.L($"mul.wide.u32 {addr}, {idx}, {e};");
+                b.L($"add.u64 {addr}, {pb}, {addr};");
+                b.L($"@{pq} ld.global.{lane.Mem} {bv0[q]}, [{addr}];");
+            }
+
+            string sOff0 = b.R(), sAddr0 = b.R();
+            int perVec = e == 4 ? 4 : 2;
+            b.L($"mad.lo.u32 {sOff0}, {bRow}, {tile}, {bCol};");
+            b.L($"mad.lo.u32 {sAddr0}, {sOff0}, {e}, {bsBase};");
+            for (int q = 0; q < perThread; q += perVec)
+            {
+                string regs = perVec == 4 ? $"{{{bv0[q]}, {bv0[q + 1]}, {bv0[q + 2]}, {bv0[q + 3]}}}" : $"{{{bv0[q]}, {bv0[q + 1]}}}";
+                b.L($"st.shared.v{perVec}.{lane.Mem} [{sAddr0}+{q * e}], {regs};");
+            }
+        }
+        else
         {
             string kk = b.R(), pk = b.P(), off = b.RD(), rowBase = b.RD();
             b.L($"add.u32 {kk}, {k0}, {bRow};");
@@ -1721,7 +1777,8 @@ internal static partial class Ptx
         }
 
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_a, .param .u64 p_b, .param .u64 p_c, .param .u32 p_m, .param .u32 p_n, .param .u32 p_k", asBytes + bsBytes);
+        string convParams = conv ? ", .param .u32 p_h, .param .u32 p_w, .param .u32 p_kh, .param .u32 p_kw, .param .u32 p_sh, .param .u32 p_sw, .param .u32 p_ph, .param .u32 p_pw, .param .u32 p_dh, .param .u32 p_dw, .param .u32 p_ow" : "";
+        return b.Finish(Header(gpu), entry, ".param .u64 p_a, .param .u64 p_b, .param .u64 p_c, .param .u32 p_m, .param .u32 p_n, .param .u32 p_k" + convParams, asBytes + bsBytes);
     }
 
     /// <summary>Shared bytes the 32-bit-lane product takes: A 128 rows × 80 B and B 16 rows × 512 B per stage.</summary>
@@ -2144,10 +2201,12 @@ internal static partial class Ptx
     // ---------------------------------------------------------------- B transposed into packed rows, through a shared tile
 
     /// <summary>Bt[j][0..kp) = B[0..k)[j] in the kind's packing, zero past k: blocks of 64 columns × 32 rows of k, read along the
-    /// stored rows (coalesced), turned in shared memory, written along the packed rows (coalesced).</summary>
-    public static string PackTransposed(Gpu gpu, Fmt f, Kind kind, out string entry)
+    /// stored rows (coalesced), turned in shared memory, written along the packed rows (coalesced). With conv (item 4g) B is
+    /// the convolution's columns read from the image (p_x: C × H × W): B[kk][j] = x[c][oh·sh − ph + kh·dh][ow·sw − pw + kw·dw]
+    /// for kk = (c, kh, kw), j = (oh, ow), 0 off the image — the implicit im2col.</summary>
+    public static string PackTransposed(Gpu gpu, Fmt f, Kind kind, out string entry, bool conv = false)
     {
-        entry = $"packt_{f.Name}_{kind.Name}";
+        entry = conv ? $"packconv_{f.Name}_{kind.Name}" : $"packt_{f.Name}_{kind.Name}";
         const int Cols = 64, Rows = 32, Stride = 33;                        // the tile: n columns, k rows; stride in elements
         int elem = kind.IsFloat ? 2 : 1;
         int wordsPerRow = Rows / kind.Per, totalWords = Cols * wordsPerRow, perThread = Math.Max(1, totalWords / 256);
@@ -2160,6 +2219,7 @@ internal static partial class Ptx
         b.L($"mul.lo.u32 {k0}, {by}, {Rows};");
         b.L($"mov.u32 {smem}, smem;");
         string src = Param64(b, "p_x"), dst = Param64(b, "p_y"), n = Param32(b, "p_n"), k = Param32(b, "p_k"), kp = Param32(b, "p_kp");
+        string[] g = conv ? [.. new[] { "h", "w", "kh", "kw", "sh", "sw", "ph", "pw", "dh", "dw", "ow" }.Select(name => Param32(b, "p_" + name))] : [];
 
         // Load: column col0 + (tid & 63), rows k0 + (tid >> 6) + 4i.
         string col = b.R(), nn = b.R(), pCol = b.P(), kBase = b.R();
@@ -2167,6 +2227,21 @@ internal static partial class Ptx
         b.L($"add.u32 {nn}, {col0}, {col};");
         b.L($"setp.lt.u32 {pCol}, {nn}, {n};");
         b.L($"shr.u32 {kBase}, {tid}, 6;");
+        string ihBase = "", iwBase = "", khw = "";
+        if (conv)
+        {
+            // The column's output pixel: ih = oh·sh − ph + kh·dh, iw = ow·sw − pw + kw·dw (the kh, kw terms per k-row).
+            string oh = b.R(), ow = b.R();
+            ihBase = b.R(); iwBase = b.R(); khw = b.R();
+            b.L($"div.u32 {oh}, {nn}, {g[10]};");
+            b.L($"rem.u32 {ow}, {nn}, {g[10]};");
+            b.L($"mul.lo.s32 {ihBase}, {oh}, {g[4]};");
+            b.L($"sub.s32 {ihBase}, {ihBase}, {g[6]};");
+            b.L($"mul.lo.s32 {iwBase}, {ow}, {g[5]};");
+            b.L($"sub.s32 {iwBase}, {iwBase}, {g[7]};");
+            b.L($"mul.lo.u32 {khw}, {g[2]}, {g[3]};");
+        }
+
         for (int i = 0; i < 8; i++)
         {
             string kr = b.R(), kk = b.R(), pk = b.P(), idx = b.R(), code = b.R(), sAddr = b.R();
@@ -2176,7 +2251,23 @@ internal static partial class Ptx
             b.L($"and.pred {pk}, {pk}, {pCol};");
             b.L($"mov.b32 {code}, 0;");
             b.L($"@!{pk} bra LOADED{i};");
-            b.L($"mad.lo.u32 {idx}, {kk}, {n}, {nn};");
+            if (conv)
+            {
+                string c = b.R(), r = b.R(), kh = b.R(), kw = b.R(), ih = b.R(), iw = b.R(), pin = b.P(), pin2 = b.P();
+                b.L($"div.u32 {c}, {kk}, {khw};");
+                b.L($"rem.u32 {r}, {kk}, {khw};");
+                b.L($"div.u32 {kh}, {r}, {g[3]};");
+                b.L($"rem.u32 {kw}, {r}, {g[3]};");
+                b.L($"mad.lo.s32 {ih}, {kh}, {g[8]}, {ihBase};");
+                b.L($"mad.lo.s32 {iw}, {kw}, {g[9]}, {iwBase};");
+                b.L($"setp.lt.u32 {pin}, {ih}, {g[0]};");                       // a negative index reads as a large one
+                b.L($"setp.lt.u32 {pin2}, {iw}, {g[1]};");
+                b.L($"and.pred {pin}, {pin}, {pin2};");
+                b.L($"@!{pin} bra LOADED{i};");
+                b.L($"mad.lo.u32 {idx}, {c}, {g[0]}, {ih};");
+                b.L($"mad.lo.u32 {idx}, {idx}, {g[1]}, {iw};");
+            }
+            else b.L($"mad.lo.u32 {idx}, {kk}, {n}, {nn};");
             if (kind.IsFloat)
             {
                 string v = Codec.UnpackAt(b, f, src, idx, Lane.F32);
@@ -2242,7 +2333,8 @@ internal static partial class Ptx
         }
 
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_y, .param .u32 p_n, .param .u32 p_k, .param .u32 p_kp", Cols * Stride * elem);
+        string convParams = conv ? ", .param .u32 p_h, .param .u32 p_w, .param .u32 p_kh, .param .u32 p_kw, .param .u32 p_sh, .param .u32 p_sw, .param .u32 p_ph, .param .u32 p_pw, .param .u32 p_dh, .param .u32 p_dw, .param .u32 p_ow" : "";
+        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_y, .param .u32 p_n, .param .u32 p_k, .param .u32 p_kp" + convParams, Cols * Stride * elem);
     }
 
     // kw0 + wi as a 64-bit register.

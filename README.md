@@ -123,7 +123,7 @@ checkout (files listed in `.gitignore`); a clone runs the other subjects.
 | `src/Ptx.Radix.cs`, `src/GpuOps.Radix.cs` | the device's ordering by target for scatter-add and the route: counts, the multi-block exclusive scan, the stable LSD radix sort |
 | `src/Ctc.cs`, `src/Ptx.Ctc.cs`, `src/GpuOps.Ctc.cs` | ctc: the arguments and the float64 reference, the CPU kernel, the device kernels (rows, then a block per sequence) |
 | `src/Recurrent.cs`, `src/Ptx.Recurrent.cs`, `src/GpuOps.Recurrent.cs`, `src/Bench/RecurrentCases.cs` | LSTM and GRU cells and steps, forward and backward |
-| `src/Conv.cs`, `src/GpuOps.Conv.cs` | convolution forward and backward as im2col / product / col2im compositions |
+| `src/Conv.cs`, `src/GpuOps.Conv.cs` | convolution: the forward fused into the product's packing (implicit GEMM: the image read through the index map; on the device's plain lanes a measured choice against im2col), the backward as im2col / product / col2im compositions |
 | `src/Optimizers.cs`, `src/Ptx.Optimizers.cs`, `src/GpuOps.Optimizers.cs` | optimizer steps: sgd with momentum, adam, adamw |
 | `src/Attention.cs`, `src/Ptx.Attention.cs`, `src/GpuOps.Attention.cs` | attention: the measured choice, the composition in lane storage, the fused decode kernel, the backward composition; the lane-storage conversions |
 | `src/AttentionRows.cs`, `src/Ptx.AttentionRows.cs` | attention's fused rows (flash: keys in tiles, the softmax online, no scores in memory) on the CPU and the device |
@@ -219,6 +219,6 @@ allows.
 ## Open
 
 What the gates have not confirmed, or is not done, is in `COVERAGE.md` ("State" for the order, **todo** in the rows):
-a fused direct convolution, a bump-allocated scope past the buffer pool, and the known-slow
+a bump-allocated scope past the buffer pool, and the known-slow
 cells (among them the tensor lanes inside the fused attention kernel, which runs in the FMA lane). The README claims nothing beyond what the gates and the regression
 comparison have confirmed.

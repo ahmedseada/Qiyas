@@ -629,8 +629,70 @@ internal static class Checks
             }
         }
 
-        if (ok) Console.WriteLine($"check convolution            {where,-6} every type: forward and the backward pair within the products' rounding");
+        // The fused forward (item 4g, implicit GEMM): forced on, within the products' rounding, and equal bit for bit to the
+        // composition through the same kernel (the same packed values): the composition itself on the CPU and on the
+        // device's tensor and dot routes; on the device's plain float lanes im2col then the same plain kernel (the plain
+        // composition may take another kernel); the integer lanes are exact either way. Block formats: the composition
+        // re-encodes the columns into blocks, the fused path reads the image's values: rounding only. Shapes: the two
+        // above, a 3 × 3 at 16 × 20 × 20 → 32 (padded tiles), 1 × 1 at 128 × 16 × 16 → 128 (whole tiles), and a strided,
+        // dilated one with an even width (sub-byte types in place).
+        foreach (var type in Bench.Registry.Names)
+        {
+            foreach (var a in new[] { new ConvArgs(3, 7, 9, 5, 3, 2, 2, 1, 1, 1), new ConvArgs(2, 5, 5, 3, 3, 3, 1, 1, 1, 1, 2, 2), new ConvArgs(16, 20, 20, 32, 3, 3, 1, 1, 1, 1), new ConvArgs(128, 16, 16, 128, 1, 1), new ConvArgs(4, 9, 12, 6, 3, 3, 2, 2, 1, 1, 2, 2) })
+            {
+                var x = Bench.Registry.Make(type, (int)a.XValues, 64, -1, 1);
+                var w = Bench.Registry.Make(type, (int)a.WValues, 65, -1, 1);
+                var want = a.Reference(Bench.Registry.Values(type, x, (int)a.XValues), Bench.Registry.Values(type, w, (int)a.WValues));
+                var fused = new byte[Bench.Registry.Bytes(type, a.YValues)];
+                var composed = new byte[fused.Length];
+                var run = new ConvModeRun(ops, a, x, w, fused, composed);
+                Bench.Registry.With(type, run);
+                string name = $"conv fused {a.C}x{a.H}x{a.W}>{a.OC} {a.Kh}x{a.Kw} s{a.Sh} d{a.Dh}";
+                ok &= Close(type, name, where, fused, want, (int)a.YValues, a.Rows);
+                if (!Bench.Registry.IsBlock(type) && !fused.AsSpan().SequenceEqual(composed))
+                {
+                    Console.WriteLine($"check {name} {where,-6} {type,-12} DIFFERS from the composition through the same kernel ({run.Lane})");
+                    ok = false;
+                }
+            }
+        }
+
+        if (ok) Console.WriteLine($"check convolution            {where,-6} every type: forward and the backward pair within the products' rounding; the fused forward equal to the composition through the same kernel");
         return ok;
+    }
+
+    // The fused forward forced on (into fused), then its composition through the same kernel (into composed).
+    private sealed class ConvModeRun(GpuOps? ops, ConvArgs a, byte[] x, byte[] w, byte[] fused, byte[] composed) : Bench.ITypeVisitor<bool>
+    {
+        public string Lane = "";
+
+        public bool Visit<TN>() where TN : struct, IQiyasNumber<TN, float>
+        {
+            if (ops is null)
+            {
+                Kernels.FusedConv = null;
+                Lane = Kernels.Conv<TN>(a, x, w, fused);
+                Kernels.FusedConv = false;
+                Kernels.Conv<TN>(a, x, w, composed);
+                Kernels.FusedConv = null;
+                return true;
+            }
+
+            var gpu = ops.Gpu;
+            ulong dX = gpu.Rent(x.Length), dW = gpu.Rent(w.Length), dY = gpu.Rent(fused.Length), dC = gpu.Rent(composed.Length);
+            Qiyas.Gpu.Upload<byte>(x, dX); Qiyas.Gpu.Upload<byte>(w, dW);
+            ops.FusedConv = true;
+            Lane = ops.Conv<TN>(a, dX, dW, dY);
+            bool packed = Lane.EndsWith("mma", StringComparison.Ordinal) || Lane.EndsWith("dp", StringComparison.Ordinal);
+            if (!packed && Lane is "f32" or "f64" && Bench.Registry.IsFloat(TN.Name)) ops.ConvPlainComposed<TN>(a, dX, dW, dC, Lane);
+            else { ops.FusedConv = false; ops.Conv<TN>(a, dX, dW, dC); }
+            ops.FusedConv = null;
+            Qiyas.Gpu.Synchronize();
+            Qiyas.Gpu.Download<byte>(dY, fused);
+            Qiyas.Gpu.Download<byte>(dC, composed);
+            gpu.Return(dX); gpu.Return(dW); gpu.Return(dY); gpu.Return(dC);
+            return true;
+        }
     }
 
     private sealed class ConvRun(GpuOps? ops, ConvArgs a, byte[] x, byte[] w, byte[] y, byte[]? dx, byte[]? dw) : Bench.ITypeVisitor<bool>

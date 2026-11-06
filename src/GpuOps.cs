@@ -571,12 +571,7 @@ public sealed partial class GpuOps(Gpu gpu)
         {
             if (laneName.EndsWith("mma", StringComparison.Ordinal) || laneName.EndsWith("dp", StringComparison.Ordinal))
             {
-                var kind = laneName[..^(laneName.EndsWith("mma", StringComparison.Ordinal) ? 3 : 2)] switch
-                {
-                    "s8" => laneName.EndsWith("mma", StringComparison.Ordinal) ? EightBitKind(true, k) : Ptx.Kind.S8,
-                    "u8" => laneName.EndsWith("mma", StringComparison.Ordinal) ? EightBitKind(false, k) : Ptx.Kind.U8,
-                    "s4" => Ptx.Kind.S4, "u4" => Ptx.Kind.U4, "f16" => Ptx.Kind.F16, _ => Ptx.Kind.BF16,
-                };
+                var kind = KindOf(laneName, k);
                 int kp = KPadded(kind, k);
                 // A's rows as stored already have the kind's layout when the type is the kind and k is whole blocks.
                 bool aAsIs = f.Bits == kind.Bits && kp == k && (f.IsFloat == kind.IsFloat) && (!f.IsFloat || f.Is(kind == Ptx.Kind.F16 ? "float16" : "bfloat16"));
@@ -635,6 +630,14 @@ public sealed partial class GpuOps(Gpu gpu)
             foreach (var p in rented) gpu.Return(p);
         }
     }
+
+    // The tensor or dot kind of a packed lane ("s8mma", "u8dp", …) at k terms.
+    private Ptx.Kind KindOf(string laneName, int k) => laneName[..^(laneName.EndsWith("mma", StringComparison.Ordinal) ? 3 : 2)] switch
+    {
+        "s8" => laneName.EndsWith("mma", StringComparison.Ordinal) ? EightBitKind(true, k) : Ptx.Kind.S8,
+        "u8" => laneName.EndsWith("mma", StringComparison.Ordinal) ? EightBitKind(false, k) : Ptx.Kind.U8,
+        "s4" => Ptx.Kind.S4, "u4" => Ptx.Kind.U4, "f16" => Ptx.Kind.F16, _ => Ptx.Kind.BF16,
+    };
 
     /// <summary>A product whose shape the kernels' tiles and vector loads cannot take as stored: A padded to mp × kp, B to
     /// kp × np (multiples of 128; zeros beyond m, k and n: the sums are unchanged), the product at the padded shape, C's

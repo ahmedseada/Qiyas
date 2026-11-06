@@ -6,8 +6,10 @@
 //   conv_bwd_x     dx = col2im(wᵀ · dy)
 //   conv_bwd_w     dw = dy · im2col(x)ᵀ
 //
-// A fused direct convolution (no columns in memory) is the step past this; the depthwise convolution is a layout
-// operation (Layout.cs: a gather with weights).
+// The forward is fused (item 4g, implicit GEMM): the product's packing builds each row of the columns from the image
+// itself, so no columns are in memory — the same packed values as the composition, so the same result bit for bit
+// (CPU: every type whose rows start on whole bytes; the device: GpuOps.Conv.cs). The backward keeps the composition.
+// The depthwise convolution is a layout operation (Layout.cs: a gather with weights).
 namespace Qiyas;
 
 /// <summary>C H W kh kw sh sw ph pw dh dw and the output channels.</summary>
@@ -45,8 +47,35 @@ public sealed record ConvArgs(int C, int H, int W, int OC, int Kh, int Kw, int S
 
 internal static partial class Kernels
 {
+    /// <summary>The gate's override: false takes the composition (im2col, then the product), null the fused path where it applies.</summary>
+    internal static bool? FusedConv;
+
+    // The fused path reads A's rows, the image's rows and C at value indices: each on whole bytes.
+    private static bool ConvInPlace<TN>(ConvArgs a) where TN : struct, IQiyasNumber<TN>
+    {
+        int per = TN.Bits >= 8 ? 1 : 8 / TN.Bits;
+        return a.XValues <= int.MaxValue && a.YValues <= int.MaxValue && a.WValues <= int.MaxValue
+            && (per == 1 || (a.OC % per == 0 && a.Rows % per == 0 && a.Cols % per == 0 && (TN.Granularity % 32 == 0 || a.W % per == 0)));
+    }
+
     /// <summary>y = conv(x, w) on the CPU; returns the product's lane.</summary>
     public static string Conv<TN>(ConvArgs a, byte[] x, byte[] w, byte[] y) where TN : struct, IQiyasNumber<TN>
+    {
+        if (FusedConv != false && ConvInPlace<TN>(a))
+        {
+            // The columns' values are the image's and 0 (padding): the image's range, with 0, bounds them.
+            var (wLo, wHi) = TN.Range(w, (int)a.WValues);
+            var (xLo, xHi) = TN.Range(x, (int)a.XValues);
+            var product = new MatMulVisitor(w, x, y, a.OC, a.Cols, a.Rows) { Where = new Operands(ImageB: a) };
+            TN.Sum(ref product, new Bounds(wLo, wHi, Math.Min(xLo, 0), Math.Max(xHi, 0), a.Rows));
+            return product.Lane;
+        }
+
+        return ConvComposed<TN>(a, x, w, y);
+    }
+
+    /// <summary>y = conv(x, w) by the composition: im2col, then the product.</summary>
+    public static string ConvComposed<TN>(ConvArgs a, byte[] x, byte[] w, byte[] y) where TN : struct, IQiyasNumber<TN>
     {
         var cols = new byte[BytesOf<TN>((long)a.Rows * a.Cols)];
         Layout<TN>(new LayoutArgs { Name = "im2col", X = x, P = a.P, Output = cols, Count = a.Rows * a.Cols, InputCount = (int)a.XValues });

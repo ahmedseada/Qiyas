@@ -154,8 +154,40 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
     left the build without it unchanged, so the gap is within this laptop's swing or a real ~10 % — re-check at item 4's
     full run.
 - 4d committed as a784145 (the coordinator: keep AggressiveOptimization; the full run settles the ~10 %).
-- 3 pieces left in item 4 after 4f: 4g, then the GRU sequence backward (below), then item 4's full run.
-- 4f: done, reported as its own boundary (uncommitted until the coordinator's go). What landed:
+- 2 steps left in item 4 after 4g: the GRU sequence backward (below), then item 4's full run.
+- 4g: done, reported as its own boundary (uncommitted until the coordinator's go). What landed:
+  - CPU: `Kernels.Operands.ImageB` (a ConvArgs): `PackBody` builds each row of the columns from the image
+    (`ImageRow`: row p = (c, kh, kw), an image row read in place or loaded once, stride 1 by a contiguous copy with the
+    padding cleared, otherwise gathered) — the micro-kernel, A and C untouched. `Kernels.Conv` takes it where
+    `ConvInPlace` (rows on whole bytes) holds, bounds = the image's range with 0; `ConvComposed` is the old body;
+    `Kernels.FusedConv` (false: the composition) for the gate.
+  - device: `Ptx.PackTransposed(…, conv: true)` (entry packconv_…: the load's index replaced by the image map, 0 off the
+    image) and `Ptx.Gemm(…, conv: true)` (gemmconv…: the B tile gathered from the image in the lane's storage).
+    `GpuOps.Conv`: the tensor / dot lanes → `ConvPacked` (the composition's steps: padded M, N, K as MatMulPadded, the
+    weights by `PackRows` into a cleared padded buffer, the image by the conv packer, `MmaFunction` / dp4a, `Back`, the
+    strided copy out — the same values, so the same bits); the plain lanes → `ConvPlain` (gemmconv at tile 128, 64 for
+    wide lanes) or `ConvComposed`, measured once per shape and type by `Measure.Faster` (`GpuOps.FusedConv` forces).
+    `GpuOps.KindOf` factored out of `MatMul` (the kind of a packed lane), unchanged behaviour.
+  - the coordinator's question (the plain lanes cannot silently keep the columns): they have the fused path
+    (gemmconv) and a measured choice against the composition. At the bench shape (64 × 128 × 128 by 128 of 3 × 3):
+    float32 fused 0.137 ms vs 0.352, q8_0 0.213 vs 1.30, q4_k 0.235 vs 1.61 → fused; float64 fused 3.40 vs 2.55 by the
+    composition through the sliced f64x route → the composition (two runs). In the full products run the sliced
+    product measured 3.56 instead of 2.15 (`SlicedFaster`: one warm call, three timed), the choice took fused and the
+    row read 3.41: a Known slow row and item 6 below.
+  - gate (`Checks.Convs`): the fused forward forced on, within rounding, and equal bit for bit to the composition
+    through the same kernel (CPU: the composition; device tensor / dot: the composition; device plain float lanes:
+    `GpuOps.ConvPlainComposed` = im2col in lane storage + the same plain kernel; integer lanes exact either way; block
+    formats rounding only — the composition re-encodes the columns into blocks), at five shapes: the two old ones, 16 ×
+    20 × 20 → 32 of 3 × 3 (padded tiles), 1 × 1 at 128 × 16 × 16 → 128 (whole tiles), 4 × 9 × 12 → 6, stride 2,
+    dilation 2. Mutations (the padding's sign): CPU `ImageRow` fails 164 checks; device packconv and gemmconv fail the
+    fused checks of every tensor / dot type and float32 / float64.
+  - measured `--subjects qiyas --ops conv` against 70f687d (a worktree): CPU conv 0.05–0.51× (float32 8.87 → 2.31 ms,
+    float16 14.1 → 3.53, int8 2.96 → 0.86, q4_k 126 → 8.4, q6_k 189 → 10.2); device 0.15–0.90× (float32 0.358 → 0.143,
+    float16 0.218 → 0.138, int64 0.724 → 0.200, q8_0 1.15 → 0.218); float64 as above. conv_bwd unchanged (the backward
+    keeps the composition).
+  - also in 4g's edits (the coordinator, from 4f): Known slow rows and item 6 entries for the device route with few
+    targets and the CPU scatter_add_rows on block formats.
+- 4f: done, committed as 70f687d. What landed:
   - `src/Ptx.Radix.cs`: `ScanTile` (a block of 256 scans 1024 values: shuffles within a warp, the warps' sums in shared
     memory; writes the block's total) and `ScanAdd`; `RadixCount` (per tile of 2048 sources, item-major, the digit
     counts by shared atomics into table[digit][tile]) and `RadixPlace` (the same tile in order: a warp's peers with the
@@ -445,11 +477,23 @@ Each: measure against the baseline cell, change, re-measure (the full run or the
 - Device float64 non-causal attention (the owner's, from 4d): 62.6 ms on the fused rows now, 59 by the composition at
   4a, and `Measure.Faster` timed the composition at 89. Re-measure both paths (the `attention` row; the composition
   forced through `AttentionComposed`); if the composition is really faster, explain the 89 and fix the measurement.
+- Device route with few targets (the coordinator, from 4f): 0.275 ms for 1M into 64 against 0.185 into 65 536 — the
+  counts' 1M atomics on 64 counters (`ScatterCount`) dominate. Take the counts from the radix table's totals instead
+  (after the last pass's `RadixCount`, or a per-tile count summed by the scan: counts[t] = offsets[t + 1] − offsets[t]
+  once the offsets come from the sorted keys' boundaries); `OrderByTarget` in src/GpuOps.Radix.cs.
+- CPU scatter_add_rows on block formats (the coordinator, from 4f): q8_0 83.9 ms against float32 1.94 on the same shape
+  (4096 into 4096 × 4096); 4f's run read q8_0 92.5, q4_0 86.0, q4_k 202, q6_k 336. Probably a per-row re-encode
+  (`Blocks.Store` of a partial block re-encodes the whole block) or a serial path: find it (src/Layout.cs, the
+  scatter_add_rows case) and fix.
 - CPU sub-byte products on views (the owner's rule for open timing questions, from 4e): int4 matmul_tn, int2 matmul_nt,
   uint2 matmul_nt slower by 7–26 % after 4e in one A/B (uint2 mixed); the coordinator's run read int4 tn 1.88 ms, int2 nt
   2.22. They keep the copy route (`MatMulViewCopies`); the shared kernel gained offsets (`Operands`, `Micro`'s cOff,
   `PackBody`'s transB branch). Re-measure both orders against fd60205's parent a784145; if it holds, give sub-byte types
   the in-place route (loads at even indices: `TN.Load` at whole bytes) or remove what the offsets cost them.
+- Device float64 conv (from 4g): the composition through the sliced route 2.55 ms against the fused plain kernel 3.40;
+  `SlicedFaster` (GpuOps.cs: one warm call and three timed) read the sliced product at 3.56 ms instead of 2.15 in one
+  run and flipped the conv choice. Time `SlicedFaster` by `Measure.Faster`; consider the image packed straight into the
+  sliced route's digits (`Ptx.SliceColumns` reading through the conv index map) so float64 conv is fused there too.
 - CPU recurrent sequences (the coordinator's observation at 4c): gru_seq 65–71 ms, lstm_seq 83 ms against ~15–20 ms
   implied by the f32 product rate (COVERAGE Known slow).
 
