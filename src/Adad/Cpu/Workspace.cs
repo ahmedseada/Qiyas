@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Ahmed Seada
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
-// The CPU product's workspace: its packed B, the loaded A and B, and every task's A panel and tile of C in lanes, kept per
+// The CPU product's workspace: its packed panel of B, and every task's A panel and tile of C in lanes, kept per
 // thread and per element type, grown to the largest shape seen, so a call of a shape seen before allocates nothing and asks no pool.
 // A slot already in use on the thread (a product inside a product) falls back to ArrayPool.
 using System.Buffers;
@@ -12,7 +12,7 @@ namespace Adad.Cpu;
 internal static class Workspace
 {
     // The product's slots.
-    public const int Packed = 0, ALanes = 1, BLanes = 2, CLanes = 3, Panel = 4, KRows = 5, Slots = 6;
+    public const int Packed = 0, CLanes = 1, Panel = 2, KRows = 3, Slots = 4;
 
     private static long s_rents, s_grows, s_pooled;
 

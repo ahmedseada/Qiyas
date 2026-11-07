@@ -3,10 +3,11 @@
 
 // Attention: O = softmax(scale · Q·Kᵀ + mask) · V per head, in the type's float lane. Three forms:
 //
-//   attention         rows of queries (prefill): the composition of Adad's own operations in lane storage — the product
-//                     Q·Kᵀ on views, scale_mask_softmax (causal with the key offset, or a key span per row), the product
-//                     P·V — every intermediate kept in the lane (float32 for the narrow floats, float64 for float64):
-//                     a narrow type's Q, K, V are widened once and O narrowed once.
+//   attention         rows of queries (prefill): the composition of Adad's own operations — the product Q·Kᵀ reading Q
+//                     and K where they are stored, scale_mask_softmax (causal with the key offset, or a key span per
+//                     row), the product P·V reading V where it is stored and writing O as the type. The scores and P are
+//                     intermediates in the float lane's own type (float32 for the narrow floats, float64 for float64);
+//                     no input is widened whole (a block format's O: the lane's values, encoded once).
 //   attention_decode  one or a few queries against a long key cache: a fused kernel on the device (a block per query,
 //                     keys in chunks, the softmax online, K and V read once); the same per query on the CPU.
 //   attention_bwd     dQ, dK, dV from dO: the composition (P recomputed; dV = Pᵀ·dO, dP = dO·Vᵀ, dS = softmax_bwd(P, dP),
@@ -25,86 +26,7 @@ namespace Adad.Cpu;
 
 internal sealed partial class Kernels
 {
-    // ---------------------------------------------------------------- lane storage: a narrow type widened to its lane's storage type
-
-    private static bool Wide<TN>() where TN : struct, IAdad<TN> => TN.Bits == 64;
-
-    /// <summary>The stored values of x (count of them) as float32 or float64 storage (TN's float lane): TN's own bytes when it is that type.</summary>
-    public static byte[] ToLane<TN>(byte[] x, long count) where TN : struct, IFloatAdad<TN>
-    {
-        if (TN.Name is "float32" or "float64") return x;
-        var v = new WidenVisitor(x, count, null);
-        TN.Float(ref v);
-        return v.Result!;
-    }
-
-    /// <summary>ToLane into an existing lane array of at least count lane values (a narrow type only).</summary>
-    public static void ToLaneInto<TN>(byte[] x, long count, byte[] into) where TN : struct, IFloatAdad<TN>
-    {
-        var v = new WidenVisitor(x, count, into);
-        TN.Float(ref v);
-    }
-
-    private struct WidenVisitor(byte[] x, long count, byte[]? into) : IFloatLaneVisitor
-    {
-        public byte[]? Result;
-
-        public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
-        {
-            var result = into ?? new byte[count * Unsafe.SizeOf<TLane>()];
-            var lanes = MemoryMarshal.Cast<byte, TLane>(result.AsSpan());
-            Team.For((int)((count + 4095) / 4096), 1, count, new WidenBody<TN, TLane>(x, result, count));
-            Result = result;
-        }
-    }
-
-    private struct WidenBody<TN, TLane>(byte[] x, byte[] result, long count) : Team.IBody where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
-    {
-        public readonly void Run(int first, int last)
-        {
-            var lanes = MemoryMarshal.Cast<byte, TLane>(result.AsSpan());
-            for (int chunk = first; chunk < last; chunk++)
-            {
-                long at = (long)chunk * 4096;
-                int len = (int)Math.Min(4096, count - at);
-                TN.Load(x, (int)at, lanes.Slice((int)at, len));
-            }
-        }
-    }
-
-    /// <summary>Lane storage (float32 / float64 bytes) back into the type at output.</summary>
-    public static void FromLane<TN>(byte[] lanes, byte[] output, long count) where TN : struct, IFloatAdad<TN>
-    {
-        if (TN.Name is "float32" or "float64") { Array.Copy(lanes, output, output.Length); return; }
-        var v = new NarrowVisitor(lanes, output, count);
-        TN.Float(ref v);
-    }
-
-    private struct NarrowVisitor(byte[] lanes, byte[] output, long count) : IFloatLaneVisitor
-    {
-        public readonly void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
-        {
-            int per = TN.Granularity;
-            int chunk = 4096 / per * per;
-            Team.For((int)((count + chunk - 1) / chunk), 1, count, new NarrowBody<TN, TLane>(lanes, output, count, chunk));
-        }
-    }
-
-    private struct NarrowBody<TN, TLane>(byte[] lanes, byte[] output, long count, int chunk) : Team.IBody where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
-    {
-        public readonly void Run(int first, int last)
-        {
-            var values = MemoryMarshal.Cast<byte, TLane>(lanes.AsSpan());
-            for (int c = first; c < last; c++)
-            {
-                long at = (long)c * chunk;
-                int len = (int)Math.Min(chunk, count - at);
-                TN.Store(values.Slice((int)at, len), output, (int)at);
-            }
-        }
-    }
-
-    // ---------------------------------------------------------------- the composition, in lane storage
+    // ---------------------------------------------------------------- the composition
 
     private static readonly Dictionary<string, bool> s_fusedFaster = [];
 
@@ -129,39 +51,102 @@ internal sealed partial class Kernels
         return fused ? AttentionRows<TN>(a, q, k, v, o) : AttentionComposed<TN>(a, q, k, v, o);
     }
 
-    /// <summary>O for rows of queries: the composition in lane storage; returns the lane's name.</summary>
+    /// <summary>O for rows of queries: the composition; returns the lane's name.</summary>
     public static string AttentionComposed<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) where TN : struct, IFloatAdad<TN>
     {
-        if (Wide<TN>()) { AttentionIn<Float64>(a, ToLane<TN>(q, a.QValues), ToLane<TN>(k, a.KValues), ToLane<TN>(v, a.KValues), o, TN.Name == "float64" ? null : (bytes => FromLane<TN>(bytes, o, a.QValues))); return "f64"; }
-        AttentionIn<Float32>(a, ToLane<TN>(q, a.QValues), ToLane<TN>(k, a.KValues), ToLane<TN>(v, a.KValues), o, TN.Name == "float32" ? null : (bytes => FromLane<TN>(bytes, o, a.QValues)));
-        return "f32";
+        var vis = new ComposeVisitor(a, q, k, v, o, null, null, null, null);
+        TN.Float(ref vis);
+        return vis.Lane;
     }
 
-    private static void AttentionIn<TS>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o, Action<byte[]>? narrow) where TS : struct, IFloatAdad<TS>
+    // The composition in TN's float lane, the lane's own type TS holding the intermediates (S, P, dP, dS).
+    private struct ComposeVisitor(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[]? o, byte[]? dO, byte[]? dq, byte[]? dk, byte[]? dv) : IFloatLaneVisitor
     {
-        int size = TS.Bits / 8;
-        var lo = narrow is null ? o : new byte[a.QValues * size];
-        var s = new byte[(long)a.Lq * a.Lk * size];
-        // positions = the last visible key of each query (limit − 1): scale_mask_softmax's causal rule excludes the keys past it.
-        var limits = new int[a.Lq];
-        for (int i = 0; i < a.Lq; i++) limits[i] = a.Limit(i) - 1;
-        var softmax = RowOps.Find("scale_mask_softmax");
-        var mask = SpanMask<TS>(a);
-        for (int h = 0; h < a.Heads; h++)
+        public string Lane = "";
+
+        public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
         {
-            long qOff = (long)h * a.Lq * a.D, kOff = (long)h * a.Lk * a.D;
-            // S = Q_h · K_hᵀ (Lq × Lk) from the views at the head's offsets.
-            var sq = Slice(q, qOff * size, a.Lq * a.D * size);
-            var sk = Slice(k, kOff * size, (long)a.Lk * a.D * size);
-            var sv = Slice(v, kOff * size, (long)a.Lk * a.D * size);
-            MatMulView<TS>(new ProductView(a.Lq, a.Lk, a.D, false, true), sq, sk, s);
-            RowOp<TS>(softmax, s, mask, null, null, null, limits, s, null, a.Lq, a.Lk, a.Scale, 1);
-            var so = new byte[(long)a.Lq * a.D * size];
-            MatMulView<TS>(new ProductView(a.Lq, a.D, a.Lk, false, false), s, sv, so);
-            Array.Copy(so, 0, lo, qOff * size, so.Length);
+            Lane = TL.Name;
+            var compose = new Compose<TN, TLane, TL>(a, q, k, v, o, dO, dq, dk, dv);
+            TL.Own(ref compose);
+        }
+    }
+
+    private readonly struct Compose<TN, TLane, TL>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[]? o, byte[]? dO, byte[]? dq, byte[]? dk, byte[]? dv) : IOwnVisitor<TLane>
+        where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    {
+        public void Run<TS>() where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane>
+        {
+            int size = Unsafe.SizeOf<TLane>();
+            // A block format's outputs: the lane's values (TS), encoded once (a block may straddle heads); otherwise each
+            // product writes its head's rows as the type.
+            bool lanes = TN.Granularity > 1;
+            if (dO is null)
+            {
+                if (!lanes) { Forward<TS, TN>(o!); return; }
+                var lo = new byte[a.QValues * size];
+                Forward<TS, TS>(lo);
+                StoreLanes<TN, TLane>(lo, o!, 0, a.QValues);
+                return;
+            }
+
+            if (!lanes) { Backward<TS, TN>(dq!, dk!, dv!); return; }
+            var lq = new byte[a.QValues * size];
+            var lk = new byte[a.KValues * size];
+            var lv = new byte[a.KValues * size];
+            Backward<TS, TS>(lq, lk, lv);
+            StoreLanes<TN, TLane>(lq, dq!, 0, a.QValues);
+            StoreLanes<TN, TLane>(lk, dk!, 0, a.KValues);
+            StoreLanes<TN, TLane>(lv, dv!, 0, a.KValues);
         }
 
-        narrow?.Invoke(lo);
+        // O (as TO) = softmax(scale·Q·Kᵀ + mask)·V per head.
+        private void Forward<TS, TO>(byte[] lo) where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TO : struct, IAdad<TO, TLane>
+        {
+            var s = new byte[(long)a.Lq * a.Lk * Unsafe.SizeOf<TLane>()];
+            var limits = Limits(a);
+            var softmax = RowOps.Find("scale_mask_softmax");
+            var mask = SpanMask<TS>(a);
+            for (int h = 0; h < a.Heads; h++)
+            {
+                int qOff = (int)((long)h * a.Lq * a.D), kOff = (int)((long)h * a.Lk * a.D);
+                MatMul<TN, TN, TS, TLane, TLane, TL>(q, k, s, a.Lq, a.Lk, a.D, new Operands(qOff, false, kOff, true, 0));      // S = Q_h·K_hᵀ
+                RowOp<TS>(softmax, s, mask, null, null, null, limits, s, null, a.Lq, a.Lk, a.Scale, 1);
+                MatMul<TS, TN, TO, TLane, TLane, TL>(s, v, lo, a.Lq, a.D, a.Lk, new Operands(0, false, kOff, false, qOff));     // O_h = P·V_h
+            }
+        }
+
+        // dQ, dK, dV (as TO): P recomputed; dV = Pᵀ·dO, dP = dO·Vᵀ, dS = softmax_bwd(P, dP)·scale, dQ = dS·K, dK = dSᵀ·Q.
+        private void Backward<TS, TO>(byte[] gq, byte[] gk, byte[] gv) where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TO : struct, IAdad<TO, TLane>
+        {
+            int size = Unsafe.SizeOf<TLane>();
+            var p = new byte[(long)a.Lq * a.Lk * size];
+            var dp = new byte[p.Length];
+            var limits = Limits(a);
+            var softmax = RowOps.Find("scale_mask_softmax");
+            var softmaxBwd = RowOps.Find("softmax_bwd");
+            var mask = SpanMask<TS>(a);
+            for (int h = 0; h < a.Heads; h++)
+            {
+                int qOff = (int)((long)h * a.Lq * a.D), kOff = (int)((long)h * a.Lk * a.D);
+                MatMul<TN, TN, TS, TLane, TLane, TL>(q, k, p, a.Lq, a.Lk, a.D, new Operands(qOff, false, kOff, true, 0));
+                RowOp<TS>(softmax, p, mask, null, null, null, limits, p, null, a.Lq, a.Lk, a.Scale, 1);
+                MatMul<TS, TN, TO, TLane, TLane, TL>(p, dO!, gv, a.Lk, a.D, a.Lq, new Operands(0, true, qOff, false, kOff));       // dV = Pᵀ·dO
+                MatMul<TN, TN, TS, TLane, TLane, TL>(dO!, v, dp, a.Lq, a.Lk, a.D, new Operands(qOff, false, kOff, true, 0));     // dP = dO·Vᵀ
+                RowOp<TS>(softmaxBwd, p, dp, null, null, null, null, dp, null, a.Lq, a.Lk, 0, 0);                              // dS = P·(dP − Σ P·dP)
+                MapFloat<TS>("scale", dp, null, null, dp, (int)((long)a.Lq * a.Lk), a.Scale, 0);                               // · scale
+                MatMul<TS, TN, TO, TLane, TLane, TL>(dp, k, gq, a.Lq, a.D, a.Lk, new Operands(0, false, kOff, false, qOff));      // dQ = dS·K
+                MatMul<TS, TN, TO, TLane, TLane, TL>(dp, q, gk, a.Lk, a.D, a.Lq, new Operands(0, true, qOff, false, kOff));       // dK = dSᵀ·Q
+            }
+        }
+    }
+
+    // Each query's last visible key (limit − 1): scale_mask_softmax's causal rule excludes the keys past it.
+    private static int[] Limits(AttentionArgs a)
+    {
+        var limits = new int[a.Lq];
+        for (int i = 0; i < a.Lq; i++) limits[i] = a.Limit(i) - 1;
+        return limits;
     }
 
     /// <summary>The additive mask (Lq × Lk, lane storage) excluding the keys below each query's span start; null when no span starts.</summary>
@@ -171,14 +156,6 @@ internal sealed partial class Kernels
         var m = new double[(long)a.Lq * a.Lk];
         for (int i = 0; i < a.Lq; i++) for (int j = 0; j < a.Start(i); j++) m[(long)i * a.Lk + j] = -400;
         return Stored.StoreValues<TS>(m);
-    }
-
-    private static byte[] Slice(byte[] x, long offset, long length)
-    {
-        if (offset == 0 && length == x.Length) return x;
-        var r = new byte[length];
-        Array.Copy(x, offset, r, 0, length);
-        return r;
     }
 
     private static readonly Dictionary<string, bool> s_backFusedFaster = [];
@@ -206,56 +183,12 @@ internal sealed partial class Kernels
         return fused ? AttentionBackwardRows<TN>(a, q, k, v, dO, dq, dk, dv) : AttentionBackwardComposed<TN>(a, q, k, v, dO, dq, dk, dv);
     }
 
-    /// <summary>dQ, dK, dV: the composition in lane storage; returns the lane's name.</summary>
+    /// <summary>dQ, dK, dV: the composition; returns the lane's name.</summary>
     public static string AttentionBackwardComposed<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] dO, byte[] dq, byte[] dk, byte[] dv) where TN : struct, IFloatAdad<TN>
     {
-        if (Wide<TN>())
-        {
-            BackwardIn<Float64>(a, ToLane<TN>(q, a.QValues), ToLane<TN>(k, a.KValues), ToLane<TN>(v, a.KValues), ToLane<TN>(dO, a.QValues), dq, dk, dv, TN.Name != "float64" ? (b, o, n) => FromLane<TN>(b, o, n) : null);
-            return "f64";
-        }
-
-        BackwardIn<Float32>(a, ToLane<TN>(q, a.QValues), ToLane<TN>(k, a.KValues), ToLane<TN>(v, a.KValues), ToLane<TN>(dO, a.QValues), dq, dk, dv, TN.Name != "float32" ? (b, o, n) => FromLane<TN>(b, o, n) : null);
-        return "f32";
-    }
-
-    private static void BackwardIn<TS>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] dO, byte[] dq, byte[] dk, byte[] dv, Action<byte[], byte[], long>? narrow) where TS : struct, IFloatAdad<TS>
-    {
-        int size = TS.Bits / 8;
-        var ldq = narrow is null ? dq : new byte[a.QValues * size];
-        var ldk = narrow is null ? dk : new byte[a.KValues * size];
-        var ldv = narrow is null ? dv : new byte[a.KValues * size];
-        var p = new byte[(long)a.Lq * a.Lk * size];
-        var dp = new byte[p.Length];
-        var limits = new int[a.Lq];
-        for (int i = 0; i < a.Lq; i++) limits[i] = a.Limit(i) - 1;
-        var softmax = RowOps.Find("scale_mask_softmax");
-        var softmaxBwd = RowOps.Find("softmax_bwd");
-        var scale = Ops.Find("scale");
-        for (int h = 0; h < a.Heads; h++)
-        {
-            long qOff = (long)h * a.Lq * a.D, kOff = (long)h * a.Lk * a.D;
-            var sq = Slice(q, qOff * size, a.Lq * a.D * size);
-            var sk = Slice(k, kOff * size, (long)a.Lk * a.D * size);
-            var sv = Slice(v, kOff * size, (long)a.Lk * a.D * size);
-            var sdo = Slice(dO, qOff * size, a.Lq * a.D * size);
-            MatMulView<TS>(new ProductView(a.Lq, a.Lk, a.D, false, true), sq, sk, p);
-            RowOp<TS>(softmax, p, SpanMask<TS>(a), null, null, null, limits, p, null, a.Lq, a.Lk, a.Scale, 1);
-            var hdv = new byte[(long)a.Lk * a.D * size];
-            MatMulView<TS>(new ProductView(a.Lk, a.D, a.Lq, true, false), p, sdo, hdv);            // dV = Pᵀ·dO
-            MatMulView<TS>(new ProductView(a.Lq, a.Lk, a.D, false, true), sdo, sv, dp);             // dP = dO·Vᵀ
-            RowOp<TS>(softmaxBwd, p, dp, null, null, null, null, dp, null, a.Lq, a.Lk, 0, 0);       // dS = P·(dP − Σ P·dP)
-            MapFloat<TS>("scale", dp, null, null, dp, (int)((long)a.Lq * a.Lk), a.Scale, 0);         // · scale
-            var hdq = new byte[a.Lq * a.D * size];
-            var hdk = new byte[(long)a.Lk * a.D * size];
-            MatMulView<TS>(new ProductView(a.Lq, a.D, a.Lk, false, false), dp, sk, hdq);            // dQ = dS·K
-            MatMulView<TS>(new ProductView(a.Lk, a.D, a.Lq, true, false), dp, sq, hdk);             // dK = dSᵀ·Q
-            Array.Copy(hdq, 0, ldq, qOff * size, hdq.Length);
-            Array.Copy(hdk, 0, ldk, kOff * size, hdk.Length);
-            Array.Copy(hdv, 0, ldv, kOff * size, hdv.Length);
-        }
-
-        if (narrow is not null) { narrow(ldq, dq, a.QValues); narrow(ldk, dk, a.KValues); narrow(ldv, dv, a.KValues); }
+        var vis = new ComposeVisitor(a, q, k, v, null, dO, dq, dk, dv);
+        TN.Float(ref vis);
+        return vis.Lane;
     }
 
     // ---------------------------------------------------------------- decode: one query at a time, K and V read once

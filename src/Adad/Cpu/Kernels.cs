@@ -36,7 +36,7 @@ internal sealed partial class Kernels
 
     private static int Gcd(int a, int b) { while (b != 0) (a, b) = (b, a % b); return a; }
 
-    /// <summary>When set (profile runs only), MatMul adds each phase's milliseconds: load, pack, product, store.</summary>
+    /// <summary>When set (profile runs only), MatMul adds each phase's milliseconds: setup, pack, product, store (C in lanes whole).</summary>
     public static double[]? Phases;
 
     private static long Mark(long since, int phase)
@@ -142,12 +142,6 @@ internal sealed partial class Kernels
         }
     }
 
-    // A stored matrix into lanes, whole (only for rows that do not start on whole bytes).
-    private struct LoadBody<TN, TLane>(byte[] stored, TLane[] lanes) : Team.IBody where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
-    {
-        public readonly void Run(int first, int last) => TN.Load(stored, first, lanes.AsSpan(first, last - first));
-    }
-
     // G rows of inputs (each n long, contiguous) into n accumulator-sized units: unit j holds the G values of column j,
     // the first in the low bits (the order the widening multiply-add reads).
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -210,26 +204,29 @@ internal sealed partial class Kernels
         }
     }
 
-    // B packed: strip s (columns s·2w ..), group g (rows g·G ..) at (s·kg + g)·2w, the last strip's missing columns and
-    // the last group's missing rows zero. Each group's rows are read where they are stored (or loaded into lanes once)
-    // and interleaved into units, then scattered into the strips: the load and the packing one pass.
+    // B packed a panel of strips [ps0, ps1) at a time: strip s (columns s·2w ..), group g (rows g·G ..) at
+    // ((s − ps0)·kg + g)·2w, the last strip's missing columns and the last group's missing rows zero. Each group's rows
+    // (the panel's columns of them) are read where they are stored, or loaded into lanes, and interleaved into units,
+    // then scattered into the strips: the load and the packing one pass, nothing of B in lanes past the panel.
     // Bᵀ stored (TransB): column j of B is row j of Bᵀ, so a group's unit of column j is g values contiguous there; a task
-    // reads each Bᵀ row's span of its groups once and lays the units into the strips.
-    private struct PackBody<TN, TIn, TAcc>(byte[] b, TIn[]? bLanes, TAcc[] packed, int n, int k, int strip, int kg, int bOff = 0, bool transB = false, ConvArgs? image = null) : Team.IBody
+    // takes a run of the panel's strips, loads each of their Bᵀ rows whole once (in place, or into lanes: a block
+    // format's rows decoded whole, not a value at a time) and lays its units down the strip's groups.
+    private struct PackBody<TN, TIn, TAcc>(byte[] b, TAcc[] packed, int n, int k, int strip, int kg, int ps0, int ps1, int bOff = 0, bool transB = false, ConvArgs? image = null) : Team.IBody
         where TN : struct, IAdad<TN, TIn> where TIn : unmanaged where TAcc : unmanaged
     {
         public readonly void Run(int first, int last)
         {
-            if (transB) { RunTransposed(first, last); return; }
-            int g = Unsafe.SizeOf<TAcc>() / Unsafe.SizeOf<TIn>(), strips = (n + strip - 1) / strip;
+            if (transB) { RunTransposed(ps0 + first, ps0 + last); return; }
+            int g = Unsafe.SizeOf<TAcc>() / Unsafe.SizeOf<TIn>();
+            int j0 = ps0 * strip, width = Math.Min(n, ps1 * strip) - j0;
             bool direct = Lanes.Direct<TN, TIn>();
             var pool = ArrayPool<byte>.Shared;
-            int rowsBytes = g * n * Unsafe.SizeOf<TIn>(), unitsBytes = n * Unsafe.SizeOf<TAcc>();
+            int rowsBytes = g * width * Unsafe.SizeOf<TIn>(), unitsBytes = width * Unsafe.SizeOf<TAcc>();
             byte[]? rented = rowsBytes + unitsBytes <= 32768 ? null : pool.Rent(rowsBytes + unitsBytes);
             Span<byte> scratch = rented is null ? stackalloc byte[rowsBytes + unitsBytes] : rented.AsSpan(0, rowsBytes + unitsBytes);
             var rowsBuffer = MemoryMarshal.Cast<byte, TIn>(scratch[..rowsBytes]);
             var units = MemoryMarshal.Cast<byte, TAcc>(scratch[rowsBytes..]);
-            ReadOnlySpan<TIn> stored = direct ? MemoryMarshal.Cast<byte, TIn>(b.AsSpan()) : bLanes;
+            ReadOnlySpan<TIn> stored = direct ? MemoryMarshal.Cast<byte, TIn>(b.AsSpan()) : default;
             TIn[]? line = image is not null && !direct ? ArrayPool<TIn>.Shared.Rent(image.W) : null;
             for (int grp = first; grp < last; grp++)
             {
@@ -239,28 +236,29 @@ internal sealed partial class Kernels
                 {
                     for (int t = 0; t < g; t++)
                     {
-                        var dst = rowsBuffer.Slice(t * n, n);
+                        var dst = rowsBuffer.Slice(t * width, width);
                         if (t >= rows) dst.Clear();
-                        else ImageRow<TN, TIn>(b, direct ? stored : default, line, image, row0 + t, dst);
+                        else if (width == n) ImageRow<TN, TIn>(b, stored, line, image, row0 + t, dst);
+                        else ImageRange<TN, TIn>(b, stored, line, image, row0 + t, j0, dst);
                     }
                 }
-                else if (rows == g && !stored.IsEmpty) group = stored.Slice(bOff + row0 * n, g * n);
+                else if (rows == g && !stored.IsEmpty && (g == 1 || width == n)) group = stored.Slice(bOff + row0 * n + j0, (g - 1) * n + width);
                 else
                 {
                     for (int t = 0; t < g; t++)
                     {
-                        var dst = rowsBuffer.Slice(t * n, n);
+                        var dst = rowsBuffer.Slice(t * width, width);
                         if (t >= rows) dst.Clear();
-                        else if (!stored.IsEmpty) stored.Slice(bOff + (row0 + t) * n, n).CopyTo(dst);
-                        else TN.Load(b, bOff + (row0 + t) * n, dst);
+                        else if (!stored.IsEmpty) stored.Slice(bOff + (row0 + t) * n + j0, width).CopyTo(dst);
+                        else TN.Load(b, bOff + (row0 + t) * n + j0, dst);
                     }
                 }
 
-                Interleave(group, units, n);
-                for (int s = 0; s < strips; s++)
+                Interleave(group, units, width);
+                for (int s = ps0; s < ps1; s++)
                 {
-                    var dst = packed.AsSpan((s * kg + grp) * strip, strip);
-                    int j = s * strip, len = Math.Min(strip, n - j);
+                    var dst = packed.AsSpan(((s - ps0) * kg + grp) * strip, strip);
+                    int j = s * strip - j0, len = Math.Min(strip, width - j);
                     units.Slice(j, len).CopyTo(dst);
                     if (len < strip) dst[len..].Clear();
                 }
@@ -270,33 +268,38 @@ internal sealed partial class Kernels
             if (line is not null) ArrayPool<TIn>.Shared.Return(line);
         }
 
+        // Strips [s0, s1) of the panel: each column's Bᵀ row (k values, padded to whole groups) loaded once, its kg units
+        // laid at the strip's groups.
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-        private readonly void RunTransposed(int first, int last)
+        private readonly void RunTransposed(int s0, int s1)
         {
-            int g = Unsafe.SizeOf<TAcc>() / Unsafe.SizeOf<TIn>(), strips = (n + strip - 1) / strip, groups = last - first;
-            int p0 = first * g, len = Math.Min(k, last * g) - p0;
+            int g = Unsafe.SizeOf<TAcc>() / Unsafe.SizeOf<TIn>();
             ReadOnlySpan<TIn> stored = Lanes.Direct<TN, TIn>() ? MemoryMarshal.Cast<byte, TIn>(b.AsSpan()) : default;
             TIn[]? line = image is not null && stored.IsEmpty ? ArrayPool<TIn>.Shared.Rent(image.W) : null;
-            int bytes = groups * g * Unsafe.SizeOf<TIn>();
+            int bytes = kg * g * Unsafe.SizeOf<TIn>();
             byte[]? rented = bytes <= 16384 ? null : ArrayPool<byte>.Shared.Rent(bytes);
             Span<byte> scratch = rented is null ? stackalloc byte[bytes] : rented.AsSpan(0, bytes);
             var row = MemoryMarshal.Cast<byte, TIn>(scratch);
             var units = MemoryMarshal.Cast<byte, TAcc>(scratch);
-            row[len..].Clear();                                                // the last group's rows past k
+            row[k..].Clear();                                                  // the last group's rows past k
             ref TAcc dst = ref MemoryMarshal.GetArrayDataReference(packed);
-            for (int j = 0; j < strips * strip; j++)
+            for (int s = s0; s < s1; s++)
             {
-                nint at = (nint)(j / strip * kg + first) * strip + j % strip;
-                if (j >= n)
+                for (int q = 0; q < strip; q++)
                 {
-                    for (int q = 0; q < groups; q++) Unsafe.Add(ref dst, at + (nint)q * strip) = default;
-                    continue;
-                }
+                    int j = s * strip + q;
+                    nint at = (nint)(s - ps0) * kg * strip + q;
+                    if (j >= n)
+                    {
+                        for (int p = 0; p < kg; p++) Unsafe.Add(ref dst, at + (nint)p * strip) = default;
+                        continue;
+                    }
 
-                if (image is not null) ImageRange<TN, TIn>(b, stored, line, image, j, p0, row[..len]);   // Bᵀ's row j: the columns' row j
-                else if (!stored.IsEmpty) stored.Slice(bOff + j * k + p0, len).CopyTo(row);
-                else TN.Load(b, bOff + j * k + p0, row[..len]);
-                for (int q = 0; q < groups; q++) Unsafe.Add(ref dst, at + (nint)q * strip) = units[q];
+                    if (image is not null) ImageRange<TN, TIn>(b, stored, line, image, j, 0, row[..k]);   // Bᵀ's row j: the columns' row j
+                    else if (!stored.IsEmpty) stored.Slice(bOff + j * k, k).CopyTo(row);
+                    else TN.Load(b, bOff + j * k, row[..k]);
+                    for (int p = 0; p < kg; p++) Unsafe.Add(ref dst, at + (nint)p * strip) = units[p];
+                }
             }
 
             if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
@@ -304,17 +307,18 @@ internal sealed partial class Kernels
         }
     }
 
-    // One tile of C: rows [r0, r1), strips [s0, s1). A's 6-row blocks come from the stored bytes per panel (in place when
-    // they are lanes, else loaded row by row), or from aLanes when A's rows do not start on whole bytes. When C is not
-    // stored as lanes, the tile's values are stored the moment its last panel ends.
+    // One tile of C: rows [r0, r1), strips [s0, s1) of B's packed panel [ps0, ps1). A's 6-row blocks come from A's stored
+    // bytes per panel of k (in place when they are lanes, else loaded row by row: any first value). When C is not stored
+    // as lanes, the tile's values are stored the moment its last panel of k ends.
     // Aᵀ stored (TransA): the panel's k-row p of Aᵀ holds the tile's rows contiguously, so each block takes R values a
     // k-row straight into its [group][R] layout (no row-major staging, no transpose step); types whose stored bytes are
     // not the lane load the tile's span of each k-row once per panel.
-    // cLanes: C's stored bytes as lanes (the type's storage is the lane's), written in place; null: each task's tile of C
-    // in lanes, accumulated over the panels of k and stored as the type when the tile is done (no C in lanes exists whole).
-    private struct ProductBody<TN, TIn, TAcc, TL>(byte[] a, TIn[]? aLanes, TAcc[] packed, TAcc[]? cLanes, byte[] c,
-        int m, int n, int k, int kg, int tileRows, int tileStrips, int rowTiles, int aOff = 0, bool transA = false, int cOff = 0)
-        : Team.IBody where TN : struct, IAdad<TN, TIn>, IAdad<TN, TAcc> where TIn : unmanaged where TAcc : unmanaged where TL : struct, ILane<TL, TAcc>
+    // cLanes: C's stored bytes as lanes (the type's storage is the lane's), written in place, or C in lanes whole (its rows
+    // not on whole storage units); null: each task's tile of C in lanes, accumulated over the panels of k and stored as
+    // TC when the tile is done.
+    private struct ProductBody<TA, TC, TIn, TAcc, TL>(byte[] a, TAcc[] packed, TAcc[]? cLanes, byte[] c,
+        int m, int n, int k, int kg, int tileRows, int tileStrips, int rowTiles, int ps0, int ps1, int aOff = 0, bool transA = false, int cOff = 0)
+        : Team.IBody where TA : struct, IAdad<TA, TIn> where TC : struct, IAdad<TC, TAcc> where TIn : unmanaged where TAcc : unmanaged where TL : struct, ILane<TL, TAcc>
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public readonly void Run(int first, int last)
@@ -327,13 +331,13 @@ internal sealed partial class Kernels
             var panel = Workspace<TAcc>.Rent(Workspace.Panel, blocksPerTile * kcg0 * R);
             Span<TIn> rowsIn = stackalloc TIn[KC * R];
             Span<TAcc> spill = stackalloc TAcc[R * strip];
-            ReadOnlySpan<TIn> direct = Lanes.Direct<TN, TIn>() ? MemoryMarshal.Cast<byte, TIn>(a.AsSpan()) : aLanes;
+            ReadOnlySpan<TIn> direct = Lanes.Direct<TA, TIn>() ? MemoryMarshal.Cast<byte, TIn>(a.AsSpan()) : default;
             TIn[]? kRows = transA && direct.IsEmpty ? Workspace<TIn>.Rent(Workspace.KRows, KC * tileRows) : null;
             TAcc[]? tile = cLanes is null ? Workspace<TAcc>.Rent(Workspace.CLanes, tileRows * tileStrips * strip) : null;
             for (int t = first; t < last; t++)
             {
                 int r0 = t % rowTiles * tileRows, r1 = Math.Min(m, r0 + tileRows);
-                int s0 = t / rowTiles * tileStrips, s1 = Math.Min(strips, s0 + tileStrips);
+                int s0 = ps0 + t / rowTiles * tileStrips, s1 = Math.Min(ps1, s0 + tileStrips);
                 // Where the micro-kernel accumulates: C in place (rows n apart), or the tile (rows its width apart).
                 int j0 = s0 * strip, width = Math.Min(n, s1 * strip) - j0;
                 var target = tile ?? cLanes!;
@@ -349,7 +353,7 @@ internal sealed partial class Kernels
                         int at = aOff + pc * m + r0, pitch = m;
                         if (kRows is not null)
                         {
-                            for (int p = 0; p < kc; p++) TN.Load(a, aOff + (pc + p) * m + r0, kRows.AsSpan(p * tileRows, r1 - r0));
+                            for (int p = 0; p < kc; p++) TA.Load(a, aOff + (pc + p) * m + r0, kRows.AsSpan(p * tileRows, r1 - r0));
                             src = kRows;
                             at = 0;
                             pitch = tileRows;
@@ -374,7 +378,7 @@ internal sealed partial class Kernels
                                 var dst = rowsIn.Slice(r * KC, padded);
                                 if (r >= rows) { dst.Clear(); continue; }
                                 if (!direct.IsEmpty) direct.Slice(aOff + (i + r) * k + pc, kc).CopyTo(dst);
-                                else TN.Load(a, aOff + (i + r) * k + pc, dst[..kc]);
+                                else TA.Load(a, aOff + (i + r) * k + pc, dst[..kc]);
                                 if (padded > kc) dst[kc..].Clear();
                             }
 
@@ -384,7 +388,7 @@ internal sealed partial class Kernels
 
                     for (int s = s0; s < s1; s++)
                     {
-                        var bstrip = packed.AsSpan((s * kg + pc / g) * strip, kcg * strip);
+                        var bstrip = packed.AsSpan(((s - ps0) * kg + pc / g) * strip, kcg * strip);
                         for (int bi = 0; bi < blocks; bi++)
                         {
                             int i = r0 + bi * R, rows = Math.Min(R, r1 - i);
@@ -396,8 +400,8 @@ internal sealed partial class Kernels
                 // The tile as the type: its rows' segments (whole rows, one span, where tiles are whole rows).
                 if (tile is not null)
                 {
-                    if (width == n) TN.Store(tile.AsSpan(0, (r1 - r0) * n), c, cOff + r0 * n);
-                    else for (int r = r0; r < r1; r++) TN.Store(tile.AsSpan((r - r0) * width, width), c, cOff + r * n + j0);
+                    if (width == n) TC.Store(tile.AsSpan(0, (r1 - r0) * n), c, cOff + r0 * n);
+                    else for (int r = r0; r < r1; r++) TC.Store(tile.AsSpan((r - r0) * width, width), c, cOff + r * n + j0);
                 }
             }
 
@@ -598,67 +602,101 @@ internal sealed partial class Kernels
 
     /// <summary>C = A·B with the operands where `o` says they are stored (transposed, at offsets): the packing reads them there.</summary>
     public static void MatMul<TN, TIn, TAcc, TL>(byte[] a, byte[] b, byte[] c, int m, int n, int k, Operands o)
-        where TN : struct, IAdad<TN, TIn>, IAdad<TN, TAcc> where TIn : unmanaged where TAcc : unmanaged where TL : struct, ILane<TL, TAcc>
+        where TN : struct, IAdad<TN, TIn>, IAdad<TN, TAcc> where TIn : unmanaged where TAcc : unmanaged where TL : struct, ILane<TL, TAcc> =>
+        MatMul<TN, TN, TN, TIn, TAcc, TL>(a, b, c, m, n, k, o);
+
+    // The packed panel of B: about this many bytes (it stays in the last-level cache between its packing and its tiles).
+    private const long PanelBytes = 8L << 20;
+
+    /// <summary>C = A·B with each operand its own type — A as TA, B as TB, C as TC, the sums in TL — each read (or written)
+    /// where it is stored, as `o` says (transposed, at offsets): no operand is widened whole. B is packed a panel of
+    /// columns at a time; C is its stored bytes when they are the lane's, otherwise each task's tile in lanes, stored as
+    /// TC when done (C's rows off its storage units — values below a byte, blocks — C in lanes, stored once at the end).</summary>
+    public static void MatMul<TA, TB, TC, TIn, TAcc, TL>(byte[] a, byte[] b, byte[] c, int m, int n, int k, Operands o)
+        where TA : struct, IAdad<TA, TIn> where TB : struct, IAdad<TB, TIn> where TC : struct, IAdad<TC, TAcc>
+        where TIn : unmanaged where TAcc : unmanaged where TL : struct, ILane<TL, TAcc>
     {
         int g = Unsafe.SizeOf<TAcc>() / Unsafe.SizeOf<TIn>(), kg = (k + g - 1) / g;
         int w = Vector<TAcc>.Count, strip = 2 * w, strips = (n + strip - 1) / strip;
-        bool aDirect = Lanes.Direct<TN, TIn>(), cDirect = Lanes.Direct<TN, TAcc>();
+        bool cDirect = Lanes.Direct<TC, TAcc>();
         if (o.Plain && cDirect && c.Length / Unsafe.SizeOf<TAcc>() != m * n) throw new ArgumentException("C must be exactly m·n values.");
         if (!o.Plain && cDirect && c.Length / Unsafe.SizeOf<TAcc>() < (long)o.COff + m * n) throw new ArgumentException("C must hold m·n values from its offset.");
-        // Values smaller than a byte: rows read where they are stored need every row to start on a whole byte.
-        int per = TN.Bits >= 8 ? 1 : 8 / TN.Bits;
-        bool aRows = aDirect || k % per == 0, nRows = aDirect || n % per == 0;
-        if (!o.Plain && !(aDirect || (m % per == 0 && n % per == 0 && k % per == 0))) throw new ArgumentException("operands read where they are stored need every row on a whole byte.");
-        var inPool = ArrayPool<TIn>.Shared;
-        var accPool = ArrayPool<TAcc>.Shared;
-        TIn[]? al = null, bl = null;
+        // A and B are read by their types' loads (any first value: rows below a byte, blocks, at any offset); C's stores
+        // keep to whole storage units (below).
         long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-        var packed = Workspace<TAcc>.Rent(Workspace.Packed, strips * strip * kg);
+
+        // Tiles of C: about six per thread (cores of unequal speed balance through the shared counter), rows in whole blocks,
+        // columns in whole strips. C is the stored bytes themselves when they are lanes; otherwise each task's tile is in
+        // lanes and stored as the type when done, each of its row segments starting on whole storage units (the tiles'
+        // strips rounded to them); where C's rows do not start on them, C is in lanes whole and stored once at the end.
+        int tileStrips = Math.Max(1, Math.Min(strips, 256 / strip * 2));
+        int unit = TC.Granularity;
+        bool cWhole = false;
+        if (!cDirect && unit > 1)
+        {
+            if (n % unit == 0 && o.COff % unit == 0) { int q = unit / Gcd(strip, unit); tileStrips = (tileStrips + q - 1) / q * q; }
+            else cWhole = true;
+        }
+
+        // B a panel of strips at a time: all of them when they fit PanelBytes, else as many whole tiles of strips as do.
+        long stripBytes = (long)kg * strip * Unsafe.SizeOf<TAcc>();
+        int allTiles = (strips + tileStrips - 1) / tileStrips;
+        int panel = (int)Math.Clamp(PanelBytes / stripBytes / tileStrips, 1, allTiles) * tileStrips;
+        int colTiles = panel / tileStrips;
+        int wantRows = Math.Max(1, Threads * 6 / colTiles);
+        int tileRows = Math.Max(R, (m + wantRows - 1) / wantRows + R - 1) / R * R;
+        int rowTiles = (m + tileRows - 1) / tileRows;
+        var cBytes = cWhole ? ArrayPool<byte>.Shared.Rent(m * n * Unsafe.SizeOf<TAcc>()) : null;
+        var cLanes = cWhole ? Unsafe.As<TAcc[]>(cBytes) : cDirect ? Unsafe.As<TAcc[]>(c) : null;
+        var packed = Workspace<TAcc>.Rent(Workspace.Packed, Math.Min(panel, strips) * strip * kg);
+        t0 = Mark(t0, 0);
         try
         {
-            // Rows that do not start on whole bytes: that matrix loaded whole first.
-            if (!aRows)
+            for (int ps0 = 0; ps0 < strips; ps0 += panel)
             {
-                al = Workspace<TIn>.Rent(Workspace.ALanes, m * k);
-                Team.For(m * k, Math.Max(4096, m * k / (Threads * 2)) / 64 * 64, m * k, new LoadBody<TN, TIn>(a, al));
+                int ps1 = Math.Min(strips, ps0 + panel), cols = Math.Min(n, ps1 * strip) - ps0 * strip;
+                // The packing's tasks: groups of k-rows, or (Bᵀ stored) runs of strips.
+                int units = o.TransB ? ps1 - ps0 : kg;
+                Team.For(units, Math.Max(1, units / (Threads * 2)), (long)k * cols, new PackBody<TB, TIn, TAcc>(b, packed, n, k, strip, kg, ps0, ps1, o.BOff, o.TransB, o.ImageB));
+                t0 = Mark(t0, 1);
+                int tiles = rowTiles * ((ps1 - ps0 + tileStrips - 1) / tileStrips);
+                Team.For(tiles, 1, (long)m * cols * k,
+                    new ProductBody<TA, TC, TIn, TAcc, TL>(a, packed, cLanes, c, m, n, k, kg, tileRows, tileStrips, rowTiles, ps0, ps1, o.AOff, o.TransA, cWhole ? 0 : o.COff));
+                t0 = Mark(t0, 2);
             }
 
-            if (!nRows && o.ImageB is null)
-            {
-                bl = Workspace<TIn>.Rent(Workspace.BLanes, k * n);
-                Team.For(k * n, Math.Max(4096, k * n / (Threads * 2)) / 64 * 64, k * n, new LoadBody<TN, TIn>(b, bl));
-            }
-
-            t0 = Mark(t0, 0);
-            Team.For(kg, Math.Max(1, kg / (Threads * 2)), (long)k * n, new PackBody<TN, TIn, TAcc>(b, bl, packed, n, k, strip, kg, o.BOff, o.TransB, o.ImageB));
-            t0 = Mark(t0, 1);
-
-            // Tiles of C: about six per thread (cores of unequal speed balance through the shared counter), rows in whole blocks,
-            // columns in whole strips. C is the stored bytes themselves when they are lanes; otherwise each task's tile is in
-            // lanes and stored as the type when done, which needs every tile's row segments to start on whole storage units:
-            // where strips or rows do not (values below a byte, blocks), tiles of whole rows, as many as start on whole units.
-            int tileStrips = Math.Max(1, Math.Min(strips, 256 / strip * 2)), rowsUnit = R;
-            int unit = TN.Granularity;
-            if (!cDirect && !(nRows && strip % unit == 0 && n % unit == 0))
-            {
-                tileStrips = strips;
-                int q = unit / Gcd(n, unit);
-                rowsUnit = R / Gcd(R, q) * q;
-            }
-
-            int colTiles = (strips + tileStrips - 1) / tileStrips;
-            int wantRows = Math.Max(1, Threads * 6 / colTiles);
-            int tileRows = Math.Max(rowsUnit, (m + wantRows - 1) / wantRows + rowsUnit - 1) / rowsUnit * rowsUnit;
-            int rowTiles = (m + tileRows - 1) / tileRows;
-            Team.For(rowTiles * colTiles, 1, (long)m * n * k,
-                new ProductBody<TN, TIn, TAcc, TL>(a, al, packed, cDirect ? Unsafe.As<TAcc[]>(c) : null, c, m, n, k, kg, tileRows, tileStrips, rowTiles, o.AOff, o.TransA, o.COff));
-            Mark(t0, 2);
+            if (cWhole) StoreLanes<TC, TAcc>(cBytes!, c, o.COff, (long)m * n);
+            Mark(t0, 3);
         }
         finally
         {
             Workspace<TAcc>.Return(Workspace.Packed, packed);
-            if (al is not null) Workspace<TIn>.Return(Workspace.ALanes, al);
-            if (bl is not null) Workspace<TIn>.Return(Workspace.BLanes, bl);
+            if (cWhole) ArrayPool<byte>.Shared.Return(cBytes!);
+        }
+    }
+
+    /// <summary>count lanes (lane storage) stored as TN into output from value at: on the team in chunks of whole storage
+    /// units (one piece when at is not on one).</summary>
+    internal static void StoreLanes<TN, TLane>(byte[] lanes, byte[] output, int at, long count) where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
+    {
+        int unit = TN.Granularity;
+        if (at % unit != 0) { TN.Store(MemoryMarshal.Cast<byte, TLane>(lanes.AsSpan())[..(int)count], output, at); return; }
+        int chunk = Math.Max(1, 4096 / unit) * unit;
+        Team.For((int)((count + chunk - 1) / chunk), 1, count, new StoreLanesBody<TN, TLane>(lanes, output, at, count, chunk));
+    }
+
+    private readonly struct StoreLanesBody<TN, TLane>(byte[] lanes, byte[] output, int at, long count, int chunk) : Team.IBody
+        where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
+    {
+        public void Run(int first, int last)
+        {
+            var values = MemoryMarshal.Cast<byte, TLane>(lanes.AsSpan());
+            for (int ch = first; ch < last; ch++)
+            {
+                long from = (long)ch * chunk;
+                int len = (int)Math.Min(chunk, count - from);
+                TN.Store(values.Slice((int)from, len), output, at + (int)from);
+            }
         }
     }
 

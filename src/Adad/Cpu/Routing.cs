@@ -24,15 +24,6 @@ internal sealed partial class Kernels
     /// <summary>top-k of each row: values stored as the type (rows × k), indices s32; returns the lane's name.</summary>
     public static string TopK<TN>(byte[] x, int rows, int cols, int k, byte[] values, int[] indices) where TN : struct, IAdad<TN>
     {
-        if (TN.Granularity > 8)
-        {
-            // A block format: the values in float32 storage, encoded by blocks once (a row's k values would re-encode their block row by row).
-            var lanes = new byte[(long)rows * k * 4];
-            string blockLane = TopK<Float32>(BlockLanes<TN>(x, (long)rows * cols), rows, cols, k, lanes, indices);
-            BlockStore<TN>(lanes, values, (long)rows * k);
-            return blockLane;
-        }
-
         var v = new TopKVisitor(x, rows, cols, k, values, indices);
         TN.Elementwise(ref v);
         return v.Lane;
@@ -45,11 +36,16 @@ internal sealed partial class Kernels
         public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
         {
             Lane = TL.Name;
-            Team.For(rows, Kernels.RowChunk<TN>(rows, k, rows / (Threads * 4)), (long)rows * cols * 4, new TopKBody<TN, TLane, TL>(x, rows, cols, k, values, indices));
+            // Each row read where it is stored; a block format's values as the lane's, encoded once after (a row's k values
+            // would re-encode their block row by row).
+            bool lanes = TN.Granularity > 8;
+            var output = lanes ? new byte[(long)rows * k * System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>()] : values;
+            Team.For(rows, Kernels.RowChunk<TN>(rows, k, rows / (Threads * 4)), (long)rows * cols * 4, new TopKBody<TN, TLane, TL>(x, rows, cols, k, output, indices, lanes));
+            if (lanes) StoreLanes<TN, TLane>(output, values, 0, (long)rows * k);
         }
     }
 
-    private struct TopKBody<TN, TLane, TL>(byte[] x, int rows, int cols, int k, byte[] values, int[] indices) : Team.IBody
+    private struct TopKBody<TN, TLane, TL>(byte[] x, int rows, int cols, int k, byte[] values, int[] indices, bool lanes) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
     {
         public readonly void Run(int first, int last)
@@ -78,7 +74,8 @@ internal sealed partial class Kernels
 
                     for (int i = taken; i < k; i++) { best[i] = TL.Zero; bestAt[i] = -1; }          // k past the row: as the passes left them
 
-                    TN.Store(best.AsSpan(0, k), values, r * k);
+                    if (lanes) best.AsSpan(0, k).CopyTo(MemoryMarshal.Cast<byte, TLane>(values.AsSpan()).Slice(r * k, k));
+                    else TN.Store(best.AsSpan(0, k), values, r * k);
                     Array.Copy(bestAt, 0, indices, r * k, k);
                 }
             }
@@ -87,45 +84,6 @@ internal sealed partial class Kernels
                 pool.Return(row); pool.Return(best); ArrayPool<int>.Shared.Return(bestAt);
             }
         }
-    }
-
-    // A block format's stored values as float32 storage, and float32 storage encoded into a block format (through its float lane).
-    private static byte[] BlockLanes<TN>(byte[] x, long count) where TN : struct, IAdad<TN>
-    {
-        var v = new BlockWiden(x, count);
-        TN.Elementwise(ref v);
-        return v.Result!;
-    }
-
-    private static void BlockStore<TN>(byte[] lanes, byte[] output, long count) where TN : struct, IAdad<TN>
-    {
-        var v = new BlockNarrow(lanes, output, count);
-        TN.Elementwise(ref v);
-    }
-
-    private struct BlockWiden(byte[] x, long count) : ILaneVisitor
-    {
-        public byte[]? Result;
-        public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
-        {
-            // Decoded by the team straight into the result's bytes (one decode per block, no copy).
-            var bytes = new byte[count * System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>()];
-            int n = (int)count, unit = Math.Max(256, TN.Granularity);
-            Team.For(n, Math.Max(4096, n / (Threads * 2)) / unit * unit + unit, n, new TopKWidenBody<TN, TLane>(x, bytes));
-            Result = bytes;
-        }
-    }
-
-    private readonly struct TopKWidenBody<TN, TLane>(byte[] x, byte[] lanes) : Team.IBody where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
-    {
-        public void Run(int first, int last) =>
-            TN.Load(x, first, System.Runtime.InteropServices.MemoryMarshal.Cast<byte, TLane>(lanes.AsSpan()).Slice(first, last - first));
-    }
-
-    private struct BlockNarrow(byte[] lanes, byte[] output, long count) : ILaneVisitor
-    {
-        public readonly void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane> =>
-            TN.Store(System.Runtime.InteropServices.MemoryMarshal.Cast<byte, TLane>(lanes.AsSpan()).Slice(0, (int)count), output, 0);
     }
 
     /// <summary>out[r] = x[r][index[r]], stored as the type.</summary>

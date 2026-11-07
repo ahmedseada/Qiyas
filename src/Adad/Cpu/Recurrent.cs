@@ -11,6 +11,8 @@
 //   A step is the gates then the cell; a sequence is T steps (the cell's inputs of each step kept for the backward).
 //   The cell backward is one pass (dgates, dc or dh from dh', dc'); the step backward the products' backward
 //   (dx = dg·W, dh = dg·U, dW = dgᵀ·x, dU = dgᵀ·h, db = Σ rows of dg).
+//   float32 and float64 run here in their own type; a narrower float or a block format runs RecurrentMixed.cs: every
+//   input read where it is stored, the gates and the states across steps in the lane's own type.
 
 using System.Buffers;
 using System.Numerics;
@@ -24,7 +26,7 @@ internal sealed partial class Kernels
     /// <summary>The LSTM cell on the CPU: h', c' from the gates and c (lane arithmetic); returns the lane's name.</summary>
     public static string LstmCell<TN>(CellArgs a, byte[] g, byte[] c, byte[] hOut, byte[] cOut) where TN : struct, IFloatAdad<TN>
     {
-        var v = new CellVisitor(a, g, null, c, hOut, cOut);
+        var v = new CellVisitor(a, new(g), default, new(c), new(hOut), new(cOut));
         TN.Float(ref v);
         return v.Lane;
     }
@@ -32,24 +34,26 @@ internal sealed partial class Kernels
     /// <summary>The GRU cell on the CPU: h' from gx, gh and h.</summary>
     public static string GruCell<TN>(CellArgs a, byte[] gx, byte[] gh, byte[] h, byte[] hOut) where TN : struct, IFloatAdad<TN>
     {
-        var v = new CellVisitor(a, gx, gh, h, hOut, null);
+        var v = new CellVisitor(a, new(gx), new(gh), new(h), new(hOut), default);
         TN.Float(ref v);
         return v.Lane;
     }
 
-    private struct CellVisitor(CellArgs a, byte[] g, byte[]? g2, byte[] state, byte[] hOut, byte[]? cOut) : IFloatLaneVisitor
+    private struct CellVisitor(CellArgs a, Arg g, Arg g2, Arg state, Arg hOut, Arg cOut) : IFloatLaneVisitor
     {
         public string Lane = "";
 
         public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
         {
             Lane = TL.Name;
-            Team.For(a.B, RowChunk<TN>(a.B, a.H, a.B / (Threads * 4)), (long)a.B * a.H * 8, new CellBody<TN, TLane, TL>(a, g, g2, state, hOut, cOut));
+            Team.For(a.B, RowChunk<TN>(a.B, a.H, a.B / (Threads * 4)), (long)a.B * a.H * 8, new CellBody<TN, TN, TLane, TL>(a, g, g2, state, hOut, cOut, default, default));
         }
     }
 
-    private struct CellBody<TN, TLane, TL>(CellArgs a, byte[] g, byte[]? g2, byte[] state, byte[] hOut, byte[]? cOut) : Team.IBody
-        where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    // A cell over rows: each operand TN or TS (Arg.Lanes); h' (and c') stored as their Args say, and mirrored as the
+    // lane's own values into m1 (m2) when given (a sequence's state for its next step).
+    private struct CellBody<TN, TS, TLane, TL>(CellArgs a, Arg g, Arg g2, Arg state, Arg hOut, Arg cOut, Arg m1, Arg m2) : Team.IBody
+        where TN : struct, IAdad<TN, TLane> where TS : struct, IAdad<TS, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         public readonly void Run(int first, int last)
         {
@@ -66,9 +70,9 @@ internal sealed partial class Kernels
                 var one = new Vector<TLane>(TL.From(1));
                 for (int b = first; b < last; b++)
                 {
-                    TN.Load(g, b * G * H, gl.AsSpan(0, G * H));
-                    if (g2 is not null) TN.Load(g2, b * G * H, g2l.AsSpan(0, G * H));
-                    TN.Load(state, b * H, sl.AsSpan(0, H));
+                    LoadArg<TN, TS, TLane>(g, b * G * H, gl.AsSpan(0, G * H));
+                    if (g2.X is not null) LoadArg<TN, TS, TLane>(g2, b * G * H, g2l.AsSpan(0, G * H));
+                    LoadArg<TN, TS, TLane>(state, b * H, sl.AsSpan(0, H));
                     if (a.Kind == "lstm")
                     {
                         int j = 0;
@@ -91,8 +95,10 @@ internal sealed partial class Kernels
                             ho[j] = TL.Mul(o, TL.Tanh(new Vector<TLane>(cn))[0]);
                         }
 
-                        TN.Store(ho.AsSpan(0, H), hOut, b * H);
-                        TN.Store(co.AsSpan(0, H), cOut!, b * H);
+                        StoreArg<TN, TS, TLane>(hOut, ho.AsSpan(0, H), b * H);
+                        StoreArg<TN, TS, TLane>(cOut, co.AsSpan(0, H), b * H);
+                        if (m1.X is not null) StoreArg<TN, TS, TLane>(m1, ho.AsSpan(0, H), b * H);
+                        if (m2.X is not null) StoreArg<TN, TS, TLane>(m2, co.AsSpan(0, H), b * H);
                     }
                     else
                     {
@@ -113,7 +119,8 @@ internal sealed partial class Kernels
                             ho[j] = TL.Fma(z, sl[j], TL.Mul(TL.Sub(TL.From(1), z), n));
                         }
 
-                        TN.Store(ho.AsSpan(0, H), hOut, b * H);
+                        StoreArg<TN, TS, TLane>(hOut, ho.AsSpan(0, H), b * H);
+                        if (m1.X is not null) StoreArg<TN, TS, TLane>(m1, ho.AsSpan(0, H), b * H);
                     }
                 }
             }
@@ -141,54 +148,10 @@ internal sealed partial class Kernels
 
     private static bool OwnLane<TN>() where TN : struct, IFloatAdad<TN> => TN.Name is "float32" or "float64";
 
-    // A narrow float's step runs in its lane's storage: the gates are sums of products the type cannot hold between the passes.
-    private static byte[] L<TN>(byte[] x, long count) where TN : struct, IFloatAdad<TN> => ToLane<TN>(x, count);
-
-    // The weights W, U widened to the lane's storage, kept per thread for each weight array (by reference, type and count)
-    // with a copy of the bytes they came from: a call whose weights' bytes are unchanged takes the kept lanes (one
-    // vectorized compare of the type's bytes instead of a conversion and a fresh array of tens of megabytes); a changed
-    // array (a weight update in place) is converted again into the same lanes. Only read by the steps.
-    private sealed class WidenedWeights
-    {
-        public string Type = ""; public long Count; public byte[] Source = []; public byte[] Lanes = [];
-    }
-
-    [ThreadStatic] private static System.Runtime.CompilerServices.ConditionalWeakTable<byte[], WidenedWeights>? s_weights;
-
-    private static byte[] Weights<TN>(byte[] x, long count) where TN : struct, IFloatAdad<TN>
-    {
-        int bytes = checked((int)TN.Bytes(count));
-        var table = s_weights ??= new();
-        if (!table.TryGetValue(x, out var e) || e.Type != TN.Name || e.Count != count)
-        {
-            e = new WidenedWeights { Type = TN.Name, Count = count, Source = x.AsSpan(0, bytes).ToArray(), Lanes = ToLane<TN>(x, count) };
-            table.AddOrUpdate(x, e);
-            return e.Lanes;
-        }
-
-        if (!x.AsSpan(0, bytes).SequenceEqual(e.Source))
-        {
-            ToLaneInto<TN>(x, count, e.Lanes);
-            x.AsSpan(0, bytes).CopyTo(e.Source);
-        }
-
-        return e.Lanes;
-    }
-    private static byte[] LOut<TN>(long count) where TN : struct, IFloatAdad<TN> => new byte[count * (TN.Bits == 64 ? 8 : 4)];
-
     /// <summary>An LSTM step: (h', c') from x, h, c and the weights W (4H × D), U (4H × H), b (4H).</summary>
     public static string LstmStep<TN>(CellArgs a, byte[] x, byte[] h, byte[] c, byte[] w, byte[] u, byte[] bias, byte[] hOut, byte[] cOut) where TN : struct, IFloatAdad<TN>
     {
-        if (!OwnLane<TN>())
-        {
-            long bh = (long)a.B * a.H;
-            var lh = LOut<TN>(bh); var lc = LOut<TN>(bh);
-            string lane = TN.Bits == 64
-                ? LstmStep<Float64>(a, L<TN>(x, (long)a.B * a.D), L<TN>(h, bh), L<TN>(c, bh), Weights<TN>(w, a.GateValues / a.B * a.D), Weights<TN>(u, a.GateValues / a.B * a.H), L<TN>(bias, a.Gates * a.H), lh, lc)
-                : LstmStep<Float32>(a, L<TN>(x, (long)a.B * a.D), L<TN>(h, bh), L<TN>(c, bh), Weights<TN>(w, a.GateValues / a.B * a.D), Weights<TN>(u, a.GateValues / a.B * a.H), L<TN>(bias, a.Gates * a.H), lh, lc);
-            FromLane<TN>(lh, hOut, bh); FromLane<TN>(lc, cOut, bh);
-            return lane;
-        }
+        if (!OwnLane<TN>()) return Mixed<TN, LstmStepCall>(new(a, x, h, c, w, u, bias, hOut, cOut));
 
         var g = new byte[BytesOf<TN>(a.GateValues)];
         CellGates<TN>(a, x, w, h, u, bias, g);
@@ -198,7 +161,7 @@ internal sealed partial class Kernels
     /// <summary>The LSTM cell backward on the CPU: dg (B × 4H) and dc from dh', dc'.</summary>
     public static string LstmCellBackward<TN>(CellArgs a, byte[] g, byte[] c, byte[] dh, byte[] dcNext, byte[] dg, byte[] dc) where TN : struct, IFloatAdad<TN>
     {
-        var v = new CellBackwardVisitor(a, g, null, c, dh, dcNext, dg, dc, null);
+        var v = new CellBackwardVisitor(a, new(g), default, new(c), new(dh), new(dcNext), new(dg), new(dc), default);
         TN.Float(ref v);
         return v.Lane;
     }
@@ -206,24 +169,25 @@ internal sealed partial class Kernels
     /// <summary>The GRU cell backward on the CPU: dgx, dgh (B × 3H) and dh from dh'.</summary>
     public static string GruCellBackward<TN>(CellArgs a, byte[] gx, byte[] gh, byte[] h, byte[] dhOut, byte[] dgx, byte[] dgh, byte[] dh) where TN : struct, IFloatAdad<TN>
     {
-        var v = new CellBackwardVisitor(a, gx, gh, h, dhOut, null, dgx, dgh, dh);
+        var v = new CellBackwardVisitor(a, new(gx), new(gh), new(h), new(dhOut), default, new(dgx), new(dgh), new(dh));
         TN.Float(ref v);
         return v.Lane;
     }
 
-    private struct CellBackwardVisitor(CellArgs a, byte[] g, byte[]? g2, byte[] state, byte[] d1, byte[]? d2, byte[] o1, byte[] o2, byte[]? o3) : IFloatLaneVisitor
+    private struct CellBackwardVisitor(CellArgs a, Arg g, Arg g2, Arg state, Arg d1, Arg d2, Arg o1, Arg o2, Arg o3) : IFloatLaneVisitor
     {
         public string Lane = "";
 
         public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
         {
             Lane = TL.Name;
-            Team.For(a.B, RowChunk<TN>(a.B, a.Gates * a.H, a.B / (Threads * 4)), (long)a.B * a.H * 16, new CellBackwardBody<TN, TLane, TL>(a, g, g2, state, d1, d2, o1, o2, o3));
+            Team.For(a.B, RowChunk<TN>(a.B, a.Gates * a.H, a.B / (Threads * 4)), (long)a.B * a.H * 16, new CellBackwardBody<TN, TN, TLane, TL>(a, g, g2, state, d1, d2, o1, o2, o3));
         }
     }
 
-    private struct CellBackwardBody<TN, TLane, TL>(CellArgs a, byte[] g, byte[]? g2, byte[] state, byte[] d1, byte[]? d2, byte[] o1, byte[] o2, byte[]? o3) : Team.IBody
-        where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    // The cell backward over rows, each operand TN or TS (Arg.Lanes).
+    private struct CellBackwardBody<TN, TS, TLane, TL>(CellArgs a, Arg g, Arg g2, Arg state, Arg d1, Arg d2, Arg o1, Arg o2, Arg o3) : Team.IBody
+        where TN : struct, IAdad<TN, TLane> where TS : struct, IAdad<TS, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         public readonly void Run(int first, int last)
         {
@@ -244,11 +208,11 @@ internal sealed partial class Kernels
                 TLane Tanh(TLane x) => TL.Tanh(new Vector<TLane>(x))[0];
                 for (int b = first; b < last; b++)
                 {
-                    TN.Load(g, b * G * H, gl.AsSpan(0, G * H));
-                    if (g2 is not null) TN.Load(g2, b * G * H, g2l.AsSpan(0, G * H));
-                    TN.Load(state, b * H, sl.AsSpan(0, H));
-                    TN.Load(d1, b * H, d1l.AsSpan(0, H));
-                    if (d2 is not null) TN.Load(d2, b * H, d2l.AsSpan(0, H));
+                    LoadArg<TN, TS, TLane>(g, b * G * H, gl.AsSpan(0, G * H));
+                    if (g2.X is not null) LoadArg<TN, TS, TLane>(g2, b * G * H, g2l.AsSpan(0, G * H));
+                    LoadArg<TN, TS, TLane>(state, b * H, sl.AsSpan(0, H));
+                    LoadArg<TN, TS, TLane>(d1, b * H, d1l.AsSpan(0, H));
+                    if (d2.X is not null) LoadArg<TN, TS, TLane>(d2, b * H, d2l.AsSpan(0, H));
                     // Whole vectors of the row first (the same formulas, a vector's sigmoid / tanh a vector of values), the tail
                     // one value at a time.
                     int w = Vector<TLane>.Count, vec = H / w * w, j0 = 0;
@@ -314,9 +278,9 @@ internal sealed partial class Kernels
                         }
                     }
 
-                    TN.Store(dg.AsSpan(0, G * H), o1, b * G * H);
-                    if (a.Kind == "lstm") TN.Store(ds.AsSpan(0, H), o2, b * H);
-                    else { TN.Store(dg2.AsSpan(0, G * H), o2, b * G * H); TN.Store(ds.AsSpan(0, H), o3!, b * H); }
+                    StoreArg<TN, TS, TLane>(o1, dg.AsSpan(0, G * H), b * G * H);
+                    if (a.Kind == "lstm") StoreArg<TN, TS, TLane>(o2, ds.AsSpan(0, H), b * H);
+                    else { StoreArg<TN, TS, TLane>(o2, dg2.AsSpan(0, G * H), b * G * H); StoreArg<TN, TS, TLane>(o3, ds.AsSpan(0, H), b * H); }
                 }
             }
             finally
@@ -369,16 +333,7 @@ internal sealed partial class Kernels
     /// <summary>An LSTM step's backward: from dh', dc' (and x, h, c, the weights): dx, dh, dc, dW, dU, db.</summary>
     public static string LstmStepBackward<TN>(CellArgs a, byte[] x, byte[] h, byte[] c, byte[] w, byte[] u, byte[] bias, byte[] dhOut, byte[] dcOut, byte[] dx, byte[] dh, byte[] dc, byte[] dw, byte[] du, byte[] db) where TN : struct, IFloatAdad<TN>
     {
-        if (!OwnLane<TN>())
-        {
-            long bh = (long)a.B * a.H, bd = (long)a.B * a.D, GH = a.Gates * a.H;
-            var ldx = LOut<TN>(bd); var ldh = LOut<TN>(bh); var ldc = LOut<TN>(bh); var ldw = LOut<TN>(GH * a.D); var ldu = LOut<TN>(GH * a.H); var ldb = LOut<TN>(GH);
-            string name = TN.Bits == 64
-                ? LstmStepBackward<Float64>(a, L<TN>(x, bd), L<TN>(h, bh), L<TN>(c, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(dhOut, bh), L<TN>(dcOut, bh), ldx, ldh, ldc, ldw, ldu, ldb)
-                : LstmStepBackward<Float32>(a, L<TN>(x, bd), L<TN>(h, bh), L<TN>(c, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(dhOut, bh), L<TN>(dcOut, bh), ldx, ldh, ldc, ldw, ldu, ldb);
-            FromLane<TN>(ldx, dx, bd); FromLane<TN>(ldh, dh, bh); FromLane<TN>(ldc, dc, bh); FromLane<TN>(ldw, dw, GH * a.D); FromLane<TN>(ldu, du, GH * a.H); FromLane<TN>(ldb, db, GH);
-            return name;
-        }
+        if (!OwnLane<TN>()) return Mixed<TN, LstmStepBackwardCall>(new(a, x, h, c, w, u, bias, dhOut, dcOut, dx, dh, dc, dw, du, db));
 
         var g = new byte[BytesOf<TN>(a.GateValues)];
         CellGates<TN>(a, x, w, h, u, bias, g);
@@ -391,16 +346,7 @@ internal sealed partial class Kernels
     /// <summary>A GRU step's backward: from dh' (and x, h, the weights): dx, dh, dW, dU, db, dbh.</summary>
     public static string GruStepBackward<TN>(CellArgs a, byte[] x, byte[] h, byte[] w, byte[] u, byte[] bias, byte[] biasH, byte[] dhOut, byte[] dx, byte[] dh, byte[] dw, byte[] du, byte[] db, byte[] dbh) where TN : struct, IFloatAdad<TN>
     {
-        if (!OwnLane<TN>())
-        {
-            long bh = (long)a.B * a.H, bd = (long)a.B * a.D, GH = a.Gates * a.H;
-            var ldx = LOut<TN>(bd); var ldh = LOut<TN>(bh); var ldw = LOut<TN>(GH * a.D); var ldu = LOut<TN>(GH * a.H); var ldb = LOut<TN>(GH); var ldbh = LOut<TN>(GH);
-            string name = TN.Bits == 64
-                ? GruStepBackward<Float64>(a, L<TN>(x, bd), L<TN>(h, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), L<TN>(dhOut, bh), ldx, ldh, ldw, ldu, ldb, ldbh)
-                : GruStepBackward<Float32>(a, L<TN>(x, bd), L<TN>(h, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), L<TN>(dhOut, bh), ldx, ldh, ldw, ldu, ldb, ldbh);
-            FromLane<TN>(ldx, dx, bd); FromLane<TN>(ldh, dh, bh); FromLane<TN>(ldw, dw, GH * a.D); FromLane<TN>(ldu, du, GH * a.H); FromLane<TN>(ldb, db, GH); FromLane<TN>(ldbh, dbh, GH);
-            return name;
-        }
+        if (!OwnLane<TN>()) return Mixed<TN, GruStepBackwardCall>(new(a, x, h, w, u, bias, biasH, dhOut, dx, dh, dw, du, db, dbh));
 
         var gx = new byte[BytesOf<TN>(a.GateValues)];
         var gh = new byte[gx.Length];
@@ -422,18 +368,7 @@ internal sealed partial class Kernels
     /// <summary>An LSTM over T steps: x (T × B × D), h0, c0 → h (T × B × H), c (T × B × H); returns the lane's name.</summary>
     public static string LstmSequence<TN>(CellArgs a, int T, byte[] x, byte[] h0, byte[] c0, byte[] w, byte[] u, byte[] bias, byte[] hOut, byte[] cOut) where TN : struct, IFloatAdad<TN>
     {
-        long bd = (long)a.B * a.D, bh = (long)a.B * a.H;
-        if (!OwnLane<TN>())
-        {
-            long GH = a.Gates * a.H;
-            var lh = LOut<TN>(T * bh); var lc = LOut<TN>(T * bh);
-            string name = TN.Bits == 64
-                ? LstmSequence<Float64>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(c0, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), lh, lc)
-                : LstmSequence<Float32>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(c0, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), lh, lc);
-            FromLane<TN>(lh, hOut, T * bh); FromLane<TN>(lc, cOut, T * bh);
-            return name;
-        }
-
+        if (!OwnLane<TN>()) return Mixed<TN, LstmSequenceCall>(new(a, T, x, h0, c0, w, u, bias, hOut, cOut));
         return LstmForward<TN>(a, T, x, h0, c0, w, u, bias, hOut, cOut, null);
     }
 
@@ -546,19 +481,7 @@ internal sealed partial class Kernels
     /// <summary>A GRU over T steps: x (T × B × D), h0 → h (T × B × H).</summary>
     public static string GruSequence<TN>(CellArgs a, int T, byte[] x, byte[] h0, byte[] w, byte[] u, byte[] bias, byte[] biasH, byte[] hOut) where TN : struct, IFloatAdad<TN>
     {
-        long bd = (long)a.B * a.D, bh = (long)a.B * a.H;
-        if (!OwnLane<TN>())
-        {
-            // A narrower type or a block format: widened once, h kept in the float lane across the steps, narrowed once.
-            long GH = a.Gates * a.H;
-            var lh = LOut<TN>(T * bh);
-            string name = TN.Bits == 64
-                ? GruSequence<Float64>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), lh)
-                : GruSequence<Float32>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), lh);
-            FromLane<TN>(lh, hOut, T * bh);
-            return name;
-        }
-
+        if (!OwnLane<TN>()) return Mixed<TN, GruSequenceCall>(new(a, T, x, h0, w, u, bias, biasH, hOut));
         return GruForward<TN>(a, T, x, h0, w, u, bias, biasH, hOut, null).Lane;
     }
 
@@ -566,17 +489,8 @@ internal sealed partial class Kernels
     /// dx (T × B × D), dh0, dc0, dW, dU, db (summed over the steps). The forward's h, c are recomputed from h0, c0.</summary>
     public static string LstmSequenceBackward<TN>(CellArgs a, int T, byte[] x, byte[] h0, byte[] c0, byte[] w, byte[] u, byte[] bias, byte[] dhOut, byte[] dcLast, byte[] dx, byte[] dh0, byte[] dc0, byte[] dw, byte[] du, byte[] db) where TN : struct, IFloatAdad<TN>
     {
-        long bd = (long)a.B * a.D, bh = (long)a.B * a.H;
-        if (!OwnLane<TN>())
-        {
-            long GH = a.Gates * a.H;
-            var ldx = LOut<TN>(T * bd); var ldh0 = LOut<TN>(bh); var ldc0 = LOut<TN>(bh); var ldw = LOut<TN>(GH * a.D); var ldu = LOut<TN>(GH * a.H); var ldb = LOut<TN>(GH);
-            string name = TN.Bits == 64
-                ? LstmSequenceBackward<Float64>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(c0, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(dhOut, T * bh), L<TN>(dcLast, bh), ldx, ldh0, ldc0, ldw, ldu, ldb)
-                : LstmSequenceBackward<Float32>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), L<TN>(c0, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(dhOut, T * bh), L<TN>(dcLast, bh), ldx, ldh0, ldc0, ldw, ldu, ldb);
-            FromLane<TN>(ldx, dx, T * bd); FromLane<TN>(ldh0, dh0, bh); FromLane<TN>(ldc0, dc0, bh); FromLane<TN>(ldw, dw, GH * a.D); FromLane<TN>(ldu, du, GH * a.H); FromLane<TN>(ldb, db, GH);
-            return name;
-        }
+        long bh = (long)a.B * a.H;
+        if (!OwnLane<TN>()) return Mixed<TN, LstmSequenceBackwardCall>(new(a, T, x, h0, c0, w, u, bias, dhOut, dcLast, dx, dh0, dc0, dw, du, db));
 
         // The forward recomputed once, each step's gates kept; per step back only the cell's backward and dh = dg · U (the
         // chain); dx, dW, dU, db over all the steps at once (SequenceWeights).
@@ -610,20 +524,11 @@ internal sealed partial class Kernels
     }
 
     /// <summary>The GRU sequence's backward: from dh (T × B × H, the loss's gradient at every step): dx (T × B × D), dh0, dW, dU,
-    /// db, dbh (summed over the steps). The forward's h are recomputed from h0; a narrower type or a block format widened once.</summary>
+    /// db, dbh (summed over the steps). The forward's h are recomputed from h0.</summary>
     public static string GruSequenceBackward<TN>(CellArgs a, int T, byte[] x, byte[] h0, byte[] w, byte[] u, byte[] bias, byte[] biasH, byte[] dhOut, byte[] dx, byte[] dh0, byte[] dw, byte[] du, byte[] db, byte[] dbh) where TN : struct, IFloatAdad<TN>
     {
-        long bd = (long)a.B * a.D, bh = (long)a.B * a.H;
-        if (!OwnLane<TN>())
-        {
-            long GH = a.Gates * a.H;
-            var ldx = LOut<TN>(T * bd); var ldh0 = LOut<TN>(bh); var ldw = LOut<TN>(GH * a.D); var ldu = LOut<TN>(GH * a.H); var ldb = LOut<TN>(GH); var ldbh = LOut<TN>(GH);
-            string name = TN.Bits == 64
-                ? GruSequenceBackward<Float64>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), L<TN>(dhOut, T * bh), ldx, ldh0, ldw, ldu, ldb, ldbh)
-                : GruSequenceBackward<Float32>(a, T, L<TN>(x, T * bd), L<TN>(h0, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), L<TN>(dhOut, T * bh), ldx, ldh0, ldw, ldu, ldb, ldbh);
-            FromLane<TN>(ldx, dx, T * bd); FromLane<TN>(ldh0, dh0, bh); FromLane<TN>(ldw, dw, GH * a.D); FromLane<TN>(ldu, du, GH * a.H); FromLane<TN>(ldb, db, GH); FromLane<TN>(ldbh, dbh, GH);
-            return name;
-        }
+        long bh = (long)a.B * a.H;
+        if (!OwnLane<TN>()) return Mixed<TN, GruSequenceBackwardCall>(new(a, T, x, h0, w, u, bias, biasH, dhOut, dx, dh0, dw, du, db, dbh));
 
         // The forward recomputed once, gx (all steps) and each step's gh kept; per step back only the cell's backward and
         // dh = dgh · U + the cell's direct part; dx, dW, db from dgx and dU, dbh from dgh over all the steps at once.
@@ -664,16 +569,7 @@ internal sealed partial class Kernels
     /// <summary>A GRU step: h' from x, h and W (3H × D), U (3H × H), b (3H), bh (3H).</summary>
     public static string GruStep<TN>(CellArgs a, byte[] x, byte[] h, byte[] w, byte[] u, byte[] bias, byte[] biasH, byte[] hOut) where TN : struct, IFloatAdad<TN>
     {
-        if (!OwnLane<TN>())
-        {
-            long bh = (long)a.B * a.H, GH = a.Gates * a.H;
-            var lh = LOut<TN>(bh);
-            string lane = TN.Bits == 64
-                ? GruStep<Float64>(a, L<TN>(x, (long)a.B * a.D), L<TN>(h, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), lh)
-                : GruStep<Float32>(a, L<TN>(x, (long)a.B * a.D), L<TN>(h, bh), Weights<TN>(w, GH * a.D), Weights<TN>(u, GH * a.H), L<TN>(bias, GH), L<TN>(biasH, GH), lh);
-            FromLane<TN>(lh, hOut, bh);
-            return lane;
-        }
+        if (!OwnLane<TN>()) return Mixed<TN, GruStepCall>(new(a, x, h, w, u, bias, biasH, hOut));
 
         var gx = new byte[BytesOf<TN>(a.GateValues)];
         var gh = new byte[gx.Length];

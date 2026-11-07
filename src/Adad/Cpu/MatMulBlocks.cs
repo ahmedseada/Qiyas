@@ -4,9 +4,10 @@
 // The block-scaled tiled product: C = A·Bᵀ for A (m × k) and B (n × k) both Q8_0 or both Q4_0, k in whole blocks of 32
 // along each row (a linear layer's weights stored n × k). C_ij = Σ_blocks dA·dB·(Σ_32 qA·qB): every 32-term dot an
 // exact integer, the block scales applied in float32 — gemv's semantics on a tile, nothing decoded to a float per value.
-//   CPU: A's and B's blocks unpacked once into int8 rows (Q4_0: q − 8) and per-4-byte scales (the scale of the block
-//        each int lane of an s8 dot covers, so any vector width works); tasks of 4 rows, a 4 × 2 register tile of float
-//        vectors, per vector of k one s8 dot, converted, times sA·sB, added. Where the runtime has the s8 dot lane.
+//   CPU: blocks unpacked into int8 rows (Q4_0: q − 8) and per-4-byte scales (the scale of the block each int lane of an
+//        s8 dot covers, so any vector width works): B a panel of its rows at a time (on the team, the panel's bytes
+//        bounded), A by each task, its 4 rows once a panel; a 4 × 2 register tile of float vectors, per vector of k one
+//        s8 dot, converted, times sA·sB, added. Where the runtime has the s8 dot lane.
 //   CUDA: the s8 tensor instruction at k = 32 (one per block per 16 × 8 tile): a block of 128 threads per 64 × 64 of C, a
 //        warp 32 × 32; per k-block A's and B's 64 blocks staged into shared memory by 16-bit loads (a 34-byte Q8_0
 //        block is 2-byte aligned only; Q4_0's nibbles widened to int8 − 8 on the way), rows 48 bytes apart (the
@@ -31,11 +32,23 @@ internal sealed partial class Kernels
     {
         if (format is not ("q8_0" or "q4_0") || k % 32 != 0) throw new NotSupportedException($"{format}: the block product takes Q8_0 or Q4_0 with k in whole blocks");
         if (!S8Dot.IsSupported) throw new NotSupportedException("the block product needs the s8 dot lane");
-        var (qa, sa) = UnpackRows(format, a, m, k);
-        var (qb, sb) = UnpackRows(format, b, n, k);
-        Team.For((m + 3) / 4, 1, (long)m * n * k, new MatMulBlocksBody(qa, sa, qb, sb, cLanes, m, n, k));
+        // B's panel: as many of its rows as fit BlockPanelBytes of int8 values and scales (2·k bytes a row), all of them
+        // when they do.
+        int panel = (int)Math.Clamp(BlockPanelBytes / (2L * k), 2, n);
+        var qb = new sbyte[(long)panel * k];
+        var sb = new float[(long)panel * k / 4];
+        for (int j0 = 0; j0 < n; j0 += panel)
+        {
+            int cols = Math.Min(panel, n - j0);
+            Team.For(cols, Math.Max(1, cols / (Threads * 4)), (long)cols * k, new UnpackRowsBody(format, b, qb, sb, k, j0));
+            Team.For((m + 3) / 4, 1, (long)m * cols * k, new MatMulBlocksBody(format, a, qb, sb, cLanes, m, n, k, j0, cols));
+        }
+
         return "s8dp blocks";
     }
+
+    // B's panel of unpacked rows: about this many bytes.
+    private const long BlockPanelBytes = 8L << 20;
 
     /// <summary>The gate's override: true takes the block product wherever the view allows it, false never, null as measured.</summary>
     internal static bool? BlockProducts;
@@ -58,11 +71,8 @@ internal sealed partial class Kernels
     // float32 lanes encoded into the block format on the team, a run of whole blocks a task.
     private readonly struct BlocksStore(byte[] lanes, byte[] output, long count) : ILaneVisitor
     {
-        public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
-        {
-            int per = TN.Granularity, chunk = 4096 / per * per;
-            Team.For((int)((count + chunk - 1) / chunk), 1, count, new NarrowBody<TN, TLane>(lanes, output, count, chunk));
-        }
+        public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane> =>
+            StoreLanes<TN, TLane>(lanes, output, 0, count);
     }
 
     // The block product or the strided route, whichever this processor measures faster at the shape and format (once,
@@ -82,51 +92,49 @@ internal sealed partial class Kernels
         }
     }
 
-    // Rows of blocks as int8 values and per-4-byte scales.
-    private static (sbyte[] Q, float[] S) UnpackRows(string format, byte[] x, int rows, int k)
-    {
-        var q = new sbyte[(long)rows * k];
-        var s = new float[(long)rows * k / 4];
-        Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)rows * k, new UnpackRowsBody(format, x, q, s, k));
-        return (q, s);
-    }
-
     // Both bodies compiled at the final tier from the first call: the runtime's first tier ran the product 20× slower,
     // for the first rounds of a run, until the counted calls promoted it.
-    private readonly struct UnpackRowsBody(string format, byte[] x, sbyte[] q, float[] s, int k) : Team.IBody
+    // Rows of blocks (from row `from` of x) as int8 values and per-4-byte scales, row r at r·k.
+    private readonly struct UnpackRowsBody(string format, byte[] x, sbyte[] q, float[] s, int k, int from) : Team.IBody
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public void Run(int first, int last)
         {
-            int blocks = k / 32, bb = format == "q8_0" ? 34 : 18;
-            for (int r = first; r < last; r++)
-            {
-                for (int bl = 0; bl < blocks; bl++)
-                {
-                    long at = (long)r * blocks + bl;
-                    UnpackBlock(format, x.AsSpan((int)(at * bb), bb), out float d, q.AsSpan((int)(at * 32), 32));
-                    s.AsSpan((int)(at * 8), 8).Fill(d);
-                }
-            }
+            for (int r = first; r < last; r++) UnpackRow(format, x, from + r, k, q.AsSpan(r * k, k), s.AsSpan(r * (k / 4), k / 4));
         }
     }
 
-    private readonly struct MatMulBlocksBody(sbyte[] qa, float[] sa, sbyte[] qb, float[] sb, byte[] cLanes, int m, int n, int k) : Team.IBody
+    private static void UnpackRow(string format, byte[] x, int row, int k, Span<sbyte> q, Span<float> s)
+    {
+        int blocks = k / 32, bb = format == "q8_0" ? 34 : 18;
+        for (int bl = 0; bl < blocks; bl++)
+        {
+            long at = (long)row * blocks + bl;
+            UnpackBlock(format, x.AsSpan((int)(at * bb), bb), out float d, q.Slice(bl * 32, 32));
+            s.Slice(bl * 8, 8).Fill(d);
+        }
+    }
+
+    // A task: 4 rows of A, unpacked once, against the panel's B rows (C's columns j0 ..).
+    private readonly struct MatMulBlocksBody(string format, byte[] a, sbyte[] qb, float[] sb, byte[] cLanes, int m, int n, int k, int j0, int cols) : Team.IBody
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public void Run(int first, int last)
         {
             int w = Vector<int>.Count, k4 = k / 4;
-            var QA = MemoryMarshal.Cast<sbyte, int>(qa.AsSpan());
+            var qa = System.Buffers.ArrayPool<sbyte>.Shared.Rent(4 * k);
+            var sa = System.Buffers.ArrayPool<float>.Shared.Rent(4 * k4);
+            var QA = MemoryMarshal.Cast<sbyte, int>(qa.AsSpan(0, 4 * k));
             var QB = MemoryMarshal.Cast<sbyte, int>(qb.AsSpan());
             var C = MemoryMarshal.Cast<byte, float>(cLanes.AsSpan());
             for (int t = first; t < last; t++)
             {
                 int i0 = t * 4;
-                int r0 = i0, r1 = Math.Min(i0 + 1, m - 1), r2 = Math.Min(i0 + 2, m - 1), r3 = Math.Min(i0 + 3, m - 1);
-                for (int j0 = 0; j0 < n; j0 += 2)
+                for (int i = 0; i < 4; i++) UnpackRow(format, a, Math.Min(i0 + i, m - 1), k, qa.AsSpan(i * k, k), sa.AsSpan(i * k4, k4));
+                const int r0 = 0, r1 = 1, r2 = 2, r3 = 3;
+                for (int jj = 0; jj < cols; jj += 2)
                 {
-                    int c0 = j0, c1 = Math.Min(j0 + 1, n - 1);
+                    int c0 = jj, c1 = Math.Min(jj + 1, cols - 1);
                     Vector<float> a00 = default, a01 = default, a10 = default, a11 = default, a20 = default, a21 = default, a30 = default, a31 = default;
                     int v = 0;
                     for (; v + w <= k4; v += w)
@@ -163,10 +171,13 @@ internal sealed partial class Kernels
 
                     for (int i = 0; i < 4 && i0 + i < m; i++)
                     {
-                        for (int j = 0; j < 2 && j0 + j < n; j++) C[(i0 + i) * n + j0 + j] = acc[i * 2 + j];
+                        for (int j = 0; j < 2 && jj + j < cols; j++) C[(i0 + i) * n + j0 + jj + j] = acc[i * 2 + j];
                     }
                 }
             }
+
+            System.Buffers.ArrayPool<sbyte>.Shared.Return(qa);
+            System.Buffers.ArrayPool<float>.Shared.Return(sa);
         }
     }
 }

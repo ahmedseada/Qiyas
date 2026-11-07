@@ -176,6 +176,10 @@ public interface IFloatLane<TSelf, T> : ILane<TSelf, T> where TSelf : struct, IF
     static abstract T Sqrt(T x);
 
     static abstract T Div(T a, T b);
+
+    /// <summary>Runs <paramref name="visitor"/> with the lane's own stored type: the type whose stored values are this
+    /// lane's (float32 for f32, float64 for f64), for the intermediates a kernel keeps in the lane (scores, gates).</summary>
+    static abstract void Own<TV>(ref TV visitor) where TV : struct, IOwnVisitor<T>;
 }
 
 /// <summary>An accumulator lane TAcc fed by sizeof(TAcc)/sizeof(TIn) inputs packed in each lane: Fma(a, b, c) is c plus
@@ -196,6 +200,12 @@ public interface ISumVisitor : ILaneVisitor
 {
     void RunDot<TN, TIn, TAcc, TD>()
         where TN : struct, IAdad<TN, TIn>, IAdad<TN, TAcc> where TIn : unmanaged where TAcc : unmanaged where TD : struct, IDotLane<TD, TIn, TAcc>;
+}
+
+/// <summary>What runs with a float lane's own stored type (IFloatLane.Own).</summary>
+public interface IOwnVisitor<T> where T : unmanaged
+{
+    void Run<TS>() where TS : struct, IFloatAdad<TS>, IAdad<TS, T>;
 }
 
 public interface IFloatLaneVisitor
@@ -241,6 +251,7 @@ public readonly struct F32 : IFloatLane<F32, float>
     public static float Sub(float a, float b) => a - b;
     public static float Sqrt(float x) => MathF.Sqrt(x);
     public static float Div(float a, float b) => a / b;
+    public static void Own<TV>(ref TV visitor) where TV : struct, IOwnVisitor<float> => visitor.Run<Float32>();
 }
 
 public readonly struct F64 : IFloatLane<F64, double>
@@ -273,6 +284,7 @@ public readonly struct F64 : IFloatLane<F64, double>
     public static double Sub(double a, double b) => a - b;
     public static double Sqrt(double x) => Math.Sqrt(x);
     public static double Div(double a, double b) => a / b;
+    public static void Own<TV>(ref TV visitor) where TV : struct, IOwnVisitor<double> => visitor.Run<Float64>();
 }
 
 public readonly struct I64 : ILane<I64, long>

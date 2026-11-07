@@ -56,38 +56,34 @@ internal sealed partial class Kernels
         return MatMulView<TN>(new ProductView(a.OC, a.Cols, a.Rows, false, false), w, cols, y);
     }
 
-    /// <summary>dx and dw from dy, in the type's float lane storage (the columns' gradient is a sum of products: a narrow
-    /// type cannot hold it between the two passes); returns the lane's name.</summary>
-    public static string ConvBackward<TN>(ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dx, byte[] dw) where TN : struct, IFloatAdad<TN>
-    {
-        bool own = TN.Name is "float32" or "float64";
-        var lx = ToLane<TN>(x, a.XValues); var lw = ToLane<TN>(w, a.WValues); var ldy = ToLane<TN>(dy, a.YValues);
-        int size = TN.Bits == 64 ? 8 : 4;
-        var ldx = own ? dx : new byte[a.XValues * size];
-        var ldw = own ? dw : new byte[a.WValues * size];
-        if (TN.Bits == 64) BackwardIn<Float64>(a, lx, lw, ldy, ldx, ldw); else BackwardIn<Float32>(a, lx, lw, ldy, ldx, ldw);
-        if (!own) { FromLane<TN>(ldx, dx, a.XValues); FromLane<TN>(ldw, dw, a.WValues); }
-        return TN.Bits == 64 ? "f64" : "f32";
-    }
+    /// <summary>dx and dw from dy: x, w, dy read where they are stored, dx and dw stored as the type; the columns'
+    /// gradient (a sum of products the type cannot hold between the two passes) an intermediate in the float lane's own
+    /// type; returns the lane's name.</summary>
+    public static string ConvBackward<TN>(ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dx, byte[] dw) where TN : struct, IFloatAdad<TN> =>
+        Mixed<TN, ConvBackwardCall>(new(a, x, w, dy, dx, dw));
 
-    // dx = col2im(wᵀ · dy), the columns' gradient in a buffer the thread keeps (exact length, every value written by the
-    // product); dw = dy · colsᵀ with colsᵀ read from the image by the transposed packing (the implicit im2col: the same
-    // packed values as the columns', so the same result bit for bit), or the columns themselves where that does not apply.
-    private static void BackwardIn<TS>(ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dx, byte[] dw) where TS : struct, IFloatAdad<TS>
+    // dx = col2im(wᵀ · dy), the columns' gradient (TS) in a buffer the thread keeps (exact length, every value written by
+    // the product), col2im gathering it in the lane and storing dx as the type; dw = dy · colsᵀ with colsᵀ read from the
+    // image by the transposed packing (the implicit im2col: the same packed values as the columns', so the same result bit
+    // for bit), or the columns themselves (im2col into the lane's own type) where that does not apply.
+    private readonly struct ConvBackwardCall(ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dx, byte[] dw) : IMixed
     {
-        long bytes = BytesOf<TS>((long)a.Rows * a.Cols);
-        var dcols = Scratch.Get(Scratch.ConvDcols, bytes);
-        MatMulView<TS>(new ProductView(a.Rows, a.Cols, a.OC, true, false), w, dy, dcols);                   // wᵀ · dy
-        Layout<TS>(new LayoutArgs { Name = "col2im", X = dcols, P = a.P, Output = dx, Count = (int)a.XValues, InputCount = a.Rows * a.Cols });
-        if (FusedConv != false && ConvInPlace<TS>(a))
+        public string Run<TN, TS, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
         {
-            var product = new MatMulVisitor(dy, x, dw, a.OC, a.Rows, a.Cols) { Where = new Operands(TransB: true, ImageB: a) };
-            TS.Sum(ref product, new Bounds(0, 0, 0, 0, a.Cols));                                            // a float type's lane does not depend on them
-            return;
-        }
+            long values = (long)a.Rows * a.Cols;
+            var dcols = Scratch.Get(Scratch.ConvDcols, values * System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>());
+            MatMul<TN, TN, TS, TLane, TLane, TL>(w, dy, dcols, a.Rows, a.Cols, a.OC, new Operands(TransA: true));    // wᵀ · dy
+            LayoutFromLanes<TN, TLane, TL>(new LayoutArgs { Name = "col2im", X = dcols, P = a.P, Output = dx, Count = (int)a.XValues, InputCount = a.Rows * a.Cols });
+            if (FusedConv != false && ConvInPlace<TN>(a))
+            {
+                MatMul<TN, TN, TN, TLane, TLane, TL>(dy, x, dw, a.OC, a.Rows, a.Cols, new Operands(TransB: true, ImageB: a));
+                return TL.Name;
+            }
 
-        var cols = Scratch.Get(Scratch.ConvCols, bytes);
-        Layout<TS>(new LayoutArgs { Name = "im2col", X = x, P = a.P, Output = cols, Count = a.Rows * a.Cols, InputCount = (int)a.XValues });
-        MatMulView<TS>(new ProductView(a.OC, a.Rows, a.Cols, false, true), dy, cols, dw);                   // dy · colsᵀ
+            var cols = Scratch.Get(Scratch.ConvCols, values * System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>());
+            LayoutToLanes<TN, TLane, TL>(new LayoutArgs { Name = "im2col", X = x, P = a.P, Output = cols, Count = a.Rows * a.Cols, InputCount = (int)a.XValues });
+            MatMul<TN, TS, TN, TLane, TLane, TL>(dy, cols, dw, a.OC, a.Rows, a.Cols, new Operands(TransB: true));     // dy · colsᵀ
+            return TL.Name;
+        }
     }
 }

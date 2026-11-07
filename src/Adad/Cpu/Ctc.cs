@@ -11,7 +11,9 @@
 //   loss_b = −log P, log P = lse(α_{T_b−1}(S−1), α_{T_b−1}(S−2)).
 //   d loss / d logit_t(c) = y_t(c) − Σ_{s: l'_s = c} exp(α_t(s) + β_t(s) − log y_t(l'_s) − log P); 0 past T_b.
 // A sequence no alignment fits (too few frames for its labels and their repeats) has loss +∞ and a gradient of 0.
-// The lane is the float lane (f32; f64 for float64), a narrow type widened once and the results narrowed once.
+// The lane is the float lane (f32; f64 for float64): a sequence's task loads its rows into lanes (in place for float32
+// and float64) and stores its loss and gradient as the type (a block format's: the lane's values, encoded once — a
+// sequence's rows do not start on blocks).
 
 using System.Buffers;
 using System.Numerics;
@@ -27,37 +29,39 @@ internal sealed partial class Kernels
     public static string Ctc<TN>(CtcArgs a, byte[] x, byte[] loss, byte[]? grad) where TN : struct, IFloatAdad<TN>
     {
         a.Validate();
-        if (TN.Granularity > 8)
-        {
-            // A block format: the logits decoded into float32 storage once, the results encoded by blocks once (a sequence's
-            // rows do not start on blocks).
-            var lx = ToLane<TN>(x, a.Values);
-            var lloss = new byte[a.B * 4];
-            var lgrad = grad is null ? null : new byte[a.Values * 4];
-            var lanes = new CtcVisitor(a, lx, lloss, lgrad);
-            Float32.Float(ref lanes);
-            FromLane<TN>(lloss, loss, a.B);
-            if (grad is not null) FromLane<TN>(lgrad!, grad, a.Values);
-            return "f32";
-        }
-
-        // Any other float type read and written as stored, a row at a time inside its sequence's task (no widening pass).
         var vis = new CtcVisitor(a, x, loss, grad);
         TN.Float(ref vis);
-        return Wide<TN>() ? "f64" : "f32";
+        return vis.Lane;
     }
 
-    private readonly struct CtcVisitor(CtcArgs a, byte[] x, byte[] loss, byte[]? grad) : IFloatLaneVisitor
+    private struct CtcVisitor(CtcArgs a, byte[] x, byte[] loss, byte[]? grad) : IFloatLaneVisitor
     {
+        public string Lane = "";
+
         public void Run<TS, TLane, TL>() where TS : struct, IAdad<TS, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
         {
-            Team.For(a.B, 1, (long)a.T * a.C * (grad is null ? 2 : 4) + (long)a.T * a.MaxStates * 16, new CtcBody<TS, TLane, TL>(a, x, loss, grad));
+            Lane = TL.Name;
+            long work = (long)a.T * a.C * (grad is null ? 2 : 4) + (long)a.T * a.MaxStates * 16;
+            if (TS.Granularity == 1)
+            {
+                Team.For(a.B, 1, work, new CtcBody<TS, TLane, TL>(a, x, loss, grad, false));
+                return;
+            }
+
+            // A block format: the loss and the gradient as the lane's values, encoded once.
+            int size = System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>();
+            var lloss = new byte[a.B * size];
+            var lgrad = grad is null ? null : new byte[a.Values * size];
+            Team.For(a.B, 1, work, new CtcBody<TS, TLane, TL>(a, x, lloss, lgrad, true));
+            StoreLanes<TS, TLane>(lloss, loss, 0, a.B);
+            if (grad is not null) StoreLanes<TS, TLane>(lgrad!, grad, 0, a.Values);
         }
     }
 
     // A sequence: its rows' log-sum-exp and the states' emissions; α forward (a vector of states at a time), log P and
     // the loss; for the gradient β backward and, per frame, the row's softmax less each state's exp(α + β − log y − log P).
-    private readonly struct CtcBody<TS, TLane, TL>(CtcArgs a, byte[] x, byte[] loss, byte[]? grad) : Team.IBody
+    // lanesOut: loss and grad are the lane's values (a block format's, encoded after).
+    private readonly struct CtcBody<TS, TLane, TL>(CtcArgs a, byte[] x, byte[] loss, byte[]? grad, bool lanesOut) : Team.IBody
         where TS : struct, IAdad<TS, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         public void Run(int first, int last)
@@ -86,8 +90,9 @@ internal sealed partial class Kernels
         {
             int B = a.B, C = a.C, tb = a.InputLengths[b], S = 2 * a.LabelLengths[b] + 1, w = Vector<TLane>.Count;
             int Sp = (S + w - 1) / w * w, stride = Sp + 2 * w;              // states rounded to whole vectors; pads around them
-            // float32 / float64 rows read and written where they are stored; a narrower type's rows converted into lanes here.
-            bool own = TS.Name is "float32" or "float64";
+            // float32 / float64 rows read and written where they are stored; a narrower type's rows converted into lanes here
+            // (own), its outputs stored as the type, or written as lanes (lanesOut).
+            bool own = TS.Direct, ownOut = own || lanesOut;
             var X = own ? null : pool0().Rent(tb * C);
             if (!own) for (int t = 0; t < tb; t++) TS.Load(x, (int)(((long)t * B + b) * C), X.AsSpan(t * C, C));
             var negInf = TL.NegativeInfinity;
@@ -154,7 +159,7 @@ internal sealed partial class Kernels
                 var last = alpha.AsSpan((tb - 1) * stride + w, S);
                 var logP = Lse(new Vector<TLane>(last[S - 1]), new Vector<TLane>(S >= 2 ? last[S - 2] : negInf), new Vector<TLane>(negInf))[0];
                 Span<TLane> one = [TL.Sub(TL.Zero, logP)];
-                TS.Store(one, loss, b);
+                if (ownOut) MemoryMarshal.Cast<byte, TLane>(loss.AsSpan())[b] = one[0]; else TS.Store(one, loss, b);
                 if (grad is null) return;
 
                 var g = pool.Rent(C);
@@ -163,7 +168,7 @@ internal sealed partial class Kernels
                 for (int t = none ? 0 : tb; t < a.T; t++)
                 {
                     int at0 = (int)(((long)t * B + b) * C);
-                    if (own) MemoryMarshal.Cast<byte, TLane>(grad.AsSpan()).Slice(at0, C).Clear(); else TS.Store(g.AsSpan(0, C), grad, at0);
+                    if (ownOut) MemoryMarshal.Cast<byte, TLane>(grad.AsSpan()).Slice(at0, C).Clear(); else TS.Store(g.AsSpan(0, C), grad, at0);
                 }
 
                 if (none) { pool.Return(g); return; }
@@ -203,11 +208,11 @@ internal sealed partial class Kernels
                     Span<TLane> row = own ? MemoryMarshal.Cast<byte, TLane>(x.AsSpan()).Slice((int)(((long)t * B + b) * C), C) : X.AsSpan(t * C, C);
                     var vl = new Vector<TLane>(lse[t]);
                     int at1 = (int)(((long)t * B + b) * C), c = 0;
-                    Span<TLane> gs = own ? MemoryMarshal.Cast<byte, TLane>(grad.AsSpan()).Slice(at1, C) : g.AsSpan(0, C);
+                    Span<TLane> gs = ownOut ? MemoryMarshal.Cast<byte, TLane>(grad.AsSpan()).Slice(at1, C) : g.AsSpan(0, C);
                     for (; c + w <= C; c += w) TL.Exp(TL.Sub(new Vector<TLane>(row.Slice(c, w)), vl)).CopyTo(gs.Slice(c, w));
                     for (; c < C; c++) gs[c] = TL.Exp(TL.Sub(row[c], lse[t]));
                     for (int s = 0; s < S; s++) gs[cls[s]] = TL.Sub(gs[cls[s]], gamma[s]);
-                    if (!own) TS.Store(gs, grad, at1);
+                    if (!ownOut) TS.Store(gs, grad, at1);
                 }
 
                 pool.Return(g);
