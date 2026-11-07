@@ -247,7 +247,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
     private readonly List<Row> _rows = [];
     private readonly string _baseline = options.BaselineOf(subjects);
 
-    public static int MatSize(Device device) => Prime(device == Device.Cuda ? 2048 : 1024);
+    public static int MatSize(Device device) => Prime(device == Device.Cpu ? 1024 : 2048);
 
     public void Run(Device device, string type)
     {

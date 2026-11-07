@@ -1168,25 +1168,27 @@ internal static partial class Checks
 
     /// <summary>Every type: 37 × 29 × 53 with each transposition, three batches of it at contiguous strides, and the
     /// backward pair, against float64 within the product's rounding over k terms.</summary>
-    public static bool Products(GpuOps? ops)
+    // blocks: false where the device refuses the block formats (said so, not proved).
+    public static bool Products(IDevice<ulong, ulong>? ops, string device = "device", bool blocks = true)
     {
         bool ok = true;
-        string where = ops is null ? "cpu" : "device";
+        string where = ops is null ? "cpu" : device;
+        var cuda = ops as GpuOps;
         const int M = 37, N = 29, K = 53;
         // On the device, every tensor kind it accepts: the measured choice, then the 4-bit kinds forced on and off with the
         // 32-deep 8-bit instruction forced on and off (a timing may pick any of them on a run).
-        var kinds = ops is null ? [(null, null, "")] : new (bool? four, bool? k32, string name)[] { (null, null, ""), (true, true, " [4-bit, k32]"), (true, false, " [4-bit, k16]"), (false, true, " [8-bit, k32]"), (false, false, " [8-bit, k16]") };
+        var kinds = cuda is null ? [(null, null, "")] : new (bool? four, bool? k32, string name)[] { (null, null, ""), (true, true, " [4-bit, k32]"), (true, false, " [4-bit, k16]"), (false, true, " [8-bit, k32]"), (false, false, " [8-bit, k16]") };
         // The device's pass repeated under --repeat (Stress / 20 passes): a fault that depends on the buffers' history shows.
         for (int pass = 0, passes = ops is null ? 1 : Math.Max(1, Stress / 20); pass < passes && ok; pass++)
         {
             foreach (var (four, k32, kindName) in kinds)
             {
-                if (ops is not null) { ops.FourBit = four; ops.K32 = k32; }
-                ok &= ProductsWith(ops, where, M, N, K, pass == 0 ? kindName : $"{kindName} pass {pass + 1}");
+                if (cuda is not null) { cuda.FourBit = four; cuda.K32 = k32; }
+                ok &= ProductsWith(ops, where, M, N, K, pass == 0 ? kindName : $"{kindName} pass {pass + 1}", blocks);
             }
         }
 
-        if (ops is not null) { ops.FourBit = null; ops.K32 = null; }
+        if (cuda is not null) { cuda.FourBit = null; cuda.K32 = null; }
         // The packing reading the views' operands where they are stored (Aᵀ, Bᵀ, batch offsets): shapes that take that
         // route. CPU: two panels of k with a partial last group, edge rows and strips; and batch strides on whole blocks
         // (the block formats in place too). Device: whole tiles (the tensor and dot routes).
@@ -1195,39 +1197,43 @@ internal static partial class Checks
             ok &= ProductsWith(null, where, 64, 40, 330, " [in place]");
             ok &= ProductsWith(null, where, 64, 48, 320, " [in place]");
         }
-        else ok &= ProductsWith(ops, where, 128, 256, 128, " [in place]");
-        if (ops is not null)
+        else ok &= ProductsWith(ops, where, 128, 256, 128, " [in place]", blocks);
+        if (cuda is not null)
         {
             // Split-k (item 6j): one tile of C (37 × 29 padded to 128 × 256) with k = 1100 (1152 padded): the rule's 4 slices,
             // then 5 forced (the last slice shorter).
             ok &= ProductsWith(ops, where, 37, 29, 1100, " [split-k]");
-            ops.SplitSlices = 5;
+            cuda.SplitSlices = 5;
             ok &= ProductsWith(ops, where, 37, 29, 1100, " [split-k 5]");
-            ops.SplitSlices = null;
+            cuda.SplitSlices = null;
             // As on a device that refuses the staged kernel (asynchronous copies): the 32-bit lanes on the register-tiled one.
-            ops.Staged = false;
+            cuda.Staged = false;
             ok &= ProductsWith(ops, where, 37, 29, 53, " [no staged kernel]");
-            ops.Staged = null;
+            cuda.Staged = null;
         }
+        else if (ops is not null) ok &= ProductsWith(ops, where, 37, 29, 1100, " [long k]", blocks);
 
-        if (ops is not null) ok &= Epilogues(ops);
-        if (ops is not null) ok &= TensorConfigs(ops);
+        if (cuda is not null) ok &= Epilogues(cuda);
+        if (cuda is not null) ok &= TensorConfigs(cuda);
         ok &= BlockProducts(ops, where);
-        if (ok) Console.WriteLine($"check products               {where,-6} every type at 37 x 29 x 53, transposed, batched, and the backward pair{(ops is null ? "" : ", under every tensor kind")}; read in place at {(ops is null ? "64 x 40 x 330 and 64 x 48 x 320" : "128 x 256 x 128; split-k at 37 x 29 x 1100")}: within the product's rounding{(ops is null ? "" : "; C stored as the type by the product (every type but the blocks and 32-bit), and the 16-bit floats' operands read in place, equal bit for bit to packed operands and C converted after, every tensor configuration and kind and the dot route")}");
+        if (ok && cuda is null && ops is not null) Console.WriteLine($"check products               {where,-6} every type{(blocks ? "" : " but the block formats")} at 37 x 29 x 53, transposed, batched, and the backward pair; at 128 x 256 x 128 and 37 x 29 x 1100: within the product's rounding");
+        else if (ok) Console.WriteLine($"check products               {where,-6} every type at 37 x 29 x 53, transposed, batched, and the backward pair{(ops is null ? "" : ", under every tensor kind")}; read in place at {(ops is null ? "64 x 40 x 330 and 64 x 48 x 320" : "128 x 256 x 128; split-k at 37 x 29 x 1100")}: within the product's rounding{(ops is null ? "" : "; C stored as the type by the product (every type but the blocks and 32-bit), and the 16-bit floats' operands read in place, equal bit for bit to packed operands and C converted after, every tensor configuration and kind and the dot route")}");
         return ok;
     }
 
     /// <summary>The block-scaled products where the device has them: A·Bᵀ of two Q8_0 / Q4_0 operands at 37 × 29 with k = 64
     /// and 320 (whole blocks), the block product forced, against the double-double reference of the stored values; gemv's
     /// block path at 37 rows of 64 (the reductions' gate has 1001 columns, never a whole number of blocks).</summary>
-    private static bool BlockProducts(GpuOps? ops, string where)
+    private static bool BlockProducts(IDevice<ulong, ulong>? device, string where)
     {
-        bool available = ops is null ? Kernels.BlockProductAvailable : ops.BlockProductAvailable;
+        bool available = device is null ? Kernels.BlockProductAvailable : device.BlockProductAvailable;
         if (!available)
         {
-            Console.WriteLine($"check block products         {where,-6} not available here (the {(ops is null ? "s8 dot lane" : "s8 tensor instruction at k = 32")}): the decoded route stands");
+            Console.WriteLine($"check block products         {where,-6} not available here (the {(device is null ? "s8 dot lane" : device is GpuOps ? "s8 tensor instruction at k = 32" : "device's block-scaled product")}): the decoded route stands");
             return true;
         }
+
+        var ops = (GpuOps?)device;
 
         bool ok = true;
         const int M = 37, N = 29;
@@ -1301,11 +1307,12 @@ internal static partial class Checks
         return ok;
     }
 
-    private static bool ProductsWith(GpuOps? ops, string where, int M, int N, int K, string kindName)
+    private static bool ProductsWith(IDevice<ulong, ulong>? ops, string where, int M, int N, int K, string kindName, bool blocks = true)
     {
         bool ok = true;
         foreach (var type in Bench.Registry.Names)
         {
+            if (!blocks && Bench.Registry.IsBlock(type)) continue;
             var views = new List<ProductView>();
             foreach (bool ta in new[] { false, true }) foreach (bool tb in new[] { false, true }) views.Add(new ProductView(M, N, K, ta, tb));
             views.Add(new ProductView(M, N, K, false, true, 3, M * K, N * K, M * N));
@@ -1402,7 +1409,7 @@ internal static partial class Checks
         return ok;
     }
 
-    private sealed class ProductRun(GpuOps? ops, ProductView v, byte[] a, byte[] b, byte[] c, byte[]? da, byte[]? db) : Bench.ITypeVisitor<bool>
+    private sealed class ProductRun(IDevice<ulong, ulong>? ops, ProductView v, byte[] a, byte[] b, byte[] c, byte[]? da, byte[]? db) : Bench.ITypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IAdad<TN, float>
         {
@@ -1413,26 +1420,25 @@ internal static partial class Checks
                 return true;
             }
 
-            var gpu = ops.Gpu;
-            ulong dA = gpu.Rent(a.Length), dB = gpu.Rent(b.Length), dC = gpu.Rent(c.Length);
-            Adad.Cuda.Gpu.Upload<byte>(a, dA); Adad.Cuda.Gpu.Upload<byte>(b, dB);
+            ulong dA = ops.Rent(a.Length + 16), dB = ops.Rent(b.Length + 16), dC = ops.Rent(c.Length + 16);
+            ops.Upload(a, dA); ops.Upload(b, dB);
             if (backward)
             {
-                Adad.Cuda.Gpu.Upload<byte>(c, dC);
-                ulong dDa = gpu.Rent(da!.Length), dDb = gpu.Rent(db!.Length);
+                ops.Upload(c, dC);
+                ulong dDa = ops.Rent(da!.Length + 16), dDb = ops.Rent(db!.Length + 16);
                 ops.MatMulBackward<TN>(dA, dB, dC, dDa, dDb, v.M, v.N, v.K);
-                Adad.Cuda.Gpu.Synchronize();
-                Adad.Cuda.Gpu.Download<byte>(dDa, da); Adad.Cuda.Gpu.Download<byte>(dDb, db);
-                gpu.Return(dDa); gpu.Return(dDb);
+                ops.Synchronize();
+                ops.Download(dDa, da); ops.Download(dDb, db);
+                ops.Return(dDa); ops.Return(dDb);
             }
             else
             {
                 ops.MatMulView<TN>(v, dA, dB, dC);
-                Adad.Cuda.Gpu.Synchronize();
-                Adad.Cuda.Gpu.Download<byte>(dC, c);
+                ops.Synchronize();
+                ops.Download(dC, c);
             }
 
-            gpu.Return(dA); gpu.Return(dB); gpu.Return(dC);
+            ops.Return(dA); ops.Return(dB); ops.Return(dC);
             return true;
         }
     }

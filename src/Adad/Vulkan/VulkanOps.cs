@@ -86,16 +86,6 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
 
     // ---------------------------------------------------------------- the families not on Vulkan yet
 
-    public string MatMul<TN>(ulong a, ulong b, ulong c, int m, int n, int k) where TN : struct, IAdad<TN> => throw Missing("matmul");
-
-    public string MatMulView<TN>(ProductView v, ulong a, ulong b, ulong c) where TN : struct, IAdad<TN> => throw Missing("matmul (view)");
-
-    public string MatMulBackward<TN>(ulong a, ulong b, ulong dc, ulong da, ulong db, int m, int n, int k) where TN : struct, IAdad<TN> => throw Missing("matmul backward");
-
-    public string MatMulViewBlocks<TN>(ProductView v, ulong a, ulong b, ulong c) where TN : struct, IAdad<TN> => throw Missing("block-scaled matmul");
-
-    public bool BlockProductAvailable => false;
-
     public string Attention<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IFloatAdad<TN> => throw Missing("attention");
 
     public string AttentionComposed<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IFloatAdad<TN> => throw Missing("attention (composed)");

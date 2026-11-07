@@ -17,6 +17,7 @@ internal static partial class Checks
         ok &= Group2(ops, "vulkan", blocks: false);
         ok &= Rows(ops, "vulkan");
         ok &= Layouts(ops, "vulkan", blocks: false);
+        ok &= Products(ops, "vulkan", blocks: false);
         return ok;
     }
 
