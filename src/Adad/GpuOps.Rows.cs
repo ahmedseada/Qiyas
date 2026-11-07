@@ -9,7 +9,7 @@ public sealed partial class GpuOps
 {
     private (int Threads, int PerThread, bool Vector, bool ValueWise) RowKernelShape(Fmt f, int cols, string what)
     {
-        bool valueWise = (long)cols * f.Bits % f.WordBits != 0;
+        bool valueWise = f.IsBlock || (long)cols * f.Bits % f.WordBits != 0;      // a block format: value by value, decoded in place
         int threads, perThread;
         if (valueWise)
         {
@@ -31,22 +31,7 @@ public sealed partial class GpuOps
     public string RowOp<TN>(RowOp op, ulong x, ulong x2, ulong g, ulong bt, ulong s, ulong pos, ulong y, ulong y2, int rows, int cols, double a, double b) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsBlock)
-        {
-            var r = new List<ulong>();
-            try
-            {
-                long n = (long)rows * cols;
-                ulong lx = Lanes(f, Lane.F32, x, n, r), lx2 = x2 == 0 ? 0 : Lanes(f, Lane.F32, x2, n, r), lg = g == 0 ? 0 : Lanes(f, Lane.F32, g, cols, r), lb = bt == 0 ? 0 : Lanes(f, Lane.F32, bt, cols, r), ls = s == 0 ? 0 : Lanes(f, Lane.F32, s, rows, r);
-                ulong ly = gpu.Rent(n * 4), ly2 = y2 == 0 ? 0 : gpu.Rent(n * 4);
-                r.Add(ly); if (ly2 != 0) r.Add(ly2);
-                RowOp<Float32>(op, lx, lx2, lg, lb, ls, pos, ly, ly2, rows, cols, a, b);
-                Back(f, Lane.F32, ly, y, n);
-                if (y2 != 0) Back(f, Lane.F32, ly2, y2, n);
-                return "f32 (blocks through lane storage)";
-            }
-            finally { foreach (var p in r) gpu.Return(p); }
-        }
+        if (f.IsBlock) return RowOpBlocks(f, op, x, x2, g, bt, s, pos, y, y2, rows, cols, a, b);
 
         var lane = RowLane(f);
         var (threads, perThread, vector, valueWise) = RowKernelShape(f, cols, op.Name);
@@ -63,6 +48,42 @@ public sealed partial class GpuOps
         try { Gpu.Launch(fn, (uint)rows, 1, (uint)threads, 1, 0, x, x2, g, bt, s, pos, y, y2, Gpu.U(rows), Gpu.U(cols), lane.Wide ? Gpu.D(a) : Gpu.F((float)a), lane.Wide ? Gpu.D(b) : Gpu.F((float)b)); }
         catch (InvalidOperationException e) { throw new InvalidOperationException($"{op.Name} {f.Name} {rows} x {cols}: {threads} threads x {perThread} values, vector {vector}, value-wise {valueWise}, segmented {segmented}: {e.Message}", e); }
         return lane.Name;
+    }
+
+    // A block format's row operation (Ptx.RowStats, Ptx.RowOpBlocks): the rows' statistics by a block a row, its inputs
+    // decoded in place, then a warp per output block replaying the operation for each value with its row's statistics.
+    private string RowOpBlocks(Fmt f, RowOp op, ulong x, ulong x2, ulong g, ulong bt, ulong s, ulong pos, ulong y, ulong y2, int rows, int cols, double a, double b)
+    {
+        var lane = Lane.F32;
+        var (threads, perThread, _, _) = RowKernelShape(f, cols, op.Name);
+        bool second = x2 != 0, segmented = Segmented(f, cols, perThread, threads, true);
+        var st = gpu.Cached($"rowstats:{op.Name}:{f.Name}:{perThread}:{threads}:{second}:{segmented}", (out string e) => Ptx.RowStats(gpu, f, lane, op, perThread, threads, second, out e, segmented));
+        if (threads > Gpu.MaxThreads(st))
+        {
+            (threads, perThread) = (256, 8);
+            segmented = Segmented(f, cols, perThread, threads, true);
+            st = gpu.Cached($"rowstats:{op.Name}:{f.Name}:{perThread}:{threads}:{second}:{segmented}", (out string e) => Ptx.RowStats(gpu, f, lane, op, perThread, threads, second, out e, segmented));
+        }
+
+        ulong stats = gpu.Rent((long)rows * 4 * lane.Size);
+        try
+        {
+            ulong[] args = [x, x2, g, bt, s, pos, y, y2, Gpu.U(rows), Gpu.U(cols), Gpu.F((float)a), Gpu.F((float)b), stats];
+            Gpu.Launch(st, (uint)rows, 1, (uint)threads, 1, 0, args);
+            var blocks = gpu.Cached($"rowblocks:{op.Name}:{f.Name}:{second}:False", (out string e) => Ptx.RowOpBlocks(gpu, f, lane, op, second, false, out e));
+            Gpu.Launch(blocks, BlockGrid(f, (long)rows * cols), 1, 256, 1, 0, args);
+            if (y2 != 0)
+            {
+                var blocks2 = gpu.Cached($"rowblocks:{op.Name}:{f.Name}:{second}:True", (out string e) => Ptx.RowOpBlocks(gpu, f, lane, op, second, true, out e));
+                Gpu.Launch(blocks2, BlockGrid(f, (long)rows * cols), 1, 256, 1, 0, args);
+            }
+        }
+        finally
+        {
+            gpu.Return(stats);
+        }
+
+        return "f32 (blocks in place)";
     }
 
     private static bool Segmented(Fmt f, int cols, int perThread, int threads, bool valueWise) => (valueWise ? cols : f.Words(cols)) > (long)perThread * threads;

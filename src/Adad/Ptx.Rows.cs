@@ -25,6 +25,52 @@ internal static partial class Ptx
             ReduceBytes);
     }
 
+    // ---------------------------------------------------------------- a block format's row operation: statistics, then the blocks
+    // A row's outputs may share a block with the next row's (a row need not end on a block), so the blocks are written by
+    // their own kernel: the row operation's reductions first (RowStats: a block per row, its inputs decoded in place, the
+    // k-th reduction's result kept at stats[row·4 + k]), then a warp per output block (RowOpBlocks), each value the
+    // operation replayed for that one value with its row's statistics read back (the same instructions after the
+    // reductions, so the same bits as one kernel holding the row), and the block encoded from those values.
+
+    /// <summary>The row operation's reductions over rows of block format f into stats (lane values, 4 a row).</summary>
+    public static string RowStats(Gpu gpu, Fmt f, Lane lane, RowOp op, int perThread, int threads, bool second, out string entry, bool segmented = false)
+    {
+        entry = $"rowstats_{op.Name}_{f.Name}_{lane.Name}_r{perThread}_t{threads}{(second ? "" : "_nosecond")}{(segmented ? "_seg" : "")}";
+        var c = new RowCtx(new PtxBuilder(), f, lane, perThread, threads, false, true, segmented) { Mode = RowMode.Stats };
+        c.Prologue(op.Second && second);
+        EmitRowOp(c, op);
+        c.B.L("ret;");
+        return c.B.Finish(Header(gpu), entry, RowParams(lane) + ", .param .u64 p_stats", ReduceBytes);
+    }
+
+    /// <summary>The row operation's output (out2: its second output) as blocks of f over rows · cols values: a warp per block,
+    /// each value the operation replayed with its row's statistics (RowStats).</summary>
+    public static string RowOpBlocks(Gpu gpu, Fmt f, Lane lane, RowOp op, bool second, bool out2, out string entry)
+    {
+        entry = $"rowblocks_{op.Name}_{f.Name}_{lane.Name}{(second ? "" : "_nosecond")}{(out2 ? "_y2" : "")}";
+        var c = new RowCtx(new PtxBuilder(), f, lane, 1, 1, false, true) { Mode = RowMode.Replay };
+        var b = c.B;
+        c.PrologueReplay(op.Second && second);
+        string n = b.R();
+        b.L($"mul.lo.u32 {n}, {c.Rows}, {c.Cols};");
+        var w = BlockWarp(b, f, n);
+        EncodeBlock(b, f, out2 ? c.Dst2 : c.Dst, w, n, at =>
+        {
+            c.BeginValue(at);
+            EmitRowOp(c, op);
+            return (out2 ? c.Captured2 : c.Captured) ?? throw new InvalidOperationException($"{op.Name}: no {(out2 ? "second " : "")}output");
+        });
+        b.Label("DONE");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, RowParams(lane) + ", .param .u64 p_stats");
+    }
+
+    private static string RowParams(Lane lane)
+    {
+        string pa = lane.Wide ? "f64" : "f32";
+        return $".param .u64 p_x, .param .u64 p_x2, .param .u64 p_g, .param .u64 p_bt, .param .u64 p_s, .param .u64 p_pos, .param .u64 p_y, .param .u64 p_y2, .param .u32 p_rows, .param .u32 p_cols, .param .{pa} p_a, .param .{pa} p_b";
+    }
+
     /// <summary>stats[2·row] = mean (0 when not centered), stats[2·row + 1] = 1/√(mean (x − mean)² + eps), lane values.</summary>
     public static string NormStats(Gpu gpu, Fmt f, Lane lane, bool centered, int perThread, int threads, bool vector, bool valueWise, out string entry, bool segmented = false)
     {
@@ -105,8 +151,22 @@ internal static partial class Ptx
 
     // ---------------------------------------------------------------- the row context: loads, lane arithmetic, reductions, stores
 
+    private enum RowMode { Normal, Stats, Replay }
+
     private sealed class RowCtx(PtxBuilder b, Fmt f, Lane lane, int perThread, int threads, bool vector, bool valueWise, bool segmented = false)
     {
+        /// <summary>Normal: the row held, reduced, stored. Stats: the reductions only, each kept at stats[row·4 + k] (thread 0),
+        /// no store. Replay: one value at a time (BeginValue), each reduction read back from stats, the store's value captured.</summary>
+        public RowMode Mode { get; init; }
+
+        private string _stats = "", _tid0 = "";
+        private int _k;
+
+        /// <summary>Replay: the value the operation stores (its second output's), for the value BeginValue set.</summary>
+        public string? Captured, Captured2;
+
+        public string Dst2 => _dst2;
+
         public PtxBuilder B => b;
         public bool Segmented => segmented;
         private string _segBase = "", _segs = "", _seg = "";
@@ -145,6 +205,12 @@ internal static partial class Ptx
             A = lane.NewReg(b); Bs = lane.NewReg(b);
             b.L($"ld.param.{lane.Op} {A}, [p_a];");
             b.L($"ld.param.{lane.Op} {Bs}, [p_b];");
+            if (Mode == RowMode.Stats)
+            {
+                _stats = Param64(b, "p_stats"); _tid0 = b.P();
+                b.L($"setp.eq.u32 {_tid0}, {Tid}, 0;");
+            }
+
             _x = new string[perThread][]; _col = new string[perThread][]; _pv = new string[perThread];
             _second = second;
             if (!valueWise)
@@ -226,6 +292,39 @@ internal static partial class Ptx
             }
         }
 
+        /// <summary>Replay: the parameters, once for the kernel (the values' rows set by BeginValue).</summary>
+        public void PrologueReplay(bool second)
+        {
+            Cols = b.R(); Rows = b.R(); ColsM1 = b.R();
+            b.L($"ld.param.u32 {Cols}, [p_cols];");
+            b.L($"ld.param.u32 {Rows}, [p_rows];");
+            b.L($"sub.u32 {ColsM1}, {Cols}, 1;");
+            Src = Param64(b, "p_x"); Dst = Param64(b, "p_y"); _src2 = Param64(b, "p_x2"); _dst2 = Param64(b, "p_y2");
+            _pg = Param64(b, "p_g"); _pb = Param64(b, "p_bt"); _ps = Param64(b, "p_s"); _ppos = Param64(b, "p_pos");
+            _stats = Param64(b, "p_stats");
+            A = lane.NewReg(b); Bs = lane.NewReg(b);
+            b.L($"ld.param.{lane.Op} {A}, [p_a];");
+            b.L($"ld.param.{lane.Op} {Bs}, [p_b];");
+            _second = second;
+            _pv = [b.P()];
+            b.L($"setp.eq.u32 {_pv[0]}, {Cols}, {Cols};");                      // always: the one value is present
+        }
+
+        /// <summary>Replay: the value at linear index `at` (row at / cols): its inputs decoded, the row's caches cleared.</summary>
+        public void BeginValue(string at)
+        {
+            Row = b.R(); _base = b.R();
+            string col = b.R();
+            b.L($"div.u32 {Row}, {at}, {Cols};");
+            b.L($"mul.lo.u32 {_base}, {Row}, {Cols};");
+            b.L($"sub.u32 {col}, {at}, {_base};");
+            _col = [[col]];
+            _x = [[Codec.UnpackAt(b, f, Src, at, lane)]];
+            _x2 = [_second ? [Codec.UnpackAt(b, f, _src2, at, lane)] : null!];
+            _g = []; _bt = []; _s = null; _pos = null; _posInt = null;
+            _k = 0; Captured = null; Captured2 = null;
+        }
+
         public string X(int q, int i) => _x[q][i];
 
         /// <summary>The second row's value; zero when the operation's second input was not given (an absent mask).</summary>
@@ -256,6 +355,17 @@ internal static partial class Ptx
         public string S()
         {
             if (_s is not null) return _s;
+            if (Mode == RowMode.Replay)
+            {
+                string pn = b.P(), ptr = b.RD(), at = b.R(), r = lane.NewReg(b);
+                b.L($"setp.eq.u64 {pn}, {_ps}, 0;");
+                b.L($"selp.b64 {ptr}, {Src}, {_ps}, {pn};");
+                b.L($"selp.u32 {at}, 0, {Row}, {pn};");
+                string got = Codec.UnpackAt(b, f, ptr, at, lane);
+                b.L($"selp.{lane.Op} {r}, {lane.Literal(1)}, {got}, {pn};");
+                return _s = r;
+            }
+
             string pz = b.P(), v = lane.NewReg(b);
             b.L($"setp.eq.u64 {pz}, {_ps}, 0;");
             b.L($"mov.{lane.Reg} {v}, {lane.Literal(1)};");
@@ -401,22 +511,59 @@ internal static partial class Ptx
         /// <summary>The block's reduction ("add" or "max") of term(q, i) over this thread's present values.</summary>
         public string Reduce(string kind, Func<int, int, string> term)
         {
+            if (Mode == RowMode.Replay)
+            {
+                string addr = b.RD(), slot = b.R(), v = lane.NewReg(b);
+                b.L($"mad.lo.u32 {slot}, {Row}, 4, {_k++};");
+                b.L($"mul.wide.u32 {addr}, {slot}, {lane.Size};");
+                b.L($"add.u64 {addr}, {_stats}, {addr};");
+                b.L($"ld.global.{lane.Mem} {v}, [{addr}];");
+                return v;
+            }
+
+            string result = ReduceRow(kind, term);
+            if (Mode == RowMode.Stats)
+            {
+                string addr = b.RD(), slot = b.R();
+                b.L($"mad.lo.u32 {slot}, {Row}, 4, {_k++};");
+                b.L($"mul.wide.u32 {addr}, {slot}, {lane.Size};");
+                b.L($"add.u64 {addr}, {_stats}, {addr};");
+                b.L($"@{_tid0} st.global.{lane.Mem} [{addr}], {result};");
+            }
+
+            return result;
+        }
+
+        private string ReduceRow(string kind, Func<int, int, string> term)
+        {
             string acc = lane.NewReg(b);
             b.L($"mov.{lane.Reg} {acc}, {(kind == "max" ? lane.Literal(double.NegativeInfinity) : lane.Zero)};");
             BeginSegments();
             foreach (var (q, i) in Each())
             {
                 string t = term(q, i);
-                b.L(kind == "max" ? $"@{Pred(q)} max.{lane.Op} {acc}, {acc}, {t};" : $"@{Pred(q)} {lane.Add(acc, acc, t)}");
+                b.L(kind switch
+                {
+                    "max" => $"@{Pred(q)} max.{lane.Op} {acc}, {acc}, {t};",
+                    "sumsq" => $"@{Pred(q)} {lane.Fma(acc, t, t, acc)}",                 // Σ t² by fma
+                    _ => $"@{Pred(q)} {lane.Add(acc, acc, t)}",
+                });
             }
 
             EndSegments();
-            return BlockReduce(b, lane, Tid, acc, kind, threads);
+            return BlockReduce(b, lane, Tid, acc, kind == "max" ? "max" : "add", threads);
         }
 
         /// <summary>The output row (or the second one) from value(q, i).</summary>
         public void Store(Func<int, int, string> value, bool second = false)
         {
+            if (Mode == RowMode.Stats) return;
+            if (Mode == RowMode.Replay)
+            {
+                if (second) Captured2 = value(0, 0); else Captured = value(0, 0);
+                return;
+            }
+
             if (!valueWise)
             {
                 BeginSegments();
@@ -445,11 +592,32 @@ internal static partial class Ptx
 
     // ---------------------------------------------------------------- the operations
 
+    /// <summary>Softmax and rms_norm as row operations (their own kernels otherwise, Ptx.SoftmaxRegs and Ptx.RmsNormRegs, whose
+    /// arithmetic these repeat): a block format's rows take them through RowStats and RowOpBlocks. rms_norm's eps is `a`.</summary>
+    internal static readonly RowOp SoftmaxRow = new("softmax", false, false, false, false, false, false, 0, 0, static (_, _, _, _, _, _, _, _, _, _, _) => 0);
+    internal static readonly RowOp RmsNormRow = new("rms_norm", false, false, false, false, false, false, 0, 0, static (_, _, _, _, _, _, _, _, _, _, _) => 0);
+
     private static void EmitRowOp(RowCtx c, RowOp op)
     {
         string n = c.Count();
         switch (op.Name)
         {
+            case "softmax":
+            {
+                string m = c.Reduce("max", c.X);
+                string sum = c.Reduce("add", (q, i) => c.Exp(c.Sub(c.X(q, i), m)));
+                string scale = c.Rcp(sum);
+                c.Store((q, i) => c.Quotient(c.Exp(c.Sub(c.X(q, i), m)), sum, scale));
+                return;
+            }
+
+            case "rms_norm":
+            {
+                string scale = c.Rcp(c.Sqrt(c.Add(c.Div(c.Reduce("sumsq", c.X), n), c.A)));
+                c.Store((q, i) => c.Mul(c.X(q, i), scale));
+                return;
+            }
+
             case "log_softmax":
             {
                 string m = c.Reduce("max", c.X);

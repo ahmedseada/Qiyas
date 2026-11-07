@@ -9,6 +9,8 @@ namespace Adad;
 internal static partial class Ptx
 {
     /// <summary>values[r][i], indices[r][i] for i &lt; k: the row's largest first, ties by the lower index.</summary>
+    /// <summary>Top-k of each row: indices s32, values as the type (a block format's values gathered after, GatherRowsBlocks:
+    /// only the indices here).</summary>
     public static string TopKRows(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"topk_rows_{f.Name}_{lane.Name}";
@@ -73,7 +75,7 @@ internal static partial class Ptx
             b.L($"mul.wide.u32 {iAddr}, {oIdx}, 4;");
             b.L($"add.u64 {iAddr}, {indices}, {iAddr};");
             b.L($"st.global.s32 [{iAddr}], {bi};");
-            StoreAnyValue(b, f, lane, bv, values, oIdx);
+            if (!f.IsBlock) StoreAnyValue(b, f, lane, bv, values, oIdx);
             _ = vAddr;
         }
 
@@ -179,6 +181,7 @@ internal static partial class Ptx
     /// row, any row length, stored as the type: one pass, each thread's running max m and Σ exp(x − m) (a larger value
     /// rescales the sum: one exp a value, e = exp(−|x − m|)), the threads' pairs joined by the same rule, then
     /// (m − x[t]) + log Σ.</summary>
+    /// <summary>Each row's loss as the type; a block format's as f32 (one a row, the rows' result before its blocks are encoded).</summary>
     public static string CrossEntropyRows(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"cross_entropy_rows_{f.Name}_{lane.Name}";
@@ -216,7 +219,7 @@ internal static partial class Ptx
         b.L($"sub.rn.{lane.Op} {d}, {bm}, {xt};");
         string ls = Fn.Log(b, lane, bs);
         b.L($"add.rn.{lane.Op} {loss}, {d}, {ls};");
-        StoreAnyValue(b, f, lane, loss, outp, row);
+        StoreAnyValue(b, f.IsBlock ? LaneFormat(Lane.F32) : f, lane, loss, outp, row);
         b.Label("OUT");
         b.L("ret;");
         return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_t, .param .u64 p_out, .param .u32 p_cols", ReduceBytes * 2);
@@ -424,5 +427,29 @@ internal static partial class Ptx
         b.Label("DONE");
         b.L("ret;");
         return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_u, .param .u64 p_picks, .param .u32 p_cols", ReduceBytes + 256 * 8 + 16);
+    }
+
+    /// <summary>out[r][j] = x[r][index[r·k + j]] (s32 columns) over rows · k values of block format f: a warp per output block,
+    /// each value decoded where it is stored and the block encoded (top-k's values, pick's with k = 1).</summary>
+    public static string GatherRowsBlocks(Gpu gpu, Fmt f, out string entry)
+    {
+        entry = $"gather_rows_{f.Name}_blocks";
+        var b = new PtxBuilder();
+        string x = Param64(b, "p_x"), index = Param64(b, "p_index"), po = Param64(b, "p_o"), rows = Param32(b, "p_rows"), cols = Param32(b, "p_cols"), k = Param32(b, "p_k"), n = b.R();
+        b.L($"mul.lo.u32 {n}, {rows}, {k};");
+        var w = BlockWarp(b, f, n);
+        EncodeBlock(b, f, po, w, n, at =>
+        {
+            string r = b.R(), col = b.R(), ia = b.RD(), src = b.R();
+            b.L($"div.u32 {r}, {at}, {k};");
+            b.L($"mul.wide.u32 {ia}, {at}, 4;");
+            b.L($"add.u64 {ia}, {index}, {ia};");
+            b.L($"ld.global.u32 {col}, [{ia}];");
+            b.L($"mad.lo.u32 {src}, {r}, {cols}, {col};");
+            return Codec.UnpackAt(b, f, x, src, Lane.F32);
+        });
+        b.Label("DONE");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_index, .param .u64 p_o, .param .u32 p_rows, .param .u32 p_cols, .param .u32 p_k");
     }
 }

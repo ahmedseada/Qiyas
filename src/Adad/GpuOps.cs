@@ -34,17 +34,10 @@ public sealed partial class GpuOps(Gpu gpu)
         var f = Fmt.Of<TN>();
         if (f.IsBlock)
         {
-            // A block format: the sum in float32 storage, the result encoded by blocks.
-            var r = new List<ulong>();
-            try
-            {
-                ulong la = Lanes(f, Lane.F32, a, n, r), lb = Lanes(f, Lane.F32, b, n, r), lc = gpu.Rent(n * 4L);
-                r.Add(lc);
-                Add<Float32>(la, lb, lc, n);
-                Back(f, Lane.F32, lc, c, n);
-                return;
-            }
-            finally { foreach (var p in r) gpu.Return(p); }
+            // A block format: a thread per output block, the inputs decoded in place, the sum in f32 registers, the block encoded.
+            var fb = gpu.Cached($"add_blocks:{f.Name}", (out string e) => Ptx.AddBlocks(gpu, f, out e));
+            Gpu.Launch(fb, BlockGrid(f, n), 1, 256, 1, 0, a, b, c, Gpu.U(n));
+            return;
         }
 
         var fn = gpu.Cached($"add:{f.Name}", (out string e) => Ptx.Add(gpu, f, out e));
@@ -227,16 +220,9 @@ public sealed partial class GpuOps(Gpu gpu)
         var f = Fmt.Of<TN>();
         if (f.IsBlock)
         {
-            var r = new List<ulong>();
-            try
-            {
-                ulong lx = Lanes(f, Lane.F32, x, (long)rows * cols, r), lv = Lanes(f, Lane.F32, v, cols, r), lo = gpu.Rent((long)rows * cols * 4);
-                r.Add(lo);
-                MapRow<Float32>(op, lx, lv, lo, rows, cols);
-                Back(f, Lane.F32, lo, output, (long)rows * cols);
-                return "f32 (blocks through lane storage)";
-            }
-            finally { foreach (var p in r) gpu.Return(p); }
+            var fb = gpu.Cached($"maprow_blocks:{op.Name}:{f.Name}", (out string e) => Ptx.MapRowBlocks(gpu, f, op, out e));
+            Gpu.Launch(fb, BlockGrid(f, (long)rows * cols), 1, 256, 1, 0, x, v, output, Gpu.U(rows * cols), Gpu.U(cols));
+            return "f32 (blocks in place)";
         }
 
         var lane = f.Natural;
@@ -251,16 +237,9 @@ public sealed partial class GpuOps(Gpu gpu)
         var f = Fmt.Of<TN>();
         if (f.IsBlock)
         {
-            var r = new List<ulong>();
-            try
-            {
-                ulong lx = Lanes(f, Lane.F32, x, (long)rows * cols, r), lo = gpu.Rent((long)rows * cols * 4);
-                r.Add(lo);
-                Transpose<Float32>(lx, lo, rows, cols);
-                Back(f, Lane.F32, lo, output, (long)rows * cols);
-                return "f32 (blocks through lane storage)";
-            }
-            finally { foreach (var p in r) gpu.Return(p); }
+            var fb = gpu.Cached($"transpose_blocks:{f.Name}", (out string e) => Ptx.TransposeBlocks(gpu, f, out e));
+            Gpu.Launch(fb, BlockGrid(f, (long)rows * cols), 1, 256, 1, 0, x, output, Gpu.U(rows), Gpu.U(cols));
+            return "f32 (blocks in place)";
         }
 
         var lane = f.Natural;
@@ -284,21 +263,8 @@ public sealed partial class GpuOps(Gpu gpu)
             finally { gpu.Return(yBlocks); }
         }
 
-        if (f.IsBlock)
-        {
-            var r = new List<ulong>();
-            try
-            {
-                int xCount = transposed ? rows : cols, yCount = transposed ? cols : rows;
-                ulong la = Lanes(f, Lane.F32, a, (long)rows * cols, r), lx = Lanes(f, Lane.F32, x, xCount, r), ly = gpu.Rent(yCount * 4L);
-                r.Add(ly);
-                Gemv<Float32>(la, lx, ly, rows, cols, transposed);
-                Back(f, Lane.F32, ly, y, yCount);
-                return "f32 (blocks through lane storage)";
-            }
-            finally { foreach (var p in r) gpu.Return(p); }
-        }
-
+        // Every type, block formats too: A and x read in place (decoded a value at a time), y's sums in the sum lane, then
+        // stored as the type (a block format's blocks encoded from them).
         int xn = transposed ? rows : cols, yn = transposed ? cols : rows;
         var ((aLo, aHi), (xLo, xHi)) = RangePair<TN>(a, rows * cols, x, xn);
         var bounds = new Bounds(aLo, aHi, xLo, xHi, xn);
@@ -352,16 +318,11 @@ public sealed partial class GpuOps(Gpu gpu)
         var f = Fmt.Of<TN>();
         if (f.IsBlock)
         {
-            var r = new List<ulong>();
-            try
-            {
-                ulong lx = x == 0 ? 0 : Lanes(f, Lane.F32, x, n, r), ly = y == 0 ? 0 : Lanes(f, Lane.F32, y, n, r), lz = z == 0 ? 0 : Lanes(f, Lane.F32, z, n, r), lo = gpu.Rent(n * 4L);
-                r.Add(lo);
-                Map<Float32>(op, lx, ly, lz, lo, n, a, b);
-                Back(f, Lane.F32, lo, output, n);
-                return "f32 (blocks through lane storage)";
-            }
-            finally { foreach (var p in r) gpu.Return(p); }
+            // A thread per output block: the inputs decoded in place, the formula in f32 registers, the block encoded.
+            (a, b) = Kernels.Held<Float32>(a, b);
+            var fb = gpu.Cached($"map_blocks:{op.Name}:{f.Name}", (out string e) => Ptx.MapBlocks(gpu, f, op, out e));
+            Gpu.Launch(fb, BlockGrid(f, n), 1, 256, 1, 0, x, y, z, output, Gpu.U(n), Gpu.F((float)a), Gpu.F((float)b));
+            return "f32 (blocks in place)";
         }
 
         if (op.FloatOnly && !f.IsFloat) throw new NotSupportedException($"{op.Name}: a float formula; {f.Name} is not a float type");
@@ -965,12 +926,15 @@ public sealed partial class GpuOps(Gpu gpu)
         return buffer;
     }
 
+    /// <summary>The grid of a warp-per-block kernel over count values of block format f (256 threads a CTA).</summary>
+    private static uint BlockGrid(Fmt f, long count) => Grid(Ptx.BlockThreads(f, count), 256);
+
     private void Back(Fmt f, Lane lane, ulong lanes, ulong stored, long count)
     {
         if (f.IsBlock)
         {
             var encode = gpu.Cached($"lanes_to:{f.Name}:{lane.Name}", (out string e) => Ptx.LanesToBlock(gpu, f, lane, out e));
-            Gpu.Launch(encode, Grid((count + f.BlockValues - 1) / f.BlockValues, 256), 1, 256, 1, 0, lanes, stored, Gpu.U((int)count));
+            Gpu.Launch(encode, BlockGrid(f, count), 1, 256, 1, 0, lanes, stored, Gpu.U((int)count));
             return;
         }
 
@@ -1025,25 +989,10 @@ public sealed partial class GpuOps(Gpu gpu)
     }
 
     /// <summary>A block format's row operation: the rows in float32 storage, the result encoded by blocks.</summary>
-    private string RowsThroughLanes(Fmt f, ulong x, ulong y, int rows, int cols, Func<ulong, ulong, string> run)
-    {
-        var r = new List<ulong>();
-        try
-        {
-            long n = (long)rows * cols;
-            ulong lx = Lanes(f, Lane.F32, x, n, r), ly = gpu.Rent(n * 4);
-            r.Add(ly);
-            run(lx, ly);
-            Back(f, Lane.F32, ly, y, n);
-            return "f32 (blocks through lane storage)";
-        }
-        finally { foreach (var p in r) gpu.Return(p); }
-    }
-
     public string Softmax<TN>(ulong x, ulong y, int rows, int cols) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsBlock) return RowsThroughLanes(f, x, y, rows, cols, (lx, ly) => Softmax<Float32>(lx, ly, rows, cols));
+        if (f.IsBlock) return RowOpBlocks(f, Ptx.SoftmaxRow, x, 0, 0, 0, 0, 0, y, 0, rows, cols, 0, 0);
         CheckRows(f, cols);
         var lane = RowLane(f);
         var (threads, perThread) = RowShape(f, cols);
@@ -1060,7 +1009,7 @@ public sealed partial class GpuOps(Gpu gpu)
     public string RmsNorm<TN>(ulong x, ulong y, int rows, int cols, double eps) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsBlock) return RowsThroughLanes(f, x, y, rows, cols, (lx, ly) => RmsNorm<Float32>(lx, ly, rows, cols, eps));
+        if (f.IsBlock) return RowOpBlocks(f, Ptx.RmsNormRow, x, 0, 0, 0, 0, 0, y, 0, rows, cols, eps, 0);
         CheckRows(f, cols);
         var lane = RowLane(f);
         var (threads, perThread) = RowShape(f, cols);

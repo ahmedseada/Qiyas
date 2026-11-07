@@ -11,25 +11,19 @@ public sealed partial class GpuOps
     {
         var f = Fmt.Of<TN>();
         var lane = f.Natural;
-        if (f.IsBlock)
-        {
-            // A block format's rows decoded into float32 storage, the top-k there, the values encoded by blocks.
-            var r = new List<ulong>();
-            try
-            {
-                ulong lx = Lanes(f, Lane.F32, x, (long)rows * cols, r), lv = gpu.Rent((long)rows * k * 4);
-                r.Add(lv);
-                TopK<Float32>(lx, rows, cols, k, lv, indices);
-                Back(f, Lane.F32, lv, values, (long)rows * k);
-                return "f32 (blocks through lane storage)";
-            }
-            finally { foreach (var q in r) gpu.Return(q); }
-        }
-
+        if (f.IsBlock) lane = Lane.F32;                                           // a block format: its rows decoded in place, in f32
         if (k > 256) throw new NotSupportedException($"top-k: k = {k} exceeds the kernel's passes (256); a partial sort is the step");
         var fn = gpu.Cached($"topk:{f.Name}", (out string e) => Ptx.TopKRows(gpu, f, lane, out e));
         if (f.Bits < 8) Gpu.Clear(values, f.Words((long)rows * k) * 4);           // sub-byte values are OR-ed into their words
         Gpu.Launch(fn, (uint)rows, 1, 256, 1, 0, x, values, indices, Gpu.U(cols), Gpu.U(k));
+        if (f.IsBlock)
+        {
+            // The values: each row's chosen columns gathered where they are stored and their blocks encoded.
+            var gather = gpu.Cached($"gather_rows_blocks:{f.Name}", (out string e) => Ptx.GatherRowsBlocks(gpu, f, out e));
+            Gpu.Launch(gather, BlockGrid(f, (long)rows * k), 1, 256, 1, 0, x, indices, values, Gpu.U(rows), Gpu.U(cols), Gpu.U(k));
+            return "f32 (blocks in place)";
+        }
+
         return lane.Name;
     }
 
@@ -39,16 +33,10 @@ public sealed partial class GpuOps
         var f = Fmt.Of<TN>();
         if (f.IsBlock)
         {
-            var r = new List<ulong>();
-            try
-            {
-                ulong lx = Lanes(f, Lane.F32, x, (long)rows * cols, r), lo = gpu.Rent(rows * 4L);
-                r.Add(lo);
-                Pick<Float32>(lx, rows, cols, index, lo);
-                Back(f, Lane.F32, lo, output, rows);
-                return "f32 (blocks through lane storage)";
-            }
-            finally { foreach (var q in r) gpu.Return(q); }
+            // Each row's value gathered where it is stored, the blocks encoded.
+            var gather = gpu.Cached($"gather_rows_blocks:{f.Name}", (out string e) => Ptx.GatherRowsBlocks(gpu, f, out e));
+            Gpu.Launch(gather, BlockGrid(f, rows), 1, 256, 1, 0, x, index, output, Gpu.U(rows), Gpu.U(cols), Gpu.U(1));
+            return "f32 (blocks in place)";
         }
 
         var fn = gpu.Cached($"pick:{f.Name}", (out string e) => Ptx.PickRows(gpu, f, f.Natural, out e));
@@ -61,22 +49,21 @@ public sealed partial class GpuOps
     public string CrossEntropy<TN>(ulong x, int rows, int cols, ulong targets, ulong output) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsBlock)
-        {
-            var r = new List<ulong>();
-            try
-            {
-                ulong lx = Lanes(f, Lane.F32, x, (long)rows * cols, r), lo = gpu.Rent(rows * 4L);
-                r.Add(lo);
-                CrossEntropy<Float32>(lx, rows, cols, targets, lo);
-                Back(f, Lane.F32, lo, output, rows);
-                return "f32 (blocks through lane storage)";
-            }
-            finally { foreach (var q in r) gpu.Return(q); }
-        }
-
         var lane = RowLane(f);
         var fn = gpu.Cached($"cross_entropy:{f.Name}", (out string e) => Ptx.CrossEntropyRows(gpu, f, lane, out e));
+        if (f.IsBlock)
+        {
+            // A block format: the rows read in place, each row's loss in f32 (one a row), those encoded by blocks.
+            ulong losses = gpu.Rent(rows * 4L);
+            try
+            {
+                Gpu.Launch(fn, (uint)rows, 1, Ptx.ReduceThreads, 1, 0, x, targets, losses, Gpu.U(cols));
+                Back(f, Lane.F32, losses, output, rows);
+            }
+            finally { gpu.Return(losses); }
+            return "f32 (blocks in place)";
+        }
+
         if (f.Bits < 8) Gpu.Clear(output, f.Words(rows) * 4);
         Gpu.Launch(fn, (uint)rows, 1, Ptx.ReduceThreads, 1, 0, x, targets, output, Gpu.U(cols));
         return lane.Name;
