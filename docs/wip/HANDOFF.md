@@ -592,6 +592,22 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
     was reverted).
   - Measured: see COVERAGE (the pools, the row operations, ctc).
 
+- 6k (the re-measure-only rows): done, reported (no code change; COVERAGE's rows updated). Single-family runs, qiyas
+  only, each under 5 minutes (the CPU recurrent family 3 min 49 s, the rest 30–70 s); old builds in temporary worktrees
+  (c936dca, a784145; removed) where a cell needed its own code's reading under the same conditions.
+  - Done (stable): the sub-byte products on views, AggressiveOptimization on the block product, item 4's changed CPU
+    matmul cells and CUDA matmul int4, the float64 attention and conv paths (the measured choices consistent), the
+    int64 product swing (the first timed row after the gates), the CPU recurrent rows, the CPU int8 / float16 sums.
+  - The CPU int8 / float16 sums: float16 sum:rows / whole / sumsq:rows bimodal at 0.40 / 0.60 ms on c936dca's build and
+    on HEAD alike (alternating runs); int8 sum:whole 0.147 / 0.114 / 0.073 at HEAD against 0.078 / 0.096 / 0.264 at
+    c936dca in three alternating pairs; int8 sum:rows 0.05 (6j part 5's fix).
+  - The run-order effect and CUDA softmax float16: the card's memory clock (COVERAGE's three-stream row). The device's
+    rows family in three runs: the float16 rows 1.6–1.9× wherever the `nvidia-smi` trace (250 ms) showed P3; float32
+    scale_mask_softmax 0.262 / 0.263 / 0.499. A device row's reading in a run follows the state the driver picked for
+    the load before it; a full run's device rows carry that (not addressed in the bench: the coordinator's call).
+  - Left as they are (stable, the step known): CUDA attention rows in float32 (the FMA rows: no tensor kind holds
+    float32 exactly), 3.80 ms.
+
 ## Item 5 progress
 
 - Done, reported (uncommitted until the coordinator's go). What landed:
