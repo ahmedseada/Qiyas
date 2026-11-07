@@ -147,11 +147,6 @@ internal sealed partial class Kernels
         public readonly void Run(int first, int last) => TN.Load(stored, first, lanes.AsSpan(first, last - first));
     }
 
-    private struct StoreBody<TN, TLane>(TLane[] lanes, byte[] stored, int offset = 0) : Team.IBody where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
-    {
-        public readonly void Run(int first, int last) => TN.Store(lanes.AsSpan(first, last - first), stored, offset + first);
-    }
-
     // G rows of inputs (each n long, contiguous) into n accumulator-sized units: unit j holds the G values of column j,
     // the first in the low bits (the order the widening multiply-add reads).
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -314,8 +309,10 @@ internal sealed partial class Kernels
     // Aᵀ stored (TransA): the panel's k-row p of Aᵀ holds the tile's rows contiguously, so each block takes R values a
     // k-row straight into its [group][R] layout (no row-major staging, no transpose step); types whose stored bytes are
     // not the lane load the tile's span of each k-row once per panel.
-    private struct ProductBody<TN, TIn, TAcc, TL>(byte[] a, TIn[]? aLanes, TAcc[] packed, TAcc[] cLanes, byte[] c, bool storeTiles,
-        int m, int n, int k, int kg, int tileRows, int tileStrips, int rowTiles, int aOff = 0, bool transA = false, int cLanesOff = 0, int cOff = 0)
+    // cLanes: C's stored bytes as lanes (the type's storage is the lane's), written in place; null: each task's tile of C
+    // in lanes, accumulated over the panels of k and stored as the type when the tile is done (no C in lanes exists whole).
+    private struct ProductBody<TN, TIn, TAcc, TL>(byte[] a, TIn[]? aLanes, TAcc[] packed, TAcc[]? cLanes, byte[] c,
+        int m, int n, int k, int kg, int tileRows, int tileStrips, int rowTiles, int aOff = 0, bool transA = false, int cOff = 0)
         : Team.IBody where TN : struct, IAdad<TN, TIn>, IAdad<TN, TAcc> where TIn : unmanaged where TAcc : unmanaged where TL : struct, ILane<TL, TAcc>
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -331,10 +328,15 @@ internal sealed partial class Kernels
             Span<TAcc> spill = stackalloc TAcc[R * strip];
             ReadOnlySpan<TIn> direct = Lanes.Direct<TN, TIn>() ? MemoryMarshal.Cast<byte, TIn>(a.AsSpan()) : aLanes;
             TIn[]? kRows = transA && direct.IsEmpty ? Workspace<TIn>.Rent(Workspace.KRows, KC * tileRows) : null;
+            TAcc[]? tile = cLanes is null ? Workspace<TAcc>.Rent(Workspace.CLanes, tileRows * tileStrips * strip) : null;
             for (int t = first; t < last; t++)
             {
                 int r0 = t % rowTiles * tileRows, r1 = Math.Min(m, r0 + tileRows);
                 int s0 = t / rowTiles * tileStrips, s1 = Math.Min(strips, s0 + tileStrips);
+                // Where the micro-kernel accumulates: C in place (rows n apart), or the tile (rows its width apart).
+                int j0 = s0 * strip, width = Math.Min(n, s1 * strip) - j0;
+                var target = tile ?? cLanes!;
+                int ti = tile is null ? 0 : r0, tj = tile is null ? 0 : j0, tn = tile is null ? n : width, tOff = tile is null ? cOff : 0;
                 for (int pc = 0; pc < k; pc += KC)
                 {
                     int kc = Math.Min(KC, k - pc), kcg = (kc + g - 1) / g, padded = kcg * g;
@@ -385,20 +387,22 @@ internal sealed partial class Kernels
                         for (int bi = 0; bi < blocks; bi++)
                         {
                             int i = r0 + bi * R, rows = Math.Min(R, r1 - i);
-                            Micro<TAcc, TL>(panel.AsSpan(bi * kcg0 * R, kcg * R), bstrip, cLanes, i, rows, s * strip, n, kcg, pc == 0, spill, cLanesOff);
+                            Micro<TAcc, TL>(panel.AsSpan(bi * kcg0 * R, kcg * R), bstrip, target, i - ti, rows, s * strip - tj, tn, kcg, pc == 0, spill, tOff);
                         }
                     }
                 }
 
-                if (storeTiles)
+                // The tile as the type: its rows' segments (whole rows, one span, where tiles are whole rows).
+                if (tile is not null)
                 {
-                    int j0 = s0 * strip, j1 = Math.Min(n, s1 * strip);
-                    for (int r = r0; r < r1; r++) TN.Store(cLanes.AsSpan(r * n + j0, j1 - j0), c, cOff + r * n + j0);
+                    if (width == n) TN.Store(tile.AsSpan(0, (r1 - r0) * n), c, cOff + r0 * n);
+                    else for (int r = r0; r < r1; r++) TN.Store(tile.AsSpan((r - r0) * width, width), c, cOff + r * n + j0);
                 }
             }
 
             Workspace<TAcc>.Return(Workspace.Panel, panel);
             if (kRows is not null) Workspace<TIn>.Return(Workspace.KRows, kRows);
+            if (tile is not null) Workspace<TAcc>.Return(Workspace.CLanes, tile);
         }
     }
 
@@ -607,7 +611,6 @@ internal sealed partial class Kernels
         var inPool = ArrayPool<TIn>.Shared;
         var accPool = ArrayPool<TAcc>.Shared;
         TIn[]? al = null, bl = null;
-        TAcc[]? cl = null;
         long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         var packed = Workspace<TAcc>.Rent(Workspace.Packed, strips * strip * kg);
         try
@@ -629,35 +632,32 @@ internal sealed partial class Kernels
             Team.For(kg, Math.Max(1, kg / (Threads * 2)), (long)k * n, new PackBody<TN, TIn, TAcc>(b, bl, packed, n, k, strip, kg, o.BOff, o.TransB, o.ImageB));
             t0 = Mark(t0, 1);
 
-            // C in lanes (the stored bytes themselves when they are lanes).
-            cl = cDirect ? null : Workspace<TAcc>.Rent(Workspace.CLanes, m * n);
-            var cLanes = cl ?? Unsafe.As<TAcc[]>(c);
-
-            // Tiles of C: about six per thread (cores of unequal speed balance through the shared counter), rows in whole blocks, columns in whole strips.
-            int tileStrips = Math.Max(1, Math.Min(strips, 256 / strip * 2));
-            int colTiles = (strips + tileStrips - 1) / tileStrips;
-            int wantRows = Math.Max(1, Threads * 6 / colTiles);
-            int tileRows = Math.Max(R, (m + wantRows - 1) / wantRows + R - 1) / R * R;
-            int rowTiles = (m + tileRows - 1) / tileRows;
-            bool storeTiles = cl is not null && nRows && strip % TN.Granularity == 0 && n % TN.Granularity == 0;
-            Team.For(rowTiles * colTiles, 1, (long)m * n * k,
-                new ProductBody<TN, TIn, TAcc, TL>(a, al, packed, cLanes, c, storeTiles, m, n, k, kg, tileRows, tileStrips, rowTiles, o.AOff, o.TransA, cl is null ? o.COff : 0, o.COff));
-            t0 = Mark(t0, 2);
-
-            if (cl is not null && !storeTiles)
+            // Tiles of C: about six per thread (cores of unequal speed balance through the shared counter), rows in whole blocks,
+            // columns in whole strips. C is the stored bytes themselves when they are lanes; otherwise each task's tile is in
+            // lanes and stored as the type when done, which needs every tile's row segments to start on whole storage units:
+            // where strips or rows do not (values below a byte, blocks), tiles of whole rows, as many as start on whole units.
+            int tileStrips = Math.Max(1, Math.Min(strips, 256 / strip * 2)), rowsUnit = R;
+            int unit = TN.Granularity;
+            if (!cDirect && !(nRows && strip % unit == 0 && n % unit == 0))
             {
-                int unit = Math.Max(64, TN.Granularity);                          // chunks of whole storage units: two tasks never share a block
-                Team.For(m * n, Math.Max(4096, m * n / (Threads * 2)) / unit * unit, m * n, new StoreBody<TN, TAcc>(cl, c, o.COff));
+                tileStrips = strips;
+                int q = unit / Gcd(n, unit);
+                rowsUnit = R / Gcd(R, q) * q;
             }
 
-            Mark(t0, 3);
+            int colTiles = (strips + tileStrips - 1) / tileStrips;
+            int wantRows = Math.Max(1, Threads * 6 / colTiles);
+            int tileRows = Math.Max(rowsUnit, (m + wantRows - 1) / wantRows + rowsUnit - 1) / rowsUnit * rowsUnit;
+            int rowTiles = (m + tileRows - 1) / tileRows;
+            Team.For(rowTiles * colTiles, 1, (long)m * n * k,
+                new ProductBody<TN, TIn, TAcc, TL>(a, al, packed, cDirect ? Unsafe.As<TAcc[]>(c) : null, c, m, n, k, kg, tileRows, tileStrips, rowTiles, o.AOff, o.TransA, o.COff));
+            Mark(t0, 2);
         }
         finally
         {
             Workspace<TAcc>.Return(Workspace.Packed, packed);
             if (al is not null) Workspace<TIn>.Return(Workspace.ALanes, al);
             if (bl is not null) Workspace<TIn>.Return(Workspace.BLanes, bl);
-            if (cl is not null) Workspace<TAcc>.Return(Workspace.CLanes, cl);
         }
     }
 

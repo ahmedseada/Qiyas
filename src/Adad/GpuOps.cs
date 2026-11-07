@@ -428,6 +428,7 @@ public sealed partial class GpuOps(Gpu gpu)
             bool tiny = f.Bits <= 4 || bounds.Within(f.Signed ? -8 : 0, f.Signed ? 7 : 15);
             var kind = EightBitKind(f.Signed, bounds.Terms);
             var kind4 = f.Signed ? Ptx.Kind.S4 : Ptx.Kind.U4;
+            if (Dot == true && Dp4aSupported(f.Signed)) return kind.Name + "dp";
             bool has8 = MmaSupported(kind), has4 = tiny && MmaSupported(kind4);
             if (has4 && (!has8 || (FourBit ?? FasterKind(kind4, kind, bounds.Terms)))) return kind4.Name + "mma";
             if (has8) return kind.Name + "mma";
@@ -517,9 +518,34 @@ public sealed partial class GpuOps(Gpu gpu)
         return fn;
     }
 
-    /// <summary>The gate's override: false stores a 16-bit float product's C in f32 and converts it after (the pass the
-    /// epilogue replaces).</summary>
-    public bool? Epilogue16;
+    /// <summary>The gate's override: false stores a packed product's C in its accumulator lane and converts it after (the
+    /// pass the epilogue replaces).</summary>
+    public bool? Epilogue;
+
+    /// <summary>The packed product's kernel (tensor or dot) on packed or in-place operands, m × n of C at kp (padded k).
+    /// C is written as the type by the kernel's epilogue, so no C in the lane exists in memory, for every type but the
+    /// block formats (encoded a block at a time); a 32-bit type in its lane's own storage takes the lane's C as is.
+    /// Returns where C was written: c, or (Epilogue false) a lane C the caller converts with Back.</summary>
+    private ulong PackedProduct(Fmt f, Ptx.Kind kind, string laneName, ulong pa, ulong pb, ulong c, int m, int n, int kp, List<ulong> rented, bool kMajorA = false, bool kMajorB = false)
+    {
+        var lane = LaneOf(laneName);
+        bool cAsIs = f.Bits == 32 && f.IsFloat == lane.IsFloat;
+        Fmt? store = cAsIs || f.IsBlock || Epilogue == false ? null : f;
+        ulong lc = c;
+        if (!cAsIs && store is null) { lc = gpu.Rent((long)m * n * lane.Size); rented.Add(lc); }
+        if (laneName.EndsWith("mma", StringComparison.Ordinal))
+        {
+            var fn = MmaFunction(kind, out uint shared, out int bn, store, kMajorA, kMajorB);
+            Gpu.Launch(fn, Grid(n, bn), Grid(m, 128), Ptx.GemmThreads, 1, shared, pa, pb, lc, Gpu.U(m), Gpu.U(n), Gpu.U(kp), Gpu.U(kp));
+        }
+        else
+        {
+            var fn = gpu.Cached($"dp4a:{f.Signed}:{store?.Name}", (out string e) => Ptx.GemmDot(gpu, f.Signed, out e, store));
+            Gpu.Launch(fn, Grid(n, 128), Grid(m, 128), Ptx.GemmThreads, 1, 0, pa, pb, lc, Gpu.U(m), Gpu.U(n), Gpu.U(kp / 4));
+        }
+
+        return lc;
+    }
 
     /// <summary>The gate's override: false packs a 16-bit float product's operands even where the tensor kernel reads them
     /// as stored (the passes the in-place reads replace).</summary>
@@ -538,6 +564,10 @@ public sealed partial class GpuOps(Gpu gpu)
     /// where values fit, and the 32-deep 8-bit instruction over the 16-deep one — so every kind the device accepts is
     /// checked, not only the one a timing happened to pick.</summary>
     internal bool? FourBit, K32;
+
+    /// <summary>The gate's override: true takes the dot route (dp4a) where values fit 8 bits, over the tensor kinds, as on a
+    /// device without them.</summary>
+    internal bool? Dot;
 
     // The 8-bit tensor instruction the device runs faster: one taking 16 or 32 values of k (measured once).
     private Ptx.Kind EightBitKind(bool signed, long terms)
@@ -631,34 +661,10 @@ public sealed partial class GpuOps(Gpu gpu)
                 t0 = Mark(t0, 0);
                 ulong pb = inPlace ? b : Pack(f, kind, b, n, k, kp, transposed: !transB, rented);
                 t0 = Mark(t0, 1);
-                bool cAsIs = f.Bits == 32 && f.IsFloat == lane.IsFloat;
-                if (laneName.EndsWith("mma", StringComparison.Ordinal) && Epilogue16 != false && (f.Is("float16") || f.Is("bfloat16")))
-                {
-                    // The 16-bit epilogue: C stored as the type by the kernel (no f32 C, no conversion pass).
-                    var fe = MmaFunction(kind, out uint sharedE, out int bnE, f, kMajorA, kMajorB);
-                    Gpu.Launch(fe, Grid(n, bnE), Grid(m, 128), Ptx.GemmThreads, 1, sharedE, pa, pb, c, Gpu.U(m), Gpu.U(n), Gpu.U(kp), Gpu.U(kp));
-                    Gpu.Flush();                                       // the product submitted now, not batched behind later launches
-                    Mark(Mark(t0, 2), 3);
-                    return laneName;
-                }
-
-                ulong lc = cAsIs ? c : gpu.Rent((long)m * n * 4);
-                if (!cAsIs) rented.Add(lc);
-                if (laneName.EndsWith("mma", StringComparison.Ordinal))
-                {
-                    var fn = MmaFunction(kind, out uint shared, out int bn, null, kMajorA, kMajorB);
-                    Gpu.Launch(fn, Grid(n, bn), Grid(m, 128), Ptx.GemmThreads, 1, shared, pa, pb, lc, Gpu.U(m), Gpu.U(n), Gpu.U(kp), Gpu.U(kp));
-                    Gpu.Flush();
-                }
-                else
-                {
-                    var fn = gpu.Cached($"dp4a:{f.Signed}", (out string e) => Ptx.GemmDot(gpu, f.Signed, out e));
-                    Gpu.Launch(fn, Grid(n, 128), Grid(m, 128), Ptx.GemmThreads, 1, 0, pa, pb, lc, Gpu.U(m), Gpu.U(n), Gpu.U(kp / 4));
-                    Gpu.Flush();
-                }
-
+                ulong lc = PackedProduct(f, kind, laneName, pa, pb, c, m, n, kp, rented, kMajorA, kMajorB);
+                Gpu.Flush();                                           // the product submitted now, not batched behind later launches
                 t0 = Mark(t0, 2);
-                if (!cAsIs) Back(f, lane, lc, c, (long)m * n);
+                if (lc != c) Back(f, lane, lc, c, (long)m * n);
                 Mark(t0, 3);
                 return laneName;
             }

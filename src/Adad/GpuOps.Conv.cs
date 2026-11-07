@@ -91,20 +91,8 @@ public sealed partial class GpuOps
             Gpu.Launch(convFn, Grid(n, 64), (uint)(kp / 32), 256, 1, 0, [x, pb, Gpu.U(n), Gpu.U(k), Gpu.U(kp), .. ConvArgsOf(a)]);
             // C as MatMul writes it (in place when the lane is the type's storage), at the padded shape when padded.
             ulong typed = whole ? y : Rent(f.Words((long)M * N) * (f.WordBits / 8));
-            bool cAsIs = f.Bits == 32 && f.IsFloat == lane.IsFloat;
-            ulong lc = cAsIs ? typed : Rent((long)M * N * 4);
-            if (laneName.EndsWith("mma", StringComparison.Ordinal))
-            {
-                var fn = MmaFunction(kind, out uint shared, out int bn);
-                Gpu.Launch(fn, Grid(N, bn), Grid(M, 128), Ptx.GemmThreads, 1, shared, pa, pb, lc, Gpu.U(M), Gpu.U(N), Gpu.U(kp), Gpu.U(kp));
-            }
-            else
-            {
-                var fn = gpu.Cached($"dp4a:{f.Signed}", (out string e) => Ptx.GemmDot(gpu, f.Signed, out e));
-                Gpu.Launch(fn, Grid(N, 128), Grid(M, 128), Ptx.GemmThreads, 1, 0, pa, pb, lc, Gpu.U(M), Gpu.U(N), Gpu.U(kp / 4));
-            }
-
-            if (!cAsIs) Back(f, lane, lc, typed, (long)M * N);
+            ulong lc = PackedProduct(f, kind, laneName, pa, pb, typed, M, N, kp, rented);
+            if (lc != typed) Back(f, lane, lc, typed, (long)M * N);
             if (!whole) Layout<TN>(new LayoutArgs { Name = "strided", X = [], P = [1, 1, m, n, 0, 0, N, 1, 0], Output = [], Count = m * n, InputCount = M * N }, typed, 0, y);
             return laneName;
         }

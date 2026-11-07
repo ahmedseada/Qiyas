@@ -852,9 +852,8 @@ internal static partial class Ptx
         else b.L($"and.b32 {dst}, {row}, 7;");
     }
 
-    /// <summary>store (item 6j, the 16-bit epilogue): C stored as that 16-bit float format (float16, bfloat16) by the
-    /// format's own encoding (Codec.Pack: the same bits the f32 C's conversion pass gives), two values a 32-bit store;
-    /// null: C as the f32 accumulators.
+    /// <summary>store (the epilogue): C stored as that format by its own encoding from the accumulators (StorePair: the same
+    /// bits the conversion pass gives from the same lane), two values a store; null: C as the accumulators (f32, s32, u32).
     /// kMajorA / kMajorB (item 6j, operands read in place; 16-bit kinds): A stored k × m (Aᵀ, rows of m values), B stored
     /// k × n (B as a product's B is stored), read as they are: each k-block's tile copied as its k-rows, every row's
     /// 16-byte chunks XOR-swizzled by the row mod 8 (the same shared bytes as a packed tile), and the fragments taken by
@@ -1185,6 +1184,8 @@ internal static partial class Ptx
         b.L($"add.u32 {rBase}, {rBase}, {l4};");
         b.L($"mad.lo.u32 {cBase}, {wnR}, {wn}, {col0};");
         b.L($"mad.lo.u32 {cBase}, {l3}, 2, {cBase};");
+        // A sub-byte C: a byte spans 8 / (2·Bits) lanes' pairs (the four lanes of an 8-column group hold its pairs in order).
+        string? lead = store is not null && store.Bits < 4 ? Leaders(b, lane, 8 / (2 * store.Bits)) : null;
         for (int i = 0; i < 4; i++)
         {
             for (int half = 0; half < 2; half++)
@@ -1208,18 +1209,7 @@ internal static partial class Ptx
                     b.L($"add.u64 {idx}, {idx}, {rowOff};");
                     if (store is not null)
                     {
-                        // Two values of the format in one 32-bit word (the column even: a whole word), or the one in range.
-                        string w0 = b.R(), w1 = b.R(), word = b.R(), h0 = b.H();
-                        b.L($"mov.b32 {w0}, 0;");
-                        Codec.Pack(b, store, c[i, j, half * 2], Lane.F32, 0, w0);
-                        b.L($"mov.b32 {w1}, 0;");
-                        Codec.Pack(b, store, c[i, j, half * 2 + 1], Lane.F32, 0, w1);
-                        b.L($"bfi.b32 {word}, {w1}, {w0}, 16, 16;");
-                        b.L($"shl.b64 {idx}, {idx}, 1;");
-                        b.L($"add.u64 {addr}, {pc}, {idx};");
-                        b.L($"@{p2} st.global.b32 [{addr}], {word};");
-                        b.L($"cvt.u16.u32 {h0}, {w0};");
-                        b.L($"@{pOnly} st.global.b16 [{addr}], {h0};");
+                        StorePair(b, store, acc, c[i, j, half * 2], c[i, j, half * 2 + 1], pc, idx, addr, p2, pOnly, lead);
                         continue;
                     }
 
@@ -1233,6 +1223,131 @@ internal static partial class Ptx
 
         b.L("ret;");
         return b.Finish(Header(gpu), entry, ".param .u64 p_a, .param .u64 p_b, .param .u64 p_c, .param .u32 p_m, .param .u32 p_n, .param .u32 p_kp, .param .u32 p_ld", totalShared);
+    }
+
+    // ---------------------------------------------------------------- C stored as its type (the products' epilogue)
+    // Each value of C is encoded from the accumulator lane by the format's own encoding (Codec.Pack: the bits the
+    // conversion pass gives from the same lane), so the product writes C once, as the type, and no C in the lane
+    // exists in memory. Not for block formats (encoded a block at a time).
+
+    /// <summary>Two neighbouring values of C (the first at an even column, element idx) stored as the format: one store of
+    /// both, or of the first alone where the second is past n (pFirst). Below 4 bits a pair is part of a byte, which the
+    /// neighbouring lanes' pairs (the next columns) complete: gathered into the byte's first lane (pLead), which stores it.
+    /// Sub-byte formats need no first alone: n is a multiple of 256 (the kernels' whole tiles).</summary>
+    private static void StorePair(PtxBuilder b, Fmt f, Lane lane, string v0, string v1, string pc, string idx, string addr, string pBoth, string pFirst, string? pLead)
+    {
+        if (f.IsBlock) throw new NotSupportedException($"{f.Name}: a block format is encoded a block at a time");
+        if (f.Bits >= 32)
+        {
+            bool wide = f.WordBits == 64;
+            string w0 = wide ? b.RD() : b.R(), w1 = wide ? b.RD() : b.R();
+            Codec.Pack(b, f, v0, lane, 0, w0);
+            Codec.Pack(b, f, v1, lane, 0, w1);
+            b.L($"shl.b64 {idx}, {idx}, {(wide ? 3 : 2)};");
+            b.L($"add.u64 {addr}, {pc}, {idx};");
+            b.L($"@{pBoth} st.global.v2.b{f.WordBits} [{addr}], {{{w0}, {w1}}};");
+            b.L($"@{pFirst} st.global.b{f.WordBits} [{addr}], {w0};");
+            return;
+        }
+
+        // The two codes side by side in the low 2·Bits of a word.
+        string c0 = b.R(), c1 = b.R(), word = b.R(), h0 = b.H();
+        b.L($"mov.b32 {c0}, 0;");
+        Codec.Pack(b, f, v0, lane, 0, c0);
+        b.L($"mov.b32 {c1}, 0;");
+        Codec.Pack(b, f, v1, lane, 0, c1);
+        b.L($"bfi.b32 {word}, {c1}, {c0}, {f.Bits}, {f.Bits};");
+        if (f.Bits == 16)
+        {
+            b.L($"shl.b64 {idx}, {idx}, 1;");
+            b.L($"add.u64 {addr}, {pc}, {idx};");
+            b.L($"@{pBoth} st.global.b32 [{addr}], {word};");
+            b.L($"cvt.u16.u32 {h0}, {c0};");
+            b.L($"@{pFirst} st.global.b16 [{addr}], {h0};");
+            return;
+        }
+
+        if (f.Bits == 8)
+        {
+            string h1 = b.H();
+            b.L($"add.u64 {addr}, {pc}, {idx};");
+            b.L($"cvt.u16.u32 {h0}, {word};");
+            b.L($"@{pBoth} st.global.b16 [{addr}], {h0};");
+            b.L($"cvt.u16.u32 {h1}, {c0};");
+            b.L($"@{pFirst} st.global.b8 [{addr}], {h1};");
+            return;
+        }
+
+        StoreByte(b, f, Gather(b, word, 2 * f.Bits, 8 / (2 * f.Bits)), pc, idx, addr, pBoth, pLead, h0);
+    }
+
+    /// <summary>One value of C (element idx) stored as the format, where p. Below 8 bits a value is part of a byte, which
+    /// the next lanes' values (the next columns) complete: gathered into the byte's first lane (pLead), which stores it
+    /// (n a multiple of 256: the kernels' whole tiles).</summary>
+    private static void StoreOne(PtxBuilder b, Fmt f, Lane lane, string v, string pc, string idx, string addr, string p, string? pLead)
+    {
+        if (f.IsBlock) throw new NotSupportedException($"{f.Name}: a block format is encoded a block at a time");
+        if (f.Bits >= 32)
+        {
+            bool wide = f.WordBits == 64;
+            string w = wide ? b.RD() : b.R();
+            Codec.Pack(b, f, v, lane, 0, w);
+            b.L($"shl.b64 {idx}, {idx}, {(wide ? 3 : 2)};");
+            b.L($"add.u64 {addr}, {pc}, {idx};");
+            b.L($"@{p} st.global.b{f.WordBits} [{addr}], {w};");
+            return;
+        }
+
+        string code = b.R(), h = b.H();
+        b.L($"mov.b32 {code}, 0;");
+        Codec.Pack(b, f, v, lane, 0, code);
+        if (f.Bits < 8)
+        {
+            StoreByte(b, f, Gather(b, code, f.Bits, 8 / f.Bits), pc, idx, addr, p, pLead, h);
+            return;
+        }
+
+        if (f.Bits == 16) b.L($"shl.b64 {idx}, {idx}, 1;");
+        b.L($"add.u64 {addr}, {pc}, {idx};");
+        b.L($"cvt.u16.u32 {h}, {code};");
+        b.L($"@{p} st.global.b{f.Bits} [{addr}], {h};");
+    }
+
+    /// <summary>Sub-byte codes `width` bits each, one a lane, from `lanes` neighbouring lanes (the lowest column first) into
+    /// the first lane's low bits: a shuffle ladder, which every lane runs (none predicated off).</summary>
+    private static string Gather(PtxBuilder b, string code, int width, int lanes)
+    {
+        for (int s = 1; s < lanes; s *= 2)
+        {
+            string other = b.R(), joined = b.R();
+            b.L($"shfl.sync.down.b32 {other}, {code}, {s}, 0x1f, 0xffffffff;");
+            b.L($"bfi.b32 {joined}, {other}, {code}, {width * s}, {width * s};");
+            code = joined;
+        }
+
+        return code;
+    }
+
+    // A whole byte of sub-byte codes (element idx its first value) stored by the lane that leads it, where p.
+    private static void StoreByte(PtxBuilder b, Fmt f, string bits, string pc, string idx, string addr, string p, string? pLead, string h)
+    {
+        b.L($"shr.b64 {idx}, {idx}, {(int)Math.Log2(8 / f.Bits)};");
+        b.L($"add.u64 {addr}, {pc}, {idx};");
+        string ps = p;
+        if (pLead is not null) { ps = b.P(); b.L($"and.pred {ps}, {p}, {pLead};"); }
+        b.L($"cvt.u16.u32 {h}, {bits};");
+        b.L($"@{ps} st.global.b8 [{addr}], {h};");
+    }
+
+    /// <summary>Where each byte of a sub-byte C starts: the lanes whose index within each group of `group` lanes (a power of
+    /// two up to 16) is 0; null when every lane holds whole bytes.</summary>
+    private static string? Leaders(PtxBuilder b, string lane, int group)
+    {
+        if (group <= 1) return null;
+        string t = b.R(), p = b.P();
+        b.L($"and.b32 {t}, {lane}, {group - 1};");
+        b.L($"setp.eq.u32 {p}, {t}, 0;");
+        return p;
     }
 
     // ---------------------------------------------------------------- float64 products on the 8-bit tensor instructions, exactly
@@ -2152,11 +2267,12 @@ internal static partial class Ptx
         return wide;
     }
 
-    /// <summary>C = G·Btᵀ over groups of four 8-bit values: G m×kg and Bt n×kg words; 128×128 tile, 8×8 per thread, 16 groups a step.</summary>
-    public static string GemmDot(Gpu gpu, bool signed, out string entry)
+    /// <summary>C = G·Btᵀ over groups of four 8-bit values: G m×kg and Bt n×kg words; 128×128 tile, 8×8 per thread, 16 groups a step.
+    /// store: C stored as that format from the 32-bit sums (StoreOne); null: C as the sums.</summary>
+    public static string GemmDot(Gpu gpu, bool signed, out string entry, Fmt? store = null)
     {
         const int Tile = 128, Micro = 8, Bk = 16, Stride = Bk + 1;
-        entry = signed ? "gemm_dp4a_s" : "gemm_dp4a_u";
+        entry = (signed ? "gemm_dp4a_s" : "gemm_dp4a_u") + (store is null ? "" : "_e" + store.Name);
         string op = signed ? "dp4a.s32.s32" : "dp4a.u32.u32";
         var b = new PtxBuilder();
         string tid = b.R(), bx = b.R(), by = b.R(), tx = b.R(), ty = b.R();
@@ -2242,6 +2358,9 @@ internal static partial class Ptx
         b.L($"add.u32 {g0}, {g0}, {Bk};");
         b.L("bra KLOOP;");
         b.Label("KDONE");
+        // A sub-byte C: a byte spans 8 / Bits lanes (columns tx, tx + 1, ... in neighbouring lanes).
+        string? lead = store is not null && store.Bits < 8 ? Leaders(b, tx, 8 / store.Bits) : null;
+
         for (int r = 0; r < Micro; r++)
         {
             string row = b.R(), pr = b.P(), rowOff = b.RD();
@@ -2258,6 +2377,12 @@ internal static partial class Ptx
                 b.L($"and.pred {pcol}, {pcol}, {pr};");
                 b.L($"cvt.u64.u32 {idx}, {col};");
                 b.L($"add.u64 {idx}, {idx}, {rowOff};");
+                if (store is not null)
+                {
+                    StoreOne(b, store, signed ? Lane.S32 : Lane.U32, acc[r, c], pc, idx, addr, pcol, lead);
+                    continue;
+                }
+
                 b.L($"shl.b64 {idx}, {idx}, 2;");
                 b.L($"add.u64 {addr}, {pc}, {idx};");
                 b.L($"@{pcol} st.global.b32 [{addr}], {acc[r, c]};");

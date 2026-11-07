@@ -1214,7 +1214,7 @@ internal static class Checks
         if (ops is not null) ok &= Epilogues(ops);
         if (ops is not null) ok &= TensorConfigs(ops);
         ok &= BlockProducts(ops, where);
-        if (ok) Console.WriteLine($"check products               {where,-6} every type at 37 x 29 x 53, transposed, batched, and the backward pair{(ops is null ? "" : ", under every tensor kind")}; read in place at {(ops is null ? "64 x 40 x 330 and 64 x 48 x 320" : "128 x 256 x 128; split-k at 37 x 29 x 1100")}: within the product's rounding{(ops is null ? "" : "; the 16-bit epilogue and in-place operands equal bit for bit to packed operands and C converted after, every tensor configuration")}");
+        if (ok) Console.WriteLine($"check products               {where,-6} every type at 37 x 29 x 53, transposed, batched, and the backward pair{(ops is null ? "" : ", under every tensor kind")}; read in place at {(ops is null ? "64 x 40 x 330 and 64 x 48 x 320" : "128 x 256 x 128; split-k at 37 x 29 x 1100")}: within the product's rounding{(ops is null ? "" : "; C stored as the type by the product (every type but the blocks and 32-bit), and the 16-bit floats' operands read in place, equal bit for bit to packed operands and C converted after, every tensor configuration and kind and the dot route")}");
         return ok;
     }
 
@@ -1339,10 +1339,12 @@ internal static class Checks
         return ok;
     }
 
-    /// <summary>The 16-bit epilogue and the in-place operand reads (item 6j): float16 and bfloat16 products with C stored by
-    /// the tensor kernel and the operands read as stored (Aᵀ and B k-major, Bᵀ as rows) equal bit for bit to the operands
-    /// packed and C stored in f32 and converted after: every tensor configuration, all four orientations, padded and
-    /// batched.</summary>
+    /// <summary>The epilogue and the in-place operand reads: every type the packed routes store as itself (all but the block
+    /// formats and the 32-bit types, whose lane C is C) with C written as the type by the product kernel, and the 16-bit
+    /// floats' operands read as stored (Aᵀ and B k-major, Bᵀ as rows), equal bit for bit to the operands packed and C
+    /// stored in the lane and converted after; all four orientations, padded and batched. The 16-bit floats under every
+    /// tensor configuration (their in-place reads differ by it), the others under one of each block width (C's layout),
+    /// the integers under each tensor kind; then the dot route.</summary>
     private static bool Epilogues(GpuOps ops)
     {
         bool ok = true;
@@ -1351,32 +1353,53 @@ internal static class Checks
         views.Add(new ProductView(37, 29, 53, false, false));
         views.Add(new ProductView(128, 256, 128, false, true, 3, 128 * 128, 256 * 128, 128 * 256));
         views.Add(new ProductView(128, 256, 128, true, false, 3, 128 * 128, 0, 128 * 256));
+        var types = Bench.Registry.Names.Where(t => !Bench.Registry.IsBlock(t) && t is not ("float32" or "float64" or "int32" or "uint32")).ToArray();
+        var kinds = new (bool? four, bool? k32, string name)[] { (true, null, "4-bit"), (false, false, "8-bit, k16"), (false, true, "8-bit, k32") };
         foreach (var cfg in GpuOps.MmaConfigs)
         {
+            bool firstOfWidth = Array.Find(GpuOps.MmaConfigs, c => c.Bn == cfg.Bn) == cfg;
             ops.ForcedShape = cfg;
-            foreach (var type in new[] { "float16", "bfloat16" })
+            string shape = $"rows {cfg.RowBytes} B x {cfg.Stages} stages x {cfg.Bn} wide{(cfg.Swizzle ? " swizzled" : "")}";
+            foreach (var type in types)
             {
-                foreach (var v in views)
+                if (type is not ("float16" or "bfloat16") && !firstOfWidth) continue;
+                foreach (var (four, k32, kindName) in Bench.Registry.IsFloat(type) ? [(null, null, "")] : kinds)
                 {
-                    var a = Bench.Registry.Make(type, (int)v.ValuesA, 51, -1, 1);
-                    var b = Bench.Registry.Make(type, (int)v.ValuesB, 52, -1, 1);
-                    var stored = new byte[Bench.Registry.Bytes(type, v.ValuesC)];
-                    var converted = new byte[stored.Length];
-                    ops.Epilogue16 = null; ops.InPlace16 = null;
-                    Bench.Registry.With(type, new ProductRun(ops, v, a, b, stored, null, null));
-                    ops.Epilogue16 = false; ops.InPlace16 = false;
-                    Bench.Registry.With(type, new ProductRun(ops, v, a, b, converted, null, null));
-                    ops.Epilogue16 = null; ops.InPlace16 = null;
-                    if (!stored.AsSpan().SequenceEqual(converted))
-                    {
-                        Console.WriteLine($"check product epilogue {v.M}x{v.N}x{v.K}{(v.TransA ? " At" : "")}{(v.TransB ? " Bt" : "")}{(v.Batch > 1 ? $" batch {v.Batch}" : "")} [rows {cfg.RowBytes} B x {cfg.Stages} stages x {cfg.Bn} wide{(cfg.Swizzle ? " swizzled" : "")}] device {type,-12} DIFFERS from the operands packed and C converted after");
-                        ok = false;
-                    }
+                    ops.FourBit = four; ops.K32 = k32;
+                    ok &= SameStored(ops, type, views, kindName.Length == 0 ? shape : $"{kindName}; {shape}");
                 }
             }
         }
 
-        ops.ForcedShape = null;
+        ops.ForcedShape = null; ops.FourBit = null; ops.K32 = null;
+        ops.Dot = true;
+        foreach (var type in types) if (!Bench.Registry.IsFloat(type)) ok &= SameStored(ops, type, views, "dp4a");
+        ops.Dot = null;
+        return ok;
+    }
+
+    // Each view's product with the epilogue (and in-place reads) against the same with C in the lane converted after.
+    private static bool SameStored(GpuOps ops, string type, List<ProductView> views, string route)
+    {
+        bool ok = true;
+        foreach (var v in views)
+        {
+            var a = Bench.Registry.Make(type, (int)v.ValuesA, 51, -1, 1);
+            var b = Bench.Registry.Make(type, (int)v.ValuesB, 52, -1, 1);
+            var stored = new byte[Bench.Registry.Bytes(type, v.ValuesC)];
+            var converted = new byte[stored.Length];
+            ops.Epilogue = null; ops.InPlace16 = null;
+            Bench.Registry.With(type, new ProductRun(ops, v, a, b, stored, null, null));
+            ops.Epilogue = false; ops.InPlace16 = false;
+            Bench.Registry.With(type, new ProductRun(ops, v, a, b, converted, null, null));
+            ops.Epilogue = null; ops.InPlace16 = null;
+            if (!stored.AsSpan().SequenceEqual(converted))
+            {
+                Console.WriteLine($"check product epilogue {v.M}x{v.N}x{v.K}{(v.TransA ? " At" : "")}{(v.TransB ? " Bt" : "")}{(v.Batch > 1 ? $" batch {v.Batch}" : "")} [{route}] device {type,-12} DIFFERS from the operands packed and C converted after");
+                ok = false;
+            }
+        }
+
         return ok;
     }
 
