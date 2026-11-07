@@ -1,6 +1,6 @@
 # Handoff: items 4–6 of the coverage stretch
 
-Written 2026-11-06 at the end of item 3 and kept current through item 4, for a session with none of this one's
+Written 2026-11-06 at the end of item 3 and kept current through item 6 (closed 2026-11-07), for a session with none of this one's
 context. Read `COVERAGE.md` ("State" first) and `README.md` before anything (the repository has no CLAUDE.md; the
 standing rules are the next sentence). Standing rules: Idrak is an application of Qiyas, never
 its guide (nothing from `Lib/` in repository files; `sh guard.sh` zero hits); card-agnostic; no fixed type; every
@@ -16,7 +16,9 @@ Release build 0 errors — then stop editing and wait for "go".
 |---|---|
 | Build | `dotnet build -c Release` (from `D:\Projects\Qiyas`); `sh guard.sh` before every build. A build fails while a bench process holds the dll. |
 | Full run (both devices' gates, then the core rows of every type) | `dotnet bin/Release/net10.0/Qiyas.dll cuda,cpu --report` (~25 min; writes `results-qiyas-cuda-cpu.md`). `cuda` alone also runs the CPU gates first. |
-| Regression gate | per item (from 4c on): the gates plus only the rows of the family the item changed, qiyas only (e.g. `dotnet bin/Release/net10.0/Qiyas.dll cuda,cpu --subjects qiyas --ops recurrent` for the GRU row; every gate runs at startup), then `python docs/wip/compare.py docs/wip/baseline.md results-qiyas-cuda-cpu.md` — compare.py finds each subject's columns by the header's names, so a qiyas-only file compares with the full baseline; the full `cuda,cpu --report` run with every column only at the end of each whole item (after item 4, after item 5, after item 6; never after a piece inside an item): the README Results tables are regenerated from it (`docs/wip/readme_results.py`) and it becomes `docs/wip/baseline.md`. compare.py prints every cell with base/new ms, ratio, lanes, errors; flags `SLOWER` (> 5 %) and `ERR UP`; "new row" for rows the baseline lacks. `baseline.md` is item 4's `cuda,cpu --report --ops all` run of
+| Regression gate | per item (from 4c on): the gates plus only the rows of the family the item changed, qiyas only (e.g. `dotnet bin/Release/net10.0/Qiyas.dll cuda,cpu --subjects qiyas --ops recurrent` for the GRU row; every gate runs at startup), then `python docs/wip/compare.py docs/wip/baseline.md results-qiyas-cuda-cpu.md` — compare.py finds each subject's columns by the header's names, so a qiyas-only file compares with the full baseline; the full `cuda,cpu --report` run with every column only at the end of each whole item (after item 4, after item 5, after item 6; never after a piece inside an item): the README Results tables are regenerated from it (`docs/wip/readme_results.py`) and it becomes `docs/wip/baseline.md`. compare.py prints every cell with base/new ms, ratio, lanes, errors; flags `SLOWER` (> 5 %) and `ERR UP`; "new row" for rows the baseline lacks. `baseline.md` is the bench assembled at the end of item 6 (2026-11-07, 4234 rows; a trailing source column names each
+row's run; cells no item 6 run measured keep item 4's reading, marked "from the item 4 run"; see "End of item 6" under
+Item 6 progress). Before that it was item 4's `cuda,cpu --report --ops all` run of
 19:11 (4216 rows, every family, every column; stopped during the CPU's q4_k rows, so the CPU's q6_k and bool rows are
 missing; converted from the console lines by the scratchpad script `log2results.py`: no shape column except where the
 4a baseline had the row). Until item 4 it was the run of item 4a (128 core rows). An earlier commit (c68ef15) held a matmul re-timing run there by mistake; the 12:38 run of item 3 survives only as the README Results tables, which `python docs/wip/compare_readme.py README.md results-qiyas-cuda-cpu.md <an older full run for the error column>` compares against cell by cell. Some CPU cells of the 4a run caught this laptop's slow level; re-time before calling a cell slower. Re-time a flagged cell several times before calling it swing: this laptop's sub-2 ms cells move ±20–40 % run to run; an A/B against a build of the baseline commit (`git worktree add <dir> c73a251`, build it, run both dlls back to back) separates code from machine state. |
@@ -608,6 +610,25 @@ scatter-add, 4g the fused direct convolution. Each may be reported as its own bo
   - Left as they are (stable, the step known): CUDA attention rows in float32 (the FMA rows: no tensor kind holds
     float32 exactly), 3.80 ms.
 
+- End of item 6 (the assembled bench): done, reported. Item 6 is closed with it (the owner: no Idrak name check and no
+  Idrak work).
+  - The capped full run (four invocations, ~28 min estimated) was stopped at the owner's request at 03:09 on
+    2026-11-07: invocations 1 (core and products, every type, qiyas) and 2 (core, lib and number) complete, 3 partial
+    (CUDA float32, float16, part of float64), 4 not run. No bench runs after it.
+  - `docs/wip/baseline.md` assembled from the session's run history by a scratchpad script (merge.py, not in the
+    repository): per subject and cell, the newest reading among the full run's invocations and the single-family runs
+    of items 5 and 6, each source filtered to the cells whose code is in main and unchanged since its reading (e.g. a
+    run before the small cells' CPU layout changes is not used for depthwise_conv or adaptive_avgpool_bwd); × recomputed
+    as lib ÷ subject from the file's own columns. Cells no such run measured keep item 4's row, marked "from the item 4
+    run". Counts by source are in COVERAGE's "Settled — item 6's bench" (3512 from the item 4 run of 4234).
+  - compare.py against item 4's baseline: 93 slower (> 5 %), 6 ERR UP (all recorded lane changes), 18 new rows. The
+    slower cells in code items 5 and 6 changed are a Known slow row (CPU layout:one_hot int8 6.97× first); not re-timed.
+  - README Results regenerated from the assembled file (`readme_results.py docs/wip/baseline.md`), with the
+    several-runs note and the P-state / "Prefer maximum performance" line; the accuracy sentences match the file's rows
+    (five CUDA rows whose fixes 01b896d / 81dac8e are gated keep item 4's errors there, not re-timed).
+  - Next session: re-time the flagged changed-code cells in alternating cooled runs (one_hot int8 first), with the card
+    set to "Prefer maximum performance" for dotnet.exe; a fresh full run replaces the assembled file when the owner asks.
+
 ## Item 5 progress
 
 - Done, reported (uncommitted until the coordinator's go). What landed:
@@ -1030,3 +1051,6 @@ The goal: Qiyas ready to replace Idrak's kernels entirely once items 4–6 are d
 the list of Idrak's operation names against COVERAGE.md, reading names only and never design (the standing rule:
 nothing of Lib's code or design enters the repository). Report every operation an application would need that Qiyas
 lacks, with what it would take; nothing is added without the coordinator's go.
+
+Not done: the owner ended item 6 with the assembled bench (2026-11-07) and asked for no Idrak name check and no Idrak
+work.

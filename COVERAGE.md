@@ -47,7 +47,7 @@ from a per-thread workspace (src/Workspace.cs) grown to the largest shape seen (
 ArrayPool); the gate requires the product and the LSTM step to reach calls with no workspace allocation, results
 unchanged.
 
-## State (2026-11-06, branch `coverage-wip`)
+## State (2026-11-07, branch `coverage-wip`)
 
 Written so the next session continues from the files alone. The tree builds (Release, 0 errors) and `guard.sh` reports
 zero hits.
@@ -73,7 +73,7 @@ regression comparer and the baseline run.
    convolution — done); the designs and the progress are in `docs/wip/HANDOFF.md`.
 2. A bump-allocated scope past the pool (buffers reserved once from the shapes; zero rents on the hot path) — done
    (item 5: the device arena and the CPU product workspace, above).
-3. The known-slow list.
+3. The known-slow list — done (item 6, closed with the assembled bench below).
 
 **Settled — the device products intermittent** (`matmul_bwd dB device uint64 / uint32 / uint16 DIFFERS by 138 steps`,
 seen once in item 3's first full run; again in item 4 as `matmul_bwd dA … by 123` and, under the forced 4-bit kind,
@@ -96,6 +96,27 @@ beyond 5 % — all sub-2 ms cells re-timed three times and, for the two consiste
 commit (c73a251): the old build measures the same today (0.083–0.085 and 1.76–2.62 ms), so the difference is the
 machine's state since 00:51, not the code. The CUDA float64 product took the sliced route (f64x: 4.19 ms against 22.7,
 exact under the double-double reference).
+
+**Settled — item 6's bench (the end of item 6).** Item 6's capped full run was stopped at the owner's request at 03:09
+on 2026-11-07 (invocation 1, the core and products at every type, and invocation 2, the core with lib and number,
+complete; invocation 3 partial: CUDA float32, float16 and part of float64; invocation 4 not run), and no further runs
+were made. `docs/wip/baseline.md` is assembled from this session's runs: each subject's newest reading of each cell
+from that run and from the single-family runs of items 5 and 6, using only readings of code that is in main and
+unchanged since; every cell no such run measured keeps item 4's reading, marked "from the item 4 run" in the file's
+source column. Qiyas cells by source: 3512 from the item 4 run, 352 invocation 1, 167 invocation 3, 44 the small cells'
+CPU layout run, 39 6j's CPU reductions, 30 the small cells' CUDA layout run, 15 6k's CUDA rows, 12 + 4 6k's CPU
+recurrent runs, 11 + 10 + 6 + 4 + 2 the small cells' CPU pools / rows / map / ctc runs, 8 6k's float64 attention and
+conv, 6 + 4 6k's CPU sums, 3 6j's CPU attention backward, 2 + 2 the small cells' CUDA float16 / bfloat16 formulas, and
+one row with no Qiyas reading (4234 rows). The lib and number columns are invocation 2's at the core rows it ran and
+item 4's elsewhere. `docs/wip/compare.py` against item 4's baseline: 93 cells slower by more than 5 % (single readings;
+most are CUDA bandwidth rows near 1.9× — the memory P-state, the three-stream row below — or CPU sub-2 ms cells; the ones
+in code items 5 and 6 changed are a Known slow row below), 6 errors grown, each a recorded lane change (CUDA attention
+float64 3.82e-16 → 4.58e-16, the fused rows' measured choice; attention_bwd float64 1.11e-16 → 1.46e-16, 6i's fused
+backward; CPU gemv_t float64 0 → 5.97e-13, 6h's column tiles; CPU attention_bwd float32 1.47e-7 → 1.72e-7, 6j's
+attention backward; CPU lstm_seq and lstm_seq_bwd float32 2.76e-7 → 2.85e-7 and 9.1e-7 → 9.4e-7, 6f's one product over
+all steps), 18 new
+rows (the CPU's q6_k and bool, q4_k's softmax and rms_norm). The README Results are generated from this file. No Idrak
+operation-name check was made: the owner ended item 6 with the assembled bench.
 
 **Settled — the float64 product reference.** `References.MatMul` (the bench's and the gates' float64 reference for every
 product, view and backward) accumulates in double-double: each product exact by a fused multiply-add, each sum with its
@@ -152,6 +173,7 @@ and measured against the baseline when it is.
 | CUDA, CPU | GRU sequence backward | 4.5–6× the forward on both devices (16 steps of 256 × 512 → 512, float32: device 12.4–15.8 ms against 2.55–2.76, CPU 102–114 against 21–22) where the products imply about 4×: the step's backward recomputes the gates the forward's recompute already made, and each step's dW, dU, db, dbh are summed by separate adds (on the CPU into fresh arrays). To re-measure in item 6; keeping the recomputed gates and accumulating into the sums in place are the steps. CPU done in 6f: the recompute keeps every step's gates, per step only the cell's backward and dg·U, dx / dW / dU / db over all the steps in one product each: float32 gru_seq_bwd 109 → 57 ms, lstm_seq_bwd 150 → 69 (3.2× and 2.7× the forward). The device in 6f2, the same restructure: float32 gru_seq_bwd 12.5 → 5.5 ms, lstm_seq_bwd 26.0 → 6.6 (3.3× and 3.4× the forward). The device's float64 lstm_seq_bwd error 4.4e-16 → 2.0e-15 since 6f2 is the float64 lane's rounding, not a regression: the float64 product's route is measured per shape, and the new shapes take the plain float64 lane where the per-step shapes took the sliced route; both within the product's proof. 6j: the f32 product on few-tile shapes by split-k (the recurrent backwards' k-long products): device float32 lstm_seq_bwd 6.57 → 4.29 ms, gru_seq_bwd 5.51 → 3.87 (one run) |
 | CUDA | products with Aᵀ after the arena (item 5) | tn / tt float16 1.11–1.14×, bfloat16 1.10–1.14×, int32 / uint32 1.17–1.30×, int64 / uint64 tt 1.59×, batched int4 / int2 1.39–1.45× against item 4's baseline in one run, nn / nt unchanged. Item 6 (6e): not the arena (the pool reads the same); int32, uint32, batched back within swing; the 16-bit transposing pack word-wide (0.025 → 0.021 ms a 2048² operand, at the bandwidth); float16 tn / tt now nn + that pack (0.285 against 0.260 in the profile). Left: the pack itself (an Aᵀ read in the product kernel) and C through f32 (0.018 ms, a 16-bit epilogue); int64 2048³ reads 0.36 or 0.57 ms by run in any orientation (nn too), not Aᵀ. 6j: both done for float16 / bfloat16 — C stored as the type by the tensor kernel, and the operands read as stored (Aᵀ and B k-major by ldmatrix.trans on row-swizzled k-rows, Bᵀ as rows): float16 matmul 0.243 → 0.229 ms, nt 0.246 → 0.220, tn 0.263 → 0.234, tt 0.267 → 0.236, batched 0.627 → 0.520, matmul_bwd 0.504 → 0.444; bfloat16 matmul 0.244 → 0.229, tn 0.262 → 0.233, batched 0.624 → 0.522, matmul_bwd 0.503 → 0.444 (item 4's baseline → one run; errors equal). A k-major operand costs about 4 % of the kernel on the measured configuration, so nn at 2048³ only breaks even; the pass it replaces is fixed per operand, and smaller m gains more. 6k (the int64 swing, done): int64 2048³ 0.355–0.364 ms in every orientation in three runs, except one run's first timed cell (matmul int64 0.564): the first row after the gates |
 | CPU, CUDA | item 4's full run: slower cells in changed code | CPU matmul float64 1.16×, float16 1.38×, float8_e5m2 1.41×, CUDA matmul int4 1.15× against item 4a's baseline (4e changed the product kernels); CUDA softmax float16 1.12× (the launch-limit query, cached since). Not re-timed: item 6 re-times each once, both orders. 6k (re-measured, done): CPU matmul against a build of a784145 (before 4e) in alternating runs, both orders: float64 3.38 / 2.56 against 3.28 / 3.83, float8_e5m2 1.86 / 1.93 against 1.90 / 1.77, float16 1.93 / 1.79 and 1.76 / 1.27 against 1.71 / 1.73 and 2.38 / 1.49 (within swing; float16 matmul_nt 1.85 against 6.2 before 4e); CUDA matmul int4 0.104 ms (unchanged); CUDA softmax float16: the memory clock (the three-stream row) |
+| CPU, CUDA | the assembled bench's slower cells in code items 5–6 changed | compare.py, item 4's baseline → the assembled bench (single readings, not re-timed: the owner stopped bench runs). CPU layout:one_hot int8 0.095 → 0.662 ms (6.97×; the layout family changed in 57f9ff0 and 89df583). CUDA int32 matmul_nt / tn / bwd 1.30×, int16 tn 1.05 / bwd 1.11, uint32 matmul 1.09 / tn 1.20, uint16 matmul 1.06 / tn 1.13 / bwd 1.10 (6d88e3d's product changes). CUDA sum:whole float32 1.06×, float16 1.32× (81dac8e's compensated whole sums, an accuracy change: float32 error 1.95e-4 → 4.87e-5). CPU products 1.06–1.53× across types (matmul int64 / int32 1.26, int8 1.28, bfloat16 1.53, float16 nt 1.38; the item 5 workspace, 2ef4e22; 6k's A/B of the float matmul cells read within swing). To re-time in alternating runs before calling any of them a regression; one_hot int8 first |
 | CUDA | the cross_entropy bench row | done in item 6 (6d): the fused loss row, 0.65 ms float32 and 0.64 float16 against 95 and 48 through the composition's host round trips; float64 12.8 ms (the device's f64 exp rate) |
 | CPU | LSTM / GRU steps | 20–31 ms forward, 56–84 backward at B = D = H = 1024: the products dominate (four gates, two operands); a fused gates product is the step. 6f: float32 lstm_step 14.9, backward 41.6 ms — at the product rate (17 and 51 GFLOP); the cell's backward vectorized. float16 22.9 / 62.6: the step widens W and U to f32 every call (the API passes the type's bytes). 6f2: W and U kept widened per array (checked unchanged by their bytes each call); the swing itself was the bench's first row measured under tiered compilation (50.7 ms first, 19.2 with it off). 6g: the bench's per-row timing settles as `Measure.Faster` does (warm until the runtime compiles nothing and the run stops getting faster, capped; tiered compilation and PGO stay on): bfloat16 lstm_step first in a run 50.7 → 22.3 ms |
 
