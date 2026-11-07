@@ -6,7 +6,7 @@
 // dimension), the fused decode kernel, the backward's fused kernels where both fit the device's workgroup memory or its
 // composition. Q, K, V and dO are read where they are stored by every route; the scores and their gradients are lane
 // storage (intermediates), the outputs lane values: the type's own storage for float32 and float64, else lane storage
-// stored as the type once after. The block formats are refused (no Vulkan block encoder yet).
+// stored as the type once after (a block format's by its encoder).
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
@@ -21,12 +21,7 @@ public sealed partial class VulkanOps
 
     private readonly Dictionary<string, bool> _fusedFaster = [];
 
-    private Fmt AttentionFormat<TN>(string what) where TN : struct, IAdad<TN>
-    {
-        var f = Fmt.Of<TN>();
-        if (f.IsBlock) throw Missing($"{what} of {f.Name} (a block format)");
-        return f;
-    }
+    private static Fmt AttentionFormat<TN>(string what) where TN : struct, IAdad<TN> => Fmt.Of<TN>();
 
     private static bool Own(Fmt f) => f.Is("float32") || f.Is("float64");
 

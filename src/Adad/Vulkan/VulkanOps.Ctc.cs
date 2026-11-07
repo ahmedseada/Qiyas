@@ -3,7 +3,7 @@
 
 // The ctc loss on Vulkan (Ctc.cs, Kernels.Ctc.cs): a workgroup per sequence in the float lane (CUDA's), the logits read
 // where they are stored; the loss and the gradient on lane storage, the type's own for float32 and float64, else stored
-// as the type once after (FromLanes). The block formats are refused (no Vulkan block encoder yet).
+// as the type once after (a block format's by its encoder).
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
@@ -16,7 +16,6 @@ public sealed partial class VulkanOps
     {
         a.Validate();
         var f = Fmt.Of<TN>();
-        if (f.IsBlock) throw Missing($"ctc of {f.Name} (a block format)");
         var lane = RowLane(f);
         int smax = a.MaxStates, cap = (smax + 63) / 64 * 64;
         if (VkKernels.CtcShared(lane, cap) > vk.MaxSharedBytes) throw new NotSupportedException($"vulkan: ctc's {smax} extended states exceed the workgroup memory ({vk.MaxSharedBytes} bytes)");

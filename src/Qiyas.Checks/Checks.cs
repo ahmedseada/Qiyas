@@ -179,11 +179,11 @@ internal static partial class Checks
     // ---------------------------------------------------------------- the block formats
 
     /// <summary>Q8_0, Q4_0, Q4_K, Q6_K: 1001 values (not whole blocks) encoded and decoded on the CPU within the block's step;
-    /// the device's decode bit for bit against the CPU's; the device's encode (Q8_0, Q4_0) byte for byte against the CPU's.</summary>
-    public static bool BlockFormats(GpuOps? ops)
+    /// the device's decode bit for bit against the CPU's; the device's encode byte for byte against the CPU's.</summary>
+    public static bool BlockFormats(IDevice<ulong, ulong>? ops)
     {
         bool ok = true;
-        string where = ops is null ? "cpu" : "device";
+        string where = ops is null ? "cpu" : DeviceOf(ops) == Bench.Device.Cuda ? "cuda" : "vulkan";
         if (ops is null) ok &= BlockSpecifications();
         var random = new Random(99);
         foreach (var type in Bench.Registry.Names)
@@ -227,33 +227,38 @@ internal static partial class Checks
             }
 
             if (ops is null) continue;
-            var gpu = ops.Gpu;
-            // The device decodes every value as the CPU does (its Widen kernel), and encodes Q8_0 / Q4_0 as the CPU does.
-            ulong d = gpu.Rent(stored.Length), lanes = gpu.Rent(n * 4L);
-            Adad.Cuda.Gpu.Upload<byte>(stored, d);
-            var lane = new float[n];
-            Bench.Registry.WithFloat(type, new WidenRun(ops, d, lanes, n));
-            Adad.Cuda.Gpu.Synchronize();
-            Adad.Cuda.Gpu.Download<float>(lanes, lane);
-            int bad = 0;
-            for (int i = 0; i < n; i++) if (lane[i] != (float)back[i]) bad++;
-            if (bad > 0) { Console.WriteLine($"check block {type,-6} decode       device DIFFERS at {bad} values"); ok = false; }
+            // The device decodes every value as the CPU does, and encodes as the CPU does, byte for byte.
+            ulong d = ops.Rent(stored.Length), lanes = ops.Rent(n * 4L);
+            try
+            {
+                ops.Upload(stored, d);
+                var lane = new float[n];
+                Bench.Registry.WithFloat(type, new WidenRun(ops, d, lanes, n));
+                ops.Synchronize();
+                ops.Download(lanes, System.Runtime.InteropServices.MemoryMarshal.AsBytes(lane.AsSpan()));
+                int bad = 0;
+                for (int i = 0; i < n; i++) if (lane[i] != (float)back[i]) bad++;
+                if (bad > 0) { Console.WriteLine($"check block {type,-6} decode       {where,-6} DIFFERS at {bad} values"); ok = false; }
+            }
+            finally { ops.Return(d); ops.Return(lanes); }
+
             {
                 var f32 = new float[n];
                 for (int i = 0; i < n; i++) f32[i] = (float)values[i];
-                ulong src = gpu.Rent(n * 4L), enc = gpu.Rent(stored.Length);
-                Adad.Cuda.Gpu.Upload<float>(f32, src);
-                Bench.Registry.WithFloat(type, new NarrowRun(ops, src, enc, n));
-                Adad.Cuda.Gpu.Synchronize();
-                var encoded = new byte[stored.Length];
-                Adad.Cuda.Gpu.Download<byte>(enc, encoded);
-                int diff = 0;
-                for (int i = 0; i < stored.Length; i++) if (encoded[i] != stored[i]) diff++;
-                if (diff > 0) { Console.WriteLine($"check block {type,-6} encode       device DIFFERS at {diff} bytes"); ok = false; }
-                gpu.Return(src); gpu.Return(enc);
+                ulong src = ops.Rent(n * 4L), enc = ops.Rent(stored.Length);
+                try
+                {
+                    ops.Upload(System.Runtime.InteropServices.MemoryMarshal.AsBytes(f32.AsSpan()), src);
+                    Bench.Registry.WithFloat(type, new NarrowRun(ops, src, enc, n));
+                    ops.Synchronize();
+                    var encoded = new byte[stored.Length];
+                    ops.Download(enc, encoded);
+                    int diff = 0;
+                    for (int i = 0; i < stored.Length; i++) if (encoded[i] != stored[i]) diff++;
+                    if (diff > 0) { Console.WriteLine($"check block {type,-6} encode       {where,-6} DIFFERS at {diff} bytes"); ok = false; }
+                }
+                finally { ops.Return(src); ops.Return(enc); }
             }
-
-            gpu.Return(d); gpu.Return(lanes);
         }
 
         if (ok) Console.WriteLine($"check block formats          {where,-6} Q8_0, Q4_0, Q4_K, Q6_K: round trips within the block's step; add, softmax, rms_norm as the references{(ops is null ? "" : "; the device's codecs as the CPU's")}");
@@ -383,14 +388,25 @@ internal static partial class Checks
         }
     }
 
-    private sealed class WidenRun(GpuOps ops, ulong stored, ulong lanes, int n) : Bench.IFloatTypeVisitor<bool>
+    // A device's stored values into f32 lanes, and back (each device's entry points for checks).
+    private sealed class WidenRun(IDevice<ulong, ulong> ops, ulong stored, ulong lanes, int n) : Bench.IFloatTypeVisitor<bool>
     {
-        public bool Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> { ops.ToLanes<TN>(Lane.F32, stored, lanes, n); return true; }
+        public bool Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        {
+            if (ops is GpuOps cuda) cuda.ToLanes<TN>(Lane.F32, stored, lanes, n);
+            else ((Adad.Vulkan.VulkanOps)ops).ToLanes<TN>(Lane.F32, stored, lanes, n);
+            return true;
+        }
     }
 
-    private sealed class NarrowRun(GpuOps ops, ulong lanes, ulong stored, int n) : Bench.IFloatTypeVisitor<bool>
+    private sealed class NarrowRun(IDevice<ulong, ulong> ops, ulong lanes, ulong stored, int n) : Bench.IFloatTypeVisitor<bool>
     {
-        public bool Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> { ops.FromLanes<TN>(Lane.F32, lanes, stored, n); return true; }
+        public bool Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        {
+            if (ops is GpuOps cuda) cuda.FromLanes<TN>(Lane.F32, lanes, stored, n);
+            else ((Adad.Vulkan.VulkanOps)ops).FromLanes<TN>(Lane.F32, lanes, stored, n);
+            return true;
+        }
     }
 
     // ---------------------------------------------------------------- routing, sampling and the loss on odd shapes

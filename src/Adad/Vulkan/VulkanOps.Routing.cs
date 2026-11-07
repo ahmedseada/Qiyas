@@ -2,8 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // Routing, sampling and the cross-entropy loss on Vulkan (Kernels.Routing.cs, Kernels.Radix.cs), CUDA's lanes: top-k and
-// pick in the type's own, the loss and sampling in the float lane. The block formats are refused (no Vulkan block
-// encoder yet).
+// pick in the type's own, the loss and sampling in the float lane; a block format's values by its encoder.
 using System.Numerics;
 using Adad.Abstraction;
 
@@ -15,14 +14,12 @@ public sealed partial class VulkanOps
     public string TopK<TN>(ulong x, int rows, int cols, int k, ulong values, ulong indices) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsBlock) throw Missing($"top-k of {f.Name} (a block format)");
         var lane = f.Natural;
         if (k > VkKernels.MaxTopK) throw new NotSupportedException($"vulkan: top-k with k = {k} exceeds the kernel's passes ({VkKernels.MaxTopK}); a partial sort is the step");
         if (rows == 0 || k == 0) return lane.Name;
         var fn = vk.Cached($"topk:{f.Name}", () => VkKernels.TopKRows(vk, f, lane));
         vk.Launch(fn, (uint)rows, 1, x, indices, Vulkan.U(cols), Vulkan.U(k));
-        var gather = vk.Cached($"gather_by_index:{f.Name}", () => VkKernels.GatherByIndex(vk, f));
-        vk.Launch(gather, Groups(f.Words((long)rows * k), VkKernels.Threads), 1, x, indices, values, Vulkan.U(rows), Vulkan.U(cols), Vulkan.U(k));
+        Gather(f, x, indices, values, rows, cols, k);
         return lane.Name;
     }
 
@@ -30,18 +27,29 @@ public sealed partial class VulkanOps
     public string Pick<TN>(ulong x, int rows, int cols, ulong index, ulong output) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsBlock) throw Missing($"pick of {f.Name} (a block format)");
         if (rows == 0) return f.Natural.Name;
-        var gather = vk.Cached($"gather_by_index:{f.Name}", () => VkKernels.GatherByIndex(vk, f));
-        vk.Launch(gather, Groups(f.Words(rows), VkKernels.Threads), 1, x, index, output, Vulkan.U(rows), Vulkan.U(cols), Vulkan.U(1));
+        Gather(f, x, index, output, rows, cols, 1);
         return f.Natural.Name;
+    }
+
+    // out[r·k + j] = x[r][index[r·k + j]] as the type (a block format's by its encoder).
+    private void Gather(Fmt f, ulong x, ulong index, ulong output, int rows, int cols, int k)
+    {
+        long n = (long)rows * k;
+        if (f.IsBlock)
+        {
+            Encode(f, n, vk.Cached($"block_gather:{f.Name}", () => VkKernels.BlockGather(vk, f)), output, x, index, Vulkan.U(cols), Vulkan.U(k));
+            return;
+        }
+
+        var gather = vk.Cached($"gather_by_index:{f.Name}", () => VkKernels.GatherByIndex(vk, f));
+        vk.Launch(gather, Groups(f.Words(n), VkKernels.Threads), 1, x, index, output, Vulkan.U(rows), Vulkan.U(cols), Vulkan.U(k));
     }
 
     /// <summary>loss[r] = log Σ exp(x[r]) − x[r][t[r]] as the type (t: s32 targets), in the type's float lane: a workgroup per row.</summary>
     public string CrossEntropy<TN>(ulong x, int rows, int cols, ulong targets, ulong output) where TN : struct, IFloatAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsBlock) throw Missing($"cross entropy of {f.Name} (a block format)");
         var lane = RowLane(f);
         if (rows == 0) return lane.Name;
         ulong losses = vk.Rent(rows * (long)lane.Size);
@@ -63,7 +71,6 @@ public sealed partial class VulkanOps
     public string Sample<TN>(ulong x, int rows, int cols, ulong u, ulong picks) where TN : struct, IFloatAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsBlock) throw Missing($"sample of {f.Name} (a block format)");
         var lane = RowLane(f);
         if (rows == 0) return lane.Name;
         var fn = vk.Cached($"sample:{f.Name}", () => VkKernels.SampleRows(vk, f, lane));

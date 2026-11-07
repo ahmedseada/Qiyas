@@ -325,6 +325,19 @@ internal static partial class VkKernels
         return b.Build();
     }
 
+    /// <summary>A stored array's n values into a lane array: a thread per value, each read where it is stored.</summary>
+    public static SpvKernel ToLanes(Vulkan vk, Fmt f, Lane lane)
+    {
+        var k = Kinds.Of(lane);
+        var b = new Spv($"to_{f.Name}_{lane.Name}", Threads, vk.Controls);
+        var src = b.Arg(0);
+        var dst = b.Arg(1);
+        var n = b.Arg(2, K.U32);
+        var gid = b.GlobalX;
+        b.If(gid < n, () => b.Store(b.At(dst, gid, lane.Size), Codec.UnpackAt(b, f, src, gid, lane)));
+        return b.Build();
+    }
+
     /// <summary>output (cols × rows) = xᵀ: a thread per output word, each of its values read where it is stored (an output
     /// row need not end on a word: a word's values are the flattened output's).</summary>
     public static SpvKernel Transpose(Vulkan vk, Fmt f, Lane lane)

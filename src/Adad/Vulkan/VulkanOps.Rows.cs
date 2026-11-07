@@ -3,7 +3,8 @@
 
 // The row operations, softmax and rms_norm among them, and the normalization parameters' backward on Vulkan
 // (Kernels.Rows.cs): the rows' statistics by a workgroup a row, then the outputs a thread per stored word. Float types
-// in the f32 lane (float64 in f64), as on CUDA; the block formats have no Vulkan encoders yet (refused).
+// in the f32 lane (float64 in f64), as on CUDA; a block format's outputs replayed into its encoder (each block from its
+// values' replays).
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
@@ -25,7 +26,6 @@ public sealed partial class VulkanOps
 
     private string Row(Fmt f, RowOp op, ulong x, ulong x2, ulong g, ulong bt, ulong s, ulong pos, ulong y, ulong y2, int rows, int cols, double a, double b)
     {
-        if (f.IsBlock) throw Missing($"{op.Name} of {f.Name} (a block format)");
         var lane = RowLane(f);
         long n = (long)rows * cols;
         if (n == 0) return lane.Name;
@@ -40,8 +40,18 @@ public sealed partial class VulkanOps
                 vk.Launch(st, (uint)rows, 1, args);
             }
 
-            var replay = vk.Cached($"rowreplay:{op.Name}:{f.Name}:{second}:{out2}", () => VkKernels.RowReplay(vk, f, lane, op, second, out2));
-            vk.Launch(replay, Groups(f.Words(n), VkKernels.Threads), 1, args);
+            if (f.IsBlock)
+            {
+                // Each output by the encoder from its values' replays (y and y2 encoded before either is written).
+                var y1 = new BlockJob(vk.Cached($"block_rowreplay:{op.Name}:{f.Name}:{second}:y", () => VkKernels.BlockRowReplay(vk, f, lane, op, second, false)), y, args);
+                if (out2) Encode(f, n, y1, new BlockJob(vk.Cached($"block_rowreplay:{op.Name}:{f.Name}:{second}:y2", () => VkKernels.BlockRowReplay(vk, f, lane, op, second, true)), y2, args));
+                else Encode(f, n, y1);
+            }
+            else
+            {
+                var replay = vk.Cached($"rowreplay:{op.Name}:{f.Name}:{second}:{out2}", () => VkKernels.RowReplay(vk, f, lane, op, second, out2));
+                vk.Launch(replay, Groups(f.Words(n), VkKernels.Threads), 1, args);
+            }
         }
         finally
         {
@@ -55,7 +65,6 @@ public sealed partial class VulkanOps
     public string NormParamsBwd<TN>(ulong x, ulong dy, ulong dgamma, ulong dbeta, int rows, int cols, double eps, bool centered) where TN : struct, IFloatAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsBlock) throw Missing($"norm parameters' backward of {f.Name} (a block format)");
         var lane = RowLane(f);
         if (cols == 0) return lane.Name;
         var stats = vk.Cached($"norm_stats:{centered}:{f.Name}", () => VkKernels.NormStats(vk, f, lane, centered));

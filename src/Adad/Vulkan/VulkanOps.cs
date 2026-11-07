@@ -3,9 +3,9 @@
 
 // Vulkan as a device: Adad's operations over the contract (Abstraction/), on device addresses — buffers of stored values
 // and of indices alike — with the same lane rules as the CPU and CUDA: a type's own lane, its float lane for the float
-// formulas. Every family of the contract has its Vulkan kernels; the block formats are refused where they arrive (no
-// Vulkan block encoder yet: NotSupportedException, naming it), and so is a shape past a kernel's limits: no operation
-// runs in another lane, or on another device, in its place.
+// formulas. Every family of the contract has its Vulkan kernels, the block formats among the types (their outputs by the
+// block encoders, VulkanOps.Blocks.cs); a shape past a kernel's limits is refused (NotSupportedException, naming it): no
+// operation runs in another lane, or on another device, in its place.
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
@@ -54,7 +54,13 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
     public void Add<TN>(ulong a, ulong b, ulong c, int n) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsBlock) throw Missing($"add of {f.Name} (a block format)");
+        if (f.IsBlock)
+        {
+            // A block format: each block encoded from the decoded sums (f32).
+            Encode(f, n, vk.Cached($"block_add:{f.Name}", () => VkKernels.BlockAdd(vk, f)), c, a, b);
+            return;
+        }
+
         var k = vk.Cached($"add:{f.Name}", () => VkKernels.Add(vk, f));
         vk.Launch(k, Groups(f.Words(n), VkKernels.Threads), 1, a, b, c, Vulkan.U(n));
     }
@@ -62,10 +68,15 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
     public string Map<TN>(MapOp op, ulong x, ulong y, ulong z, ulong output, int n, double a, double b) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsBlock) throw Missing($"map {op.Name} of {f.Name} (a block format)");
         if (op.FloatOnly && !f.IsFloat) throw new NotSupportedException($"{op.Name}: a float formula; {f.Name} is not a float type");
         var lane = f.Natural;
         (a, b) = Stored.Held<TN>(a, b);
+        if (f.IsBlock)
+        {
+            Encode(f, n, vk.Cached($"block_map:{op.Name}:{f.Name}:{lane.Name}", () => VkKernels.BlockMap(vk, f, lane, op)), output, x, y, z, Slot(lane, a), Slot(lane, b));
+            return lane.Name;
+        }
+
         var k = vk.Cached($"map:{op.Name}:{f.Name}:{lane.Name}", () => VkKernels.Map(vk, f, lane, op));
         vk.Launch(k, Groups(f.Words(n), VkKernels.Threads), 1, x, y, z, output, Vulkan.U(n), Slot(lane, a), Slot(lane, b));
         return lane.Name;
@@ -77,10 +88,15 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
     public string MapRow<TN>(MapOp op, ulong x, ulong v, ulong output, int rows, int cols) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsBlock) throw Missing($"map_row {op.Name} of {f.Name} (a block format)");
         var lane = f.Natural;
-        var k = vk.Cached($"maprow:{op.Name}:{f.Name}", () => VkKernels.MapRow(vk, f, lane, op));
         int n = rows * cols;
+        if (f.IsBlock)
+        {
+            Encode(f, n, vk.Cached($"block_maprow:{op.Name}:{f.Name}", () => VkKernels.BlockMapRow(vk, f, lane, op)), output, x, v, Vulkan.U(cols));
+            return lane.Name;
+        }
+
+        var k = vk.Cached($"maprow:{op.Name}:{f.Name}", () => VkKernels.MapRow(vk, f, lane, op));
         vk.Launch(k, Groups(f.Words(n), VkKernels.Threads), 1, x, v, output, Vulkan.U(n), Vulkan.U(cols));
         return lane.Name;
     }

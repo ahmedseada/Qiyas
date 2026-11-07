@@ -7,7 +7,7 @@
 // (Product: a format per operand), the adds (the mixed add) and the cells (each input its own format); the gates, the
 // recurrence's states across the steps and every gradient of them are lane intermediates; the outputs are lane values,
 // the type's own storage for float32 and float64, else stored as the type once after. The gates (CellGates) are the
-// type's own operations on any type. The block formats are refused (no Vulkan block encoder yet).
+// type's own operations on any type (a block format's outputs by its encoder).
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
@@ -22,12 +22,7 @@ public sealed partial class VulkanOps
 
     private static Buf Lanes(Lane lane, ulong p) => new(p, VkKernels.LaneFormat(lane));
 
-    private Fmt RecurrentFormat<TN>(string what) where TN : struct, IAdad<TN>
-    {
-        var f = Fmt.Of<TN>();
-        if (f.IsBlock) throw Missing($"{what} of {f.Name} (a block format)");
-        return f;
-    }
+    private static Fmt RecurrentFormat<TN>(string what) where TN : struct, IAdad<TN> => Fmt.Of<TN>();
 
     private ulong RentLanes(Lane lane, List<ulong> rented, long values)
     {

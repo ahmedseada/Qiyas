@@ -1,9 +1,8 @@
 // Copyright (c) 2026 Ahmed Seada
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
-// The Vulkan device's proofs before its timing: each family it has kernels for, against the same references (and the
-// CPU's own results, bit for bit, where the operation is exact) as the CPU and CUDA are held to. A family it refuses is
-// said so, not proved.
+// The Vulkan device's proofs before its timing: every family, every type (the block formats among them), against the same
+// references (and the CPU's own results, bit for bit, where the operation is exact) as the CPU and CUDA are held to.
 namespace Qiyas;
 
 internal static partial class Checks
@@ -14,27 +13,27 @@ internal static partial class Checks
         bool ok = true;
         ok &= Adds(ops, "vulkan");
         ok &= Maps(ops, "vulkan");
-        ok &= Group2(ops, "vulkan", blocks: false);
+        ok &= Group2(ops, "vulkan");
         ok &= Rows(ops, "vulkan");
-        ok &= Layouts(ops, "vulkan", blocks: false);
-        ok &= Products(ops, "vulkan", blocks: false);
-        ok &= Optimizers(ops, "vulkan", blocks: false);
-        ok &= Routings(ops, "vulkan", blocks: false);
-        ok &= Ctcs(ops, "vulkan", blocks: false);
-        ok &= Attentions(ops, "vulkan", blocks: false);
-        ok &= Convs(ops, "vulkan", blocks: false);
-        ok &= Recurrents(ops, "vulkan", blocks: false);
+        ok &= Layouts(ops, "vulkan");
+        ok &= Products(ops, "vulkan");
+        ok &= Optimizers(ops, "vulkan");
+        ok &= Routings(ops, "vulkan");
+        ok &= Ctcs(ops, "vulkan");
+        ok &= Attentions(ops, "vulkan");
+        ok &= Convs(ops, "vulkan");
+        ok &= Recurrents(ops, "vulkan");
+        ok &= BlockFormats(ops);
         return ok;
     }
 
     /// <summary>c = a + b on the device against the CPU's, value for value (both in the type's own lane: the same sums), at
-    /// 1001 and 4099 values (a last word part-filled), every type but the block formats (refused: said so).</summary>
+    /// 1001 and 4099 values (a last word, or block, part-filled), every type (a block format's sums encoded as the CPU's).</summary>
     private static bool Adds(IDevice<ulong, ulong> ops, string where)
     {
         bool ok = true;
         foreach (var type in Bench.Registry.Names)
         {
-            if (Bench.Registry.IsBlock(type)) continue;
             foreach (int n in new[] { 1001, 4099 })
             {
                 var a = Bench.Registry.Make(type, n, 51, -100, 100);
@@ -55,7 +54,7 @@ internal static partial class Checks
             }
         }
 
-        if (ok) Console.WriteLine($"check add                  {where,-6} every type but the block formats: the CPU's sums, value for value");
+        if (ok) Console.WriteLine($"check add                  {where,-6} every type: the CPU's sums, value for value");
         return ok;
     }
 

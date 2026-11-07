@@ -8,7 +8,8 @@
 // image's values with 0 (the padding). The backward in the type's float lane, on the type's own tensors: dcols = wᵀ·dy
 // (an intermediate: lane storage) with w and dy read where they are stored, dx = col2im(dcols); dw = dy · colsᵀ with the
 // columns gathered from the image where it is stored; the gradients lane values (the type's own storage for float32 and
-// float64, else stored as the type once after). The block formats are refused (no Vulkan block encoder yet).
+// float64, else stored as the type once after; a block format's by its encoder). A block format's forward is fused: its
+// composition would encode the columns as blocks (each window's values quantized again).
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
@@ -20,12 +21,7 @@ public sealed partial class VulkanOps
 
     private readonly Dictionary<string, bool> _convFused = [];
 
-    private Fmt ConvFormat<TN>(string what) where TN : struct, IAdad<TN>
-    {
-        var f = Fmt.Of<TN>();
-        if (f.IsBlock) throw Missing($"{what} of {f.Name} (a block format)");
-        return f;
-    }
+    private static Fmt ConvFormat<TN>(string what) where TN : struct, IAdad<TN> => Fmt.Of<TN>();
 
     /// <summary>y = conv(x, w); returns the product's lane.</summary>
     public string Conv<TN>(ConvArgs a, ulong x, ulong w, ulong y) where TN : struct, IAdad<TN>
@@ -36,7 +32,7 @@ public sealed partial class VulkanOps
         var (wLo, wHi) = Range<TN>(w, (int)a.WValues);
         var (xLo, xHi) = Range<TN>(x, (int)a.XValues);
         var lane = SumLane(f, new Bounds(wLo, wHi, Math.Min(xLo, 0), Math.Max(xHi, 0), a.Rows));
-        if (FusedConv == true) return ConvFused(f, a, x, w, y, lane);
+        if (FusedConv == true || f.IsBlock) return ConvFused(f, a, x, w, y, lane);
         string key = $"{f.Name}:{a.C}x{a.H}x{a.W}>{a.OC}:{a.Kh}x{a.Kw}:s{a.Sh}x{a.Sw}:p{a.Ph}x{a.Pw}:d{a.Dh}x{a.Dw}";
         if (!_convFused.TryGetValue(key, out bool fused))
         {

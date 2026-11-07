@@ -4,8 +4,8 @@
 // The products on Vulkan (Kernels.Products.cs): the lane by the bounds of the operands' values and k (CUDA's sum lane:
 // f32 while exact, the integers' own, f64), every batch's operands read where they are stored (transposed, at their
 // offsets, broadcast at stride 0), C written in the lane where the lane is the type's storage, otherwise kept as lane
-// values and stored as the type once. Block formats are refused (no Vulkan block encoder yet), and so is the
-// block-scaled product.
+// values and stored as the type once (a block format's by its encoder). The block-scaled product (the blocks' integer
+// dot products) is not on Vulkan: the decoded route stands.
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
@@ -19,7 +19,6 @@ public sealed partial class VulkanOps
     public string MatMulView<TN>(ProductView v, ulong a, ulong b, ulong c) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsBlock) throw Missing($"matmul of {f.Name} (a block format)");
         var (aLo, aHi) = Range<TN>(a, (int)v.ValuesA);
         var (bLo, bHi) = Range<TN>(b, (int)v.ValuesB);
         var lane = SumLane(f, new Bounds(aLo, aHi, bLo, bHi, v.K));
@@ -52,6 +51,13 @@ public sealed partial class VulkanOps
     // count), the rest of C's words (between the batches' regions, past its last value) kept as they are stored.
     private void BackKeep(Fmt f, Lane lane, ulong lanes, ulong c, long count, long period, long span)
     {
+        if (f.IsBlock)
+        {
+            // A block re-encoded whole: its kept values decoded from C as it is stored.
+            Encode(f, count, vk.Cached($"block_lanes_keep:{lane.Name}:{f.Name}", () => VkKernels.BlockFromLanesKeep(vk, lane, f)), c, lanes, c, Vulkan.U(period), Vulkan.U(span));
+            return;
+        }
+
         var back = vk.Cached($"back_keep:{lane.Name}:{f.Name}", () => VkKernels.FromLanesKeep(vk, lane, f));
         vk.Launch(back, Groups(f.Words(count), VkKernels.Threads), 1, lanes, c, Vulkan.U(count), Vulkan.U(period), Vulkan.U(span));
     }
@@ -64,7 +70,8 @@ public sealed partial class VulkanOps
         return lane;
     }
 
-    public string MatMulViewBlocks<TN>(ProductView v, ulong a, ulong b, ulong c) where TN : struct, IAdad<TN> => throw Missing("block-scaled matmul");
+    public string MatMulViewBlocks<TN>(ProductView v, ulong a, ulong b, ulong c) where TN : struct, IAdad<TN> =>
+        throw new NotSupportedException("vulkan: the block-scaled product has no Vulkan kernels (the decoded route, MatMulView, stands)");
 
     public bool BlockProductAvailable => false;
 }

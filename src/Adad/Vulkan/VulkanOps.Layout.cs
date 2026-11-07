@@ -4,8 +4,8 @@
 // The layout operations on Vulkan (Kernels.Layout.cs), CUDA's lane rule (Cuda/GpuOps.Layout.cs): the type's own lane for
 // moves, the float lane for the weighted ones (bilinear interpolation, the average pools), the sum lane by the bounds of
 // the terms for the sums (an integer sum stays an integer); scatter-add's ordering and the max-pool backward's window
-// choices built on the device first; then one kernel, a thread per output word. Block formats are refused (no Vulkan
-// block encoder yet).
+// choices built on the device first; then one kernel, a thread per output word (a block format's by its encoder, each
+// block from its values).
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
@@ -16,7 +16,6 @@ public sealed partial class VulkanOps
     public string Layout<TN>(LayoutArgs k, ulong x, ulong idx, ulong output, ulong x2) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsBlock) throw Missing($"layout {k.Name} of {f.Name} (a block format)");
         var (rows, cols) = LayoutArgs.OutputRows(k);
         Lane lane;
         if (LayoutArgs.Sums(k.Name))
@@ -50,7 +49,9 @@ public sealed partial class VulkanOps
                 if (windows > 0) vk.Launch(argmax, Groups(windows, VkKernels.Threads), 1, VkKernels.LayoutSlots(0, x2, 0, 0, aux, windows, 0, 0, k.P));
             }
 
-            if (k.Count > 0)
+            if (k.Count > 0 && f.IsBlock)
+                Encode(f, k.Count, vk.Cached($"block_layout:{k.Name}:{f.Name}:{lane.Name}", () => VkKernels.BlockLayout(vk, f, lane, k.Name)), output, VkKernels.LayoutSlots(x, x2, idx, aux, output, k.Count, rows, cols, k.P));
+            else if (k.Count > 0)
             {
                 var fn = vk.Cached($"layout:{k.Name}:{f.Name}:{lane.Name}", () => VkKernels.Layout(vk, f, lane, k.Name));
                 vk.Launch(fn, Groups(f.Words(k.Count), VkKernels.Threads), 1, VkKernels.LayoutSlots(x, x2, idx, aux, output, k.Count, rows, cols, k.P));

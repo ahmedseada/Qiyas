@@ -182,19 +182,41 @@ public sealed partial class VulkanOps
         }
     }
 
-    // A lane array into stored values (not a block format: their encoders are not on Vulkan yet).
+    // A lane array into stored values (a block format's by its encoder).
     private void Back(Fmt f, Lane lane, ulong lanes, ulong stored, long count)
     {
-        if (f.IsBlock) throw Missing($"{f.Name}'s block encoder");
+        if (f.IsBlock)
+        {
+            Encode(f, count, vk.Cached($"block_lanes:{lane.Name}:{f.Name}", () => VkKernels.BlockFromLanes(vk, lane, f)), stored, lanes);
+            return;
+        }
+
         var k = vk.Cached($"back:{lane.Name}:{f.Name}", () => VkKernels.FromLanes(vk, lane, f));
         vk.Launch(k, Groups(f.Words(count), VkKernels.Threads), 1, lanes, stored, Vulkan.U((int)count));
     }
 
+    /// <summary>A stored array into a lane array (for checks).</summary>
+    public void ToLanes<TN>(Lane lane, ulong stored, ulong lanes, int count) where TN : struct, IAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        var k = vk.Cached($"to:{f.Name}:{lane.Name}", () => VkKernels.ToLanes(vk, f, lane));
+        vk.Launch(k, Groups(count, VkKernels.Threads), 1, stored, lanes, Vulkan.U(count));
+    }
+
+    /// <summary>A lane array into a stored array (for checks; a block format's by its encoder).</summary>
+    public void FromLanes<TN>(Lane lane, ulong lanes, ulong stored, int count) where TN : struct, IAdad<TN> =>
+        Back(Fmt.Of<TN>(), lane, lanes, stored, count);
+
     public string Transpose<TN>(ulong x, ulong output, int rows, int cols) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsBlock) throw Missing($"transpose of {f.Name} (a block format)");
         var lane = f.Natural;
+        if (f.IsBlock)
+        {
+            Encode(f, (long)rows * cols, vk.Cached($"block_transpose:{f.Name}", () => VkKernels.BlockTranspose(vk, f)), output, x, Vulkan.U(rows), Vulkan.U(cols));
+            return lane.Name;
+        }
+
         var k = vk.Cached($"transpose:{f.Name}", () => VkKernels.Transpose(vk, f, lane));
         vk.Launch(k, Groups(f.Words((long)rows * cols), VkKernels.Threads), 1, x, output, Vulkan.U(rows), Vulkan.U(cols));
         return lane.Name;
@@ -204,7 +226,6 @@ public sealed partial class VulkanOps
     public string Gemv<TN>(ulong a, ulong x, ulong y, int rows, int cols, bool transposed) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsBlock) throw Missing($"gemv of {f.Name} (a block format)");
         int xn = transposed ? rows : cols, yn = transposed ? cols : rows;
         var (aLo, aHi) = Range<TN>(a, rows * cols);
         var (xLo, xHi) = Range<TN>(x, xn);
