@@ -86,12 +86,6 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
 
     // ---------------------------------------------------------------- the families not on Vulkan yet
 
-    public string Conv<TN>(ConvArgs a, ulong x, ulong w, ulong y) where TN : struct, IAdad<TN> => throw Missing("conv");
-
-    public string ConvComposed<TN>(ConvArgs a, ulong x, ulong w, ulong y) where TN : struct, IAdad<TN> => throw Missing("conv (composed)");
-
-    public string ConvBackward<TN>(ConvArgs a, ulong x, ulong w, ulong dy, ulong dx, ulong dw) where TN : struct, IFloatAdad<TN> => throw Missing("conv backward");
-
     public void CellGates<TN>(CellArgs a, ulong x, ulong w, ulong h, ulong u, ulong bias, ulong g) where TN : struct, IAdad<TN> => throw Missing("recurrent gates");
 
     public string LstmCell<TN>(CellArgs a, ulong g, ulong c, ulong hOut, ulong cOut) where TN : struct, IFloatAdad<TN> => throw Missing("lstm cell");

@@ -37,8 +37,7 @@ public sealed partial class VulkanOps
             {
                 // C's values between the batches' regions (a stride past m·n) kept as they are stored.
                 long span = (long)v.M * v.N, period = v.Batch > 1 ? Math.Max(span, v.StrideCOrDefault) : span;
-                var back = vk.Cached($"back_keep:{lane.Name}:{f.Name}", () => VkKernels.FromLanesKeep(vk, lane, f));
-                vk.Launch(back, Groups(f.Words(valuesC), VkKernels.Threads), 1, lanes, c, Vulkan.U(valuesC), Vulkan.U(period), Vulkan.U(span));
+                BackKeep(f, lane, lanes, c, valuesC, period, span);
             }
         }
         finally
@@ -47,6 +46,14 @@ public sealed partial class VulkanOps
         }
 
         return lane.Name;
+    }
+
+    // A product's lane values into C as the type: the values at positions p with p mod period below span (and below
+    // count), the rest of C's words (between the batches' regions, past its last value) kept as they are stored.
+    private void BackKeep(Fmt f, Lane lane, ulong lanes, ulong c, long count, long period, long span)
+    {
+        var back = vk.Cached($"back_keep:{lane.Name}:{f.Name}", () => VkKernels.FromLanesKeep(vk, lane, f));
+        vk.Launch(back, Groups(f.Words(count), VkKernels.Threads), 1, lanes, c, Vulkan.U(count), Vulkan.U(period), Vulkan.U(span));
     }
 
     /// <summary>dA = dC·Bᵀ and dB = Aᵀ·dC for C = A·B (A m × k, B k × n, dC m × n); returns dA's lane.</summary>

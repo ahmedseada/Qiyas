@@ -138,6 +138,25 @@ internal static partial class VkKernels
         return b.Build();
     }
 
+    /// <summary>im2col's value at column row r = (ch·kh + a)·kw + bb, column c = oh·OW + ow (p: its parameters,
+    /// ConvArgs.P): the image's index (ch, oh·sh − ph + a·dh, ow·sw − pw + bb·dw), and whether it is inside the image (else
+    /// the value is 0, the index 0: a safe address). The layout's im2col and the convolution's product share it.</summary>
+    internal static (V Src, V Inside) Im2colAt(Spv b, V[] p, V r, V c)
+    {
+        V kw = p[4], kh = p[3], H = p[1], W = p[2];
+        var OW = PoolSize(p[2], p[4], p[6], p[8], p[10]);
+        var ow = c % OW;
+        var oh = c / OW;
+        var bb = r % kw;
+        var t = r / kw;
+        var ka = t % kh;
+        var ch = t / kh;
+        var ih = oh * p[5] - p[7] + ka * p[9];                                          // above or left: unsigned past H or W
+        var iw = ow * p[6] - p[8] + bb * p[10];
+        var inside = (ih < H) & (iw < W);
+        return (b.Select(inside, (ch * H + ih) * W + iw, b.U(0)), inside);
+    }
+
     // [⌊o·n/outs⌋, ⌈(o + 1)·n/outs⌉): the start and the length.
     private static (V Start, V Length) AdaptiveSpan(V o, V n, V outs)
     {
@@ -208,19 +227,7 @@ internal static partial class VkKernels
 
             case "im2col":
             {
-                // r = (ch·kh + a)·kw + bb; c = oh·OW + ow; source (ch, oh·sh − ph + a·dh, ow·sw − pw + bb·dw) or 0.
-                V kw = p[4], kh = p[3], H = p[1], W = p[2];
-                var OW = PoolSize(p[2], p[4], p[6], p[8], p[10]);
-                var ow = c % OW;
-                var oh = c / OW;
-                var bb = r % kw;
-                var t = r / kw;
-                var ka = t % kh;
-                var ch = t / kh;
-                var ih = oh * p[5] - p[7] + ka * p[9];
-                var iw = ow * p[6] - p[8] + bb * p[10];
-                var inside = (ih < H) & (iw < W);
-                var src = b.Select(inside, (ch * H + ih) * W + iw, b.U(0));             // a safe address when out of range (dropped)
+                var (src, inside) = Im2colAt(b, p, r, c);
                 return b.Select(inside, Load(src), Zero());
             }
 

@@ -6,7 +6,8 @@
 // (Codec.UnpackAt: transposed or at a batch's offset by the index alone) into workgroup memory in the product's lane,
 // and each value of C accumulates its k terms in order by fused multiply-adds (the integer lanes exactly). C is the
 // lane's values: written as C where the lane is the type's storage, otherwise into lane storage and stored as the type
-// once (FromLanesKeep, which keeps the values between the batches' regions).
+// once (FromLanesKeep, which keeps the values between the batches' regions). The convolution's product is the same tile
+// loop with B gathered from the image (MatMulConv).
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
@@ -23,7 +24,6 @@ internal static partial class VkKernels
     /// <summary>The product kernel with A stored as fa and B as fb (attention's P in lane storage against V as stored).</summary>
     public static SpvKernel MatMul(Vulkan vk, Fmt fa, Fmt fb, Lane lane, bool transA, bool transB)
     {
-        var k = Kinds.Of(lane);
         string formats = fa.Name == fb.Name ? fa.Name : $"{fa.Name}_{fb.Name}";
         var b = new Spv($"matmul_{formats}_{lane.Name}{(transA ? "_ta" : "")}{(transB ? "_tb" : "")}", TileSide, vk.Controls, TileSide);
         var pa = b.Arg(0);
@@ -38,16 +38,63 @@ internal static partial class VkKernels
         var tilesM = b.Arg(9, K.U32);
         var offsetA = b.Arg(10, K.U32);
         var offsetB = b.Arg(11, K.U32);
-        var tx = b.LocalIdX;
-        var ty = b.LocalIdY;
-        var tid = ty * TileSide + tx;
         var gy = b.GroupY;
         var batch = gy / tilesM;
         var row0 = (gy - batch * tilesM) * TileM;
-        var col0 = b.GroupX * TileN;
         var baseA = batch * strideA + offsetA;
         var baseB = batch * strideB + offsetB;
-        var baseC = batch * strideC;
+        ProductTiles(b, lane, transA, transB, M, N, Kd, row0, pc, batch * strideC,
+            (gr, gk, inside) => Codec.UnpackAt(b, fa, pa, baseA + b.Select(inside, transA ? gk * M + gr : gr * Kd + gk, b.U(0)), lane),
+            (gk, gc, inside) => Codec.UnpackAt(b, fb, pb, baseB + b.Select(inside, transB ? gc * Kd + gk : gk * N + gc, b.U(0)), lane));
+        return b.Build();
+    }
+
+    /// <summary>The convolution's product (implicit GEMM: no columns in memory): A (m × k, stored as fa) times the image's
+    /// columns (im2col of x, stored as fb, gathered by the index map on the load: Im2colAt), or, transB, times their
+    /// transpose (dw = dy · colsᵀ). Arguments: a, x, c (lane values), m, n, k, then the im2col parameters (ConvArgs.P) two
+    /// a slot; workgroups (⌈n/64⌉, ⌈m/64⌉).</summary>
+    public static SpvKernel MatMulConv(Vulkan vk, Fmt fa, Fmt fb, Lane lane, bool transB)
+    {
+        string formats = fa.Name == fb.Name ? fa.Name : $"{fa.Name}_{fb.Name}";
+        var b = new Spv($"matmul_conv_{formats}_{lane.Name}{(transB ? "_tb" : "")}", TileSide, vk.Controls, TileSide);
+        var pa = b.Arg(0);
+        var px = b.Arg(1);
+        var pc = b.Arg(2);
+        var M = b.Arg(3, K.U32);
+        var N = b.Arg(4, K.U32);
+        var Kd = b.Arg(5, K.U32);
+        var p = new V[12];
+        for (int i = 0; i < 12; i++)
+        {
+            var raw = b.Arg(6 + i / 2);
+            p[i] = b.Convert(i % 2 == 0 ? raw : raw >> 32, K.U32);
+        }
+
+        var zero = b.C(Kinds.Of(lane), 0);
+        ProductTiles(b, lane, false, transB, M, N, Kd, b.GroupY * TileM, pc, b.U(0),
+            (gr, gk, inside) => Codec.UnpackAt(b, fa, pa, b.Select(inside, gr * Kd + gk, b.U(0)), lane),
+            (gk, gc, inside) =>
+            {
+                // B(k, c) = cols[k][c], or for transB cols[c][k]: column row r, column (pixel) q.
+                var (src, image) = Im2colAt(b, p, transB ? gc : gk, transB ? gk : gc);
+                var ok = inside & image;
+                return b.Select(ok, Codec.UnpackAt(b, fb, px, b.Select(ok, src, b.U(0)), lane), zero);
+            });
+        return b.Build();
+    }
+
+    // C(r, c) = Σ_k A(r, k)·B(k, c) for the workgroup's 64 × 64 tile (rows from row0, columns from the workgroup's x),
+    // into lane values at pc + (baseC + r·N + c)·size: A's and B's 64 × 16 slices loaded through loadA(row, k, inside)
+    // and loadB(k, column, inside) (a value at a safe place when not inside; 0 is taken there) into workgroup memory,
+    // consecutive invocations along the operand's stored rows; each value of C its k terms in order by fused multiply-adds.
+    private static void ProductTiles(Spv b, Lane lane, bool transA, bool transB, V M, V N, V Kd, V row0, V pc, V baseC,
+        Func<V, V, V, V> loadA, Func<V, V, V, V> loadB)
+    {
+        var k = Kinds.Of(lane);
+        var tx = b.LocalIdX;
+        var ty = b.LocalIdY;
+        var tid = ty * TileSide + tx;
+        var col0 = b.GroupX * TileN;
         var sa = b.Shared(k, TileK * TileM);                                         // sa[kk·64 + i] = A(row0 + i, k0 + kk)
         var sb = b.Shared(k, TileK * TileN);                                         // sb[kk·64 + j] = B(k0 + kk, col0 + j)
         var acc = new Var[4, 4];
@@ -65,8 +112,7 @@ internal static partial class VkKernels
                 var gr = row0 + ii;
                 var gk = k0 + kk;
                 var inside = (gr < M) & (gk < Kd);
-                var at = transA ? gk * M + gr : gr * Kd + gk;
-                sa[kk * TileM + ii] = b.Select(inside, Codec.UnpackAt(b, fa, pa, baseA + b.Select(inside, at, b.U(0)), lane), zero);
+                sa[kk * TileM + ii] = b.Select(inside, loadA(gr, gk, inside), zero);
             }
 
             for (int l = 0; l < TileK * TileN / threads; l++)
@@ -77,8 +123,7 @@ internal static partial class VkKernels
                 var gk = k0 + kk;
                 var gc = col0 + jj;
                 var inside = (gk < Kd) & (gc < N);
-                var at = transB ? gc * Kd + gk : gk * N + gc;
-                sb[kk * TileN + jj] = b.Select(inside, Codec.UnpackAt(b, fb, pb, baseB + b.Select(inside, at, b.U(0)), lane), zero);
+                sb[kk * TileN + jj] = b.Select(inside, loadB(gk, gc, inside), zero);
             }
 
             b.Barrier();
@@ -104,8 +149,6 @@ internal static partial class VkKernels
                 b.If((r < M) & (c < N), () => b.Store(b.At(pc, baseC + r * N + c, lane.Size), value));
             }
         }
-
-        return b.Build();
     }
 
     /// <summary>A lane array's n values into a stored array a thread per word, the values at positions p with p mod period

@@ -685,12 +685,14 @@ internal static partial class Checks
     /// <summary>Every type: a 3 × 7 × 9 image by 5 filters of 3 × 2 at stride 2 × 1, pad 1, dilation 1; and 2 × 5 × 5 by 3 of 3 × 3
     /// dilated 2; forward and the backward pair against float64 within the products' rounding. Then the fused forward on
     /// five shapes, and on the CPU the backward with dw's columns read from the image on the same five.</summary>
-    public static bool Convs(GpuOps? ops)
+    // blocks: false where the device refuses the block formats (said so, not proved).
+    public static bool Convs(IDevice<ulong, ulong>? ops, string device = "device", bool blocks = true)
     {
         bool ok = true;
-        string where = ops is null ? "cpu" : "device";
+        string where = ops is null ? "cpu" : device;
         foreach (var type in Bench.Registry.Names)
         {
+            if (!blocks && Bench.Registry.IsBlock(type)) continue;
             foreach (var a in new[] { new ConvArgs(3, 7, 9, 5, 3, 2, 2, 1, 1, 1), new ConvArgs(2, 5, 5, 3, 3, 3, 1, 1, 1, 1, 2, 2) })
             {
                 var x = Bench.Registry.Make(type, (int)a.XValues, 61, -1, 1);
@@ -716,9 +718,11 @@ internal static partial class Checks
         // composition may take another kernel); the integer lanes are exact either way. Block formats: the composition
         // re-encodes the columns into blocks, the fused path reads the image's values: rounding only. Shapes: the two
         // above, a 3 × 3 at 16 × 20 × 20 → 32 (padded tiles), 1 × 1 at 128 × 16 × 16 → 128 (whole tiles), and a strided,
-        // dilated one with an even width (sub-byte types in place).
+        // dilated one with an even width (sub-byte types in place). Vulkan: the fused path and the composition are the same
+        // tile loop over the same values, equal bit for bit.
         foreach (var type in Bench.Registry.Names)
         {
+            if (!blocks && Bench.Registry.IsBlock(type)) continue;
             foreach (var a in new[] { new ConvArgs(3, 7, 9, 5, 3, 2, 2, 1, 1, 1), new ConvArgs(2, 5, 5, 3, 3, 3, 1, 1, 1, 1, 2, 2), new ConvArgs(16, 20, 20, 32, 3, 3, 1, 1, 1, 1), new ConvArgs(128, 16, 16, 128, 1, 1), new ConvArgs(4, 9, 12, 6, 3, 3, 2, 2, 1, 1, 2, 2) })
             {
                 var x = Bench.Registry.Make(type, (int)a.XValues, 64, -1, 1);
@@ -753,12 +757,12 @@ internal static partial class Checks
             }
         }
 
-        if (ok) Console.WriteLine($"check convolution            {where,-6} every type: forward and the backward pair within the products' rounding; the fused forward equal to the composition through the same kernel{(ops is null ? ", and the backward with dw's columns from the image" : "")}");
+        if (ok) Console.WriteLine($"check convolution            {where,-6} every type{(blocks ? "" : " but the block formats")}: forward and the backward pair within the products' rounding; the fused forward equal to the composition through the same kernel{(ops is null ? ", and the backward with dw's columns from the image" : "")}");
         return ok;
     }
 
     // The fused forward forced on (into fused), then its composition through the same kernel (into composed).
-    private sealed class ConvModeRun(GpuOps? ops, ConvArgs a, byte[] x, byte[] w, byte[] fused, byte[] composed) : Bench.ITypeVisitor<bool>
+    private sealed class ConvModeRun(IDevice<ulong, ulong>? ops, ConvArgs a, byte[] x, byte[] w, byte[] fused, byte[] composed) : Bench.ITypeVisitor<bool>
     {
         public string Lane = "";
 
@@ -774,19 +778,33 @@ internal static partial class Checks
                 return true;
             }
 
-            var gpu = ops.Gpu;
-            ulong dX = gpu.Rent(x.Length), dW = gpu.Rent(w.Length), dY = gpu.Rent(fused.Length), dC = gpu.Rent(composed.Length);
-            Adad.Cuda.Gpu.Upload<byte>(x, dX); Adad.Cuda.Gpu.Upload<byte>(w, dW);
-            ops.FusedConv = true;
-            Lane = ops.Conv<TN>(a, dX, dW, dY);
-            bool packed = Lane.EndsWith("mma", StringComparison.Ordinal) || Lane.EndsWith("dp", StringComparison.Ordinal);
-            if (!packed && Lane is "f32" or "f64" && Bench.Registry.IsFloat(TN.Name)) ops.ConvPlainComposed<TN>(a, dX, dW, dC, Lane);
-            else { ops.FusedConv = false; ops.Conv<TN>(a, dX, dW, dC); }
-            ops.FusedConv = null;
-            Adad.Cuda.Gpu.Synchronize();
-            Adad.Cuda.Gpu.Download<byte>(dY, fused);
-            Adad.Cuda.Gpu.Download<byte>(dC, composed);
-            gpu.Return(dX); gpu.Return(dW); gpu.Return(dY); gpu.Return(dC);
+            ulong dX = ops.Rent(x.Length + 16), dW = ops.Rent(w.Length + 16), dY = ops.Rent(fused.Length + 16), dC = ops.Rent(composed.Length + 16);
+            ops.Upload(x, dX); ops.Upload(w, dW);
+            // Both outputs start as the host's (zero) bytes: the bits of y's last word past its values are kept as stored,
+            // so the comparison is of the same bytes as the CPU's.
+            ops.Upload(fused, dY); ops.Upload(composed, dC);
+            if (ops is GpuOps cuda)
+            {
+                cuda.FusedConv = true;
+                Lane = cuda.Conv<TN>(a, dX, dW, dY);
+                bool packed = Lane.EndsWith("mma", StringComparison.Ordinal) || Lane.EndsWith("dp", StringComparison.Ordinal);
+                if (!packed && Lane is "f32" or "f64" && Bench.Registry.IsFloat(TN.Name)) cuda.ConvPlainComposed<TN>(a, dX, dW, dC, Lane);
+                else { cuda.FusedConv = false; cuda.Conv<TN>(a, dX, dW, dC); }
+                cuda.FusedConv = null;
+            }
+            else if (ops is Adad.Vulkan.VulkanOps vulkan)
+            {
+                vulkan.FusedConv = true;
+                Lane = vulkan.Conv<TN>(a, dX, dW, dY);
+                vulkan.FusedConv = false;
+                vulkan.Conv<TN>(a, dX, dW, dC);
+                vulkan.FusedConv = null;
+            }
+
+            ops.Synchronize();
+            ops.Download(dY, fused);
+            ops.Download(dC, composed);
+            ops.Return(dX); ops.Return(dW); ops.Return(dY); ops.Return(dC);
             return true;
         }
     }
@@ -805,34 +823,32 @@ internal static partial class Checks
         }
     }
 
-    private sealed class ConvRun(GpuOps? ops, ConvArgs a, byte[] x, byte[] w, byte[] y, byte[]? dx, byte[]? dw) : Bench.ITypeVisitor<bool>
+    private sealed class ConvRun(IDevice<ulong, ulong>? ops, ConvArgs a, byte[] x, byte[] w, byte[] y, byte[]? dx, byte[]? dw) : Bench.ITypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IAdad<TN, float>
         {
             if (ops is null) { Kernels.Conv<TN>(a, x, w, y); return true; }
-            var gpu = ops.Gpu;
-            ulong dX = gpu.Rent(x.Length), dW = gpu.Rent(w.Length), dY = gpu.Rent(y.Length);
-            Adad.Cuda.Gpu.Upload<byte>(x, dX); Adad.Cuda.Gpu.Upload<byte>(w, dW);
+            ulong dX = ops.Rent(x.Length + 16), dW = ops.Rent(w.Length + 16), dY = ops.Rent(y.Length + 16);
+            ops.Upload(x, dX); ops.Upload(w, dW);
             ops.Conv<TN>(a, dX, dW, dY);
-            Adad.Cuda.Gpu.Synchronize();
-            Adad.Cuda.Gpu.Download<byte>(dY, y);
-            gpu.Return(dX); gpu.Return(dW); gpu.Return(dY);
+            ops.Synchronize();
+            ops.Download(dY, y);
+            ops.Return(dX); ops.Return(dW); ops.Return(dY);
             return true;
         }
     }
 
-    private sealed class ConvBackwardRun(GpuOps? ops, ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dx, byte[] dw) : Bench.IFloatTypeVisitor<bool>
+    private sealed class ConvBackwardRun(IDevice<ulong, ulong>? ops, ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dx, byte[] dw) : Bench.IFloatTypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
         {
             if (ops is null) { Kernels.ConvBackward<TN>(a, x, w, dy, dx, dw); return true; }
-            var gpu = ops.Gpu;
-            ulong dX = gpu.Rent(x.Length), dW = gpu.Rent(w.Length), dY = gpu.Rent(dy.Length), gx = gpu.Rent(dx.Length), gw = gpu.Rent(dw.Length);
-            Adad.Cuda.Gpu.Upload<byte>(x, dX); Adad.Cuda.Gpu.Upload<byte>(w, dW); Adad.Cuda.Gpu.Upload<byte>(dy, dY);
+            ulong dX = ops.Rent(x.Length + 16), dW = ops.Rent(w.Length + 16), dY = ops.Rent(dy.Length + 16), gx = ops.Rent(dx.Length + 16), gw = ops.Rent(dw.Length + 16);
+            ops.Upload(x, dX); ops.Upload(w, dW); ops.Upload(dy, dY);
             ops.ConvBackward<TN>(a, dX, dW, dY, gx, gw);
-            Adad.Cuda.Gpu.Synchronize();
-            Adad.Cuda.Gpu.Download<byte>(gx, dx); Adad.Cuda.Gpu.Download<byte>(gw, dw);
-            gpu.Return(dX); gpu.Return(dW); gpu.Return(dY); gpu.Return(gx); gpu.Return(gw);
+            ops.Synchronize();
+            ops.Download(gx, dx); ops.Download(gw, dw);
+            ops.Return(dX); ops.Return(dW); ops.Return(dY); ops.Return(gx); ops.Return(gw);
             return true;
         }
     }
