@@ -33,24 +33,11 @@ public sealed partial class VulkanOps
         {
             if (k.Name == "scatter_add_rows")
             {
-                // The rows' offsets, then the sources in order of their row (stable).
+                // The rows' offsets, then the sources in order of their row (stable: the radix ordering, VulkanOps.Routing.cs).
                 int n = k.P[0], targets = k.P[2];
                 counts = vk.Rent(Math.Max(1, targets) * 4L);
                 aux = vk.Rent((targets + 1 + Math.Max(1, n)) * 4L);
-                vk.Clear(counts, Math.Max(1, targets) * 4L);
-                if (n > 0)
-                {
-                    var count = vk.Cached("scatter_count", () => VkKernels.ScatterCount(vk));
-                    vk.Launch(count, Groups(n, VkKernels.Threads), 1, idx, counts, Vulkan.U(n), Vulkan.U(targets));
-                }
-
-                var scan = vk.Cached("scatter_scan", () => VkKernels.ScatterScan(vk));
-                vk.Launch(scan, 1, 1, counts, aux, Vulkan.U(targets));
-                if (n > 0)
-                {
-                    var place = vk.Cached("scatter_place", () => VkKernels.ScatterPlace(vk));
-                    vk.Launch(place, Groups(n, VkKernels.Threads), 1, idx, aux, aux + (ulong)((targets + 1) * 4L), Vulkan.U(n), Vulkan.U(targets));
-                }
+                Order(idx, n, targets, counts, aux, aux + (ulong)((targets + 1) * 4L));
             }
 
             if (k.Name is "maxpool_bwd" or "adaptive_maxpool_bwd")

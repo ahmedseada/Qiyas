@@ -398,14 +398,20 @@ internal static partial class Checks
     /// <summary>Every type: top-k (k = 5 of 1001, ties included) exact; pick exact; sampling (float types) exact against
     /// the float64 draw except where the lane's rounding of the running sum crosses the threshold (allowed: the next
     /// column); the route of 1001 indices into 7 buckets exact.</summary>
-    public static bool Routings(GpuOps? ops)
+    // The bench's name of a device.
+    private static Bench.Device DeviceOf(IDevice<ulong, ulong>? ops) => ops is null ? Bench.Device.Cpu : ops is GpuOps ? Bench.Device.Cuda : Bench.Device.Vulkan;
+
+    // blocks: false where the device refuses the block formats (said so, not proved).
+    public static bool Routings(IDevice<ulong, ulong>? ops, string device = "device", bool blocks = true)
     {
         bool ok = true;
-        string where = ops is null ? "cpu" : "device";
+        string where = ops is null ? "cpu" : device;
+        var cuda = ops as GpuOps;
         const int rows = 37, cols = 1001, k = 5;
         var random = new Random(98);
         foreach (var type in Bench.Registry.Names)
         {
+            if (!blocks && Bench.Registry.IsBlock(type)) continue;
             var x = Bench.Registry.Make(type, rows * cols, 95, -4, 4);
             var xv = Bench.Registry.Values(type, x, rows * cols);
             var (wantV, wantI) = Routing.TopKReference(xv, rows, cols, k);
@@ -433,7 +439,7 @@ internal static partial class Checks
                 if (off > 0) { Console.WriteLine($"check sample        {where,-6} {type,-12} DIFFERS at {off} rows by more than one column"); ok = false; }
                 // The cross-entropy loss per row: the type's step at the loss plus the lane's rounding of a sum of cols terms.
                 var loss = new byte[Bench.Registry.Bytes(type, rows)];
-                using (var ce = new Bench.AdadSubject().CrossEntropy(ops is null ? Bench.Device.Cpu : Bench.Device.Cuda, type, x, rows, cols, index, loss)!) { ce.Run(); ce.Collect(); }
+                using (var ce = new Bench.AdadSubject().CrossEntropy(DeviceOf(ops), type, x, rows, cols, index, loss)!) { ce.Run(); ce.Collect(); }
                 ok &= Close(type, "cross_entropy", where, loss, Routing.CrossEntropyReference(xv, rows, cols, index), rows, terms: cols);
             }
         }
@@ -445,7 +451,7 @@ internal static partial class Checks
             var offsets = new int[8];
             var order = new int[1001];
             var subject = new Bench.AdadSubject();
-            using var run = subject.Route(ops is null ? Bench.Device.Cpu : Bench.Device.Cuda, index, 7, counts, offsets, order)!;
+            using var run = subject.Route(DeviceOf(ops), index, 7, counts, offsets, order)!;
             run.Run(); run.Collect();
             if (!counts.SequenceEqual(wc) || !offsets.SequenceEqual(wo) || !order.SequenceEqual(worder)) { Console.WriteLine($"check route         {where,-6} DIFFERS"); ok = false; }
         }
@@ -455,11 +461,11 @@ internal static partial class Checks
         // all into one, and descending indices (every tile's pairs reversed).
         // Under --repeat the device's cases run Stress / 20 passes (the radix place's barriers and shared counts: a race shows).
         // On the device also with the counting atomics for few targets (TableCounts false): both ways of taking the counts.
-        foreach (bool? table in ops is null ? new bool?[] { null } : new bool?[] { null, false })
+        foreach (bool? table in cuda is null ? new bool?[] { null } : new bool?[] { null, false })
         for (int pass = 0, passes = ops is null ? 1 : Math.Max(1, Stress / 20); pass < passes && ok; pass++)
         foreach (var (n, buckets, kind) in new[] { (1 << 20, 64, "random"), (1_000_003, 100_000, "random"), (5_000, 1, "one"), (70_001, 65_536, "descending"), (1001, 7, "random") })
         {
-            if (ops is not null) ops.TableCounts = table;
+            if (cuda is not null) cuda.TableCounts = table;
             var index = kind switch
             {
                 "one" => new int[n],
@@ -470,35 +476,35 @@ internal static partial class Checks
             var counts = new int[buckets];
             var offsets = new int[buckets + 1];
             var order = new int[n];
-            using var run = new Bench.AdadSubject().Route(ops is null ? Bench.Device.Cpu : Bench.Device.Cuda, index, buckets, counts, offsets, order)!;
+            using var run = new Bench.AdadSubject().Route(DeviceOf(ops), index, buckets, counts, offsets, order)!;
             run.Run(); run.Collect();
             if (!counts.SequenceEqual(wc) || !offsets.SequenceEqual(wo) || !order.SequenceEqual(worder)) { Console.WriteLine($"check route {n} into {buckets} ({kind}{(table == false ? ", counting atomics" : "")}) {where,-6} DIFFERS"); ok = false; }
         }
 
-        if (ops is not null) ops.TableCounts = null;
+        if (cuda is not null) cuda.TableCounts = null;
 
-        if (ok) Console.WriteLine($"check routing                {where,-6} every type: top-k, pick, sampling and the cross-entropy loss (float types) and the route as the references (also 1M into 64, 1 000 003 into 100 000, all into one, descending into 65 536)");
+        if (ok) Console.WriteLine($"check routing                {where,-6} every type{(blocks ? "" : " but the block formats")}: top-k, pick, sampling and the cross-entropy loss (float types) and the route as the references (also 1M into 64, 1 000 003 into 100 000, all into one, descending into 65 536)");
         return ok;
     }
 
-    private sealed class TopKRun(GpuOps? ops, byte[] x, int rows, int cols, int k, byte[]? values, int[]? indices, int[]? index, byte[]? picked, object? u1, object? u2) : Bench.ITypeVisitor<bool>
+    private sealed class TopKRun(IDevice<ulong, ulong>? ops, byte[] x, int rows, int cols, int k, byte[]? values, int[]? indices, int[]? index, byte[]? picked, object? u1, object? u2) : Bench.ITypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IAdad<TN, float>
         {
             var subject = new Bench.AdadSubject();
-            var device = ops is null ? Bench.Device.Cpu : Bench.Device.Cuda;
+            var device = DeviceOf(ops);
             using var run = values is not null ? subject.TopK(device, TN.Name, x, rows, cols, k, values, indices!)! : subject.Pick(device, TN.Name, x, rows, cols, index!, picked!)!;
             run.Run(); run.Collect();
             return true;
         }
     }
 
-    private sealed class SampleRun(GpuOps? ops, byte[] x, int rows, int cols, byte[] u, int[] picks) : Bench.IFloatTypeVisitor<bool>
+    private sealed class SampleRun(IDevice<ulong, ulong>? ops, byte[] x, int rows, int cols, byte[] u, int[] picks) : Bench.IFloatTypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
         {
             var subject = new Bench.AdadSubject();
-            using var run = subject.Sample(ops is null ? Bench.Device.Cpu : Bench.Device.Cuda, TN.Name, x, rows, cols, u, picks)!;
+            using var run = subject.Sample(DeviceOf(ops), TN.Name, x, rows, cols, u, picks)!;
             run.Run(); run.Collect();
             return true;
         }

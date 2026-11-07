@@ -8,7 +8,7 @@
 // Arguments: x, x2, idx, aux, out (slots 0–4), count (5), rows (6), cols (7), then the operation's twelve integers
 // (LayoutArgs order) two to a slot, low half first (8–13).
 // Scatter-add's ordering is built first: the sources counted per target (integer atomics: exact), the offsets by a
-// scan, each source placed by its rank among the earlier sources of its target (deterministic: the sources in order).
+// scan, the sources' stable order by target by the radix sort (Kernels.Radix.cs).
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
@@ -482,28 +482,4 @@ internal static partial class VkKernels
         return b.Build();
     }
 
-    /// <summary>sources[offsets[index[i]] + rank] = i, rank = the number of earlier sources with the same index (a scan over
-    /// the earlier indices: deterministic, quadratic in the source count). Arguments: idx, offsets, sources, n, targets.</summary>
-    public static SpvKernel ScatterPlace(Vulkan vk)
-    {
-        var b = new Spv("scatter_place", Threads, vk.Controls);
-        var idx = b.Arg(0);
-        var offsets = b.Arg(1);
-        var sources = b.Arg(2);
-        var n = b.Arg(3, K.U32);
-        var targets = b.Arg(4, K.U32);
-        var i = b.GlobalX;
-        b.If(i < n, () =>
-        {
-            var mine = b.Load(K.S32, b.At(idx, i, 4));
-            b.If(b.Bitcast(mine, K.U32) < targets, () =>
-            {
-                var rank = b.Local(b.U(0));
-                b.For(b.U(0), i, j => rank.V = b.Select(b.Load(K.S32, b.At(idx, j, 4)) == mine, rank.V + 1, rank.V));
-                var slot = b.Load(K.U32, b.At(offsets, mine, 4)) + rank.V;
-                b.Store(b.At(sources, slot, 4), i);
-            });
-        });
-        return b.Build();
-    }
 }

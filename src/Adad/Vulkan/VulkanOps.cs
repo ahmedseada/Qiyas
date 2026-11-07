@@ -136,15 +136,5 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
     public string GruSequenceBackward<TN>(CellArgs a, int T, ulong x, ulong h0, ulong w, ulong u, ulong bias, ulong biasH, ulong dhOut, ulong dx, ulong dh0, ulong dw, ulong du, ulong db, ulong dbh)
         where TN : struct, IFloatAdad<TN> => throw Missing("gru sequence backward");
 
-    public string TopK<TN>(ulong x, int rows, int cols, int k, ulong values, ulong indices) where TN : struct, IAdad<TN> => throw Missing("topk");
-
-    public string Pick<TN>(ulong x, int rows, int cols, ulong index, ulong output) where TN : struct, IAdad<TN> => throw Missing("pick");
-
-    public string Sample<TN>(ulong x, int rows, int cols, ulong u, ulong picks) where TN : struct, IFloatAdad<TN> => throw Missing("sample");
-
-    public string CrossEntropy<TN>(ulong x, int rows, int cols, ulong targets, ulong output) where TN : struct, IFloatAdad<TN> => throw Missing("cross entropy");
-
-    public void Route(ulong index, int count, int buckets, ulong counts, ulong offsets, ulong order) => throw Missing("route");
-
     public string Ctc<TN>(CtcArgs a, ulong x, ulong loss, ulong grad) where TN : struct, IFloatAdad<TN> => throw Missing("ctc");
 }
