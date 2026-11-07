@@ -230,11 +230,11 @@ internal static class Checks
             var gpu = ops.Gpu;
             // The device decodes every value as the CPU does (its Widen kernel), and encodes Q8_0 / Q4_0 as the CPU does.
             ulong d = gpu.Rent(stored.Length), lanes = gpu.Rent(n * 4L);
-            Adad.Gpu.Upload<byte>(stored, d);
+            Adad.Cuda.Gpu.Upload<byte>(stored, d);
             var lane = new float[n];
             Bench.Registry.WithFloat(type, new WidenRun(ops, d, lanes, n));
-            Adad.Gpu.Synchronize();
-            Adad.Gpu.Download<float>(lanes, lane);
+            Adad.Cuda.Gpu.Synchronize();
+            Adad.Cuda.Gpu.Download<float>(lanes, lane);
             int bad = 0;
             for (int i = 0; i < n; i++) if (lane[i] != (float)back[i]) bad++;
             if (bad > 0) { Console.WriteLine($"check block {type,-6} decode       device DIFFERS at {bad} values"); ok = false; }
@@ -242,11 +242,11 @@ internal static class Checks
                 var f32 = new float[n];
                 for (int i = 0; i < n; i++) f32[i] = (float)values[i];
                 ulong src = gpu.Rent(n * 4L), enc = gpu.Rent(stored.Length);
-                Adad.Gpu.Upload<float>(f32, src);
+                Adad.Cuda.Gpu.Upload<float>(f32, src);
                 Bench.Registry.WithFloat(type, new NarrowRun(ops, src, enc, n));
-                Adad.Gpu.Synchronize();
+                Adad.Cuda.Gpu.Synchronize();
                 var encoded = new byte[stored.Length];
-                Adad.Gpu.Download<byte>(enc, encoded);
+                Adad.Cuda.Gpu.Download<byte>(enc, encoded);
                 int diff = 0;
                 for (int i = 0; i < stored.Length; i++) if (encoded[i] != stored[i]) diff++;
                 if (diff > 0) { Console.WriteLine($"check block {type,-6} encode       device DIFFERS at {diff} bytes"); ok = false; }
@@ -371,13 +371,13 @@ internal static class Checks
             ulong dx = gpu.Rent(x.Length), dx2 = x2 is null ? 0 : gpu.Rent(x2.Length), dy = gpu.Rent(output.Length);
             try
             {
-                Adad.Gpu.Upload<byte>(x, dx);
-                if (x2 is not null) Adad.Gpu.Upload<byte>(x2, dx2);
+                Adad.Cuda.Gpu.Upload<byte>(x, dx);
+                if (x2 is not null) Adad.Cuda.Gpu.Upload<byte>(x2, dx2);
                 if (what == "add") ops.Add<TN>(dx, dx2, dy, n);
                 else if (what == "softmax") ops.Softmax<TN>(dx, dy, rows, cols);
                 else ops.RmsNorm<TN>(dx, dy, rows, cols, 1e-5);
-                Adad.Gpu.Synchronize();
-                Adad.Gpu.Download<byte>(dy, output);
+                Adad.Cuda.Gpu.Synchronize();
+                Adad.Cuda.Gpu.Download<byte>(dy, output);
                 return true;
             }
             finally { gpu.Return(dx); if (dx2 != 0) gpu.Return(dx2); gpu.Return(dy); }
@@ -771,16 +771,16 @@ internal static class Checks
 
             var gpu = ops.Gpu;
             ulong dX = gpu.Rent(x.Length), dW = gpu.Rent(w.Length), dY = gpu.Rent(fused.Length), dC = gpu.Rent(composed.Length);
-            Adad.Gpu.Upload<byte>(x, dX); Adad.Gpu.Upload<byte>(w, dW);
+            Adad.Cuda.Gpu.Upload<byte>(x, dX); Adad.Cuda.Gpu.Upload<byte>(w, dW);
             ops.FusedConv = true;
             Lane = ops.Conv<TN>(a, dX, dW, dY);
             bool packed = Lane.EndsWith("mma", StringComparison.Ordinal) || Lane.EndsWith("dp", StringComparison.Ordinal);
             if (!packed && Lane is "f32" or "f64" && Bench.Registry.IsFloat(TN.Name)) ops.ConvPlainComposed<TN>(a, dX, dW, dC, Lane);
             else { ops.FusedConv = false; ops.Conv<TN>(a, dX, dW, dC); }
             ops.FusedConv = null;
-            Adad.Gpu.Synchronize();
-            Adad.Gpu.Download<byte>(dY, fused);
-            Adad.Gpu.Download<byte>(dC, composed);
+            Adad.Cuda.Gpu.Synchronize();
+            Adad.Cuda.Gpu.Download<byte>(dY, fused);
+            Adad.Cuda.Gpu.Download<byte>(dC, composed);
             gpu.Return(dX); gpu.Return(dW); gpu.Return(dY); gpu.Return(dC);
             return true;
         }
@@ -807,10 +807,10 @@ internal static class Checks
             if (ops is null) { Kernels.Conv<TN>(a, x, w, y); return true; }
             var gpu = ops.Gpu;
             ulong dX = gpu.Rent(x.Length), dW = gpu.Rent(w.Length), dY = gpu.Rent(y.Length);
-            Adad.Gpu.Upload<byte>(x, dX); Adad.Gpu.Upload<byte>(w, dW);
+            Adad.Cuda.Gpu.Upload<byte>(x, dX); Adad.Cuda.Gpu.Upload<byte>(w, dW);
             ops.Conv<TN>(a, dX, dW, dY);
-            Adad.Gpu.Synchronize();
-            Adad.Gpu.Download<byte>(dY, y);
+            Adad.Cuda.Gpu.Synchronize();
+            Adad.Cuda.Gpu.Download<byte>(dY, y);
             gpu.Return(dX); gpu.Return(dW); gpu.Return(dY);
             return true;
         }
@@ -823,10 +823,10 @@ internal static class Checks
             if (ops is null) { Kernels.ConvBackward<TN>(a, x, w, dy, dx, dw); return true; }
             var gpu = ops.Gpu;
             ulong dX = gpu.Rent(x.Length), dW = gpu.Rent(w.Length), dY = gpu.Rent(dy.Length), gx = gpu.Rent(dx.Length), gw = gpu.Rent(dw.Length);
-            Adad.Gpu.Upload<byte>(x, dX); Adad.Gpu.Upload<byte>(w, dW); Adad.Gpu.Upload<byte>(dy, dY);
+            Adad.Cuda.Gpu.Upload<byte>(x, dX); Adad.Cuda.Gpu.Upload<byte>(w, dW); Adad.Cuda.Gpu.Upload<byte>(dy, dY);
             ops.ConvBackward<TN>(a, dX, dW, dY, gx, gw);
-            Adad.Gpu.Synchronize();
-            Adad.Gpu.Download<byte>(gx, dx); Adad.Gpu.Download<byte>(gw, dw);
+            Adad.Cuda.Gpu.Synchronize();
+            Adad.Cuda.Gpu.Download<byte>(gx, dx); Adad.Cuda.Gpu.Download<byte>(gw, dw);
             gpu.Return(dX); gpu.Return(dW); gpu.Return(dY); gpu.Return(gx); gpu.Return(gw);
             return true;
         }
@@ -902,12 +902,12 @@ internal static class Checks
             if (ops is null) { Kernels.Optimizer<TN>(a, p, g, m, v, n); return true; }
             var gpu = ops.Gpu;
             ulong dp = gpu.Rent(p.Length), dg = gpu.Rent(g.Length), dm = gpu.Rent(m.Length), dv = v is null ? 0 : gpu.Rent(v.Length);
-            Adad.Gpu.Upload<byte>(p, dp); Adad.Gpu.Upload<byte>(g, dg); Adad.Gpu.Upload<byte>(m, dm);
-            if (v is not null) Adad.Gpu.Upload<byte>(v, dv);
+            Adad.Cuda.Gpu.Upload<byte>(p, dp); Adad.Cuda.Gpu.Upload<byte>(g, dg); Adad.Cuda.Gpu.Upload<byte>(m, dm);
+            if (v is not null) Adad.Cuda.Gpu.Upload<byte>(v, dv);
             ops.Optimizer<TN>(a, dp, dg, dm, dv, n);
-            Adad.Gpu.Synchronize();
-            Adad.Gpu.Download<byte>(dp, p); Adad.Gpu.Download<byte>(dm, m);
-            if (v is not null) Adad.Gpu.Download<byte>(dv, v);
+            Adad.Cuda.Gpu.Synchronize();
+            Adad.Cuda.Gpu.Download<byte>(dp, p); Adad.Cuda.Gpu.Download<byte>(dm, m);
+            if (v is not null) Adad.Cuda.Gpu.Download<byte>(dv, v);
             gpu.Return(dp); gpu.Return(dg); gpu.Return(dm);
             if (v is not null) gpu.Return(dv);
             return true;
@@ -1028,21 +1028,21 @@ internal static class Checks
 
             var gpu = ops.Gpu;
             ulong dQ = gpu.Rent(q.Length), dK = gpu.Rent(k.Length), dV = gpu.Rent(v.Length), dO = gpu.Rent(o.Length);
-            Adad.Gpu.Upload<byte>(q, dQ); Adad.Gpu.Upload<byte>(k, dK); Adad.Gpu.Upload<byte>(v, dV);
+            Adad.Cuda.Gpu.Upload<byte>(q, dQ); Adad.Cuda.Gpu.Upload<byte>(k, dK); Adad.Cuda.Gpu.Upload<byte>(v, dV);
             if (backward)
             {
-                Adad.Gpu.Upload<byte>(o, dO);
+                Adad.Cuda.Gpu.Upload<byte>(o, dO);
                 ulong gq = gpu.Rent(dq!.Length), gk = gpu.Rent(dk!.Length), gv = gpu.Rent(dv!.Length);
                 ops.AttentionBackward<TN>(a, dQ, dK, dV, dO, gq, gk, gv);
-                Adad.Gpu.Synchronize();
-                Adad.Gpu.Download<byte>(gq, dq); Adad.Gpu.Download<byte>(gk, dk); Adad.Gpu.Download<byte>(gv, dv);
+                Adad.Cuda.Gpu.Synchronize();
+                Adad.Cuda.Gpu.Download<byte>(gq, dq); Adad.Cuda.Gpu.Download<byte>(gk, dk); Adad.Cuda.Gpu.Download<byte>(gv, dv);
                 gpu.Return(gq); gpu.Return(gk); gpu.Return(gv);
             }
             else
             {
                 if (decode) ops.AttentionDecode<TN>(a, dQ, dK, dV, dO); else if (fused) ops.AttentionRows<TN>(a, dQ, dK, dV, dO); else ops.Attention<TN>(a, dQ, dK, dV, dO);
-                Adad.Gpu.Synchronize();
-                Adad.Gpu.Download<byte>(dO, o);
+                Adad.Cuda.Gpu.Synchronize();
+                Adad.Cuda.Gpu.Download<byte>(dO, o);
             }
 
             gpu.Return(dQ); gpu.Return(dK); gpu.Return(dV); gpu.Return(dO);
@@ -1155,11 +1155,11 @@ internal static class Checks
             if (ops is null) { Kernels.Ctc<TN>(a, x, loss, grad); return true; }
             var gpu = ops.Gpu;
             ulong dx = gpu.Rent(x.Length), dl = gpu.Rent(loss.Length), dg = grad is null ? 0 : gpu.Rent(grad.Length);
-            Adad.Gpu.Upload<byte>(x, dx);
+            Adad.Cuda.Gpu.Upload<byte>(x, dx);
             ops.Ctc<TN>(a, dx, dl, dg);
-            Adad.Gpu.Synchronize();
-            Adad.Gpu.Download<byte>(dl, loss);
-            if (grad is not null) { Adad.Gpu.Download<byte>(dg, grad); gpu.Return(dg); }
+            Adad.Cuda.Gpu.Synchronize();
+            Adad.Cuda.Gpu.Download<byte>(dl, loss);
+            if (grad is not null) { Adad.Cuda.Gpu.Download<byte>(dg, grad); gpu.Return(dg); }
             gpu.Return(dx); gpu.Return(dl);
             return true;
         }
@@ -1416,21 +1416,21 @@ internal static class Checks
 
             var gpu = ops.Gpu;
             ulong dA = gpu.Rent(a.Length), dB = gpu.Rent(b.Length), dC = gpu.Rent(c.Length);
-            Adad.Gpu.Upload<byte>(a, dA); Adad.Gpu.Upload<byte>(b, dB);
+            Adad.Cuda.Gpu.Upload<byte>(a, dA); Adad.Cuda.Gpu.Upload<byte>(b, dB);
             if (backward)
             {
-                Adad.Gpu.Upload<byte>(c, dC);
+                Adad.Cuda.Gpu.Upload<byte>(c, dC);
                 ulong dDa = gpu.Rent(da!.Length), dDb = gpu.Rent(db!.Length);
                 ops.MatMulBackward<TN>(dA, dB, dC, dDa, dDb, v.M, v.N, v.K);
-                Adad.Gpu.Synchronize();
-                Adad.Gpu.Download<byte>(dDa, da); Adad.Gpu.Download<byte>(dDb, db);
+                Adad.Cuda.Gpu.Synchronize();
+                Adad.Cuda.Gpu.Download<byte>(dDa, da); Adad.Cuda.Gpu.Download<byte>(dDb, db);
                 gpu.Return(dDa); gpu.Return(dDb);
             }
             else
             {
                 ops.MatMulView<TN>(v, dA, dB, dC);
-                Adad.Gpu.Synchronize();
-                Adad.Gpu.Download<byte>(dC, c);
+                Adad.Cuda.Gpu.Synchronize();
+                Adad.Cuda.Gpu.Download<byte>(dC, c);
             }
 
             gpu.Return(dA); gpu.Return(dB); gpu.Return(dC);
@@ -1478,12 +1478,12 @@ internal static class Checks
             if (ops is null) { Kernels.Layout<TN>(k); return true; }
             var gpu = ops.Gpu;
             ulong dx = gpu.Rent(k.X.Length), dout = gpu.Rent(k.Output.Length), didx = k.Index is null ? 0 : gpu.Rent(k.Index.Length * 4L), dx2 = k.X2 is null ? 0 : gpu.Rent(k.X2.Length);
-            Adad.Gpu.Upload<byte>(k.X, dx);
-            if (k.Index is not null) Adad.Gpu.Upload<int>(k.Index, didx);
-            if (k.X2 is not null) Adad.Gpu.Upload<byte>(k.X2, dx2);
+            Adad.Cuda.Gpu.Upload<byte>(k.X, dx);
+            if (k.Index is not null) Adad.Cuda.Gpu.Upload<int>(k.Index, didx);
+            if (k.X2 is not null) Adad.Cuda.Gpu.Upload<byte>(k.X2, dx2);
             ops.Layout<TN>(k, dx, didx, dout, dx2);
-            Adad.Gpu.Synchronize();
-            Adad.Gpu.Download<byte>(dout, k.Output);
+            Adad.Cuda.Gpu.Synchronize();
+            Adad.Cuda.Gpu.Download<byte>(dout, k.Output);
             gpu.Return(dx); gpu.Return(dout);
             if (didx != 0) gpu.Return(didx);
             if (dx2 != 0) gpu.Return(dx2);
@@ -1595,24 +1595,24 @@ internal static class Checks
                 }
 
                 var gpu = ops.Gpu;
-                var d = inputs.Select(x => { ulong p = gpu.Rent(x.Length); Adad.Gpu.Upload<byte>(x, p); return p; }).ToArray();
+                var d = inputs.Select(x => { ulong p = gpu.Rent(x.Length); Adad.Cuda.Gpu.Upload<byte>(x, p); return p; }).ToArray();
                 ulong dout = gpu.Rent(outBytes);
                 try
                 {
                     var pooled = new byte[outBytes];
-                    Adad.Gpu.Clear(dout, outBytes);
+                    Adad.Cuda.Gpu.Clear(dout, outBytes);
                     device!(d, dout);
-                    Adad.Gpu.Synchronize();
-                    Adad.Gpu.Download<byte>(dout, pooled);
+                    Adad.Cuda.Gpu.Synchronize();
+                    Adad.Cuda.Gpu.Download<byte>(dout, pooled);
                     for (int call = 0; call < 3; call++)
                     {
-                        Adad.Gpu.Clear(dout, outBytes);
+                        Adad.Cuda.Gpu.Clear(dout, outBytes);
                         var c0 = gpu.Counts;
                         using (ops.Scope()) device(d, dout);
                         var c1 = gpu.Counts;
                         var got = new byte[outBytes];
-                        Adad.Gpu.Synchronize();
-                        Adad.Gpu.Download<byte>(dout, got);
+                        Adad.Cuda.Gpu.Synchronize();
+                        Adad.Cuda.Gpu.Download<byte>(dout, got);
                         if (!got.AsSpan().SequenceEqual(pooled)) { Console.WriteLine($"check arena {name} {type} device: scoped call {call + 1} differs from the pool's"); ok = false; }
                         if (c1.Leaks != c0.Leaks || c1.Strays != c0.Strays) { Console.WriteLine($"check arena {name} {type} device: scoped call {call + 1} left {c1.Leaks - c0.Leaks} buffers unreturned, {c1.Strays - c0.Strays} returned late"); ok = false; }
                         var (high, peak) = gpu.LastScope;
@@ -1768,16 +1768,16 @@ internal static class Checks
             if (ops is null) { Kernels.RowOp<TN>(op, k.X, k.X2, k.G, k.Bt, k.S, k.Pos, y, y2, k.Rows, k.Cols, op.A, op.B); return true; }
             var gpu = ops.Gpu;
             var rented = new List<ulong>();
-            ulong Up(byte[]? a) { if (a is null) return 0; ulong d = gpu.Rent(a.Length); rented.Add(d); Adad.Gpu.Upload<byte>(a, d); return d; }
+            ulong Up(byte[]? a) { if (a is null) return 0; ulong d = gpu.Rent(a.Length); rented.Add(d); Adad.Cuda.Gpu.Upload<byte>(a, d); return d; }
             ulong dx = Up(k.X), dx2 = Up(k.X2), dg = Up(k.G), dbt = Up(k.Bt), ds = Up(k.S), dpos = 0;
-            if (k.Pos is not null) { dpos = gpu.Rent(k.Pos.Length * 4L); rented.Add(dpos); Adad.Gpu.Upload<int>(k.Pos, dpos); }
+            if (k.Pos is not null) { dpos = gpu.Rent(k.Pos.Length * 4L); rented.Add(dpos); Adad.Cuda.Gpu.Upload<int>(k.Pos, dpos); }
             ulong dy = gpu.Rent(y.Length), dy2 = y2 is null ? 0 : gpu.Rent(y2.Length);
             rented.Add(dy);
             if (dy2 != 0) rented.Add(dy2);
             ops.RowOp<TN>(op, dx, dx2, dg, dbt, ds, dpos, dy, dy2, k.Rows, k.Cols, op.A, op.B);
-            Adad.Gpu.Synchronize();
-            Adad.Gpu.Download<byte>(dy, y);
-            if (y2 is not null) Adad.Gpu.Download<byte>(dy2, y2);
+            Adad.Cuda.Gpu.Synchronize();
+            Adad.Cuda.Gpu.Download<byte>(dy, y);
+            if (y2 is not null) Adad.Cuda.Gpu.Download<byte>(dy2, y2);
             foreach (var p in rented) gpu.Return(p);
             return true;
         }
@@ -1796,10 +1796,10 @@ internal static class Checks
             {
                 var gpu = ops.Gpu;
                 ulong dx = gpu.Rent(x.Length), ddy = gpu.Rent(dy.Length), dg = gpu.Rent(dgamma.Length), db = gpu.Rent(dbeta.Length);
-                Adad.Gpu.Upload<byte>(x, dx); Adad.Gpu.Upload<byte>(dy, ddy);
+                Adad.Cuda.Gpu.Upload<byte>(x, dx); Adad.Cuda.Gpu.Upload<byte>(dy, ddy);
                 lane = ops.NormParamsBwd<TN>(dx, ddy, dg, db, rows, cols, 1e-5, centered);
-                Adad.Gpu.Synchronize();
-                Adad.Gpu.Download<byte>(dg, dgamma); Adad.Gpu.Download<byte>(db, dbeta);
+                Adad.Cuda.Gpu.Synchronize();
+                Adad.Cuda.Gpu.Download<byte>(dg, dgamma); Adad.Cuda.Gpu.Download<byte>(db, dbeta);
                 gpu.Return(dx); gpu.Return(ddy); gpu.Return(dg); gpu.Return(db);
             }
 
@@ -1859,7 +1859,7 @@ internal static class Checks
             // Broadcasts (two formulas), transpose, gemv both ways.
             foreach (var opName in new[] { "add", "mul" })
             {
-                var op = Adad.Ops.Find(opName);
+                var op = Adad.Abstraction.Ops.Find(opName);
                 var v = Bench.Registry.Make(type, C, 42, -1, 1);
                 var want = References.MapRow(type, op, values, Bench.Registry.Values(type, v, C), R, C);
                 var output = new byte[data.Length];
@@ -1960,11 +1960,11 @@ internal static class Checks
             var gpu = ops.Gpu;
             int count = axis == Axis.Whole ? 1 : axis == Axis.Rows ? rows : cols;
             ulong dx = gpu.Rent(x.Length), dout = gpu.Rent(count * 8L);
-            Adad.Gpu.Upload<byte>(x, dx);
+            Adad.Cuda.Gpu.Upload<byte>(x, dx);
             string lane = ops.Reduce<TN>(op, axis, dx, rows, cols, dout);
-            Adad.Gpu.Synchronize();
+            Adad.Cuda.Gpu.Synchronize();
             var output = new byte[count * 8];
-            Adad.Gpu.Download<byte>(dout, output);
+            Adad.Cuda.Gpu.Download<byte>(dout, output);
             gpu.Return(dx); gpu.Return(dout);
             return (output, lane);
         }
@@ -1977,10 +1977,10 @@ internal static class Checks
             if (ops is null) { Kernels.MapRow<TN>(op.Name, x, v, output, rows, cols); return true; }
             var gpu = ops.Gpu;
             ulong dx = gpu.Rent(x.Length), dv = gpu.Rent(v.Length), dout = gpu.Rent(output.Length);
-            Adad.Gpu.Upload<byte>(x, dx); Adad.Gpu.Upload<byte>(v, dv);
+            Adad.Cuda.Gpu.Upload<byte>(x, dx); Adad.Cuda.Gpu.Upload<byte>(v, dv);
             ops.MapRow<TN>(op, dx, dv, dout, rows, cols);
-            Adad.Gpu.Synchronize();
-            Adad.Gpu.Download<byte>(dout, output);
+            Adad.Cuda.Gpu.Synchronize();
+            Adad.Cuda.Gpu.Download<byte>(dout, output);
             gpu.Return(dx); gpu.Return(dv); gpu.Return(dout);
             return true;
         }
@@ -1993,11 +1993,11 @@ internal static class Checks
             if (ops is null) { Kernels.Transpose<TN>(x, output, rows, cols); return true; }
             var gpu = ops.Gpu;
             ulong dx = gpu.Rent(x.Length), dout = gpu.Rent(output.Length);
-            Adad.Gpu.Upload<byte>(x, dx);
-            Adad.Gpu.Clear(dout, output.Length);
+            Adad.Cuda.Gpu.Upload<byte>(x, dx);
+            Adad.Cuda.Gpu.Clear(dout, output.Length);
             ops.Transpose<TN>(dx, dout, rows, cols);
-            Adad.Gpu.Synchronize();
-            Adad.Gpu.Download<byte>(dout, output);
+            Adad.Cuda.Gpu.Synchronize();
+            Adad.Cuda.Gpu.Download<byte>(dout, output);
             gpu.Return(dx); gpu.Return(dout);
             return true;
         }
@@ -2010,10 +2010,10 @@ internal static class Checks
             if (ops is null) { Kernels.Gemv<TN>(a, x, y, rows, cols, transposed); return true; }
             var gpu = ops.Gpu;
             ulong da = gpu.Rent(a.Length), dx = gpu.Rent(x.Length), dy = gpu.Rent(y.Length);
-            Adad.Gpu.Upload<byte>(a, da); Adad.Gpu.Upload<byte>(x, dx);
+            Adad.Cuda.Gpu.Upload<byte>(a, da); Adad.Cuda.Gpu.Upload<byte>(x, dx);
             ops.Gemv<TN>(da, dx, dy, rows, cols, transposed);
-            Adad.Gpu.Synchronize();
-            Adad.Gpu.Download<byte>(dy, y);
+            Adad.Cuda.Gpu.Synchronize();
+            Adad.Cuda.Gpu.Download<byte>(dy, y);
             gpu.Return(da); gpu.Return(dx); gpu.Return(dy);
             return true;
         }
@@ -2175,15 +2175,15 @@ internal static class Checks
                 if (array is null) return 0;
                 ulong d = gpu.Rent(array.Length);
                 rented.Add(d);
-                Adad.Gpu.Upload<byte>(array, d);
+                Adad.Cuda.Gpu.Upload<byte>(array, d);
                 return d;
             }
 
             ulong dx = Up(x), dy = Up(y), dz = Up(z), dout = gpu.Rent(output.Length);
             rented.Add(dout);
             ops.Map<TN>(op, dx, dy, dz, dout, n, op.A, op.B);
-            Adad.Gpu.Synchronize();
-            Adad.Gpu.Download<byte>(dout, output);
+            Adad.Cuda.Gpu.Synchronize();
+            Adad.Cuda.Gpu.Download<byte>(dout, output);
             foreach (var p in rented) gpu.Return(p);
             return true;
         }
@@ -2259,12 +2259,12 @@ internal static class Checks
 
             var gpu = ops.Gpu;
             ulong da = gpu.Rent(a.Length * 8L), db = gpu.Rent(b.Length * 8L), dc = gpu.Rent((long)M * N * 8);
-            Adad.Gpu.Upload<double>(a, da);
-            Adad.Gpu.Upload<double>(b, db);
+            Adad.Cuda.Gpu.Upload<double>(a, da);
+            Adad.Cuda.Gpu.Upload<double>(b, db);
             bool ran = ops.MatMulSliced(da, db, dc, M, N, K);
-            Adad.Gpu.Synchronize();
+            Adad.Cuda.Gpu.Synchronize();
             var got = new double[M * N];
-            if (ran) Adad.Gpu.Download<double>(dc, got);
+            if (ran) Adad.Cuda.Gpu.Download<double>(dc, got);
             gpu.Return(da); gpu.Return(db); gpu.Return(dc);
             if (!ran)
             {
@@ -2312,10 +2312,10 @@ internal static class Checks
         random.NextBytes(stored);
         var gpu = ops.Gpu;
         ulong dStored = gpu.Rent(stored.Length), dLanes = gpu.Rent((long)N * lane.Size);
-        Adad.Gpu.Upload<byte>(stored, dStored);
+        Adad.Cuda.Gpu.Upload<byte>(stored, dStored);
         ops.ToLanes<TN>(lane, dStored, dLanes, N);
         var got = new TL[N];
-        Adad.Gpu.Download<TL>(dLanes, got);
+        Adad.Cuda.Gpu.Download<TL>(dLanes, got);
         var want = new TL[N];
         TN.Load(stored, 0, want);
         bool ok = Same($"device {TN.Name} → {lane.Name}", MemoryMarshal.AsBytes(got.AsSpan()), MemoryMarshal.AsBytes(want.AsSpan()), lane.Size, lane.IsFloat);
@@ -2332,11 +2332,11 @@ internal static class Checks
             else lanes[i] = (TL)(object)(uint)Math.Max(0, v);
         }
 
-        Adad.Gpu.Upload<TL>(lanes, dLanes);
-        Adad.Gpu.Clear(dStored, stored.Length);
+        Adad.Cuda.Gpu.Upload<TL>(lanes, dLanes);
+        Adad.Cuda.Gpu.Clear(dStored, stored.Length);
         ops.FromLanes<TN>(lane, dLanes, dStored, N);
         var gotStored = new byte[stored.Length];
-        Adad.Gpu.Download<byte>(dStored, gotStored);
+        Adad.Cuda.Gpu.Download<byte>(dStored, gotStored);
         var wantStored = new byte[stored.Length];
         TN.Store(lanes, wantStored, 0);
         if (TN.IsFloat)
@@ -2396,8 +2396,8 @@ internal static class Checks
     {
         var got = new T[values.Length];
         var want = new T[values.Length];
-        Adad.Widths.Store<float, T>(values, got);
-        for (int i = 0; i < values.Length; i++) want[i] = Adad.Widths.FromLong<T>((long)Math.Clamp(Math.Round(values[i], MidpointRounding.ToEven), low, high));
+        Adad.Abstraction.Widths.Store<float, T>(values, got);
+        for (int i = 0; i < values.Length; i++) want[i] = Adad.Abstraction.Widths.FromLong<T>((long)Math.Clamp(Math.Round(values[i], MidpointRounding.ToEven), low, high));
         return Report(name, MemoryMarshal.AsBytes(got.AsSpan()).ToArray(), MemoryMarshal.AsBytes(want.AsSpan()).ToArray(), System.Runtime.CompilerServices.Unsafe.SizeOf<T>(), values);
     }
 
@@ -2406,7 +2406,7 @@ internal static class Checks
         var got = new TD[values.Length];
         var want = new TD[values.Length];
         bool narrowing = System.Runtime.CompilerServices.Unsafe.SizeOf<TD>() < System.Runtime.CompilerServices.Unsafe.SizeOf<TS>();
-        if (narrowing) Adad.Widths.Store(values, got); else Adad.Widths.Load(values, got);
+        if (narrowing) Adad.Abstraction.Widths.Store(values, got); else Adad.Abstraction.Widths.Load(values, got);
         for (int i = 0; i < values.Length; i++) want[i] = Reference.Resize<TS, TD>(values[i]);
         return Report(name, MemoryMarshal.AsBytes(got.AsSpan()).ToArray(), MemoryMarshal.AsBytes(want.AsSpan()).ToArray(), System.Runtime.CompilerServices.Unsafe.SizeOf<TD>(), null);
     }
@@ -2415,7 +2415,7 @@ internal static class Checks
     {
         var got = new TF[values.Length];
         var want = new TF[values.Length];
-        Adad.Widths.Load(values, got);
+        Adad.Abstraction.Widths.Load(values, got);
         for (int i = 0; i < values.Length; i++) want[i] = reference(values[i]);
         return Report(name, MemoryMarshal.AsBytes(got.AsSpan()).ToArray(), MemoryMarshal.AsBytes(want.AsSpan()).ToArray(), System.Runtime.CompilerServices.Unsafe.SizeOf<TF>(), null);
     }
@@ -2458,9 +2458,9 @@ internal static class Checks
         var inb = MemoryMarshal.Cast<TAcc, TIn>(b.AsSpan());
         for (int l = 0; l < w; l++)
         {
-            long sum = Adad.Widths.AsLong(c[l]);
-            for (int t = 0; t < g; t++) sum += Adad.Widths.AsLong(ins[l * g + t]) * Adad.Widths.AsLong(inb[l * g + t]);
-            want[l] = Adad.Widths.FromLong<TAcc>(sum);
+            long sum = Adad.Abstraction.Widths.AsLong(c[l]);
+            for (int t = 0; t < g; t++) sum += Adad.Abstraction.Widths.AsLong(ins[l * g + t]) * Adad.Abstraction.Widths.AsLong(inb[l * g + t]);
+            want[l] = Adad.Abstraction.Widths.FromLong<TAcc>(sum);
         }
 
         var gotLanes = new TAcc[w];
@@ -2603,10 +2603,10 @@ internal static class Reference
         {
             ulong v = System.Runtime.CompilerServices.Unsafe.As<TS, ulong>(ref value);
             ulong high = typeof(TD) == typeof(byte) ? byte.MaxValue : typeof(TD) == typeof(ushort) ? ushort.MaxValue : uint.MaxValue;
-            return Adad.Widths.FromLong<TD>((long)Math.Min(v, high));
+            return Adad.Abstraction.Widths.FromLong<TD>((long)Math.Min(v, high));
         }
 
-        long x = Adad.Widths.AsLong(value);
+        long x = Adad.Abstraction.Widths.AsLong(value);
         int size = System.Runtime.CompilerServices.Unsafe.SizeOf<TD>();
         bool signed = typeof(TD) == typeof(sbyte) || typeof(TD) == typeof(short) || typeof(TD) == typeof(int) || typeof(TD) == typeof(long);
         if (size < System.Runtime.CompilerServices.Unsafe.SizeOf<TS>())
@@ -2615,6 +2615,6 @@ internal static class Reference
             x = Math.Clamp(x, low, high);
         }
 
-        return Adad.Widths.FromLong<TD>(x);
+        return Adad.Abstraction.Widths.FromLong<TD>(x);
     }
 }

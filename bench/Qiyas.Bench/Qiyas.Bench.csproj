@@ -9,13 +9,16 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Adad\Adad.csproj" />
     <ProjectReference Include="..\..\src\Qiyas.Checks\Qiyas.Checks.csproj" />
-    <Using Include="Adad" />
+    <!-- The contracts and shared types, and the devices. -->
+    <Using Include="Adad.Abstraction" />
+    <Using Include="Adad.Cpu" />
+    <Using Include="Adad.Cuda" />
     <!-- The stored integer types by their names, as inside the library (not System's). -->
-    <Using Include="Adad.Int64" Alias="Int64" />
-    <Using Include="Adad.Int32" Alias="Int32" />
-    <Using Include="Adad.Int16" Alias="Int16" />
-    <Using Include="Adad.UInt64" Alias="UInt64" />
-    <Using Include="Adad.UInt32" Alias="UInt32" />
-    <Using Include="Adad.UInt16" Alias="UInt16" />
+    <Using Include="Adad.Abstraction.Int64" Alias="Int64" />
+    <Using Include="Adad.Abstraction.Int32" Alias="Int32" />
+    <Using Include="Adad.Abstraction.Int16" Alias="Int16" />
+    <Using Include="Adad.Abstraction.UInt64" Alias="UInt64" />
+    <Using Include="Adad.Abstraction.UInt32" Alias="UInt32" />
+    <Using Include="Adad.Abstraction.UInt16" Alias="UInt16" />
   </ItemGroup>
 </Project>

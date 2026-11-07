@@ -100,10 +100,10 @@ public sealed class AdadSubject : IBenchSubject
     }
 
     private static IBenchRun On<TN, TR>(Device device, TR run) where TN : struct, IAdad<TN, float> where TR : INumberRun =>
-        device == Device.Cpu ? run.Make<TN, byte[], int[]>(new(Cpu.Device, 0)) : run.Make<TN, ulong, ulong>(new(Devices.Ops, 4));
+        device == Device.Cpu ? run.Make<TN, byte[], int[]>(new(CpuDevice.Device, 0)) : run.Make<TN, ulong, ulong>(new(Devices.Ops, 4));
 
     private static IBenchRun OnFloat<TN, TR>(Device device, TR run) where TN : struct, IFloatAdad<TN>, IAdad<TN, float> where TR : IFloatRun =>
-        device == Device.Cpu ? run.Make<TN, byte[], int[]>(new(Cpu.Device, 0)) : run.Make<TN, ulong, ulong>(new(Devices.Ops, 4));
+        device == Device.Cpu ? run.Make<TN, byte[], int[]>(new(CpuDevice.Device, 0)) : run.Make<TN, ulong, ulong>(new(Devices.Ops, 4));
 
     // ---------------------------------------------------------------- the operations
 
@@ -319,7 +319,7 @@ public sealed class AdadSubject : IBenchSubject
     }
 
     public IBenchRun? MatMulBlocks(Device device, string type, int m, int n, int k, byte[] a, byte[] b, byte[] c) =>
-        type is "q8_0" or "q4_0" && k % 32 == 0 && (device == Device.Cpu ? Cpu.Device.BlockProductAvailable : Devices.Ops.BlockProductAvailable)
+        type is "q8_0" or "q4_0" && k % 32 == 0 && (device == Device.Cpu ? CpuDevice.Device.BlockProductAvailable : Devices.Ops.BlockProductAvailable)
             ? Registry.With(type, new MatMulBlocksVisitor(device, new ProductView(m, n, k, false, true), a, b, c)) : null;
 
     private sealed class MatMulBlocksVisitor(Device device, ProductView v, byte[] a, byte[] b, byte[] c) : ITypeVisitor<IBenchRun?>, INumberRun
@@ -492,7 +492,7 @@ public sealed class AdadSubject : IBenchSubject
             return s.Run(() => { s.D.Route(di, index.Length, buckets, dc, dof, dor); return "s32"; });
         }
 
-        return device == Device.Cpu ? Make<byte[], int[]>(new(Cpu.Device, 0)) : Make<ulong, ulong>(new(Devices.Ops, 4));
+        return device == Device.Cpu ? Make<byte[], int[]>(new(CpuDevice.Device, 0)) : Make<ulong, ulong>(new(Devices.Ops, 4));
     }
 
     public IBenchRun? Recurrent(Device device, string type, CellArgs a, byte[] x, byte[] h, byte[]? c, byte[] w, byte[] u, byte[] b, byte[]? bh, byte[] hOut, byte[]? cOut,

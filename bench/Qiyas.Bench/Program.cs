@@ -28,7 +28,7 @@ if (!Checks.Run())
     return 1;
 }
 
-if (options.Report) Console.WriteLine(Adad.Kernels.Report());
+if (options.Report) Console.WriteLine(Adad.Cpu.Kernels.Report());
 
 if (options.Mode == "team")
 {
@@ -95,7 +95,7 @@ bench.Write(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..",
 if (options.Report)
 {
     Console.WriteLine("measured during the run");
-    Console.Write(Adad.Kernels.Measured());
+    Console.Write(Adad.Cpu.Kernels.Measured());
     if (options.Devices.Contains(Device.Cuda) && Devices.HasCuda) Console.Write(Devices.Ops.Measured());
 }
 return 0;
@@ -149,8 +149,8 @@ internal sealed class Options
                 case "--types": o.Types = Next(); break;
                 case "--ops":
                     o.Ops = Next();
-                    if (o.Ops.Contains("all")) o.Ops = [.. Core, .. Adad.Ops.All.Select(m => "map:" + m.Name), .. Group2, .. Group3, .. Group4, .. Group4b, .. Group5, .. Group6, .. Group7, .. Group8, .. Group9];
-                    if (o.Ops.Contains("map")) o.Ops = [.. o.Ops.Where(n => n != "map"), .. Adad.Ops.All.Select(m => "map:" + m.Name)];
+                    if (o.Ops.Contains("all")) o.Ops = [.. Core, .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name), .. Group2, .. Group3, .. Group4, .. Group4b, .. Group5, .. Group6, .. Group7, .. Group8, .. Group9];
+                    if (o.Ops.Contains("map")) o.Ops = [.. o.Ops.Where(n => n != "map"), .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name)];
                     if (o.Ops.Contains("reduce")) o.Ops = [.. o.Ops.Where(n => n != "reduce"), .. Group2];
                     if (o.Ops.Contains("rows")) o.Ops = [.. o.Ops.Where(n => n != "rows"), .. Group3];
                     if (o.Ops.Contains("layout")) o.Ops = [.. o.Ops.Where(n => n != "layout"), .. Group4];
@@ -254,7 +254,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             for (int rep = 0; rep < options.Repeat; rep++) Measure(device, "matmul", type, $"{s}x{s}x{s}", reference, (subject, c) => subject.MatMul(device, type, a, b, c, s, s, s), a.Length);
         }
 
-        foreach (var op in Adad.Ops.All)
+        foreach (var op in Adad.Abstraction.Ops.All)
         {
             if (!options.Ops.Contains("map:" + op.Name)) continue;
             if (op.FloatOnly && !Registry.IsFloat(type)) continue;
@@ -350,7 +350,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
 
         if (name.StartsWith("maprow:", StringComparison.Ordinal))
         {
-            var op = Adad.Ops.Find(name[7..]);
+            var op = Adad.Abstraction.Ops.Find(name[7..]);
             var v = Registry.Make(type, c, 24, -1, 1);
             var reference = References.MapRow(type, op, values, Registry.Values(type, v, c), r, c);
             Measure(device, name, type, $"{r}x{c}", reference, (s, o) => s.MapRow(device, op, type, data, v, o, r, c), data.Length);
@@ -443,7 +443,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
                 var want = Routing.CrossEntropyReference(Registry.Values(type, x, rows * cols), rows, cols, targets);
                 var logp = new byte[x.Length];
                 var op = RowOps.Find("log_softmax");
-                var neg = Adad.Ops.Find("neg");
+                var neg = Adad.Abstraction.Ops.Find("neg");
                 Measure(device, name, type, $"{rows}x{cols}", want, (s, o) =>
                 {
                     // The subject's own loss per row where it has one; else the composition.

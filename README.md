@@ -16,9 +16,11 @@ does best for it, chosen per operation from the data itself. No type is fixed an
   generates PTX per (type, lane) with its own driver binding — tensor-core, dot-product and plain GEMMs, row kernels,
   conversions — all from the type's description.
 - **One device contract.** Each operation family is an interface generic over the number type and the device's buffers
-  (`src/Adad/Abstractions/`: `IDevice<TBuffer, TIndex>` and its families, each operation under its own constraint —
-  `IAdad<TN>` for every type, `IFloatAdad<TN>` for the float formulas). The CPU (`Cpu.Device`: byte arrays) and CUDA
-  (`GpuOps`: device pointers) implement it, each with its own lanes; a device may implement a family at a time.
+  (`src/Adad/Abstraction/`, namespace `Adad.Abstraction`: `IDevice<TBuffer, TIndex>` and its families, each operation
+  under its own constraint — `IAdad<TN>` for every type, `IFloatAdad<TN>` for the float formulas — with the types,
+  formats and everything the devices share). The CPU (`Adad.Cpu`, `CpuDevice.Device`: byte arrays) and CUDA
+  (`Adad.Cuda`, `GpuOps`: device pointers) implement it, each in its own folder and namespace with its own lanes; a
+  device may implement a family at a time.
 - **Proven, not assumed.** Before anything is timed, every conversion is checked bit for bit against a scalar
   reference written from the format's definition, the dot lanes against scalar sums, exp against the runtime's, and
   the device's conversions against the CPU's; then every operation of every family runs over every type it applies to
@@ -122,35 +124,36 @@ checkout (files listed in `.gitignore`); a clone runs the other subjects.
 
 | file | what |
 |---|---|
-| `src/Adad/Abstractions/` | the device contract: `IDevice<TBuffer, TIndex>` and its families (memory, element-wise, reductions, rows, layouts, products, attention, optimizers, convolution, recurrent, routing, ctc); `Fmt` and `Lane`, the stored formats and lanes described once for every device |
-| `src/Adad/Kernels.Device.cs`, `src/Adad/GpuOps.Device.cs` | the CPU and CUDA as devices: the contract on byte arrays and on device pointers |
-| `src/Adad/Numbers.cs` | the contract: `IAdad<TSelf>`, lanes, dot lanes, the visitors; exp on vectors |
-| `src/Adad/Types.cs` | the seventeen stored types and their lane rules |
-| `src/Adad/Blocks.cs`, `src/Adad/Ptx.Blocks.cs`, `src/Adad/BlockProducts.cs` | the block formats Q8_0, Q4_0, Q4_K, Q6_K and bool: the codecs (CPU and device encoders, a thread per block), the block-scaled integer gemv |
-| `src/Adad/MatMulBlocks.cs` | the block-scaled tiled product A·Bᵀ of Q8_0 / Q4_0 on the CPU (the s8 dot lane) and the device (the s8 tensor instruction at k = 32), and its measured choice against the decoded route |
-| `src/Adad/Report.cs` | `--report`: the facts and measured decisions of each device, the buffers' costs and steady state |
-| `src/Adad/Arena.cs` | the device's buffer arena: a scope's buffers bumped in one region, released from the top, the region grown between calls |
-| `src/Adad/Workspace.cs` | the CPU product's per-thread workspace (packed B, loaded A / B, C lanes, A panels) |
+| `src/Adad/Abstraction/`, `src/Adad/Cpu/`, `src/Adad/Cuda/` | a folder and a namespace each: the shared contracts, types and references (`Adad.Abstraction`); the CPU (`Adad.Cpu`); CUDA (`Adad.Cuda`). An operation family's arguments, catalogue and references sit in `Abstraction/`, its kernels in each device's folder |
+| `src/Adad/Abstraction/` | namespace `Adad.Abstraction`, what every device shares. The device contract: `IDevice<TBuffer, TIndex>` and its families (memory, element-wise, reductions, rows, layouts, products, attention, optimizers, convolution, recurrent, routing, ctc); `Fmt` and `Lane`, the stored formats and lanes described once for every device |
+| `src/Adad/Cpu/Kernels.Device.cs`, `src/Adad/Cuda/GpuOps.Device.cs` | the CPU and CUDA as devices: the contract on byte arrays and on device pointers |
+| `src/Adad/Abstraction/Numbers.cs` | the contract: `IAdad<TSelf>`, lanes, dot lanes, the visitors; exp on vectors |
+| `src/Adad/Abstraction/Types.cs` | the seventeen stored types and their lane rules |
+| `src/Adad/Abstraction/Blocks.cs`, `src/Adad/Cuda/Ptx.Blocks.cs`, `src/Adad/Cpu/BlockProducts.cs`, `src/Adad/Cuda/BlockProducts.cs` | the block formats Q8_0, Q4_0, Q4_K, Q6_K and bool: the codecs (CPU and device encoders, a thread per block), the block-scaled integer gemv |
+| `src/Adad/Cpu/MatMulBlocks.cs`, `src/Adad/Cuda/MatMulBlocks.cs` | the block-scaled tiled product A·Bᵀ of Q8_0 / Q4_0 on the CPU (the s8 dot lane) and the device (the s8 tensor instruction at k = 32), and its measured choice against the decoded route |
+| `src/Adad/Cpu/Report.cs`, `src/Adad/Cuda/Report.cs` | `--report`: the facts and measured decisions of each device, the buffers' costs and steady state |
+| `src/Adad/Cuda/Arena.cs` | the device's buffer arena: a scope's buffers bumped in one region, released from the top, the region grown between calls |
+| `src/Adad/Cpu/Workspace.cs` | the CPU product's per-thread workspace (packed B, loaded A / B, C lanes, A panels) |
 | `docs/wip/` | the regression comparer (`compare.py`), the baseline run it compares against (`baseline.md`), the README Results generator (`readme_results.py`) |
-| `src/Adad/Convert.cs` | every load and store on vectors; `Widths`, any lane to any lane |
-| `src/Adad/Kernels.cs` | the CPU kernels: add, product (GotoBLAS-shaped, dot lanes in groups), softmax, rms_norm |
-| `src/Adad/Map.cs`, `src/Adad/Ptx.Map.cs` | the element-wise family: the catalogue of formulas (with float64 references), the CPU kernel, the device kernel |
-| `src/Adad/Rows.cs`, `src/Adad/Ptx.Rows.cs`, `src/Adad/GpuOps.Rows.cs`, `src/Qiyas.Checks/Bench/RowInputs.cs` | the row family: the catalogue (references, error scales), the CPU kernels, the device kernels, the inputs and tolerance shared by the checks and the bench |
-| `src/Adad/Routing.cs`, `src/Adad/Ptx.Routing.cs`, `src/Adad/GpuOps.Routing.cs` | top-k, pick, sampling, the route, the cross-entropy loss per row (one pass); its backward is a row operation |
-| `src/Adad/Ptx.Radix.cs`, `src/Adad/GpuOps.Radix.cs` | the device's ordering by target for scatter-add and the route: counts, the multi-block exclusive scan, the stable LSD radix sort |
-| `src/Adad/Ctc.cs`, `src/Adad/Ptx.Ctc.cs`, `src/Adad/GpuOps.Ctc.cs` | ctc: the arguments and the float64 reference, the CPU kernel, the device kernels (rows, then a block per sequence) |
-| `src/Adad/Recurrent.cs`, `src/Adad/Ptx.Recurrent.cs`, `src/Adad/GpuOps.Recurrent.cs`, `src/Qiyas.Checks/Bench/RecurrentCases.cs` | LSTM and GRU cells and steps, forward and backward |
-| `src/Adad/Conv.cs`, `src/Adad/GpuOps.Conv.cs` | convolution: the forward fused into the product's packing (implicit GEMM: the image read through the index map; on the device's plain lanes a measured choice against im2col), the backward as im2col / product / col2im compositions |
-| `src/Adad/Optimizers.cs`, `src/Adad/Ptx.Optimizers.cs`, `src/Adad/GpuOps.Optimizers.cs` | optimizer steps: sgd with momentum, adam, adamw |
-| `src/Adad/Attention.cs`, `src/Adad/Ptx.Attention.cs`, `src/Adad/GpuOps.Attention.cs` | attention: the measured choice, the composition in lane storage, the fused decode kernel, the backward composition; the lane-storage conversions |
-| `src/Adad/AttentionRows.cs`, `src/Adad/Ptx.AttentionRows.cs`, `src/Adad/Ptx.AttentionMma.cs` | attention's fused rows (flash: keys in tiles, the softmax online, no scores in memory) on the CPU and the device; on the device the tensor instructions for float16, bfloat16 and the 8-bit floats |
-| `src/Adad/Ptx.AttentionBackward.cs` | attention's fused backward on the device (dQ by the rows, dK and dV by the keys) |
-| `src/Adad/Products.cs`, `src/Adad/GpuOps.Products.cs` | products on views (transposed operands, batches) and the matmul backward: the product's packing reads the operands where they are stored (`Kernels.Operands`; the device's tensor and dot routes), otherwise through the strided copy |
-| `src/Adad/Layout.cs`, `src/Adad/Ptx.Layout.cs`, `src/Adad/GpuOps.Layout.cs`, `src/Qiyas.Checks/Bench/LayoutCases.cs` | layout and indexing: the references, the CPU kernels, the device kernels, the gate's and the bench's cases |
-| `src/Adad/Reduce.cs`, `src/Adad/Ptx.Reduce.cs` | reductions (sum, sum of squares, max, min, argmax: whole, rows, columns), row-vector broadcasts, transpose, gemv: the CPU kernels, the device kernels |
-| `src/Adad/Functions.cs` | log, sin, cos, expm1, tanh, sigmoid, erf, erfc on vectors: coefficient tables shared with the device emitter |
-| `src/Adad/Team.cs` | the CPU thread team (jobs closed on completion, so a late worker never takes a chunk under the next job's half-written description) |
-| `src/Adad/Gpu.cs`, `src/Adad/Ptx.cs`, `src/Adad/GpuOps.cs` | the CUDA side: driver binding, PTX generation, the operations |
+| `src/Adad/Abstraction/Convert.cs` | every load and store on vectors; `Widths`, any lane to any lane |
+| `src/Adad/Cpu/Kernels.cs` | the CPU kernels: add, product (GotoBLAS-shaped, dot lanes in groups), softmax, rms_norm |
+| `src/Adad/Abstraction/Map.cs`, `src/Adad/Cpu/Map.cs`, `src/Adad/Cuda/Ptx.Map.cs` | the element-wise family: the catalogue of formulas (with float64 references), the CPU kernel, the device kernel |
+| `src/Adad/Abstraction/Rows.cs`, `src/Adad/Cpu/Rows.cs`, `src/Adad/Cuda/Ptx.Rows.cs`, `src/Adad/Cuda/GpuOps.Rows.cs`, `src/Qiyas.Checks/Bench/RowInputs.cs` | the row family: the catalogue (references, error scales), the CPU kernels, the device kernels, the inputs and tolerance shared by the checks and the bench |
+| `src/Adad/Abstraction/Routing.cs`, `src/Adad/Cpu/Routing.cs`, `src/Adad/Cuda/Ptx.Routing.cs`, `src/Adad/Cuda/GpuOps.Routing.cs` | top-k, pick, sampling, the route, the cross-entropy loss per row (one pass); its backward is a row operation |
+| `src/Adad/Cuda/Ptx.Radix.cs`, `src/Adad/Cuda/GpuOps.Radix.cs` | the device's ordering by target for scatter-add and the route: counts, the multi-block exclusive scan, the stable LSD radix sort |
+| `src/Adad/Abstraction/Ctc.cs`, `src/Adad/Cpu/Ctc.cs`, `src/Adad/Cuda/Ptx.Ctc.cs`, `src/Adad/Cuda/GpuOps.Ctc.cs` | ctc: the arguments and the float64 reference, the CPU kernel, the device kernels (rows, then a block per sequence) |
+| `src/Adad/Abstraction/Recurrent.cs`, `src/Adad/Cpu/Recurrent.cs`, `src/Adad/Cuda/Ptx.Recurrent.cs`, `src/Adad/Cuda/GpuOps.Recurrent.cs`, `src/Qiyas.Checks/Bench/RecurrentCases.cs` | LSTM and GRU cells and steps, forward and backward |
+| `src/Adad/Abstraction/Conv.cs`, `src/Adad/Cpu/Conv.cs`, `src/Adad/Cuda/GpuOps.Conv.cs` | convolution: the forward fused into the product's packing (implicit GEMM: the image read through the index map; on the device's plain lanes a measured choice against im2col), the backward as im2col / product / col2im compositions |
+| `src/Adad/Abstraction/Optimizers.cs`, `src/Adad/Cpu/Optimizers.cs`, `src/Adad/Cuda/Ptx.Optimizers.cs`, `src/Adad/Cuda/GpuOps.Optimizers.cs` | optimizer steps: sgd with momentum, adam, adamw |
+| `src/Adad/Abstraction/Attention.cs`, `src/Adad/Cpu/Attention.cs`, `src/Adad/Cuda/Ptx.Attention.cs`, `src/Adad/Cuda/GpuOps.Attention.cs` | attention: the measured choice, the composition in lane storage, the fused decode kernel, the backward composition; the lane-storage conversions |
+| `src/Adad/Cpu/AttentionRows.cs`, `src/Adad/Cuda/Ptx.AttentionRows.cs`, `src/Adad/Cuda/Ptx.AttentionMma.cs` | attention's fused rows (flash: keys in tiles, the softmax online, no scores in memory) on the CPU and the device; on the device the tensor instructions for float16, bfloat16 and the 8-bit floats |
+| `src/Adad/Cuda/Ptx.AttentionBackward.cs` | attention's fused backward on the device (dQ by the rows, dK and dV by the keys) |
+| `src/Adad/Abstraction/Products.cs`, `src/Adad/Cpu/Products.cs`, `src/Adad/Cuda/GpuOps.Products.cs` | products on views (transposed operands, batches) and the matmul backward: the product's packing reads the operands where they are stored (`Kernels.Operands`; the device's tensor and dot routes), otherwise through the strided copy |
+| `src/Adad/Abstraction/Layout.cs`, `src/Adad/Cpu/Layout.cs`, `src/Adad/Cuda/Ptx.Layout.cs`, `src/Adad/Cuda/GpuOps.Layout.cs`, `src/Qiyas.Checks/Bench/LayoutCases.cs` | layout and indexing: the references, the CPU kernels, the device kernels, the gate's and the bench's cases |
+| `src/Adad/Abstraction/Reduce.cs`, `src/Adad/Cpu/Reduce.cs`, `src/Adad/Cuda/Ptx.Reduce.cs` | reductions (sum, sum of squares, max, min, argmax: whole, rows, columns), row-vector broadcasts, transpose, gemv: the CPU kernels, the device kernels |
+| `src/Adad/Abstraction/Functions.cs` | log, sin, cos, expm1, tanh, sigmoid, erf, erfc on vectors: coefficient tables shared with the device emitter |
+| `src/Adad/Abstraction/Team.cs` | the host thread team, shared: the CPU's kernels and the shared conversions run on it (jobs closed on completion, so a late worker never takes a chunk under the next job's half-written description) |
+| `src/Adad/Cuda/Gpu.cs`, `src/Adad/Cuda/Ptx.cs`, `src/Adad/Cuda/GpuOps.cs` | the CUDA side: driver binding, PTX generation, the operations |
 | `src/Qiyas.Checks/Checks.cs`, `src/Qiyas.Checks/References.cs` | the proofs; the float64 references the proofs and the bench score against |
 | `bench/Qiyas.Bench/CpuGeneric.cs`, `bench/Qiyas.Bench/GenericPtx.cs` | the `INumberBase<T>` version (the `number` column) |
 | `src/Qiyas.Checks/Bench/` | the bench contract, the type registry, the Adad subject |
