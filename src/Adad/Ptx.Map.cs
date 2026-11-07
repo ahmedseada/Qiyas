@@ -550,6 +550,33 @@ internal static partial class Ptx
         }
     }
 
+    // ---------------------------------------------------------------- the mixed map: operands of their own formats
+
+    /// <summary>output = op(x, y; a, b) over n values in the lane, a thread a value: x of fx from value p_xoff, y of fy from
+    /// value p_yoff (row: y[i mod p_cols], a row vector), the output of fo (whole bytes, not blocks). A composition's adds of
+    /// the type's tensors and its f32 intermediates, each read where it is stored.</summary>
+    public static string MapMixed(Gpu gpu, Fmt fx, Fmt fy, Fmt fo, Lane lane, MapOp op, bool row, out string entry)
+    {
+        if (fo.IsBlock || fo.Bits < 8) throw new ArgumentException($"{fo.Name}: the mixed map stores whole bytes");
+        entry = $"mapmix_{op.Name}_{fx.Name}_{fy.Name}_{fo.Name}_{lane.Name}{(row ? "_row" : "")}";
+        var b = new PtxBuilder();
+        string gid = GlobalIndex(b);
+        string px = Param64(b, "p_x"), py = Param64(b, "p_y"), po = Param64(b, "p_o"), n = Param32(b, "p_n"), cols = Param32(b, "p_cols"), xoff = Param32(b, "p_xoff"), yoff = Param32(b, "p_yoff");
+        string a = lane.NewReg(b), pb = lane.NewReg(b), p = b.P(), ix = b.R(), iy = b.R();
+        b.L($"ld.param.{lane.Mem} {a}, [p_a];");
+        b.L($"ld.param.{lane.Mem} {pb}, [p_b];");
+        b.L($"setp.ge.u32 {p}, {gid}, {n};");
+        b.L($"@{p} bra DONE;");
+        b.L($"add.u32 {ix}, {gid}, {xoff};");
+        if (row) b.L($"rem.u32 {iy}, {gid}, {cols};"); else b.L($"mov.u32 {iy}, {gid};");
+        b.L($"add.u32 {iy}, {iy}, {yoff};");
+        string x = Codec.UnpackAt(b, fx, px, ix, lane), y = Codec.UnpackAt(b, fy, py, iy, lane);
+        StoreAs(b, fo, lane, Formula(b, lane, op.Name, x, y, x, a, pb), po, gid);
+        b.Label("DONE");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, $".param .u64 p_x, .param .u64 p_y, .param .u64 p_o, .param .u32 p_n, .param .u32 p_cols, .param .u32 p_xoff, .param .u32 p_yoff, .param .{lane.Mem} p_a, .param .{lane.Mem} p_b");
+    }
+
     // ---------------------------------------------------------------- the map kernel: a thread per word
 
     /// <summary>output = op(x, y, z; a, b) over n values of format f in lane `lane`; absent inputs are passed as any pointer and never read.</summary>

@@ -7,11 +7,20 @@ namespace Adad;
 
 internal static partial class Ptx
 {
-    /// <summary>LSTM: (h', c') from the gates (B × 4H) and c; GRU: h' from gx, gh (B × 3H) and h. Backward variants give the
-    /// gates' gradients (and dc or dh) from dh' (and dc').</summary>
-    public static string Cell(Gpu gpu, Fmt f, Lane lane, string kind, bool backward, out string entry)
+    /// <summary>The formats a mixed cell reads its inputs as: the gates (g, g2), the state, dh' and dc'. O: the format its
+    /// state outputs (h', c'; dc; dh) are stored as (whole bytes, not blocks; null: lane storage, as the gates' gradients
+    /// always are). Mirror: h' and c' also as lane values at p_o4, p_o5 (a sequence's state for the next step).</summary>
+    public sealed record CellFormats(Fmt G, Fmt G2, Fmt S, Fmt D1, Fmt D2, Fmt? O = null, bool Mirror = false)
     {
-        entry = $"cell_{kind}{(backward ? "_bwd" : "")}_{f.Name}_{lane.Name}";
+        public string Name => $"{G.Name}_{G2.Name}_{S.Name}_{D1.Name}_{D2.Name}{(O is null ? "" : "_o" + O.Name)}{(Mirror ? "_mirror" : "")}";
+    }
+
+    /// <summary>LSTM: (h', c') from the gates (B × 4H) and c; GRU: h' from gx, gh (B × 3H) and h. Backward variants give the
+    /// gates' gradients (and dc or dh) from dh' (and dc'). formats: each input read as its own format where it is stored
+    /// (f the outputs': lane storage), as a composition's cell of the type's tensors and its f32 intermediates.</summary>
+    public static string Cell(Gpu gpu, Fmt f, Lane lane, string kind, bool backward, out string entry, CellFormats? formats = null)
+    {
+        entry = $"cell_{kind}{(backward ? "_bwd" : "")}_{f.Name}_{lane.Name}{(formats is null ? "" : "_m" + formats.Name)}";
         var b = new PtxBuilder();
         string tid = b.R(), bid = b.R(), word = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
@@ -20,7 +29,9 @@ internal static partial class Ptx
         // p_g, p_g2: the gates (GRU: gx, gh); p_s: the state (c or h); p_d1, p_d2: dh', dc'; outputs p_o1, p_o2 (h', c' | dg, dc or dgx, dgh) and p_o3 (GRU backward: dh).
         string g = Param64(b, "p_g"), g2 = Param64(b, "p_g2"), st = Param64(b, "p_s"), d1 = Param64(b, "p_d1"), d2 = Param64(b, "p_d2");
         string o1 = Param64(b, "p_o1"), o2 = Param64(b, "p_o2"), o3 = Param64(b, "p_o3");
+        string o4 = formats is null ? "" : Param64(b, "p_o4"), o5 = formats is null ? "" : Param64(b, "p_o5");
         string B = Param32(b, "p_b"), H = Param32(b, "p_h");
+        if (formats is not null && f.Per != 1) throw new ArgumentException("a mixed cell: a value a thread (f the lane's storage)");
         bool lstm = kind == "lstm";
         int G = lstm ? 4 : 3;
         string count = b.R(), words = b.R(), pw = b.P();
@@ -30,7 +41,8 @@ internal static partial class Ptx
         b.L($"setp.ge.u32 {pw}, {word}, {words};");
         b.L($"@{pw} bra DONE;");
         var natural = f.Natural;
-        string Load(string ptr, string idx) => Codec.UnpackAt(b, f, ptr, idx, lane);
+        Fmt FormatOf(string ptr) => formats is null ? f : ptr == g ? formats.G : ptr == g2 ? formats.G2 : ptr == st ? formats.S : ptr == d1 ? formats.D1 : formats.D2;
+        string Load(string ptr, string idx) => Codec.UnpackAt(b, FormatOf(ptr), ptr, idx, lane);
         string Sig(string x) => Fn.Sigmoid(b, lane, x);
         string Tanh(string x) => Fn.Tanh(b, lane, x);
         string Mul(string x, string y) { string d = lane.NewReg(b); b.L(lane.Mul(d, x, y)); return d; }
@@ -42,7 +54,7 @@ internal static partial class Ptx
         string last = b.R();
         b.L($"sub.u32 {last}, {count}, 1;");
         // Output words: up to three (o1, o2, o3) assembled per value and stored once.
-        string[] outWords = new string[3];
+        string[] outWords = new string[3], outVals = new string[3];
         int outs = lstm ? 2 : backward ? 3 : 1;
         for (int k = 0; k < outs; k++) { outWords[k] = f.WordBits == 64 ? b.RD() : b.R(); if (f.WordBits == 32) b.L($"mov.b32 {outWords[k]}, 0;"); }
         // GRU backward writes dgx, dgh (B × 3H) by a separate word mapping: a thread per hidden unit word writes its three gate values' words via value-wise stores.
@@ -67,6 +79,7 @@ internal static partial class Ptx
                 string hn = Mul(og, Tanh(cn));
                 PackValue(b, f, lane, natural, hn, pv, i, outWords[0]);
                 PackValue(b, f, lane, natural, cn, pv, i, outWords[1]);
+                outVals[0] = hn; outVals[1] = cn;
             }
             else if (lstm)
             {
@@ -83,7 +96,8 @@ internal static partial class Ptx
                 StoreValue(b, f, lane, natural, dgf, pv, o1, gIdx[1]);
                 StoreValue(b, f, lane, natural, dgg, pv, o1, gIdx[2]);
                 StoreValue(b, f, lane, natural, dgo, pv, o1, gIdx[3]);
-                PackValue(b, f, lane, natural, Mul(dcn, fg), pv, i, outWords[1]);
+                outVals[1] = Mul(dcn, fg);
+                PackValue(b, f, lane, natural, outVals[1], pv, i, outWords[1]);
             }
             else if (!backward)
             {
@@ -91,6 +105,7 @@ internal static partial class Ptx
                 string n = Tanh(Fma(r, Load(g2, gIdx[2]), Load(g, gIdx[2])));
                 string hn = Fma(z, Load(st, v), Mul(OneMinus(z), n));
                 PackValue(b, f, lane, natural, hn, pv, i, outWords[0]);
+                outVals[0] = hn;
             }
             else
             {
@@ -108,7 +123,8 @@ internal static partial class Ptx
                 StoreValue(b, f, lane, natural, dgr, pv, o2, gIdx[0]);
                 StoreValue(b, f, lane, natural, dgz, pv, o2, gIdx[1]);
                 StoreValue(b, f, lane, natural, Mul(dpre, r), pv, o2, gIdx[2]);
-                PackValue(b, f, lane, natural, Mul(d, z), pv, i, outWords[2]);
+                outVals[2] = Mul(d, z);
+                PackValue(b, f, lane, natural, outVals[2], pv, i, outWords[2]);
             }
         }
 
@@ -117,13 +133,22 @@ internal static partial class Ptx
         b.L($"mul.wide.u32 {addr}, {word}, {f.WordBits / 8};");
         string wt = f.WordBits == 64 ? "b64" : "b32";
         void StoreWord(string ptr, string w) { string a = b.RD(); b.L($"add.u64 {a}, {ptr}, {addr};"); b.L($"st.global.{wt} [{a}], {w};"); }
-        if (lstm && !backward) { StoreWord(o1, outWords[0]); StoreWord(o2, outWords[1]); }
-        else if (lstm) StoreWord(o2, outWords[1]);
-        else if (!backward) StoreWord(o1, outWords[0]);
-        else StoreWord(o3, outWords[2]);
+        // A state output: its word in lane storage, or (formats.O) its value stored as that format, mirrored when asked.
+        void StoreOut(string ptr, int k, string mirror)
+        {
+            if (formats?.O is not { } fo) { StoreWord(ptr, outWords[k]); return; }
+            StoreAs(b, fo, lane, outVals[k], ptr, word);
+            if (formats.Mirror) StoreWord(mirror, outWords[k]);
+        }
+
+        if (lstm && !backward) { StoreOut(o1, 0, o4); StoreOut(o2, 1, o5); }
+        else if (lstm) StoreOut(o2, 1, o5);
+        else if (!backward) StoreOut(o1, 0, o4);
+        else StoreOut(o3, 2, o5);
         b.Label("DONE");
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_g, .param .u64 p_g2, .param .u64 p_s, .param .u64 p_d1, .param .u64 p_d2, .param .u64 p_o1, .param .u64 p_o2, .param .u64 p_o3, .param .u32 p_b, .param .u32 p_h");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_g, .param .u64 p_g2, .param .u64 p_s, .param .u64 p_d1, .param .u64 p_d2, .param .u64 p_o1, .param .u64 p_o2, .param .u64 p_o3"
+            + (formats is null ? "" : ", .param .u64 p_o4, .param .u64 p_o5") + ", .param .u32 p_b, .param .u32 p_h");
     }
 
     // A lane value into position i of an output word (zero when the value is past the count).
