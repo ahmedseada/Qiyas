@@ -11,7 +11,7 @@ using System.Runtime.InteropServices;
 
 namespace Qiyas;
 
-internal static partial class Kernels
+internal sealed partial class Kernels
 {
     /// <summary>y = A·x for A (rows × cols) and x (cols) both Q8_0 or both Q4_0 (cols a multiple of 32); y as float32 lanes. Returns the lane's name.</summary>
     public static string GemvBlocks(string format, byte[] a, byte[] x, float[] y, int rows, int cols)

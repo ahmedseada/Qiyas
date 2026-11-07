@@ -88,7 +88,7 @@ public sealed record CellArgs(string Kind, int B, int D, int H)
     }
 }
 
-internal static partial class Kernels
+internal sealed partial class Kernels
 {
     /// <summary>The LSTM cell on the CPU: h', c' from the gates and c (lane arithmetic); returns the lane's name.</summary>
     public static string LstmCell<TN>(CellArgs a, byte[] g, byte[] c, byte[] hOut, byte[] cOut) where TN : struct, IQiyasFloat<TN>

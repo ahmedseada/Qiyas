@@ -261,7 +261,7 @@ internal static class MapOps
 
 // ---------------------------------------------------------------------------------------------- the CPU kernel
 
-internal static partial class Kernels
+internal sealed partial class Kernels
 {
     /// <summary>Runs a formula over n stored values in the number's element-wise lane (the formulas every lane has).</summary>
     public static string Map<TN>(string op, byte[]? x, byte[]? y, byte[]? z, byte[] output, int n, double a, double b) where TN : struct, IQiyasNumber<TN>

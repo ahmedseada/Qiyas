@@ -75,7 +75,7 @@ public sealed record ProductView(int M, int N, int K, bool TransA, bool TransB, 
     }
 }
 
-internal static partial class Kernels
+internal sealed partial class Kernels
 {
     private static int BytesOf<TN>(long values) where TN : struct, IQiyasNumber<TN> => (int)TN.Bytes(values);
 

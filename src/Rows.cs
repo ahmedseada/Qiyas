@@ -609,7 +609,7 @@ internal static class RowKernels
     }
 }
 
-internal static partial class Kernels
+internal sealed partial class Kernels
 {
     /// <summary>A row operation over x (rows × cols, stored as TN) into y (and y2) in the type's float lane; returns the lane's name.</summary>
     public static string RowOp<TN>(RowOp op, byte[] x, byte[]? x2, byte[]? g, byte[]? bt, byte[]? s, int[]? pos, byte[] y, byte[]? y2, int rows, int cols, double a, double b) where TN : struct, IQiyasFloat<TN>

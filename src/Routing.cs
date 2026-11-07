@@ -84,7 +84,7 @@ public static class Routing
     }
 }
 
-internal static partial class Kernels
+internal sealed partial class Kernels
 {
     /// <summary>top-k of each row: values stored as the type (rows × k), indices s32; returns the lane's name.</summary>
     public static string TopK<TN>(byte[] x, int rows, int cols, int k, byte[] values, int[] indices) where TN : struct, IQiyasNumber<TN>

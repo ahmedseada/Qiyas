@@ -24,7 +24,7 @@ public enum Axis
     Cols,
 }
 
-internal static partial class Kernels
+internal sealed partial class Kernels
 {
     // ---------------------------------------------------------------- reductions
 

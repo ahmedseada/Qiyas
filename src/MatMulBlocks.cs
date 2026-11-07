@@ -19,7 +19,7 @@ using System.Runtime.InteropServices;
 
 namespace Qiyas;
 
-internal static partial class Kernels
+internal sealed partial class Kernels
 {
     /// <summary>Whether the CPU has the block product (the s8 dot lane).</summary>
     public static bool BlockProductAvailable => S8Dot.IsSupported;

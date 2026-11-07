@@ -109,7 +109,7 @@ public sealed record AttentionArgs(int Heads, int Lq, int Lk, int D, double Scal
     }
 }
 
-internal static partial class Kernels
+internal sealed partial class Kernels
 {
     // ---------------------------------------------------------------- lane storage: a narrow type widened to its lane's storage type
 

@@ -49,7 +49,7 @@ public sealed record ConvArgs(int C, int H, int W, int OC, int Kh, int Kw, int S
     }
 }
 
-internal static partial class Kernels
+internal sealed partial class Kernels
 {
     /// <summary>The gate's override: false takes the composition (im2col, then the product), null the fused path where it applies.</summary>
     internal static bool? FusedConv;

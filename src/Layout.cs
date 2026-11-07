@@ -343,7 +343,7 @@ public sealed class LayoutArgs
 
 // ---------------------------------------------------------------------------------------------- the CPU kernels
 
-internal static partial class Kernels
+internal sealed partial class Kernels
 {
     /// <summary>A layout operation on the CPU; returns the lane's name (the type's own, or the sum lane where values are summed).</summary>
     public static string Layout<TN>(LayoutArgs k) where TN : struct, IQiyasNumber<TN>

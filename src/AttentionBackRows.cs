@@ -20,7 +20,7 @@ using System.Runtime.InteropServices;
 
 namespace Qiyas;
 
-internal static partial class Kernels
+internal sealed partial class Kernels
 {
     private const int BackKeys = 16;                                        // a keys task's keys; the transposed runs' grain
 

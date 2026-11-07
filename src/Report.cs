@@ -9,7 +9,7 @@ using System.Text;
 
 namespace Qiyas;
 
-internal static partial class Kernels
+internal sealed partial class Kernels
 {
     private static readonly List<string> s_decisions = [];
 

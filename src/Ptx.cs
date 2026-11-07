@@ -2,10 +2,10 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // Qiyas on CUDA: PTX generated once per (stored format, lane) from the number's description — the same contract as the
-// CPU side, in the device's terms. A stored format (Fmt) says how values sit in 32-bit words (64-bit words for the
-// 64-bit types) and emits the instructions that take one value out of a word into a lane register or put a lane value
-// back (rounded to nearest even, held to the type's range); a lane (Lane) is a register type with its arithmetic. The
-// kernels are written once over those:
+// CPU side, in the device's terms. The stored format (Fmt) and the lane (Lane) are the device-neutral description
+// (Abstractions/Formats.cs); here a lane gets its PTX register and instruction types and its arithmetic (PtxLane), and
+// the codec emits the instructions that take one value out of a word into a lane register or put a lane value back
+// (rounded to nearest even, held to the type's range). The kernels are written once over those:
 //
 //   add            c = a + b on 16-byte vectors, each value unpacked, added in the lane, packed
 //   cvt / back     a stored array into a lane array and back (the operands of a product in lanes other than the dot lane)
@@ -22,58 +22,34 @@ using System.Text;
 
 namespace Qiyas;
 
-/// <summary>A value's stored format as the PTX sees it.</summary>
-public sealed record Fmt(string Name, int Bits, bool IsFloat, bool Signed)
+/// <summary>A lane (Abstractions/Formats.cs) in PTX's terms: its register and instruction types, and its arithmetic as instructions.</summary>
+public static class PtxLane
 {
-    public int WordBits => Bits == 64 ? 64 : 32;
+    extension(Lane lane)
+    {
+        /// <summary>The register type: f32, f64, b32, b64.</summary>
+        public string Reg => lane.IsFloat ? lane.Name : lane.Wide ? "b64" : "b32";
 
-    /// <summary>Values a word holds.</summary>
-    public int Per => WordBits / Bits;
+        /// <summary>The instruction type: f32, f64, s32, u32, s64, u64.</summary>
+        public string Op => lane.Name;
 
-    /// <summary>A block format: values in blocks of BlockValues taking BlockBytes (0 for the plain formats).</summary>
-    public int BlockValues => Name switch { "q8_0" or "q4_0" => 32, "q4_k" or "q6_k" => 256, _ => 0 };
-    public int BlockBytes => Name switch { "q8_0" => 34, "q4_0" => 18, "q4_k" => 144, "q6_k" => 210, _ => 0 };
-    public bool IsBlock => BlockValues > 0;
+        public string Zero => lane.IsFloat ? (lane.Wide ? "0d0000000000000000" : "0f00000000") : "0";
 
-    public static Fmt Of<TN>() where TN : struct, IQiyasNumber<TN> => new(TN.Name, TN.Bits, TN.IsFloat, TN.Min < 0);
+        public string NewReg(PtxBuilder b) => lane.Reg switch { "f32" => b.F(), "f64" => b.FD(), "b32" => b.R(), _ => b.RD() };
 
-    public bool Is(string name) => Name == name;
+        public string Fma(string d, string a, string b, string c) => lane.IsFloat ? $"fma.rn.{lane.Op} {d}, {a}, {b}, {c};" : $"mad.lo.{lane.Op} {d}, {a}, {b}, {c};";
 
-    /// <summary>Words that hold <paramref name="values"/> values (a block format: its whole blocks, in words).</summary>
-    public long Words(long values) => IsBlock ? ((values + BlockValues - 1) / BlockValues * BlockBytes + 3) / 4 : (values * Bits + WordBits - 1) / WordBits;
+        public string Add(string d, string a, string b) => lane.IsFloat ? $"add.rn.{lane.Op} {d}, {a}, {b};" : $"add.{lane.Op} {d}, {a}, {b};";
 
-    /// <summary>The lane this format's values are read into before any other (floats f32/f64, integers s32/u32/s64/u64).</summary>
-    public Lane Natural => IsFloat ? (Bits == 64 ? Lane.F64 : Lane.F32) : Bits == 64 ? (Signed ? Lane.S64 : Lane.U64) : Signed ? Lane.S32 : Lane.U32;
-}
+        public string Mul(string d, string a, string b) => lane.IsFloat ? $"mul.rn.{lane.Op} {d}, {a}, {b};" : $"mul.lo.{lane.Op} {d}, {a}, {b};";
 
-/// <summary>A register type kernels compute in.</summary>
-public sealed record Lane(string Name, string Reg, string Op, int Size, bool IsFloat)
-{
-    public static readonly Lane F32 = new("f32", "f32", "f32", 4, true);
-    public static readonly Lane F64 = new("f64", "f64", "f64", 8, true);
-    public static readonly Lane S32 = new("s32", "b32", "s32", 4, false);
-    public static readonly Lane U32 = new("u32", "b32", "u32", 4, false);
-    public static readonly Lane S64 = new("s64", "b64", "s64", 8, false);
-    public static readonly Lane U64 = new("u64", "b64", "u64", 8, false);
+        /// <summary>The memory type of a load or store of this lane.</summary>
+        public string Mem => lane.IsFloat ? lane.Op : lane.Wide ? "b64" : "b32";
 
-    public bool Wide => Size == 8;
-
-    public string Zero => IsFloat ? (Wide ? "0d0000000000000000" : "0f00000000") : "0";
-
-    public string NewReg(PtxBuilder b) => Reg switch { "f32" => b.F(), "f64" => b.FD(), "b32" => b.R(), _ => b.RD() };
-
-    public string Fma(string d, string a, string b, string c) => IsFloat ? $"fma.rn.{Op} {d}, {a}, {b}, {c};" : $"mad.lo.{Op} {d}, {a}, {b}, {c};";
-
-    public string Add(string d, string a, string b) => IsFloat ? $"add.rn.{Op} {d}, {a}, {b};" : $"add.{Op} {d}, {a}, {b};";
-
-    public string Mul(string d, string a, string b) => IsFloat ? $"mul.rn.{Op} {d}, {a}, {b};" : $"mul.lo.{Op} {d}, {a}, {b};";
-
-    /// <summary>The memory type of a load or store of this lane.</summary>
-    public string Mem => IsFloat ? Op : Wide ? "b64" : "b32";
-
-    public string Literal(double value) => IsFloat
-        ? Wide ? "0d" + BitConverter.DoubleToUInt64Bits(value).ToString("X16") : "0f" + BitConverter.SingleToUInt32Bits((float)value).ToString("X8")
-        : ((long)value).ToString(CultureInfo.InvariantCulture);
+        public string Literal(double value) => lane.IsFloat
+            ? lane.Wide ? "0d" + BitConverter.DoubleToUInt64Bits(value).ToString("X16") : "0f" + BitConverter.SingleToUInt32Bits((float)value).ToString("X8")
+            : ((long)value).ToString(CultureInfo.InvariantCulture);
+    }
 }
 
 /// <summary>A kernel's text: registers named as they are asked for, declared when the kernel is finished.</summary>

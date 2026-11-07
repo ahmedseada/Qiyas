@@ -150,7 +150,7 @@ public sealed record CtcArgs(int T, int B, int C, int Blank, int[] InputLengths,
     }
 }
 
-internal static partial class Kernels
+internal sealed partial class Kernels
 {
     /// <summary>The ctc loss per sequence (B values as the type) and, when grad is given, the gradient with respect to the
     /// logits (T × B × C as the type); returns the lane's name.</summary>

@@ -47,7 +47,7 @@ public sealed record OptimizerArgs(string Name, double Lr, double B1, double B2,
     }
 }
 
-internal static partial class Kernels
+internal sealed partial class Kernels
 {
     /// <summary>An optimizer step over n values: p, g as the type; m, v as lane storage (v null for one moment). Returns the lane's name.</summary>
     public static string Optimizer<TN>(OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) where TN : struct, IQiyasFloat<TN>

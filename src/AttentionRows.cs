@@ -18,7 +18,7 @@ using System.Runtime.InteropServices;
 
 namespace Qiyas;
 
-internal static partial class Kernels
+internal sealed partial class Kernels
 {
     private const int FusedRows = 16, FusedKeys = 64;                       // a task's query rows; a key tile (L1: 64 × d lanes, twice)
 
