@@ -1751,7 +1751,7 @@ internal static partial class Ptx
         int tile = micro * 16, bk = 16, e = lane.Size;
         entry = conv ? $"gemmconv{tile}_{lane.Name}" : $"gemm{tile}_{lane.Name}";
         if (stored is not null) entry += $"_s{stored.Name}{(transA ? "_ta" : "")}{(transB ? "_tb" : "")}{(runsA ? "_ra" : "")}{(runsB ? "_rb" : "")}";
-        if ((runsA || runsB) && (stored is null || !stored.IsBlock || conv)) throw new ArgumentException("runs: a block format's stored operands");
+        if ((runsA || runsB) && (stored is null || !stored.IsBlock) || runsB && conv) throw new ArgumentException("runs: a block format's stored operands (B's not gathered)");
         bool typedC = stored is not null && !stored.IsBlock && stored.Bits >= 8;
         var b = new PtxBuilder();
         string tid = b.R(), bx = b.R(), by = b.R(), tx = b.R(), ty = b.R();

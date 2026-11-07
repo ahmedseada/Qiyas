@@ -26,12 +26,16 @@ internal static partial class Ptx
         return ((br + bc) * stride + br * (bc + 1)) * lane.Size;
     }
 
-    public static string AttentionRows(Gpu gpu, Fmt f, Lane lane, int dCap, out string entry)
+    /// <summary>outFmt: O's format where it is not f (a block format's O in lane storage, encoded by blocks after). runs (a
+    /// block format, d a multiple of 8): each thread loads runs of consecutive values of a row (Codec.UnpackRun: a block's
+    /// scales read once a run) in place of one value a row.</summary>
+    public static string AttentionRows(Gpu gpu, Fmt f, Lane lane, int dCap, out string entry, Fmt? outFmt = null, bool runs = false)
     {
+        if (runs && !f.IsBlock) throw new ArgumentException("runs: a block format's rows");
         var (Br, Bc) = AttentionTile(lane);
         int T = RowsThreads, tpr = T / Br, spt = Bc / tpr, vec = 16 / lane.Size, stride = dCap + vec, nvec = dCap / (vec * tpr), size = lane.Size;
         int logTpr = System.Numerics.BitOperations.Log2((uint)tpr), logD = System.Numerics.BitOperations.Log2((uint)dCap);
-        entry = $"attention_rows_{f.Name}_{lane.Name}_d{dCap}";
+        entry = $"attention_rows_{f.Name}_{lane.Name}_d{dCap}{(outFmt is null ? "" : "_o" + outFmt.Name)}{(runs ? "_runs" : "")}";
         var b = new PtxBuilder();
         string tid = b.R(), qb = b.R(), h = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
@@ -87,6 +91,7 @@ internal static partial class Ptx
         b.L($"mul.lo.u32 {mySlot}, {mySlot}, {size};");
         void LoadTile(string dst, int count, string head, string first, string rowLimit, string src)
         {
+            if (runs) { LoadRuns(dst, count, head, first, rowLimit, src); return; }
             string gr = b.R(), idx = b.R(), sBase = b.R();
             b.L($"add.u32 {gr}, {first}, {myRow};");
             b.L($"mad.lo.u32 {idx}, {gr}, {d}, {myCol};");
@@ -102,6 +107,39 @@ internal static partial class Ptx
                 string loaded = Codec.UnpackAt(b, f, src, at, lane);
                 b.L($"selp.{lane.Op} {val}, {loaded}, {lane.Zero}, {pv};");
                 b.L($"st.shared.{lane.Mem} [{sBase}+{it * rowsPerStep * stride * size}], {val};");
+            }
+        }
+
+        // LoadTile by runs: count · dCap / T values a thread (at most 8 a run), consecutive in a row: a run starts at a
+        // multiple of its length, so with d a multiple of 8 it is in the row whole or past d whole, in one block's sub-block.
+        void LoadRuns(string dst, int count, string head, string first, string rowLimit, string src)
+        {
+            int run = Math.Min(8, count * dCap / T), threadsPerRow = dCap / run, rowsStep = T / threadsPerRow;
+            string c0 = b.R(), r0 = b.R(), cv = b.P(), slot = b.R(), gr = b.R(), idx = b.R(), sBase = b.R(), stepV = b.R();
+            b.L($"and.b32 {c0}, {tid}, {threadsPerRow - 1};");
+            b.L($"mul.lo.u32 {c0}, {c0}, {run};");
+            b.L($"shr.u32 {r0}, {tid}, {System.Numerics.BitOperations.Log2((uint)threadsPerRow)};");
+            b.L($"setp.lt.u32 {cv}, {c0}, {d};");
+            b.L($"mad.lo.u32 {slot}, {r0}, {stride}, {c0};");
+            b.L($"mad.lo.u32 {sBase}, {slot}, {size}, {dst};");
+            b.L($"add.u32 {gr}, {first}, {r0};");
+            b.L($"mad.lo.u32 {idx}, {gr}, {d}, {c0};");
+            b.L($"add.u32 {idx}, {idx}, {head};");
+            b.L($"mul.lo.u32 {stepV}, {d}, {rowsStep};");
+            for (int it = 0; it < count / rowsStep; it++)
+            {
+                string pv = b.P(), at = b.R();
+                if (it > 0) { b.L($"add.u32 {gr}, {gr}, {rowsStep};"); b.L($"add.u32 {idx}, {idx}, {stepV};"); }
+                b.L($"setp.lt.u32 {pv}, {gr}, {rowLimit};");
+                b.L($"and.pred {pv}, {pv}, {cv};");
+                b.L($"selp.b32 {at}, {idx}, {head}, {pv};");                  // a dropped run reads the head's first (valid)
+                var vals = Codec.UnpackRun(b, f, src, at, run, lane);
+                for (int q = 0; q < run; q++)
+                {
+                    string val = lane.NewReg(b);
+                    b.L($"selp.{lane.Op} {val}, {vals[q]}, {lane.Zero}, {pv};");
+                    b.L($"st.shared.{lane.Mem} [{sBase}+{(it * rowsStep * stride + q) * size}], {val};");
+                }
             }
         }
 
@@ -250,7 +288,8 @@ internal static partial class Ptx
         b.L($"div.rn.{lane.Op} {inv}, {lane.Literal(1)}, {l};");
         b.L($"selp.{lane.Op} {inv}, {inv}, {lane.Zero}, {pAny};");
         b.L($"mad.lo.u32 {oRow}, {i}, {d}, {qHead};");
-        var natural = f.Natural;
+        var fo = outFmt ?? f;                                                   // O's format: the type, or lane storage for a block format
+        var natural = fo.Natural;
         for (int j = 0; j < nvec; j++)
         {
             for (int e = 0; e < vec; e++)
@@ -263,25 +302,25 @@ internal static partial class Ptx
                 b.L($"@!{rowValid} bra {skip};");
                 b.L(lane.Mul(val, acc[j, e], inv));
                 b.L($"add.u32 {idx}, {oRow}, {dim};");
-                string stored = lane == natural ? val : Codec.Convert(b, lane, val, natural, f);
-                if (f.Bits >= 32)
+                string stored = lane == natural ? val : Codec.Convert(b, lane, val, natural, fo);
+                if (fo.Bits >= 32)
                 {
-                    string code = f.WordBits == 64 ? b.RD() : b.R();
-                    if (f.WordBits == 32) b.L($"mov.b32 {code}, 0;");
-                    Codec.Pack(b, f, stored, natural, 0, code);
-                    b.L($"mul.wide.u32 {oAddr}, {idx}, {f.Bits / 8};");
+                    string code = fo.WordBits == 64 ? b.RD() : b.R();
+                    if (fo.WordBits == 32) b.L($"mov.b32 {code}, 0;");
+                    Codec.Pack(b, fo, stored, natural, 0, code);
+                    b.L($"mul.wide.u32 {oAddr}, {idx}, {fo.Bits / 8};");
                     b.L($"add.u64 {oAddr}, {o}, {oAddr};");
-                    b.L($"st.global.{(f.WordBits == 64 ? "b64" : "b32")} [{oAddr}], {code};");
+                    b.L($"st.global.{(fo.WordBits == 64 ? "b64" : "b32")} [{oAddr}], {code};");
                 }
                 else
                 {
                     string code = b.R(), hh = b.H();
                     b.L($"mov.b32 {code}, 0;");
-                    Codec.Pack(b, f, stored, natural, 0, code);
-                    b.L($"mul.wide.u32 {oAddr}, {idx}, {f.Bits / 8};");
+                    Codec.Pack(b, fo, stored, natural, 0, code);
+                    b.L($"mul.wide.u32 {oAddr}, {idx}, {fo.Bits / 8};");
                     b.L($"add.u64 {oAddr}, {o}, {oAddr};");
                     b.L($"cvt.u16.u32 {hh}, {code};");
-                    b.L($"st.global.b{f.Bits} [{oAddr}], {hh};");
+                    b.L($"st.global.b{fo.Bits} [{oAddr}], {hh};");
                 }
 
                 b.Label(skip);

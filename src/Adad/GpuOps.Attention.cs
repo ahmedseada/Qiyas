@@ -118,16 +118,11 @@ public sealed partial class GpuOps
         var rented = new List<ulong>();
         try
         {
-            if (f.IsBlock)
-            {
-                ulong bq = ToLane<TN>(q, a.QValues, rented), bk = ToLane<TN>(k, a.KValues, rented), bv = ToLane<TN>(v, a.KValues, rented), bo = gpu.Rent(a.QValues * 4);
-                rented.Add(bo);
-                AttentionRows<Float32>(a, bq, bk, bv, bo);
-                FromLane<TN>(bo, o, a.QValues);
-                return "f32 (blocks through lane storage)";
-            }
-
-            var kind = MmaRows != false ? Ptx.AttentionKind(f) : null;
+            // A block format: Q, K, V decoded where they are stored (the kernel's loads), O the rows' f32 values (a block of O
+            // may span the rows of several blocks of queries), encoded by blocks after.
+            ulong lo = f.IsBlock ? gpu.Rent(a.QValues * 4) : o;
+            if (f.IsBlock) rented.Add(lo);
+            var kind = MmaRows != false && !f.IsBlock ? Ptx.AttentionKind(f) : null;
             char mLoad = f.Bits == 16 && a.D % 8 == 0 && (q | k | v) % 16 == 0 ? 'c' : f.Bits == 8 && a.D % 4 == 0 && (q | k | v) % 4 == 0 ? 'w' : 'v';
             if (kind is not null && !(Ptx.AttentionMmaShared(dCap) <= AttnSharedLimit
                 && AttnAccepts($"attention_rows_mma:{f.Name}:{dCap}:{mLoad}", (out string e) => Ptx.AttentionRowsMma(gpu, f, kind, dCap, mLoad, out e)))) kind = null;
@@ -146,9 +141,12 @@ public sealed partial class GpuOps
             var (br, _) = Ptx.AttentionTile(lane);
             int blocks = (a.Lq + br - 1) / br;
             ulong limits = Limits(a, rented), starts = Starts(a, rented), ranges = KeyRanges(a, br, rented);
-            var fn = gpu.Cached($"attention_rows:{f.Name}:{dCap}", (out string e) => Ptx.AttentionRows(gpu, f, lane, dCap, out e));
-            Gpu.Launch(fn, (uint)blocks, (uint)a.Heads, Ptx.RowsThreads, 1, 0, q, k, v, o, limits, starts, ranges, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), lane.Wide ? Gpu.D(a.Scale) : Gpu.F((float)a.Scale));
-            return lane.Name;
+            bool runs = f.IsBlock && a.D % 8 == 0;
+            var fn = gpu.Cached($"attention_rows:{f.Name}:{dCap}:{runs}", (out string e) => Ptx.AttentionRows(gpu, f, lane, dCap, out e, f.IsBlock ? Fmt.Of<Float32>() : null, runs));
+            Gpu.Launch(fn, (uint)blocks, (uint)a.Heads, Ptx.RowsThreads, 1, 0, q, k, v, lo, limits, starts, ranges, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), lane.Wide ? Gpu.D(a.Scale) : Gpu.F((float)a.Scale));
+            if (!f.IsBlock) return lane.Name;
+            Back(f, lane, lo, o, a.QValues);
+            return "f32 (blocks in place)";
         }
         finally
         {
@@ -223,19 +221,15 @@ public sealed partial class GpuOps
         var rented = new List<ulong>();
         try
         {
-            if (f.IsBlock)
-            {
-                ulong lq = ToLane<TN>(q, a.QValues, rented), lk = ToLane<TN>(k, a.KValues, rented), lv = ToLane<TN>(v, a.KValues, rented), lo = gpu.Rent(a.QValues * 4);
-                rented.Add(lo);
-                AttentionDecode<Float32>(a, lq, lk, lv, lo);
-                FromLane<TN>(lo, o, a.QValues);
-                return "f32 (blocks through lane storage)";
-            }
-
+            // A block format: Q, K, V decoded where they are stored, O the queries' f32 values, encoded by blocks after.
+            ulong lo = f.IsBlock ? gpu.Rent(a.QValues * 4) : o;
+            if (f.IsBlock) rented.Add(lo);
             ulong limits = Limits(a, rented), starts = Starts(a, rented);
-            var fn = gpu.Cached($"attention_decode:{f.Name}:{dCap}", (out string e) => Ptx.AttentionDecode(gpu, f, lane, dCap, out e));
-            Gpu.Launch(fn, (uint)(a.Heads * a.Lq), 1, Ptx.DecodeThreads, 1, 0, q, k, v, o, limits, starts, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), lane.Wide ? Gpu.D(a.Scale) : Gpu.F((float)a.Scale));
-            return lane.Name;
+            var fn = gpu.Cached($"attention_decode:{f.Name}:{dCap}", (out string e) => Ptx.AttentionDecode(gpu, f, lane, dCap, out e, f.IsBlock ? Fmt.Of<Float32>() : null));
+            Gpu.Launch(fn, (uint)(a.Heads * a.Lq), 1, Ptx.DecodeThreads, 1, 0, q, k, v, lo, limits, starts, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), lane.Wide ? Gpu.D(a.Scale) : Gpu.F((float)a.Scale));
+            if (!f.IsBlock) return lane.Name;
+            Back(f, lane, lo, o, a.QValues);
+            return "f32 (blocks in place)";
         }
         finally
         {

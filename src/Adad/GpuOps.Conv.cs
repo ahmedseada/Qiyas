@@ -5,7 +5,7 @@
 //   the tensor and dot routes   the image packed straight into the kind's packed rows (Ptx.PackTransposed with conv: the
 //                               index map in place of the load), the weights packed by rows, the same kernel, padding
 //                               and C path as the composition: the same result bit for bit;
-//   the plain lanes (f32, f64, the integer lanes, block formats through f32)   the plain product kernel with its B tile
+//   the plain lanes (f32, f64, the integer lanes, block formats in f32)   the plain product kernel with its B tile
 //                               gathered from the image (Ptx.Gemm with conv), or the composition (im2col, then the
 //                               product: Gemm2, the sliced float64 route) where this device measures that faster, once
 //                               per shape and type by Measure.Faster, the decision in --report.
@@ -31,7 +31,8 @@ public sealed partial class GpuOps
         if (!f.IsBlock && (laneName.EndsWith("mma", StringComparison.Ordinal) || laneName.EndsWith("dp", StringComparison.Ordinal)))
             return ConvPacked<TN>(a, x, w, y, laneName);
         var lane = LaneOf(laneName);
-        if (FusedConv == true) return ConvPlain<TN>(a, x, w, y, lane);
+        // A block format's composition would encode the columns as blocks (each window's values quantized again): fused.
+        if (FusedConv == true || f.IsBlock) return ConvPlain<TN>(a, x, w, y, lane);
         string key = $"{f.Name}:{a.C}x{a.H}x{a.W}>{a.OC}:{a.Kh}x{a.Kw}:s{a.Sh}x{a.Sw}:p{a.Ph}x{a.Pw}:d{a.Dh}x{a.Dw}";
         if (!_convFused.TryGetValue(key, out bool fused))
         {
@@ -99,23 +100,30 @@ public sealed partial class GpuOps
         finally { foreach (var p in rented) gpu.Return(p); }
     }
 
-    // The plain lanes with B gathered from the image by the product kernel itself (Ptx.Gemm with conv); the image and the
-    // weights converted to the lane's storage once where it is not the type's.
+    // The plain lanes with B gathered from the image by the product kernel itself (Ptx.Gemm with conv); where the lane's
+    // storage is not the type's, the image and the weights decoded where they are stored (the stored mode) and y stored as
+    // the type where its values are whole bytes and not blocks, else the lane's sums encoded after.
     private string ConvPlain<TN>(ConvArgs a, ulong x, ulong w, ulong y, Lane lane) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
         bool direct = !f.IsBlock && f.Natural == lane && f.Bits == lane.Size * 8 && f.IsFloat == lane.IsFloat;
-        var rented = new List<ulong>();
+        if (direct) { GemmConv(a, lane, w, x, y); return lane.Name; }
+        bool typedC = !f.IsBlock && f.Bits >= 8;
+        int micro = lane.Wide ? 4 : 8, tile = micro * 16;
+        bool runsA = f.IsBlock && a.Rows % micro == 0;                                    // the weights' rows as runs of their blocks
+        var fn = gpu.Cached($"gemmconv_stored:{f.Name}:{lane.Name}:{micro}:{runsA}", (out string e) => Ptx.Gemm(gpu, lane, micro, out e, conv: true, stored: f, runsA: runsA));
+        ulong lc = typedC ? y : gpu.Rent(a.YValues * lane.Size);
         try
         {
-            ulong lx = direct ? x : Lanes(f, lane, x, a.XValues, rented), lw = direct ? w : Lanes(f, lane, w, a.WValues, rented);
-            ulong lc = direct ? y : gpu.Rent(a.YValues * lane.Size);
-            if (!direct) rented.Add(lc);
-            GemmConv(a, lane, lw, lx, lc);
-            if (!direct) Back(f, lane, lc, y, a.YValues);
-            return lane.Name;
+            Gpu.Launch(fn, Grid(a.Cols, tile), Grid(a.OC, tile), Ptx.GemmThreads, 1, 0, [w, x, lc, Gpu.U(a.OC), Gpu.U(a.Cols), Gpu.U(a.Rows), .. ConvArgsOf(a), 0, 0]);
+            if (!typedC) Back(f, lane, lc, y, a.YValues);
         }
-        finally { foreach (var p in rented) gpu.Return(p); }
+        finally
+        {
+            if (!typedC) gpu.Return(lc);
+        }
+
+        return lane.Name;
     }
 
     private void GemmConv(ConvArgs a, Lane lane, ulong lw, ulong lx, ulong lc, bool composed = false)

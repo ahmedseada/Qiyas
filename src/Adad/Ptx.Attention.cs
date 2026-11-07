@@ -15,9 +15,9 @@ internal static partial class Ptx
     /// <summary>Shared bytes the decode kernel takes for a head dimension capacity: the reduction's slots, the query, the chunk's scores and weights.</summary>
     public static int DecodeShared(Lane lane, int dCap) => ReduceBytes + (dCap + 2 * DecodeThreads) * lane.Size;
 
-    public static string AttentionDecode(Gpu gpu, Fmt f, Lane lane, int dCap, out string entry)
+    public static string AttentionDecode(Gpu gpu, Fmt f, Lane lane, int dCap, out string entry, Fmt? outFmt = null)
     {
-        entry = $"attention_decode_{f.Name}_{lane.Name}_d{dCap}";
+        entry = $"attention_decode_{f.Name}_{lane.Name}_d{dCap}{(outFmt is null ? "" : "_o" + outFmt.Name)}";
         var b = new PtxBuilder();
         string tid = b.R(), bid = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
@@ -158,7 +158,8 @@ internal static partial class Ptx
         b.L($"setp.gt.{lane.Op} {pAny}, {l}, {lane.Zero};");
         b.L($"div.rn.{lane.Op} {inv}, {lane.Literal(1)}, {l};");
         b.L($"selp.{lane.Op} {inv}, {inv}, {lane.Zero}, {pAny};");
-        var natural = f.Natural;
+        var fo = outFmt ?? f;                                                   // O's format: the type, or lane storage for a block format
+        var natural = fo.Natural;
         for (int a = 0; a < PerThread; a++)
         {
             string dim = b.R(), pDim = b.P(), val = lane.NewReg(b), idx = b.R(), addr = b.RD();
@@ -167,25 +168,25 @@ internal static partial class Ptx
             b.L($"@{pDim} bra OUT{a}_END;");
             b.L(lane.Mul(val, acc[a], inv));
             b.L($"add.u32 {idx}, {qBase}, {dim};");
-            string stored = lane == natural ? val : Codec.Convert(b, lane, val, natural, f);
-            if (f.Bits >= 32)
+            string stored = lane == natural ? val : Codec.Convert(b, lane, val, natural, fo);
+            if (fo.Bits >= 32)
             {
-                string code = f.WordBits == 64 ? b.RD() : b.R();
-                if (f.WordBits == 32) b.L($"mov.b32 {code}, 0;");
-                Codec.Pack(b, f, stored, natural, 0, code);
-                b.L($"mul.wide.u32 {addr}, {idx}, {f.Bits / 8};");
+                string code = fo.WordBits == 64 ? b.RD() : b.R();
+                if (fo.WordBits == 32) b.L($"mov.b32 {code}, 0;");
+                Codec.Pack(b, fo, stored, natural, 0, code);
+                b.L($"mul.wide.u32 {addr}, {idx}, {fo.Bits / 8};");
                 b.L($"add.u64 {addr}, {o}, {addr};");
-                b.L($"st.global.{(f.WordBits == 64 ? "b64" : "b32")} [{addr}], {code};");
+                b.L($"st.global.{(fo.WordBits == 64 ? "b64" : "b32")} [{addr}], {code};");
             }
             else
             {
                 string code = b.R(), hh = b.H();
                 b.L($"mov.b32 {code}, 0;");
-                Codec.Pack(b, f, stored, natural, 0, code);
-                b.L($"mul.wide.u32 {addr}, {idx}, {f.Bits / 8};");
+                Codec.Pack(b, fo, stored, natural, 0, code);
+                b.L($"mul.wide.u32 {addr}, {idx}, {fo.Bits / 8};");
                 b.L($"add.u64 {addr}, {o}, {addr};");
                 b.L($"cvt.u16.u32 {hh}, {code};");
-                b.L($"st.global.b{f.Bits} [{addr}], {hh};");
+                b.L($"st.global.b{fo.Bits} [{addr}], {hh};");
             }
 
             b.Label($"OUT{a}_END");
