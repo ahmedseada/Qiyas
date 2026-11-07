@@ -25,6 +25,12 @@ public interface IMapOp<TLane, TL> where TLane : unmanaged where TL : struct, IL
     static abstract Vector<TLane> Apply(Vector<TLane> x, Vector<TLane> y, Vector<TLane> z, Vector<TLane> a, Vector<TLane> b);
 }
 
+/// <summary>What runs a formula once its struct is known: a map over values, over rows.</summary>
+public interface IOpUse<TLane, TL> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
+{
+    void Use<TOp>() where TOp : struct, IMapOp<TLane, TL>;
+}
+
 internal static class MapOps
 {
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -65,6 +71,13 @@ internal static class MapOps
     public struct ReluBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(x, Vector<T>.Zero), y, Vector<T>.Zero); }
     public struct ClampBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(x, a) & TL.Greater(b, x), y, Vector<T>.Zero); }
     public struct WhereBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Equal(x, Vector<T>.Zero), Vector<T>.Zero, y); }
+    public struct MaxBwdX<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(y, x), Vector<T>.Zero, z); }
+    public struct MaxBwdY<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(y, x), z, Vector<T>.Zero); }
+    public struct MinBwdX<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(x, y), Vector<T>.Zero, z); }
+    public struct MinBwdY<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(x, y), z, Vector<T>.Zero); }
+    public struct GatedRelu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Max(x, Vector<T>.Zero), y); }
+    public struct GatedReluBwdX<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(x, Vector<T>.Zero), TL.Mul(y, z), Vector<T>.Zero); }
+    public struct GatedReluBwdY<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Max(x, Vector<T>.Zero), z); }
 
     // float lanes
     private const double GeluK = 0.7978845608028654, GeluC = 0.044715, InvSqrt2 = 0.7071067811865476, InvSqrt2Pi = 0.3989422804014327;
@@ -157,6 +170,101 @@ internal static class MapOps
     public struct GatedSiluBwdY<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Mul(x, TL.Sigmoid(x)), z); }
     public struct GatedGeluBwdX<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Mul(GeluGradF<T, TL>(x), y), z); }
     public struct GatedGeluBwdY<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(GeluF<T, TL>(x), z); }
+    public struct GatedTanhSigmoid<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Tanh(x), TL.Sigmoid(y)); }
+    public struct GatedTanhSigmoidBwdX<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) { var s = TL.Sigmoid(TL.Mul(C<T, TL>(2), x)); var sech2 = TL.Mul(C<T, TL>(4), TL.Mul(s, TL.Sigmoid(TL.Mul(C<T, TL>(-2), x)))); return TL.Mul(TL.Mul(sech2, TL.Sigmoid(y)), z); } }
+    public struct GatedTanhSigmoidBwdY<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Mul(TL.Tanh(x), TL.Mul(TL.Sigmoid(y), TL.Sigmoid(TL.Neg(y)))), z); }
+    public struct AddGelu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => GeluF<T, TL>(TL.Add(x, y)); }
+    public struct ClipFactor<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) { var one = C<T, TL>(1); return TL.Select(TL.Greater(x, Vector<T>.Zero), TL.Min(one, TL.Div(a, TL.Sqrt(x))), one); } }
+
+    /// <summary>The formulas every lane has: runs `use` with op's struct; false for any other name.</summary>
+    public static bool AnyOp<T, TL, TU>(string op, ref TU use) where T : unmanaged where TL : struct, ILane<TL, T> where TU : struct, IOpUse<T, TL>
+    {
+        switch (op)
+        {
+            case "copy": use.Use<Copy<T, TL>>(); return true;
+            case "fill": use.Use<Fill<T, TL>>(); return true;
+            case "neg": use.Use<Neg<T, TL>>(); return true;
+            case "abs": use.Use<Abs<T, TL>>(); return true;
+            case "sign": use.Use<SignOp<T, TL>>(); return true;
+            case "square": use.Use<Square<T, TL>>(); return true;
+            case "relu": use.Use<Relu<T, TL>>(); return true;
+            case "add_scalar": use.Use<AddScalar<T, TL>>(); return true;
+            case "scale": use.Use<Scale<T, TL>>(); return true;
+            case "affine": use.Use<Affine<T, TL>>(); return true;
+            case "clamp": use.Use<Clamp<T, TL>>(); return true;
+            case "add": use.Use<Add<T, TL>>(); return true;
+            case "sub": use.Use<Sub<T, TL>>(); return true;
+            case "mul": use.Use<Mul<T, TL>>(); return true;
+            case "div": use.Use<Div<T, TL>>(); return true;
+            case "max": use.Use<Max<T, TL>>(); return true;
+            case "min": use.Use<Min<T, TL>>(); return true;
+            case "axpy": use.Use<Axpy<T, TL>>(); return true;
+            case "muladd": use.Use<MulAdd<T, TL>>(); return true;
+            case "where": use.Use<Where<T, TL>>(); return true;
+            case "square_bwd": use.Use<SquareBwd<T, TL>>(); return true;
+            case "abs_bwd": use.Use<AbsBwd<T, TL>>(); return true;
+            case "relu_bwd": use.Use<ReluBwd<T, TL>>(); return true;
+            case "clamp_bwd": use.Use<ClampBwd<T, TL>>(); return true;
+            case "where_bwd": use.Use<WhereBwd<T, TL>>(); return true;
+            case "max_bwd_x": use.Use<MaxBwdX<T, TL>>(); return true;
+            case "max_bwd_y": use.Use<MaxBwdY<T, TL>>(); return true;
+            case "min_bwd_x": use.Use<MinBwdX<T, TL>>(); return true;
+            case "min_bwd_y": use.Use<MinBwdY<T, TL>>(); return true;
+            case "gated_relu": use.Use<GatedRelu<T, TL>>(); return true;
+            case "gated_relu_bwd_x": use.Use<GatedReluBwdX<T, TL>>(); return true;
+            case "gated_relu_bwd_y": use.Use<GatedReluBwdY<T, TL>>(); return true;
+            default: return false;
+        }
+    }
+
+    /// <summary>The float formulas: runs `use` with op's struct; false for any other name.</summary>
+    public static bool FloatOp<T, TL, TU>(string op, ref TU use) where T : unmanaged where TL : struct, IFloatLane<TL, T> where TU : struct, IOpUse<T, TL>
+    {
+        switch (op)
+        {
+            case "sqrt": use.Use<Sqrt<T, TL>>(); return true;
+            case "inv_sqrt": use.Use<InvSqrt<T, TL>>(); return true;
+            case "exp": use.Use<Exp<T, TL>>(); return true;
+            case "expm1": use.Use<Expm1<T, TL>>(); return true;
+            case "log": use.Use<Log<T, TL>>(); return true;
+            case "sin": use.Use<Sin<T, TL>>(); return true;
+            case "cos": use.Use<Cos<T, TL>>(); return true;
+            case "tanh": use.Use<Tanh<T, TL>>(); return true;
+            case "sigmoid": use.Use<Sigmoid<T, TL>>(); return true;
+            case "erf": use.Use<Erf<T, TL>>(); return true;
+            case "gelu": use.Use<Gelu<T, TL>>(); return true;
+            case "gelu_erf": use.Use<GeluErf<T, TL>>(); return true;
+            case "silu": use.Use<Silu<T, TL>>(); return true;
+            case "leaky_relu": use.Use<LeakyRelu<T, TL>>(); return true;
+            case "pow": use.Use<Pow<T, TL>>(); return true;
+            case "dropout": use.Use<Dropout<T, TL>>(); return true;
+            case "gated_silu": use.Use<GatedSilu<T, TL>>(); return true;
+            case "gated_gelu": use.Use<GatedGelu<T, TL>>(); return true;
+            case "sqrt_bwd": use.Use<SqrtBwd<T, TL>>(); return true;
+            case "inv_sqrt_bwd": use.Use<InvSqrtBwd<T, TL>>(); return true;
+            case "exp_bwd": use.Use<ExpBwd<T, TL>>(); return true;
+            case "log_bwd": use.Use<LogBwd<T, TL>>(); return true;
+            case "sin_bwd": use.Use<SinBwd<T, TL>>(); return true;
+            case "cos_bwd": use.Use<CosBwd<T, TL>>(); return true;
+            case "tanh_bwd": use.Use<TanhBwd<T, TL>>(); return true;
+            case "sigmoid_bwd": use.Use<SigmoidBwd<T, TL>>(); return true;
+            case "silu_bwd": use.Use<SiluBwd<T, TL>>(); return true;
+            case "gelu_bwd": use.Use<GeluBwd<T, TL>>(); return true;
+            case "gelu_erf_bwd": use.Use<GeluErfBwd<T, TL>>(); return true;
+            case "leaky_relu_bwd": use.Use<LeakyReluBwd<T, TL>>(); return true;
+            case "pow_bwd": use.Use<PowBwd<T, TL>>(); return true;
+            case "gated_silu_bwd_x": use.Use<GatedSiluBwdX<T, TL>>(); return true;
+            case "gated_silu_bwd_y": use.Use<GatedSiluBwdY<T, TL>>(); return true;
+            case "gated_gelu_bwd_x": use.Use<GatedGeluBwdX<T, TL>>(); return true;
+            case "gated_gelu_bwd_y": use.Use<GatedGeluBwdY<T, TL>>(); return true;
+            case "gated_tanh_sigmoid": use.Use<GatedTanhSigmoid<T, TL>>(); return true;
+            case "gated_tanh_sigmoid_bwd_x": use.Use<GatedTanhSigmoidBwdX<T, TL>>(); return true;
+            case "gated_tanh_sigmoid_bwd_y": use.Use<GatedTanhSigmoidBwdY<T, TL>>(); return true;
+            case "add_gelu": use.Use<AddGelu<T, TL>>(); return true;
+            case "clip_factor": use.Use<ClipFactor<T, TL>>(); return true;
+            default: return false;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------- the CPU kernel
@@ -193,41 +301,13 @@ internal sealed partial class Kernels
     {
         public string Lane = "";
 
-        public readonly bool Known => op is "copy" or "fill" or "neg" or "abs" or "sign" or "square" or "relu" or "add_scalar" or "scale" or "affine" or "clamp"
-            or "add" or "sub" or "mul" or "div" or "max" or "min" or "axpy" or "muladd" or "where" or "square_bwd" or "abs_bwd" or "relu_bwd" or "clamp_bwd" or "where_bwd";
+        public readonly bool Known => !Ops.Find(op).FloatOnly;
 
         public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
         {
             Lane = TL.Name;
-            switch (op)
-            {
-                case "copy": MapRun<TN, TLane, TL, MapOps.Copy<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "fill": MapRun<TN, TLane, TL, MapOps.Fill<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "neg": MapRun<TN, TLane, TL, MapOps.Neg<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "abs": MapRun<TN, TLane, TL, MapOps.Abs<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "sign": MapRun<TN, TLane, TL, MapOps.SignOp<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "square": MapRun<TN, TLane, TL, MapOps.Square<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "relu": MapRun<TN, TLane, TL, MapOps.Relu<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "add_scalar": MapRun<TN, TLane, TL, MapOps.AddScalar<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "scale": MapRun<TN, TLane, TL, MapOps.Scale<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "affine": MapRun<TN, TLane, TL, MapOps.Affine<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "clamp": MapRun<TN, TLane, TL, MapOps.Clamp<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "add": MapRun<TN, TLane, TL, MapOps.Add<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "sub": MapRun<TN, TLane, TL, MapOps.Sub<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "mul": MapRun<TN, TLane, TL, MapOps.Mul<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "div": MapRun<TN, TLane, TL, MapOps.Div<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "max": MapRun<TN, TLane, TL, MapOps.Max<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "min": MapRun<TN, TLane, TL, MapOps.Min<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "axpy": MapRun<TN, TLane, TL, MapOps.Axpy<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "muladd": MapRun<TN, TLane, TL, MapOps.MulAdd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "where": MapRun<TN, TLane, TL, MapOps.Where<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "square_bwd": MapRun<TN, TLane, TL, MapOps.SquareBwd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "abs_bwd": MapRun<TN, TLane, TL, MapOps.AbsBwd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "relu_bwd": MapRun<TN, TLane, TL, MapOps.ReluBwd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "clamp_bwd": MapRun<TN, TLane, TL, MapOps.ClampBwd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "where_bwd": MapRun<TN, TLane, TL, MapOps.WhereBwd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                default: throw new ArgumentException(op);
-            }
+            var use = new MapUse<TN, TLane, TL>(x, y, z, output, n, a, b);
+            if (!MapOps.AnyOp<TLane, TL, MapUse<TN, TLane, TL>>(op, ref use)) throw new ArgumentException(op);
         }
     }
 
@@ -238,46 +318,15 @@ internal sealed partial class Kernels
         public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
         {
             Lane = TL.Name;
-            switch (op)
-            {
-                case "sqrt": MapRun<TN, TLane, TL, MapOps.Sqrt<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "inv_sqrt": MapRun<TN, TLane, TL, MapOps.InvSqrt<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "exp": MapRun<TN, TLane, TL, MapOps.Exp<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "expm1": MapRun<TN, TLane, TL, MapOps.Expm1<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "log": MapRun<TN, TLane, TL, MapOps.Log<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "sin": MapRun<TN, TLane, TL, MapOps.Sin<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "cos": MapRun<TN, TLane, TL, MapOps.Cos<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "tanh": MapRun<TN, TLane, TL, MapOps.Tanh<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "sigmoid": MapRun<TN, TLane, TL, MapOps.Sigmoid<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "erf": MapRun<TN, TLane, TL, MapOps.Erf<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "gelu": MapRun<TN, TLane, TL, MapOps.Gelu<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "gelu_erf": MapRun<TN, TLane, TL, MapOps.GeluErf<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "silu": MapRun<TN, TLane, TL, MapOps.Silu<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "leaky_relu": MapRun<TN, TLane, TL, MapOps.LeakyRelu<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "pow": MapRun<TN, TLane, TL, MapOps.Pow<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "dropout": MapRun<TN, TLane, TL, MapOps.Dropout<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "gated_silu": MapRun<TN, TLane, TL, MapOps.GatedSilu<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "gated_gelu": MapRun<TN, TLane, TL, MapOps.GatedGelu<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "sqrt_bwd": MapRun<TN, TLane, TL, MapOps.SqrtBwd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "inv_sqrt_bwd": MapRun<TN, TLane, TL, MapOps.InvSqrtBwd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "exp_bwd": MapRun<TN, TLane, TL, MapOps.ExpBwd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "log_bwd": MapRun<TN, TLane, TL, MapOps.LogBwd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "sin_bwd": MapRun<TN, TLane, TL, MapOps.SinBwd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "cos_bwd": MapRun<TN, TLane, TL, MapOps.CosBwd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "tanh_bwd": MapRun<TN, TLane, TL, MapOps.TanhBwd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "sigmoid_bwd": MapRun<TN, TLane, TL, MapOps.SigmoidBwd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "silu_bwd": MapRun<TN, TLane, TL, MapOps.SiluBwd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "gelu_bwd": MapRun<TN, TLane, TL, MapOps.GeluBwd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "gelu_erf_bwd": MapRun<TN, TLane, TL, MapOps.GeluErfBwd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "leaky_relu_bwd": MapRun<TN, TLane, TL, MapOps.LeakyReluBwd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "pow_bwd": MapRun<TN, TLane, TL, MapOps.PowBwd<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "gated_silu_bwd_x": MapRun<TN, TLane, TL, MapOps.GatedSiluBwdX<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "gated_silu_bwd_y": MapRun<TN, TLane, TL, MapOps.GatedSiluBwdY<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "gated_gelu_bwd_x": MapRun<TN, TLane, TL, MapOps.GatedGeluBwdX<TLane, TL>>(x, y, z, output, n, a, b); break;
-                case "gated_gelu_bwd_y": MapRun<TN, TLane, TL, MapOps.GatedGeluBwdY<TLane, TL>>(x, y, z, output, n, a, b); break;
-                default: throw new ArgumentException(op);
-            }
+            var use = new MapUse<TN, TLane, TL>(x, y, z, output, n, a, b);
+            if (!MapOps.FloatOp<TLane, TL, MapUse<TN, TLane, TL>>(op, ref use)) throw new ArgumentException(op);
         }
+    }
+
+    private readonly struct MapUse<TN, TLane, TL>(byte[]? x, byte[]? y, byte[]? z, byte[] output, int n, double a, double b) : IOpUse<TLane, TL>
+        where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
+    {
+        public void Use<TOp>() where TOp : struct, IMapOp<TLane, TL> => MapRun<TN, TLane, TL, TOp>(x, y, z, output, n, a, b);
     }
 
     private static void MapRun<TN, TLane, TL, TOp>(byte[]? x, byte[]? y, byte[]? z, byte[] output, int n, double a, double b)
@@ -372,6 +421,74 @@ internal sealed partial class Kernels
                 if (!z.IsEmpty) z.Slice(i, rest).CopyTo(pz);
                 var r = TOp.Apply(new Vector<TLane>(px), new Vector<TLane>(py), new Vector<TLane>(pz), a, b);
                 for (int l = 0; l < rest; l++) o[i + l] = r[l];
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- dropout from a seed
+
+    /// <summary>output = residual + x·(1/(1 − p)) where the seed's draw i keeps value i, the residual where it does not (no
+    /// residual: +0), in the type's float lane: a kept value with a residual is one fused multiply-add.</summary>
+    public static string Dropout<TN>(byte[] x, byte[]? residual, byte[] output, int n, double p, ulong seed) where TN : struct, IFloatAdad<TN>
+    {
+        var v = new DropoutVisitor(x, residual, output, n, Draws.Key(seed), Draws.Threshold(p), 1 / (1 - p));
+        TN.Float(ref v);
+        return v.Lane;
+    }
+
+    private struct DropoutVisitor(byte[] x, byte[]? residual, byte[] output, int n, uint key, uint threshold, double scale) : IFloatLaneVisitor
+    {
+        public string Lane = "";
+
+        public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+        {
+            Lane = TL.Name;
+            int size = Math.Max(Tile, (n / (Threads * 4) + Tile - 1) / Tile * Tile);
+            Team.For(n, size, (long)n * 4, new DropoutBody<TN, TLane, TL>(x, residual, output, key, threshold, TL.From(scale)));
+        }
+    }
+
+    private readonly struct DropoutBody<TN, TLane, TL>(byte[] x, byte[]? residual, byte[] output, uint key, uint threshold, TLane scale) : Team.IBody
+        where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    {
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public void Run(int first, int last)
+        {
+            Span<TLane> tx = stackalloc TLane[Tile];
+            Span<TLane> tr = stackalloc TLane[Tile];
+            Span<TLane> keep = stackalloc TLane[Tile];
+            int w = Vector<TLane>.Count;
+            Span<TLane> px = stackalloc TLane[w], pr = stackalloc TLane[w], pk = stackalloc TLane[w];
+            var s = new Vector<TLane>(scale);
+            for (int at = first; at < last; at += Tile)
+            {
+                int len = Math.Min(Tile, last - at);
+                TN.Load(x, at, tx[..len]);
+                if (residual is not null) TN.Load(residual, at, tr[..len]);
+                else tr[..len].Clear();
+                TLane one = TL.From(1), zero = TL.From(0);
+                for (int i = 0; i < len; i++) keep[i] = Draws.Keep(key, (uint)(at + i), threshold) ? one : zero;
+                int l = 0;
+                for (; l + w <= len; l += w)
+                {
+                    var vx = new Vector<TLane>(tx[l..]);
+                    var vr = new Vector<TLane>(tr[l..]);
+                    var kept = residual is null ? TL.Mul(vx, s) : TL.Fma(vx, s, vr);
+                    TL.Select(TL.Equal(new Vector<TLane>(keep[l..]), Vector<TLane>.Zero), vr, kept).CopyTo(tx[l..]);
+                }
+
+                if (l < len)
+                {
+                    px.Clear(); pr.Clear(); pk.Clear();
+                    tx[l..len].CopyTo(px); tr[l..len].CopyTo(pr); keep[l..len].CopyTo(pk);
+                    var vx = new Vector<TLane>(px);
+                    var vr = new Vector<TLane>(pr);
+                    var kept = residual is null ? TL.Mul(vx, s) : TL.Fma(vx, s, vr);
+                    var res = TL.Select(TL.Equal(new Vector<TLane>(pk), Vector<TLane>.Zero), vr, kept);
+                    for (int i = l; i < len; i++) tx[i] = res[i - l];
+                }
+
+                TN.Store(tx[..len], output, at);
             }
         }
     }

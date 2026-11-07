@@ -15,6 +15,7 @@
 
 using System.Buffers;
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
 using Adad.Abstraction;
 
 namespace Adad.Cpu;
@@ -106,6 +107,72 @@ internal sealed partial class Kernels
             for (int r = 0; r < rows; r++) { TN.Load(x, r * cols + index[r], one.AsSpan(0, 1)); picked[r] = one[0]; }
             TN.Store(picked, output, 0);
         }
+    }
+
+    /// <summary>output[r] = 1 where row r of the predictions is right, else 0: one column, (p ≥ threshold) = (t ≥ ½) in the lane
+    /// (each bound the lane's smallest value at least it); more, the first largest column of p (by >, from column 0) is t's.</summary>
+    public static string ClassMatch<TN>(byte[] p, byte[] t, byte[] output, int rows, int cols, double threshold) where TN : struct, IAdad<TN>
+    {
+        var v = new ClassMatchVisitor(p, t, output, rows, cols, threshold);
+        TN.Elementwise(ref v);
+        return v.Lane;
+    }
+
+    private struct ClassMatchVisitor(byte[] p, byte[] t, byte[] output, int rows, int cols, double threshold) : ILaneVisitor
+    {
+        public string Lane = "";
+
+        public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
+        {
+            Lane = TL.Name;
+            var lane = typeof(TLane) == typeof(float) ? Abstraction.Lane.F32 : typeof(TLane) == typeof(double) ? Abstraction.Lane.F64
+                : typeof(TLane) == typeof(ulong) ? Abstraction.Lane.U64 : typeof(TLane) == typeof(long) ? Abstraction.Lane.S64
+                : typeof(TLane) == typeof(uint) || typeof(TLane) == typeof(ushort) || typeof(TLane) == typeof(byte) ? Abstraction.Lane.U32 : Abstraction.Lane.S32;
+            TLane th = TL.From(lane.AtLeast(threshold)), half = TL.From(lane.AtLeast(0.5));
+            var match = new TLane[rows];
+            Team.For(rows, 64, (long)rows * cols * 2, new ClassMatchBody<TN, TLane, TL>(p, t, match, cols, th, half));
+            TN.Store(match, output, 0);
+        }
+    }
+
+    private readonly struct ClassMatchBody<TN, TLane, TL>(byte[] p, byte[] t, TLane[] match, int cols, TLane th, TLane half) : Team.IBody
+        where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
+    {
+        public void Run(int first, int last)
+        {
+            var pr = new TLane[cols];
+            var tr = new TLane[cols];
+            TLane one = TL.From(1), zero = TL.From(0);
+            for (int r = first; r < last; r++)
+            {
+                TN.Load(p, r * cols, pr);
+                TN.Load(t, r * cols, tr);
+                bool right = cols == 1 ? AtLeast(pr[0], th) == AtLeast(tr[0], half) : First(pr) == First(tr);
+                match[r] = right ? one : zero;
+            }
+        }
+
+        // The first column whose value exceeds every one before it (> as IEEE compares: a NaN never exceeds, nor is exceeded).
+        private static int First(TLane[] row)
+        {
+            int best = 0;
+            for (int i = 1; i < row.Length; i++) if (Greater(row[i], row[best])) best = i;
+            return best;
+        }
+    }
+
+    private static bool AtLeast<T>(T a, T b) where T : unmanaged
+    {
+        if (typeof(T) == typeof(float)) return Unsafe.As<T, float>(ref a) >= Unsafe.As<T, float>(ref b);
+        if (typeof(T) == typeof(double)) return Unsafe.As<T, double>(ref a) >= Unsafe.As<T, double>(ref b);
+        return Widths.Compare(a, b) >= 0;
+    }
+
+    private static bool Greater<T>(T a, T b) where T : unmanaged
+    {
+        if (typeof(T) == typeof(float)) return Unsafe.As<T, float>(ref a) > Unsafe.As<T, float>(ref b);
+        if (typeof(T) == typeof(double)) return Unsafe.As<T, double>(ref a) > Unsafe.As<T, double>(ref b);
+        return Widths.Compare(a, b) > 0;
     }
 
     /// <summary>loss[r] = log Σ exp(x[r]) − x[r][t[r]] as the type, in the type's float lane: a row's max, its Σ exp(x − max),

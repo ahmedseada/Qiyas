@@ -262,18 +262,33 @@ internal static class Cvt
         for (; i < s.Length; i++) d[i] = (ushort)RoundClamp(s[i], 0, ushort.MaxValue);
     }
 
+    // The integer types' largest values are not floats: a value from the next power of two on holds to the largest itself.
     public static void FromFloat(ReadOnlySpan<float> s, Span<int> d)
     {
         int i = 0, w = Vector<float>.Count;
-        for (; i + w <= s.Length; i += w) Vector.ConvertToInt32(RoundClamp(new Vector<float>(s[i..]), int.MinValue, 2147483520f)).CopyTo(d[i..]);
-        for (; i < s.Length; i++) d[i] = (int)RoundClamp(s[i], int.MinValue, 2147483520f);
+        Vector<float> top = new(2147483648f);
+        Vector<int> max = new(int.MaxValue);
+        for (; i + w <= s.Length; i += w)
+        {
+            var v = new Vector<float>(s[i..]);
+            Vector.ConditionalSelect(Vector.GreaterThanOrEqual(v, top), max, Vector.ConvertToInt32(RoundClamp(v, int.MinValue, 2147483520f))).CopyTo(d[i..]);
+        }
+
+        for (; i < s.Length; i++) d[i] = s[i] >= 2147483648f ? int.MaxValue : (int)RoundClamp(s[i], int.MinValue, 2147483520f);
     }
 
     public static void FromFloat(ReadOnlySpan<float> s, Span<uint> d)
     {
         int i = 0, w = Vector<float>.Count;
-        for (; i + w <= s.Length; i += w) Vector.ConvertToUInt32(RoundClamp(new Vector<float>(s[i..]), 0, 4294967040f)).CopyTo(d[i..]);
-        for (; i < s.Length; i++) d[i] = (uint)RoundClamp(s[i], 0, 4294967040f);
+        Vector<float> top = new(4294967296f);
+        Vector<uint> max = new(uint.MaxValue);
+        for (; i + w <= s.Length; i += w)
+        {
+            var v = new Vector<float>(s[i..]);
+            Vector.ConditionalSelect(Vector.AsVectorUInt32(Vector.GreaterThanOrEqual(v, top)), max, Vector.ConvertToUInt32(RoundClamp(v, 0, 4294967040f))).CopyTo(d[i..]);
+        }
+
+        for (; i < s.Length; i++) d[i] = s[i] >= 4294967296f ? uint.MaxValue : (uint)RoundClamp(s[i], 0, 4294967040f);
     }
 
     public static void FromFloat(ReadOnlySpan<float> s, Span<long> d)
@@ -281,12 +296,16 @@ internal static class Cvt
         int i = 0, w = Vector<float>.Count, h = w / 2;
         for (; i + w <= s.Length; i += w)
         {
-            Vector.Widen(RoundClamp(new Vector<float>(s[i..]), -9.223372e18f, 9.223371e18f), out Vector<double> a, out Vector<double> b);
-            Vector.ConvertToInt64(a).CopyTo(d[i..]);
-            Vector.ConvertToInt64(b).CopyTo(d[(i + h)..]);
+            var v = new Vector<float>(s[i..]);
+            Vector.Widen(RoundClamp(v, -9.223372e18f, 9.223371e18f), out Vector<double> a, out Vector<double> b);
+            Vector.Widen(v, out Vector<double> va, out Vector<double> vb);
+            Vector<double> top = new(9223372036854775808.0);
+            Vector<long> max = new(long.MaxValue);
+            Vector.ConditionalSelect(Vector.GreaterThanOrEqual(va, top), max, Vector.ConvertToInt64(a)).CopyTo(d[i..]);
+            Vector.ConditionalSelect(Vector.GreaterThanOrEqual(vb, top), max, Vector.ConvertToInt64(b)).CopyTo(d[(i + h)..]);
         }
 
-        for (; i < s.Length; i++) d[i] = (long)RoundClamp(s[i], -9.223372e18f, 9.223371e18f);
+        for (; i < s.Length; i++) d[i] = s[i] >= 9.223372036854775808e18f ? long.MaxValue : (long)RoundClamp(s[i], -9.223372e18f, 9.223371e18f);
     }
 
     public static void FromFloat(ReadOnlySpan<float> s, Span<ulong> d)
@@ -294,12 +313,16 @@ internal static class Cvt
         int i = 0, w = Vector<float>.Count, h = w / 2;
         for (; i + w <= s.Length; i += w)
         {
-            Vector.Widen(RoundClamp(new Vector<float>(s[i..]), 0, 1.8446743e19f), out Vector<double> a, out Vector<double> b);
-            Vector.ConvertToUInt64(a).CopyTo(d[i..]);
-            Vector.ConvertToUInt64(b).CopyTo(d[(i + h)..]);
+            var v = new Vector<float>(s[i..]);
+            Vector.Widen(RoundClamp(v, 0, 1.8446743e19f), out Vector<double> a, out Vector<double> b);
+            Vector.Widen(v, out Vector<double> va, out Vector<double> vb);
+            Vector<double> top = new(18446744073709551616.0);
+            Vector<ulong> max = new(ulong.MaxValue);
+            Vector.ConditionalSelect(Vector.AsVectorUInt64(Vector.GreaterThanOrEqual(va, top)), max, Vector.ConvertToUInt64(a)).CopyTo(d[i..]);
+            Vector.ConditionalSelect(Vector.AsVectorUInt64(Vector.GreaterThanOrEqual(vb, top)), max, Vector.ConvertToUInt64(b)).CopyTo(d[(i + h)..]);
         }
 
-        for (; i < s.Length; i++) d[i] = (ulong)RoundClamp(s[i], 0, 1.8446743e19f);
+        for (; i < s.Length; i++) d[i] = s[i] >= 1.8446744073709551616e19f ? ulong.MaxValue : (ulong)RoundClamp(s[i], 0, 1.8446743e19f);
     }
 
     // ---------------------------------------------------------------- float64 to integers (rounded, held to the range)
@@ -314,15 +337,33 @@ internal static class Cvt
     public static void FromDouble(ReadOnlySpan<double> s, Span<long> d, double low = long.MinValue, double high = 9223372036854774784.0)
     {
         int i = 0, w = Vector<double>.Count;
-        for (; i + w <= s.Length; i += w) Vector.ConvertToInt64(RoundClamp(new Vector<double>(s[i..]), low, high)).CopyTo(d[i..]);
-        for (; i < s.Length; i++) d[i] = (long)RoundClamp(s[i], low, high);
+        bool whole = high >= 9223372036854774784.0;                           // the whole range: from 2^63 on, the largest
+        Vector<double> top = new(9223372036854775808.0);
+        Vector<long> max = new(long.MaxValue);
+        for (; i + w <= s.Length; i += w)
+        {
+            var v = new Vector<double>(s[i..]);
+            var r = Vector.ConvertToInt64(RoundClamp(v, low, high));
+            (whole ? Vector.ConditionalSelect(Vector.GreaterThanOrEqual(v, top), max, r) : r).CopyTo(d[i..]);
+        }
+
+        for (; i < s.Length; i++) d[i] = whole && s[i] >= 9223372036854775808.0 ? long.MaxValue : (long)RoundClamp(s[i], low, high);
     }
 
     public static void FromDouble(ReadOnlySpan<double> s, Span<ulong> d, double high = 18446744073709549568.0)
     {
         int i = 0, w = Vector<double>.Count;
-        for (; i + w <= s.Length; i += w) Vector.ConvertToUInt64(RoundClamp(new Vector<double>(s[i..]), 0, high)).CopyTo(d[i..]);
-        for (; i < s.Length; i++) d[i] = (ulong)RoundClamp(s[i], 0, high);
+        bool whole = high >= 18446744073709549568.0;
+        Vector<double> top = new(18446744073709551616.0);
+        Vector<ulong> max = new(ulong.MaxValue);
+        for (; i + w <= s.Length; i += w)
+        {
+            var v = new Vector<double>(s[i..]);
+            var r = Vector.ConvertToUInt64(RoundClamp(v, 0, high));
+            (whole ? Vector.ConditionalSelect(Vector.AsVectorUInt64(Vector.GreaterThanOrEqual(v, top)), max, r) : r).CopyTo(d[i..]);
+        }
+
+        for (; i < s.Length; i++) d[i] = whole && s[i] >= 18446744073709551616.0 ? ulong.MaxValue : (ulong)RoundClamp(s[i], 0, high);
     }
 
     public static void FromDouble(ReadOnlySpan<double> s, Span<float> d)

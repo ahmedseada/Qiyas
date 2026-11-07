@@ -120,6 +120,7 @@ internal static partial class Checks
         ok &= Function32("erfc f32", Funcs.Erfc, Funcs.ErfcReference, -4, 9, 4, random);
         ok &= Function64("erfc f64", Funcs.Erfc, Funcs.ErfcReference, -4, 26, 4, random);
         ok &= Maps(null);
+        ok &= Elementwise(null);
         ok &= Group2(null);
         ok &= Rows(null);
         ok &= Layouts(null);
@@ -2285,6 +2286,7 @@ internal static partial class Checks
         ok &= Device<Int16, double>(ops, Lane.F64);
         ok &= Sliced(ops);
         ok &= Maps(ops);
+        ok &= Elementwise(ops, "cuda");
         ok &= Group2(ops);
         ok &= Rows(ops);
         ok &= Layouts(ops);

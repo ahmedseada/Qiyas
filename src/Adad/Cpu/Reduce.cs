@@ -678,8 +678,18 @@ internal sealed partial class Kernels
 
     public static string MapRow<TN>(string op, byte[] x, byte[] v, byte[] output, int rows, int cols) where TN : struct, IAdad<TN>
     {
+        if (Ops.Find(op).FloatOnly) throw new NotSupportedException($"{op}: a float formula; {TN.Name} runs it through MapRowFloat");
         var visitor = new RowMapVisitor(op, x, v, output, rows, cols);
         TN.Elementwise(ref visitor);
+        return visitor.Lane;
+    }
+
+    /// <summary>MapRow for a float type: the formulas every lane has in its element-wise lane, the float formulas in its float lane.</summary>
+    public static string MapRowFloat<TN>(string op, byte[] x, byte[] v, byte[] output, int rows, int cols) where TN : struct, IFloatAdad<TN>
+    {
+        if (!Ops.Find(op).FloatOnly) return MapRow<TN>(op, x, v, output, rows, cols);
+        var visitor = new FloatRowMapVisitor(op, x, v, output, rows, cols);
+        TN.Float(ref visitor);
         return visitor.Lane;
     }
 
@@ -690,17 +700,27 @@ internal sealed partial class Kernels
         public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
         {
             Lane = TL.Name;
-            switch (op)
-            {
-                case "add": RowMapRun<TN, TLane, TL, MapOps.Add<TLane, TL>>(x, v, output, rows, cols); break;
-                case "sub": RowMapRun<TN, TLane, TL, MapOps.Sub<TLane, TL>>(x, v, output, rows, cols); break;
-                case "mul": RowMapRun<TN, TLane, TL, MapOps.Mul<TLane, TL>>(x, v, output, rows, cols); break;
-                case "div": RowMapRun<TN, TLane, TL, MapOps.Div<TLane, TL>>(x, v, output, rows, cols); break;
-                case "max": RowMapRun<TN, TLane, TL, MapOps.Max<TLane, TL>>(x, v, output, rows, cols); break;
-                case "min": RowMapRun<TN, TLane, TL, MapOps.Min<TLane, TL>>(x, v, output, rows, cols); break;
-                default: throw new ArgumentException($"{op}: not a two-input formula every lane has");
-            }
+            var use = new RowMapUse<TN, TLane, TL>(x, v, output, rows, cols);
+            if (!MapOps.AnyOp<TLane, TL, RowMapUse<TN, TLane, TL>>(op, ref use)) throw new ArgumentException(op);
         }
+    }
+
+    public struct FloatRowMapVisitor(string op, byte[] x, byte[] v, byte[] output, int rows, int cols) : IFloatLaneVisitor
+    {
+        public string Lane = "";
+
+        public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+        {
+            Lane = TL.Name;
+            var use = new RowMapUse<TN, TLane, TL>(x, v, output, rows, cols);
+            if (!MapOps.FloatOp<TLane, TL, RowMapUse<TN, TLane, TL>>(op, ref use)) throw new ArgumentException(op);
+        }
+    }
+
+    private readonly struct RowMapUse<TN, TLane, TL>(byte[] x, byte[] v, byte[] output, int rows, int cols) : IOpUse<TLane, TL>
+        where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
+    {
+        public void Use<TOp>() where TOp : struct, IMapOp<TLane, TL> => RowMapRun<TN, TLane, TL, TOp>(x, v, output, rows, cols);
     }
 
     private static void RowMapRun<TN, TLane, TL, TOp>(byte[] x, byte[] v, byte[] output, int rows, int cols)

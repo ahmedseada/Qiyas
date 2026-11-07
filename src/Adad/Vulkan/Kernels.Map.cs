@@ -290,6 +290,13 @@ internal static partial class VkKernels
             case "relu_bwd": return b.Select(x > 0, y, e.C(0));
             case "clamp_bwd": return b.Select((x > a) & (x < pb), y, e.C(0));
             case "where_bwd": return b.Select(x != 0, y, e.C(0));
+            case "max_bwd_x": return b.Select(y > x, e.C(0), z);
+            case "max_bwd_y": return b.Select(y > x, z, e.C(0));
+            case "min_bwd_x": return b.Select(x > y, e.C(0), z);
+            case "min_bwd_y": return b.Select(x > y, z, e.C(0));
+            case "gated_relu": return b.Max(x, e.C(0)) * y;
+            case "gated_relu_bwd_x": return b.Select(x > 0, y * z, e.C(0));
+            case "gated_relu_bwd_y": return b.Max(x, e.C(0)) * z;
             case "sqrt": return b.Sqrt(x);
             case "inv_sqrt": return e.C(1) / b.Sqrt(x + a);
             case "exp": return e.Exp(x);
@@ -330,6 +337,11 @@ internal static partial class VkKernels
             case "gated_silu_bwd_y": return (x * e.Sigmoid(x)) * z;
             case "gated_gelu_bwd_x": return (e.GeluGrad(x) * y) * z;
             case "gated_gelu_bwd_y": return e.Gelu(x) * z;
+            case "gated_tanh_sigmoid": return Fn.Tanh(b, x) * e.Sigmoid(y);
+            case "gated_tanh_sigmoid_bwd_x": { var s = e.Sigmoid(e.C(2) * x); var sech2 = e.C(4) * (s * e.Sigmoid(e.C(-2) * x)); return (sech2 * e.Sigmoid(y)) * z; }
+            case "gated_tanh_sigmoid_bwd_y": return (Fn.Tanh(b, x) * (e.Sigmoid(y) * e.Sigmoid(-y))) * z;
+            case "add_gelu": return e.Gelu(x + y);
+            case "clip_factor": return b.Select(x > 0, b.Min(e.C(1), a / b.Sqrt(x)), e.C(1));
             default: throw new ArgumentException(op);
         }
     }

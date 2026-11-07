@@ -13,6 +13,7 @@ internal static partial class Checks
         bool ok = true;
         ok &= Adds(ops, "vulkan");
         ok &= Maps(ops, "vulkan");
+        ok &= Elementwise(ops, "vulkan");
         ok &= Group2(ops, "vulkan");
         ok &= Rows(ops, "vulkan");
         ok &= Layouts(ops, "vulkan");

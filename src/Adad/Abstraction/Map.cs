@@ -72,6 +72,13 @@ public static class Ops
         new("relu_bwd", 2, false, (x, y, z, a, b) => x > 0 ? y : 0, Any, Any, 0, 0),
         new("clamp_bwd", 2, false, (x, y, z, a, b) => x > a && x < b ? y : 0, Any, Any, -1, 2),
         new("where_bwd", 2, false, (x, y, z, a, b) => x != 0 ? y : 0, (0, 1), Any, 0, 0),
+        new("max_bwd_x", 3, false, (x, y, z, a, b) => x >= y ? z : 0, Any, Any, 0, 0, "max(x, y)'s gradient to x given dz: x takes it where x ≥ y"),
+        new("max_bwd_y", 3, false, (x, y, z, a, b) => x >= y ? 0 : z, Any, Any, 0, 0, "y takes it where x < y"),
+        new("min_bwd_x", 3, false, (x, y, z, a, b) => x <= y ? z : 0, Any, Any, 0, 0, "min(x, y)'s gradient to x given dz: x takes it where x ≤ y"),
+        new("min_bwd_y", 3, false, (x, y, z, a, b) => x <= y ? 0 : z, Any, Any, 0, 0, "y takes it where x > y"),
+        new("gated_relu", 2, false, (x, y, z, a, b) => Math.Max(x, 0) * y, Any, Any, 0, 0),
+        new("gated_relu_bwd_x", 3, false, (x, y, z, a, b) => x > 0 ? y * z : 0, Any, Any, 0, 0, "d/dx of relu(x)·y given dz"),
+        new("gated_relu_bwd_y", 3, false, (x, y, z, a, b) => Math.Max(x, 0) * z, Any, Any, 0, 0),
         // ---- float lanes
         new("sqrt", 1, true, (x, y, z, a, b) => Math.Sqrt(x), Positive, Any, 0, 0),
         new("inv_sqrt", 1, true, (x, y, z, a, b) => 1 / Math.Sqrt(x + a), Positive, Any, 1e-6, 0),
@@ -108,6 +115,11 @@ public static class Ops
         new("gated_silu_bwd_y", 3, true, (x, y, z, a, b) => Silu(x) * z, Any, Any, 0, 0),
         new("gated_gelu_bwd_x", 3, true, (x, y, z, a, b) => GeluGrad(x) * y * z, Any, Any, 0, 0, Cond, Ulps: 256),
         new("gated_gelu_bwd_y", 3, true, (x, y, z, a, b) => Gelu(x) * z, Any, Any, 0, 0, Cond, Ulps: 64),
+        new("gated_tanh_sigmoid", 2, true, (x, y, z, a, b) => Math.Tanh(x) * Sigmoid(y), Any, Any, 0, 0, "tanh(x)·σ(y): a gate whose other side has its own function"),
+        new("gated_tanh_sigmoid_bwd_x", 3, true, (x, y, z, a, b) => Funcs.SechSquaredReference(x) * Sigmoid(y) * z, Any, Any, 0, 0, "d/dx given dz (sech² by σ(2x)·σ(−2x), as tanh_bwd)", Ulps: 16),
+        new("gated_tanh_sigmoid_bwd_y", 3, true, (x, y, z, a, b) => Math.Tanh(x) * Sigmoid(y) * Sigmoid(-y) * z, Any, Any, 0, 0, "d/dy given dz"),
+        new("add_gelu", 2, true, (x, y, z, a, b) => Gelu(x + y), Any, Any, 0, 0, "gelu(x + y): a bias and its gelu in one pass (a row of biases by MapRowFloat); the sum rounded in the lane first, then gelu's conditioning" + Cond, Ulps: 256),
+        new("clip_factor", 1, true, (x, y, z, a, b) => x > 0 ? Math.Min(1, a / Math.Sqrt(x)) : 1, (0, 4), Any, 1, 0, "min(1, a/√x), 1 where x is 0: the clipping factor of a sum of squares x to the norm a"),
     ];
 
     public static MapOp Find(string name) => All.FirstOrDefault(o => o.Name == name) ?? throw new ArgumentException($"no element-wise operation named {name}");

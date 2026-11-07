@@ -55,6 +55,12 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
 
     string IElementwise<byte[]>.MapRow<TN>(MapOp op, byte[] x, byte[] v, byte[] output, int rows, int cols) => MapRow<TN>(op.Name, x, v, output, rows, cols);
 
+    string IElementwise<byte[]>.MapRowFloat<TN>(MapOp op, byte[] x, byte[] v, byte[] output, int rows, int cols) => MapRowFloat<TN>(op.Name, x, v, output, rows, cols);
+
+    string IElementwise<byte[]>.Dropout<TN>(byte[] x, byte[]? residual, byte[] output, int n, double p, ulong seed) => Dropout<TN>(x, residual, output, n, p, seed);
+
+    string IElementwise<byte[]>.Convert<TFrom, TTo>(byte[] x, byte[] output, int n) => Convert<TFrom, TTo>(x, output, n);
+
     // ---------------------------------------------------------------- reductions
 
     string IReductions<byte[]>.Reduce<TN>(string op, Axis axis, byte[] x, int rows, int cols, byte[] output)
@@ -189,6 +195,9 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
 
     void IRouting<byte[], int[]>.Route(int[] index, int count, int buckets, int[] counts, int[] offsets, int[] order) =>
         Route(count == index.Length ? index : index[..count], buckets, counts, offsets, order);
+
+    string IRouting<byte[], int[]>.ClassMatch<TN>(byte[] predictions, byte[] targets, byte[] output, int rows, int cols, double threshold) =>
+        ClassMatch<TN>(predictions, targets, output, rows, cols, threshold);
 
     // ---------------------------------------------------------------- the lanes
 

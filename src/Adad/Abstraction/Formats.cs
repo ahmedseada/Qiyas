@@ -28,6 +28,19 @@ public sealed record Fmt(string Name, int Bits, bool IsFloat, bool Signed)
 
     /// <summary>The lane this format's values are read into before any other (floats f32/f64, integers s32/u32/s64/u64).</summary>
     public Lane Natural => IsFloat ? (Bits == 64 ? Lane.F64 : Lane.F32) : Bits == 64 ? (Signed ? Lane.S64 : Lane.U64) : Signed ? Lane.S32 : Lane.U32;
+
+    /// <summary>How Convert takes a value of <paramref name="from"/> into <paramref name="to"/> with one rounding: the lane it is
+    /// read into (exact: the natural lane; between integers a 64-bit one, so the range is held once, in it), and whether it is
+    /// first rounded to odd at float32 — a value read wider than float32 going to a float narrower than it, whose odd last
+    /// bit (float32 keeps at least two bits past any narrower float's) leaves the store's rounding the only one. A block
+    /// format encodes from float32 values: a value read wider is rounded to nearest float32 first, as the format defines.</summary>
+    public static (Lane Lane, bool ToOdd) ConvertPlan(Fmt from, Fmt to)
+    {
+        if (to.IsBlock) return (Lane.F32, false);
+        if (!from.IsFloat && !to.IsFloat) return (from.Bits == 64 && !from.Signed ? Lane.U64 : Lane.S64, false);
+        var lane = from.IsBlock ? Lane.F32 : from.Natural;
+        return (lane, to.IsFloat && to.Bits < 32 && lane != Lane.F32);
+    }
 }
 
 /// <summary>A register type kernels compute in: f32, f64, and the 32- and 64-bit integers, signed (s) or not (u).</summary>
@@ -41,4 +54,15 @@ public sealed record Lane(string Name, int Size, bool IsFloat)
     public static readonly Lane U64 = new("u64", 8, false);
 
     public bool Wide => Size == 8;
+
+    /// <summary>The smallest value of this lane at least <paramref name="v"/> (so x ≥ v in the lane is x ≥ v exactly): float32
+    /// the next float up where the nearest is below; an integer lane the ceiling, held to the lane's range.</summary>
+    public double AtLeast(double v)
+    {
+        if (double.IsNaN(v)) return v;
+        if (this == F64) return v;
+        if (this == F32) { float f = (float)v; return f < v ? MathF.BitIncrement(f) : f; }
+        double c = Math.Ceiling(v), lo = this == S32 ? int.MinValue : this == S64 ? long.MinValue : 0, hi = this == S32 ? int.MaxValue : this == U32 ? uint.MaxValue : this == S64 ? long.MaxValue : ulong.MaxValue;
+        return Math.Clamp(c, lo, hi);
+    }
 }

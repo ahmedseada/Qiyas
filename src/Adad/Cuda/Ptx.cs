@@ -458,7 +458,15 @@ internal static class Codec
             return;
         }
 
-        // Integers: the lane value rounded (floats) and held to the type's range, then its low bits into the word.
+        // Integers: the lane value rounded (floats; a NaN to 0) and held to the type's range, then its low bits into the word.
+        if (lane.IsFloat)
+        {
+            string pn = b.P(), held = lane.NewReg(b);
+            b.L($"testp.notanumber.{lane.Op} {pn}, {v};");
+            b.L($"selp.{lane.Op} {held}, {lane.Zero}, {v}, {pn};");
+            v = held;
+        }
+
         if (f.WordBits == 64)
         {
             if (lane.IsFloat) b.L($"cvt.rni.sat.{f.Natural.Op}.{lane.Op} {word}, {v};");

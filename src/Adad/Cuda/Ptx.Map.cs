@@ -507,6 +507,13 @@ internal static partial class Ptx
             case "relu_bwd": return e.Select(e.Greater(x, e.C(0)), y, e.C(0));
             case "clamp_bwd": return e.Select(e.And(e.Greater(x, a), e.Less(x, pb)), y, e.C(0));
             case "where_bwd": return e.Select(e.NotZero(x), y, e.C(0));
+            case "max_bwd_x": return e.Select(e.Greater(y, x), e.C(0), z);
+            case "max_bwd_y": return e.Select(e.Greater(y, x), z, e.C(0));
+            case "min_bwd_x": return e.Select(e.Greater(x, y), e.C(0), z);
+            case "min_bwd_y": return e.Select(e.Greater(x, y), z, e.C(0));
+            case "gated_relu": return e.Mul(e.Max(x, e.C(0)), y);
+            case "gated_relu_bwd_x": return e.Select(e.Greater(x, e.C(0)), e.Mul(y, z), e.C(0));
+            case "gated_relu_bwd_y": return e.Mul(e.Max(x, e.C(0)), z);
             case "sqrt": return e.Sqrt(x);
             case "inv_sqrt": return e.Div(e.C(1), e.Sqrt(e.Add(x, a)));
             case "exp": return e.Exp(x);
@@ -547,6 +554,11 @@ internal static partial class Ptx
             case "gated_silu_bwd_y": return e.Mul(e.Mul(x, e.Sigmoid(x)), z);
             case "gated_gelu_bwd_x": return e.Mul(e.Mul(e.GeluGrad(x), y), z);
             case "gated_gelu_bwd_y": return e.Mul(e.Gelu(x), z);
+            case "gated_tanh_sigmoid": return e.Mul(e.Tanh(x), e.Sigmoid(y));
+            case "gated_tanh_sigmoid_bwd_x": { string s = e.Sigmoid(e.Mul(e.C(2), x)); string sech2 = e.Mul(e.C(4), e.Mul(s, e.Sigmoid(e.Mul(e.C(-2), x)))); return e.Mul(e.Mul(sech2, e.Sigmoid(y)), z); }
+            case "gated_tanh_sigmoid_bwd_y": return e.Mul(e.Mul(e.Tanh(x), e.Mul(e.Sigmoid(y), e.Sigmoid(e.Neg(y)))), z);
+            case "add_gelu": return e.Gelu(e.Add(x, y));
+            case "clip_factor": return e.Select(e.Greater(x, e.C(0)), e.Min(e.C(1), e.Div(a, e.Sqrt(x))), e.C(1));
             default: throw new ArgumentException(op);
         }
     }

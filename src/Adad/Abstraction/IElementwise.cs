@@ -18,4 +18,17 @@ public interface IElementwise<TBuffer>
 
     /// <summary>output[r, c] = op(x[r, c], v[c]): a row vector broadcast over rows × cols.</summary>
     string MapRow<TN>(MapOp op, TBuffer x, TBuffer v, TBuffer output, int rows, int cols) where TN : struct, IAdad<TN>;
+
+    /// <summary>MapRow for a float type: every formula, the float formulas in its float lane (a row of biases and its gelu).</summary>
+    string MapRowFloat<TN>(MapOp op, TBuffer x, TBuffer v, TBuffer output, int rows, int cols) where TN : struct, IFloatAdad<TN>;
+
+    /// <summary>output = residual + x·(1/(1 − p)) where the seed's draw i keeps value i (Draws.Keep), the residual where it
+    /// does not (no residual: 0), over n values in the type's float lane: dropout, and its backward from dy with the same seed
+    /// (the residual: the gradient accumulated so far).</summary>
+    string Dropout<TN>(TBuffer x, TBuffer? residual, TBuffer output, int n, double p, ulong seed) where TN : struct, IFloatAdad<TN>;
+
+    /// <summary>output (TTo) = x (TFrom) over n values, each value rounded once into TTo (to nearest, ties to even) and held to
+    /// its range as TTo's stores hold (Fmt.ConvertPlan: the lane it is read in, exact); a block format encodes from the
+    /// values as float32, as its definition does.</summary>
+    string Convert<TFrom, TTo>(TBuffer x, TBuffer output, int n) where TFrom : struct, IAdad<TFrom> where TTo : struct, IAdad<TTo>;
 }

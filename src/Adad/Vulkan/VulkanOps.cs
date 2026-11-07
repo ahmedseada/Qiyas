@@ -100,4 +100,45 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
         vk.Launch(k, Groups(f.Words(n), VkKernels.Threads), 1, x, v, output, Vulkan.U(n), Vulkan.U(cols));
         return lane.Name;
     }
+
+    public string MapRowFloat<TN>(MapOp op, ulong x, ulong v, ulong output, int rows, int cols) where TN : struct, IFloatAdad<TN> =>
+        MapRow<TN>(op, x, v, output, rows, cols);
+
+    /// <summary>Dropout from the seed's draws (VkKernels.Dropout): a thread per word in the float lane, or a block format's
+    /// blocks by their encoder (the residual and the output may be x).</summary>
+    public string Dropout<TN>(ulong x, ulong residual, ulong output, int n, double p, ulong seed) where TN : struct, IFloatAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        ulong key = Draws.Key(seed), thr = Draws.Threshold(p);
+        double s = 1 / (1 - p);
+        bool res = residual != 0;
+        ulong r = res ? residual : x;
+        if (f.IsBlock)
+        {
+            Encode(f, n, vk.Cached($"block_dropout:{f.Name}:{res}", () => VkKernels.BlockDropout(vk, f, res)), output, x, r, key, thr, Vulkan.F((float)s));
+            return "f32 (blocks in place)";
+        }
+
+        var lane = RowLane(f);
+        var k = vk.Cached($"dropout:{f.Name}:{res}", () => VkKernels.Dropout(vk, f, lane, res));
+        vk.Launch(k, Groups(f.Words(n), VkKernels.Threads), 1, x, r, output, Vulkan.U(n), key, thr, Slot(lane, s));
+        return lane.Name;
+    }
+
+    /// <summary>Each value of TFrom rounded once into TTo (VkKernels.Convert, Fmt.ConvertPlan): a thread per output word, or a
+    /// block format's blocks by their encoder from the values as float32.</summary>
+    public string Convert<TFrom, TTo>(ulong x, ulong output, int n) where TFrom : struct, IAdad<TFrom> where TTo : struct, IAdad<TTo>
+    {
+        Fmt ff = Fmt.Of<TFrom>(), ft = Fmt.Of<TTo>();
+        var (lane, toOdd) = Fmt.ConvertPlan(ff, ft);
+        if (ft.IsBlock)
+        {
+            Encode(ft, n, vk.Cached($"block_convert:{ff.Name}:{ft.Name}", () => VkKernels.BlockConvert(vk, ff, ft)), output, x);
+            return "f32 (blocks encoded)";
+        }
+
+        var k = vk.Cached($"convert:{ff.Name}:{ft.Name}", () => VkKernels.Convert(vk, ff, ft));
+        vk.Launch(k, Groups(ft.Words(n), VkKernels.Threads), 1, x, output, Vulkan.U(n));
+        return lane.Name + (toOdd ? " (to odd at f32 first)" : "");
+    }
 }

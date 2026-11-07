@@ -233,6 +233,47 @@ public sealed partial class GpuOps(Gpu gpu)
         return lane.Name;
     }
 
+    public string MapRowFloat<TN>(MapOp op, ulong x, ulong v, ulong output, int rows, int cols) where TN : struct, IFloatAdad<TN> =>
+        MapRow<TN>(op, x, v, output, rows, cols);
+
+    /// <summary>Dropout from the seed's draws (Ptx.Dropout): a thread per word in the float lane, or a block format's blocks.</summary>
+    public string Dropout<TN>(ulong x, ulong residual, ulong output, int n, double p, ulong seed) where TN : struct, IFloatAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        ulong key = Draws.Key(seed), thr = Draws.Threshold(p);
+        double s = 1 / (1 - p);
+        bool res = residual != 0;
+        if (f.IsBlock)
+        {
+            var fb = gpu.Cached($"dropout_blocks:{f.Name}:{res}", (out string e) => Ptx.DropoutBlocks(gpu, f, res, out e));
+            Gpu.Launch(fb, BlockGrid(f, n), 1, 256, 1, 0, x, residual, output, Gpu.U(n), key, thr, Gpu.F((float)s));
+            return "f32 (blocks in place)";
+        }
+
+        var lane = f.Bits == 64 ? Lane.F64 : Lane.F32;
+        var fn = gpu.Cached($"dropout:{f.Name}:{res}", (out string e) => Ptx.Dropout(gpu, f, lane, res, out e));
+        Gpu.Launch(fn, Grid(f.Words(n), 256), 1, 256, 1, 0, x, residual, output, Gpu.U(n), key, thr, lane.Wide ? Gpu.D(s) : Gpu.F((float)s));
+        return lane.Name;
+    }
+
+    /// <summary>Each value of TFrom rounded once into TTo (Ptx.Convert, Fmt.ConvertPlan): a thread per output word, or a block
+    /// format's blocks encoded from the values as float32.</summary>
+    public string Convert<TFrom, TTo>(ulong x, ulong output, int n) where TFrom : struct, IAdad<TFrom> where TTo : struct, IAdad<TTo>
+    {
+        Fmt ff = Fmt.Of<TFrom>(), ft = Fmt.Of<TTo>();
+        var (lane, toOdd) = Fmt.ConvertPlan(ff, ft);
+        if (ft.IsBlock)
+        {
+            var fb = gpu.Cached($"convert_blocks:{ff.Name}:{ft.Name}", (out string e) => Ptx.ConvertBlocks(gpu, ff, ft, out e));
+            Gpu.Launch(fb, BlockGrid(ft, n), 1, 256, 1, 0, x, output, Gpu.U(n));
+            return "f32 (blocks encoded)";
+        }
+
+        var fn = gpu.Cached($"convert:{ff.Name}:{ft.Name}", (out string e) => Ptx.Convert(gpu, ff, ft, out e));
+        Gpu.Launch(fn, Grid(ft.Words(n), 256), 1, 256, 1, 0, x, output, Gpu.U(n));
+        return lane.Name + (toOdd ? " (to odd at f32 first)" : "");
+    }
+
     public string Transpose<TN>(ulong x, ulong output, int rows, int cols) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
