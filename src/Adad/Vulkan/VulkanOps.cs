@@ -86,16 +86,6 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
 
     // ---------------------------------------------------------------- the families not on Vulkan yet
 
-    public string Softmax<TN>(ulong x, ulong y, int rows, int cols) where TN : struct, IFloatAdad<TN> => throw Missing("softmax");
-
-    public string RmsNorm<TN>(ulong x, ulong y, int rows, int cols, double eps) where TN : struct, IFloatAdad<TN> => throw Missing("rms_norm");
-
-    public string RowOp<TN>(RowOp op, ulong x, ulong x2, ulong g, ulong bt, ulong s, ulong pos, ulong y, ulong y2, int rows, int cols, double a, double b) where TN : struct, IFloatAdad<TN> =>
-        throw Missing($"row op {op}");
-
-    public string NormParamsBwd<TN>(ulong x, ulong dy, ulong dgamma, ulong dbeta, int rows, int cols, double eps, bool centered) where TN : struct, IFloatAdad<TN> =>
-        throw Missing("norm parameters' backward");
-
     public string Layout<TN>(LayoutArgs k, ulong x, ulong index, ulong output, ulong x2) where TN : struct, IAdad<TN> => throw Missing($"layout {k.Name}");
 
     public string MatMul<TN>(ulong a, ulong b, ulong c, int m, int n, int k) where TN : struct, IAdad<TN> => throw Missing("matmul");

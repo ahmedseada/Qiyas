@@ -354,7 +354,7 @@ internal static partial class Checks
         return ok;
     }
 
-    private sealed class CoreRun(GpuOps? ops, string what, byte[] x, byte[]? x2, byte[] output, int rows, int cols) : Bench.IFloatTypeVisitor<bool>
+    private sealed class CoreRun(IDevice<ulong, ulong>? ops, string what, byte[] x, byte[]? x2, byte[] output, int rows, int cols) : Bench.IFloatTypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
         {
@@ -367,20 +367,19 @@ internal static partial class Checks
                 return true;
             }
 
-            var gpu = ops.Gpu;
-            ulong dx = gpu.Rent(x.Length), dx2 = x2 is null ? 0 : gpu.Rent(x2.Length), dy = gpu.Rent(output.Length);
+            ulong dx = ops.Rent(x.Length + 16), dx2 = x2 is null ? 0 : ops.Rent(x2.Length + 16), dy = ops.Rent(output.Length + 16);
             try
             {
-                Adad.Cuda.Gpu.Upload<byte>(x, dx);
-                if (x2 is not null) Adad.Cuda.Gpu.Upload<byte>(x2, dx2);
+                ops.Upload(x, dx);
+                if (x2 is not null) ops.Upload(x2, dx2);
                 if (what == "add") ops.Add<TN>(dx, dx2, dy, n);
                 else if (what == "softmax") ops.Softmax<TN>(dx, dy, rows, cols);
                 else ops.RmsNorm<TN>(dx, dy, rows, cols, 1e-5);
-                Adad.Cuda.Gpu.Synchronize();
-                Adad.Cuda.Gpu.Download<byte>(dy, output);
+                ops.Synchronize();
+                ops.Download(dy, output);
                 return true;
             }
-            finally { gpu.Return(dx); if (dx2 != 0) gpu.Return(dx2); gpu.Return(dy); }
+            finally { ops.Return(dx); if (dx2 != 0) ops.Return(dx2); ops.Return(dy); }
         }
     }
 
@@ -1708,10 +1707,10 @@ internal static partial class Checks
     /// <summary>Every float type, three shapes (37 × 1001; 5 × 64, a short row; 3 × 17, rows not ending on a word for the
     /// narrow floats): every row operation against float64 within the type's step plus the operation's ulps of its error
     /// scale; the parameter backward (both statistics) against float64 within its scale.</summary>
-    public static bool Rows(GpuOps? ops)
+    public static bool Rows(IDevice<ulong, ulong>? ops, string device = "device")
     {
         bool ok = true;
-        string where = ops is null ? "cpu" : "device";
+        string where = ops is null ? "cpu" : device;
         foreach (var type in Bench.Registry.Names)
         {
             if (!Bench.Registry.IsFloat(type) || Bench.Registry.IsBlock(type)) continue;
@@ -1761,29 +1760,29 @@ internal static partial class Checks
         return ok;
     }
 
-    private sealed class RowOpRun(GpuOps? ops, RowOp op, Bench.RowCase k, byte[] y, byte[]? y2) : Bench.IFloatTypeVisitor<bool>
+    private sealed class RowOpRun(IDevice<ulong, ulong>? ops, RowOp op, Bench.RowCase k, byte[] y, byte[]? y2) : Bench.IFloatTypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
         {
             if (ops is null) { Kernels.RowOp<TN>(op, k.X, k.X2, k.G, k.Bt, k.S, k.Pos, y, y2, k.Rows, k.Cols, op.A, op.B); return true; }
-            var gpu = ops.Gpu;
             var rented = new List<ulong>();
-            ulong Up(byte[]? a) { if (a is null) return 0; ulong d = gpu.Rent(a.Length); rented.Add(d); Adad.Cuda.Gpu.Upload<byte>(a, d); return d; }
+            ulong Up(byte[]? a) { if (a is null) return 0; ulong d = ops.Rent(a.Length + 16); rented.Add(d); ops.Upload(a, d); return d; }
             ulong dx = Up(k.X), dx2 = Up(k.X2), dg = Up(k.G), dbt = Up(k.Bt), ds = Up(k.S), dpos = 0;
-            if (k.Pos is not null) { dpos = gpu.Rent(k.Pos.Length * 4L); rented.Add(dpos); Adad.Cuda.Gpu.Upload<int>(k.Pos, dpos); }
-            ulong dy = gpu.Rent(y.Length), dy2 = y2 is null ? 0 : gpu.Rent(y2.Length);
+            if (k.Pos is not null) { dpos = ops.RentIndices(k.Pos.Length); ops.UploadIndices(k.Pos, dpos); }
+            ulong dy = ops.Rent(y.Length + 16), dy2 = y2 is null ? 0 : ops.Rent(y2.Length + 16);
             rented.Add(dy);
             if (dy2 != 0) rented.Add(dy2);
             ops.RowOp<TN>(op, dx, dx2, dg, dbt, ds, dpos, dy, dy2, k.Rows, k.Cols, op.A, op.B);
-            Adad.Cuda.Gpu.Synchronize();
-            Adad.Cuda.Gpu.Download<byte>(dy, y);
-            if (y2 is not null) Adad.Cuda.Gpu.Download<byte>(dy2, y2);
-            foreach (var p in rented) gpu.Return(p);
+            ops.Synchronize();
+            ops.Download(dy, y);
+            if (y2 is not null) ops.Download(dy2, y2);
+            foreach (var p in rented) ops.Return(p);
+            if (dpos != 0) ops.ReturnIndices(dpos);
             return true;
         }
     }
 
-    private sealed class NormParamsRun(GpuOps? ops, byte[] x, byte[] dy, int rows, int cols, bool centered) : Bench.IFloatTypeVisitor<(byte[], string)>
+    private sealed class NormParamsRun(IDevice<ulong, ulong>? ops, byte[] x, byte[] dy, int rows, int cols, bool centered) : Bench.IFloatTypeVisitor<(byte[], string)>
     {
         public (byte[], string) Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
         {
@@ -1794,13 +1793,12 @@ internal static partial class Checks
             if (ops is null) lane = Kernels.NormParamsBwd<TN>(x, dy, dgamma, dbeta, rows, cols, 1e-5, centered);
             else
             {
-                var gpu = ops.Gpu;
-                ulong dx = gpu.Rent(x.Length), ddy = gpu.Rent(dy.Length), dg = gpu.Rent(dgamma.Length), db = gpu.Rent(dbeta.Length);
-                Adad.Cuda.Gpu.Upload<byte>(x, dx); Adad.Cuda.Gpu.Upload<byte>(dy, ddy);
+                ulong dx = ops.Rent(x.Length + 16), ddy = ops.Rent(dy.Length + 16), dg = ops.Rent(dgamma.Length + 16), db = ops.Rent(dbeta.Length + 16);
+                ops.Upload(x, dx); ops.Upload(dy, ddy);
                 lane = ops.NormParamsBwd<TN>(dx, ddy, dg, db, rows, cols, 1e-5, centered);
-                Adad.Cuda.Gpu.Synchronize();
-                Adad.Cuda.Gpu.Download<byte>(dg, dgamma); Adad.Cuda.Gpu.Download<byte>(db, dbeta);
-                gpu.Return(dx); gpu.Return(ddy); gpu.Return(dg); gpu.Return(db);
+                ops.Synchronize();
+                ops.Download(dg, dgamma); ops.Download(db, dbeta);
+                ops.Return(dx); ops.Return(ddy); ops.Return(dg); ops.Return(db);
             }
 
             var output = new byte[2 * cols * size];
