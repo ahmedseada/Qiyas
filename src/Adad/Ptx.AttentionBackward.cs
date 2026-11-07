@@ -1,8 +1,11 @@
 // Copyright (c) 2026 Ahmed Seada
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
-// The device's fused attention backward (item 6i): two kernels over the lane storage of Q, K, V and dO (f32, f64 for
-// float64), no scores in memory, no atomics (each output value written by one thread: the same result every run).
+// The device's fused attention backward (item 6i): two kernels over Q, K, V and dO in the lane (f32, f64 for float64),
+// no scores in memory, no atomics (each output value written by one thread: the same result every run). The tensors are
+// lane storage, or the type's own (f: each value decoded on its load into shared memory, a block format's by runs where
+// d is a multiple of 8; the gradients stored as the type where its values are whole bytes and not blocks, else as the
+// lane's values for the caller to encode).
 //
 //   rows (dQ)    a block per (head, Br query rows), as the fused rows: pass 1 the forward itself (the scores, the online
 //                max and sum, the context) → the row's max m, 1/l, and D = dO · O (= Σ_j P·dP); pass 2 over the same key
@@ -35,15 +38,19 @@ internal static partial class Ptx
     }
 
     // The pieces both kernels share: tile loads through shared memory, group reductions, vector registers.
-    private sealed class BackPieces(PtxBuilder b, Lane lane, int dCap, string tid, string d)
+    private sealed class BackPieces(PtxBuilder b, Lane lane, int dCap, string tid, string d, Fmt? f, bool runs)
     {
         public int Vec => 16 / lane.Size;
         public int Stride => dCap + Vec;
+
+        // The gradients' format where the kernel stores them as the type (null: lane storage).
+        private Fmt? Out => f is { IsBlock: false, Bits: >= 8 } ? f : null;
 
         // `count` rows [first, first + count) of a lane tensor (rows of d values from value `head`; rows past rowLimit and
         // dimensions past d as 0) into shared at dst. A thread's column is fixed (tid mod dCap), its rows step by 256 / dCap.
         public void LoadTile(string dst, int count, string head, string first, string rowLimit, string src)
         {
+            if (runs) { LoadRuns(dst, count, head, first, rowLimit, src); return; }
             int rowsPerStep = 256 / dCap, size = lane.Size;
             string myCol = b.R(), myRow = b.R(), colValid = b.P(), slot = b.R(), gr = b.R(), idx = b.R(), sBase = b.R();
             b.L($"and.b32 {myCol}, {tid}, {dCap - 1};");
@@ -63,11 +70,53 @@ internal static partial class Ptx
                 b.L($"setp.lt.u32 {pv}, {g2}, {rowLimit};");
                 b.L($"and.pred {pv}, {pv}, {colValid};");
                 b.L($"selp.b32 {at}, {i2}, {head}, {pv};");
-                b.L($"mul.wide.u32 {addr}, {at}, {size};");
-                b.L($"add.u64 {addr}, {src}, {addr};");
-                b.L($"ld.global.{lane.Mem} {val}, [{addr}];");
-                b.L($"selp.{lane.Op} {val}, {val}, {lane.Zero}, {pv};");
+                if (f is not null)
+                {
+                    string loaded = Codec.UnpackAt(b, f, src, at, lane);
+                    b.L($"selp.{lane.Op} {val}, {loaded}, {lane.Zero}, {pv};");
+                }
+                else
+                {
+                    b.L($"mul.wide.u32 {addr}, {at}, {size};");
+                    b.L($"add.u64 {addr}, {src}, {addr};");
+                    b.L($"ld.global.{lane.Mem} {val}, [{addr}];");
+                    b.L($"selp.{lane.Op} {val}, {val}, {lane.Zero}, {pv};");
+                }
+
                 b.L($"st.shared.{lane.Mem} [{sBase}+{it * rowsPerStep * Stride * size}], {val};");
+            }
+        }
+
+        // LoadTile by runs of a block format's values (count · dCap / 256 a thread, at most 8 a run, consecutive in a row:
+        // with d a multiple of 8 a run is in the row whole or past d whole, in one block's sub-block).
+        private void LoadRuns(string dst, int count, string head, string first, string rowLimit, string src)
+        {
+            int size = lane.Size, run = Math.Min(8, count * dCap / 256), threadsPerRow = dCap / run, rowsStep = 256 / threadsPerRow;
+            string c0 = b.R(), r0 = b.R(), cv = b.P(), slot = b.R(), gr = b.R(), idx = b.R(), sBase = b.R(), stepV = b.R();
+            b.L($"and.b32 {c0}, {tid}, {threadsPerRow - 1};");
+            b.L($"mul.lo.u32 {c0}, {c0}, {run};");
+            b.L($"shr.u32 {r0}, {tid}, {System.Numerics.BitOperations.Log2((uint)threadsPerRow)};");
+            b.L($"setp.lt.u32 {cv}, {c0}, {d};");
+            b.L($"mad.lo.u32 {slot}, {r0}, {Stride}, {c0};");
+            b.L($"mad.lo.u32 {sBase}, {slot}, {size}, {dst};");
+            b.L($"add.u32 {gr}, {first}, {r0};");
+            b.L($"mad.lo.u32 {idx}, {gr}, {d}, {c0};");
+            b.L($"add.u32 {idx}, {idx}, {head};");
+            b.L($"mul.lo.u32 {stepV}, {d}, {rowsStep};");
+            for (int it = 0; it < count / rowsStep; it++)
+            {
+                string pv = b.P(), at = b.R();
+                if (it > 0) { b.L($"add.u32 {gr}, {gr}, {rowsStep};"); b.L($"add.u32 {idx}, {idx}, {stepV};"); }
+                b.L($"setp.lt.u32 {pv}, {gr}, {rowLimit};");
+                b.L($"and.pred {pv}, {pv}, {cv};");
+                b.L($"selp.b32 {at}, {idx}, {head}, {pv};");
+                var vals = Codec.UnpackRun(b, f!, src, at, run, lane);
+                for (int q = 0; q < run; q++)
+                {
+                    string val = lane.NewReg(b);
+                    b.L($"selp.{lane.Op} {val}, {vals[q]}, {lane.Zero}, {pv};");
+                    b.L($"st.shared.{lane.Mem} [{sBase}+{(it * rowsStep * Stride + q) * size}], {val};");
+                }
             }
         }
 
@@ -160,20 +209,54 @@ internal static partial class Ptx
                     b.L($"@{pDim} bra {skip};");
                     b.L($"@!{valid} bra {skip};");
                     b.L($"add.u32 {idx}, {rowBase}, {dim};");
-                    b.L($"mul.wide.u32 {addr}, {idx}, {lane.Size};");
-                    b.L($"add.u64 {addr}, {dst}, {addr};");
-                    b.L($"st.global.{lane.Mem} [{addr}], {acc[j, e]};");
+                    if (Out is { } fo) StoreAs(b, fo, lane, acc[j, e], dst, idx);
+                    else
+                    {
+                        b.L($"mul.wide.u32 {addr}, {idx}, {lane.Size};");
+                        b.L($"add.u64 {addr}, {dst}, {addr};");
+                        b.L($"st.global.{lane.Mem} [{addr}], {acc[j, e]};");
+                    }
+
                     b.Label(skip);
                 }
             }
         }
     }
 
-    public static string AttentionBackRows(Gpu gpu, Lane lane, int dCap, out string entry)
+    /// <summary>One lane value stored as fo (a format of whole bytes, not blocks) at element idx of dst.</summary>
+    internal static void StoreAs(PtxBuilder b, Fmt fo, Lane lane, string val, string dst, string idx)
+    {
+        var natural = fo.Natural;
+        string stored = lane == natural ? val : Codec.Convert(b, lane, val, natural, fo), addr = b.RD();
+        b.L($"mul.wide.u32 {addr}, {idx}, {fo.Bits / 8};");
+        b.L($"add.u64 {addr}, {dst}, {addr};");
+        if (fo.Bits >= 32)
+        {
+            string code = fo.WordBits == 64 ? b.RD() : b.R();
+            if (fo.WordBits == 32) b.L($"mov.b32 {code}, 0;");
+            Codec.Pack(b, fo, stored, natural, 0, code);
+            b.L($"st.global.{(fo.WordBits == 64 ? "b64" : "b32")} [{addr}], {code};");
+        }
+        else
+        {
+            string code = b.R(), hh = b.H();
+            b.L($"mov.b32 {code}, 0;");
+            Codec.Pack(b, fo, stored, natural, 0, code);
+            b.L($"cvt.u16.u32 {hh}, {code};");
+            b.L($"st.global.b{fo.Bits} [{addr}], {hh};");
+        }
+    }
+
+    // A kernel's name suffix for the tensors' format: none for lane storage.
+    private static string BackSuffix(Fmt? f, bool runs) => f is null ? "" : $"_{f.Name}{(runs ? "_runs" : "")}";
+
+    /// <summary>f: Q, K, V, dO stored as f (null: lane storage), dQ as f where its values are whole bytes and not blocks
+    /// (else the lane's values). runs: a block format's tiles by runs (d a multiple of 8).</summary>
+    public static string AttentionBackRows(Gpu gpu, Lane lane, int dCap, out string entry, Fmt? f = null, bool runs = false)
     {
         var (Br, Bc) = AttentionTile(lane);
         int T = RowsThreads, tpr = T / Br, spt = Bc / tpr, size = lane.Size;
-        entry = $"attention_back_rows_{lane.Name}_d{dCap}";
+        entry = $"attention_back_rows_{lane.Name}_d{dCap}{BackSuffix(f, runs)}";
         var b = new PtxBuilder();
         string tid = b.R(), qb = b.R(), h = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
@@ -184,7 +267,7 @@ internal static partial class Ptx
         string lq = Param32(b, "p_lq"), lk = Param32(b, "p_lk"), d = Param32(b, "p_d");
         string scale = lane.NewReg(b), negInf = lane.Literal(double.NegativeInfinity);
         b.L($"ld.param.{lane.Op} {scale}, [p_scale];");
-        var P = new BackPieces(b, lane, dCap, tid, d);
+        var P = new BackPieces(b, lane, dCap, tid, d, f, runs);
         int vec = P.Vec, stride = P.Stride, nvec = dCap / (vec * tpr);
 
         string r = b.R(), sub = b.R(), i = b.R(), rowValid = b.P(), iClamped = b.R(), lqm1 = b.R(), limit = b.R(), start = b.R(), addr = b.RD();
@@ -399,11 +482,12 @@ internal static partial class Ptx
             AttentionBackRowsShared(lane, dCap));
     }
 
-    public static string AttentionBackKeys(Gpu gpu, Lane lane, int dCap, out string entry)
+    /// <summary>As AttentionBackRows: f the tensors' format, dK and dV stored as it where the kernel can.</summary>
+    public static string AttentionBackKeys(Gpu gpu, Lane lane, int dCap, out string entry, Fmt? f = null, bool runs = false)
     {
         var (Br, Bc) = AttentionTile(lane);
         int T = RowsThreads, tpk = T / Bc, spt = Br / tpk, size = lane.Size;
-        entry = $"attention_back_keys_{lane.Name}_d{dCap}";
+        entry = $"attention_back_keys_{lane.Name}_d{dCap}{BackSuffix(f, runs)}";
         var b = new PtxBuilder();
         string tid = b.R(), kb = b.R(), h = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
@@ -414,7 +498,7 @@ internal static partial class Ptx
         string lq = Param32(b, "p_lq"), lk = Param32(b, "p_lk"), d = Param32(b, "p_d");
         string scale = lane.NewReg(b);
         b.L($"ld.param.{lane.Op} {scale}, [p_scale];");
-        var P = new BackPieces(b, lane, dCap, tid, d);
+        var P = new BackPieces(b, lane, dCap, tid, d, f, runs);
         int vec = P.Vec, stride = P.Stride, nvec = dCap / (vec * tpk);
 
         // This thread's key and place in it.

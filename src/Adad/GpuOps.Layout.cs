@@ -18,14 +18,18 @@ public sealed partial class GpuOps
         Ptx.PerValueFits(f) && (LayoutPerValue ?? (long)f.Words(count) < (long)gpu.Multiprocessors * gpu.ThreadsPerMultiprocessor);
 
     /// <summary>A layout operation (LayoutArgs.Names) from x (and the index array) into output, all on the device. Returns the lane's name.</summary>
-    public string Layout<TN>(LayoutArgs k, ulong x, ulong idx, ulong output, ulong x2 = 0) where TN : struct, IAdad<TN>
+    public string Layout<TN>(LayoutArgs k, ulong x, ulong idx, ulong output, ulong x2 = 0) where TN : struct, IAdad<TN> => Layout<TN>(k, x, idx, output, x2, null);
+
+    /// <summary>As Layout, x (and x2) of inFmt where it is not TN's: a float composition's f32 lane storage (the lane f32).</summary>
+    internal string Layout<TN>(LayoutArgs k, ulong x, ulong idx, ulong output, ulong x2, Fmt? inFmt) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
         // A block format takes the same lanes (f32: a float type's) with its inputs decoded where they are stored, and its
         // output written by a warp or a CTA per block (Ptx.LayoutBlocks).
         var (rows, cols) = LayoutArgs.OutputRows(k);
         Lane lane;
-        if (LayoutArgs.Sums(k.Name))
+        if (inFmt is not null) lane = inFmt.Natural;
+        else if (LayoutArgs.Sums(k.Name))
         {
             var (lo, hi) = Range<TN>(x, k.InputCount);
             var (lo2, hi2) = x2 != 0 && k.Name == "depthwise_conv" ? Range<TN>(x2, k.P[0] * k.P[3] * k.P[4]) : (1, 1);
@@ -69,14 +73,14 @@ public sealed partial class GpuOps
             args[0] = x; args[1] = x2; args[2] = idx; args[3] = aux; args[4] = output; args[5] = Gpu.U(k.Count); args[6] = Gpu.U(rows); args[7] = Gpu.U(cols);
             if (f.IsBlock)
             {
-                var fb = gpu.Cached($"layout_blocks:{k.Name}:{f.Name}", (out string e) => Ptx.LayoutBlocks(gpu, f, k.Name, out e));
+                var fb = gpu.Cached($"layout_blocks:{k.Name}:{f.Name}:{inFmt?.Name}", (out string e) => Ptx.LayoutBlocks(gpu, f, k.Name, out e, inFmt));
                 if (k.Count > 0 && Ptx.BlockByCta(f)) Gpu.Launch(fb, (uint)((k.Count + f.BlockValues - 1) / f.BlockValues), 1, (uint)f.BlockValues, 1, 0, args);
                 else if (k.Count > 0) Gpu.Launch(fb, BlockGrid(f, k.Count), 1, 256, 1, 0, args);
                 return "f32 (blocks in place)";
             }
 
-            bool perValue = PerValueLayout(f, k.Count);
-            var fn = gpu.Cached($"layout:{k.Name}:{f.Name}:{lane.Name}{(perValue ? ":v" : "")}", (out string e) => Ptx.Layout(gpu, f, lane, k.Name, perValue, out e));
+            bool perValue = inFmt is null && PerValueLayout(f, k.Count);
+            var fn = gpu.Cached($"layout:{k.Name}:{f.Name}:{lane.Name}{(perValue ? ":v" : "")}:{inFmt?.Name}", (out string e) => Ptx.Layout(gpu, f, lane, k.Name, perValue, out e, inFmt));
             Gpu.Launch(fn, Grid(perValue ? (long)f.Words(k.Count) * f.Per : f.Words(k.Count), 256), 1, 256, 1, 0, args);
         }
         finally

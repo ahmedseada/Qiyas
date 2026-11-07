@@ -18,12 +18,14 @@ internal static partial class Ptx
     /// <summary>perValue (a packed 32-bit word of 2, 4, 8, 16 or 32 values; GpuOps.LayoutPerValue): a thread per output
     /// value, not per word, the word's values joined by the word's lanes (shfl.sync, a group of Per lanes a word) and
     /// stored by its first: Per times the threads for an output too small to fill the device (an adaptive pool's few
-    /// windows).</summary>
-    public static string Layout(Gpu gpu, Fmt f, Lane lane, string name, bool perValue, out string entry)
+    /// windows).
+    /// inFmt: the inputs' format where it is not the output's (a composition's lane storage, as col2im of a product's sums).</summary>
+    public static string Layout(Gpu gpu, Fmt f, Lane lane, string name, bool perValue, out string entry, Fmt? inFmt = null)
     {
         if (perValue && !PerValueFits(f)) throw new NotSupportedException($"{f.Name}: a thread per value takes a word of 2 to 32 whole values");
+        if (perValue && inFmt is not null) throw new NotSupportedException("a thread per value: the inputs as the output's format");
         if (perValue) return LayoutPerValue(gpu, f, lane, name, out entry);
-        entry = $"layout_{name}_{f.Name}_{lane.Name}";
+        entry = $"layout_{name}_{f.Name}_{lane.Name}{(inFmt is null ? "" : "_i" + inFmt.Name)}";
         var b = new PtxBuilder();
         string tid = b.R(), bid = b.R(), word = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
@@ -52,7 +54,7 @@ internal static partial class Ptx
             b.L($"div.u32 {r}, {v}, {cols};");
             b.L($"mul.lo.u32 {t}, {r}, {cols};");
             b.L($"sub.u32 {c}, {v}, {t};");
-            string value = LayoutValue(b, f, lane, name, x, x2, idx, aux, p, cols, v, r, c, i);
+            string value = LayoutValue(b, inFmt ?? f, lane, name, x, x2, idx, aux, p, cols, v, r, c, i);
             string stored = lane == natural ? value : Codec.Convert(b, lane, value, natural, f);
             string kept = natural.NewReg(b);
             b.L($"selp.{natural.Reg} {kept}, {stored}, {natural.Zero}, {pv};");
@@ -71,9 +73,9 @@ internal static partial class Ptx
     /// <summary>A layout operation's output as blocks of f: each value the operation's own (LayoutValue, its inputs decoded
     /// where they are stored, in f32), the block encoded from them: a warp per block, or a CTA per block (a thread a value)
     /// for the formats of more values than a warp's lanes (BlockByCta), a value's window or gather being costly.</summary>
-    public static string LayoutBlocks(Gpu gpu, Fmt f, string name, out string entry)
+    public static string LayoutBlocks(Gpu gpu, Fmt f, string name, out string entry, Fmt? inFmt = null)
     {
-        entry = $"layout_{name}_{f.Name}_blocks";
+        entry = $"layout_{name}_{f.Name}_blocks{(inFmt is null ? "" : "_i" + inFmt.Name)}";
         var lane = Lane.F32;
         var b = new PtxBuilder();
         string x = Param64(b, "p_x"), x2 = Param64(b, "p_x2"), idx = Param64(b, "p_idx"), aux = Param64(b, "p_aux"), outp = Param64(b, "p_out");
@@ -87,7 +89,7 @@ internal static partial class Ptx
             b.L($"div.u32 {r}, {at}, {cols};");
             b.L($"mul.lo.u32 {t}, {r}, {cols};");
             b.L($"sub.u32 {c}, {at}, {t};");
-            return LayoutValue(b, f, lane, name, x, x2, idx, aux, p, cols, at, r, c, tag++);     // its own labels a value
+            return LayoutValue(b, inFmt ?? f, lane, name, x, x2, idx, aux, p, cols, at, r, c, tag++);     // its own labels a value
         }
 
         bool cta = BlockByCta(f);

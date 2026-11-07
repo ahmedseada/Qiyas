@@ -688,30 +688,82 @@ public sealed partial class GpuOps(Gpu gpu)
     private string MatMulStored<TN>(ProductView v, ulong a, ulong b, ulong c, Lane lane) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        bool typedC = !f.IsBlock && f.Bits >= 8;
-        int micro = v.M >= 128 && v.N >= 128 && !lane.Wide ? 8 : 4, tile = micro * 16;
-        // A block format's operand as runs of micro values where they are aligned runs of its stored rows.
-        bool runsA = f.IsBlock && (v.TransA ? v.M : v.K) % micro == 0 && v.StrideAOrDefault % micro == 0;
-        bool runsB = f.IsBlock && (v.TransB ? v.K : v.N) % micro == 0 && v.StrideBOrDefault % micro == 0;
-        var fn = gpu.Cached($"gemm_stored:{f.Name}:{lane.Name}:{micro}:{v.TransA}:{v.TransB}:{runsA}:{runsB}", (out string e) => Ptx.Gemm(gpu, lane, micro, out e, false, f, v.TransA, v.TransB, runsA, runsB));
-        ulong lc = typedC ? 0 : gpu.Rent(v.ValuesC * lane.Size);
+        bool typedC = StoredC(f);
+        ulong lc = typedC ? c : gpu.Rent(v.ValuesC * lane.Size);
         try
         {
-            for (int i = 0; i < v.Batch; i++)
-            {
-                long cOff = i * v.StrideCOrDefault;
-                ulong ci = typedC ? c + (ulong)(cOff * f.Bits / 8) : lc + (ulong)(cOff * lane.Size);
-                Gpu.Launch(fn, Grid(v.N, tile), Grid(v.M, tile), Ptx.GemmThreads, 1, 0, a, b, ci, Gpu.U(v.M), Gpu.U(v.N), Gpu.U(v.K), Gpu.U((int)(i * v.StrideAOrDefault)), Gpu.U((int)(i * v.StrideBOrDefault)));
-            }
-
+            ProductStored(v, lane, a, f, 0, b, f, 0, lc, typedC ? f : null);
             if (!typedC) Back(f, lane, lc, c, v.ValuesC);
         }
         finally
         {
-            if (lc != 0) gpu.Return(lc);
+            if (!typedC) gpu.Return(lc);
         }
 
         return f.IsBlock ? $"{lane.Name} (blocks in place)" : lane.Name;
+    }
+
+    /// <summary>Whether the product kernel stores C as f itself: its values whole bytes and not blocks (else C is the
+    /// lane's sums, encoded after: a block of C may span tiles, a byte of sub-byte codes neighbouring tiles' values).</summary>
+    private static bool StoredC(Fmt f) => !f.IsBlock && f.Bits >= 8;
+
+    /// <summary>C = op(A)·op(B) over the view's batches in the lane, each operand read as its own format where it is stored
+    /// (a lane's own storage, the type's, a block format's: Ptx.Gemm's stored mode), from value aOff of A and bOff of B; C
+    /// at c as fc (StoredC) or, fc null, as the lane's sums. A composition's intermediates (scores, gradients of them) and
+    /// the type's tensors meet in one product so, none of the type's widened in memory.</summary>
+    private void ProductStored(ProductView v, Lane lane, ulong a, Fmt fa, long aOff, ulong b, Fmt fb, long bOff, ulong c, Fmt? fc)
+    {
+        int micro = v.M >= 128 && v.N >= 128 && !lane.Wide ? 8 : 4, tile = micro * 16;
+        if (v.Batch == 1 && ProductSplit(v, lane, tile, c, fc, out int slices, out int sliceBlocks))
+        {
+            // Split-k: too few tiles of C to fill the device; the slices' partial C (lane storage) joined in order, then
+            // stored as fc (or joined into C itself, lane storage).
+            ulong parts = gpu.Rent((long)slices * v.M * v.N * lane.Size), joined = fc is null ? c : gpu.Rent((long)v.M * v.N * lane.Size);
+            try
+            {
+                bool ra = fa.IsBlock && (v.TransA ? v.M : v.K) % micro == 0 && aOff % micro == 0, rb = fb.IsBlock && (v.TransB ? v.K : v.N) % micro == 0 && bOff % micro == 0;
+                var st = new Ptx.GemmStored(fa, fb, null);
+                var fs = gpu.Cached($"gemm_stored:{fa.Name}:{fb.Name}:lane:{lane.Name}:{micro}:{v.TransA}:{v.TransB}:{ra}:{rb}:k", (out string e) => Ptx.Gemm(gpu, lane, micro, out e, false, st, v.TransA, v.TransB, ra, rb, split: true));
+                uint mb = Grid(v.M, tile);
+                Gpu.Launch(fs, Grid(v.N, tile), mb * (uint)slices, Ptx.GemmThreads, 1, 0, a, b, parts, Gpu.U(v.M), Gpu.U(v.N), Gpu.U(v.K), Gpu.U((int)aOff), Gpu.U((int)bOff), mb, Gpu.U(sliceBlocks));
+                var join = gpu.Cached($"sum_slices:{lane.Name}", (out string e) => Ptx.SumSlices(gpu, lane, out e));
+                Gpu.Launch(join, Grid((long)v.M * v.N / 4, 256), 1, 256, 1, 0, parts, joined, Gpu.U(v.M * v.N), Gpu.U(slices));
+                if (fc is not null) Back(fc, lane, joined, c, (long)v.M * v.N);
+            }
+            finally
+            {
+                gpu.Return(parts);
+                if (fc is not null) gpu.Return(joined);
+            }
+
+            return;
+        }
+
+        // A block format's operand as runs of micro values where they are aligned runs of its stored rows.
+        bool runsA = fa.IsBlock && (v.TransA ? v.M : v.K) % micro == 0 && v.StrideAOrDefault % micro == 0 && aOff % micro == 0;
+        bool runsB = fb.IsBlock && (v.TransB ? v.K : v.N) % micro == 0 && v.StrideBOrDefault % micro == 0 && bOff % micro == 0;
+        var stored = new Ptx.GemmStored(fa, fb, fc);
+        var fn = gpu.Cached($"gemm_stored:{fa.Name}:{fb.Name}:{fc?.Name ?? "lane"}:{lane.Name}:{micro}:{v.TransA}:{v.TransB}:{runsA}:{runsB}", (out string e) => Ptx.Gemm(gpu, lane, micro, out e, false, stored, v.TransA, v.TransB, runsA, runsB));
+        for (int i = 0; i < v.Batch; i++)
+        {
+            long cOff = i * v.StrideCOrDefault;
+            ulong ci = c + (ulong)(fc is null ? cOff * lane.Size : cOff * fc.Bits / 8);
+            Gpu.Launch(fn, Grid(v.N, tile), Grid(v.M, tile), Ptx.GemmThreads, 1, 0, a, b, ci, Gpu.U(v.M), Gpu.U(v.N), Gpu.U(v.K), Gpu.U((int)(aOff + i * v.StrideAOrDefault)), Gpu.U((int)(bOff + i * v.StrideBOrDefault)));
+        }
+    }
+
+    // Split-k for the stored mode as for the staged kernel (SplitK): too few tiles to fill the device and k long. The
+    // slices' join takes four f32 lanes a thread: an f32 lane, m·n a multiple of 4, C (when joined in place) 16-byte aligned.
+    private bool ProductSplit(ProductView v, Lane lane, int tile, ulong c, Fmt? fc, out int slices, out int sliceBlocks)
+    {
+        slices = sliceBlocks = 1;
+        if (lane.Wide || (long)v.M * v.N % 4 != 0 || fc is null && c % 16 != 0) return false;
+        int tiles = (int)(Grid(v.N, tile) * Grid(v.M, tile)), kBlocks = (v.K + 15) / 16, sms = gpu.Multiprocessors;
+        slices = SplitSlices ?? (tiles >= sms || v.K < 1024 ? 1 : Math.Min(v.K / 256, (2 * sms + tiles - 1) / tiles));
+        slices = Math.Clamp(slices, 1, kBlocks);
+        sliceBlocks = (kBlocks + slices - 1) / slices;
+        slices = (kBlocks + sliceBlocks - 1) / sliceBlocks;
+        return slices > 1;
     }
 
     /// <summary>The gate's override: false takes the register-tiled kernel as on a device that refuses the staged one.</summary>

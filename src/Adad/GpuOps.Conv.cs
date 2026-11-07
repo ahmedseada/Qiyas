@@ -9,7 +9,8 @@
 //                               gathered from the image (Ptx.Gemm with conv), or the composition (im2col, then the
 //                               product: Gemm2, the sliced float64 route) where this device measures that faster, once
 //                               per shape and type by Measure.Faster, the decision in --report.
-// The backward keeps the composition.
+// The backward is the composition (im2col and col2im around the products), on the type's own tensors: the columns of
+// dw's product gathered from the image by the product kernel (transposed), dx's columns an f32 intermediate.
 namespace Adad;
 
 public sealed partial class GpuOps
@@ -108,10 +109,11 @@ public sealed partial class GpuOps
         var f = Fmt.Of<TN>();
         bool direct = !f.IsBlock && f.Natural == lane && f.Bits == lane.Size * 8 && f.IsFloat == lane.IsFloat;
         if (direct) { GemmConv(a, lane, w, x, y); return lane.Name; }
-        bool typedC = !f.IsBlock && f.Bits >= 8;
+        bool typedC = StoredC(f);
         int micro = lane.Wide ? 4 : 8, tile = micro * 16;
         bool runsA = f.IsBlock && a.Rows % micro == 0;                                    // the weights' rows as runs of their blocks
-        var fn = gpu.Cached($"gemmconv_stored:{f.Name}:{lane.Name}:{micro}:{runsA}", (out string e) => Ptx.Gemm(gpu, lane, micro, out e, conv: true, stored: f, runsA: runsA));
+        var stored = new Ptx.GemmStored(f, f, typedC ? f : null);
+        var fn = gpu.Cached($"gemmconv_stored:{f.Name}:{lane.Name}:{micro}:{runsA}", (out string e) => Ptx.Gemm(gpu, lane, micro, out e, conv: true, stored: stored, runsA: runsA));
         ulong lc = typedC ? y : gpu.Rent(a.YValues * lane.Size);
         try
         {
@@ -162,26 +164,67 @@ public sealed partial class GpuOps
         finally { foreach (var p in rented) gpu.Return(p); }
     }
 
-    /// <summary>dx and dw from dy, in the type's float lane storage; returns the lane's name.</summary>
+    /// <summary>dx and dw from dy in the type's float lane; returns the lane's name.</summary>
     public string ConvBackward<TN>(ConvArgs a, ulong x, ulong w, ulong dy, ulong dx, ulong dw) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
         var lane = RowLane(f);
-        bool own = f.Is("float32") || f.Is("float64");
-        var rented = new List<ulong>();
+        if (f.Is("float64")) { ConvBackwardIn<Float64>(a, x, w, dy, dx, dw); return lane.Name; }
+        if (f.Is("float32")) { ConvBackwardIn<Float32>(a, x, w, dy, dx, dw); return lane.Name; }
+        ConvBackwardStored<TN>(a, x, w, dy, dx, dw);
+        return lane.Name;
+    }
+
+    // The backward on the type's own tensors (f32 lane), none widened in memory: dcols = wᵀ·dy (an intermediate: f32 lane
+    // storage) with w and dy read where they are stored, dx = col2im(dcols) stored as the type; dw = dy · colsᵀ with the
+    // columns gathered from the image where it is stored (Ptx.Gemm's conv mode, transposed), stored as the type or as the
+    // lane's sums encoded after.
+    private void ConvBackwardStored<TN>(ConvArgs a, ulong x, ulong w, ulong dy, ulong dx, ulong dw) where TN : struct, IAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        var lane = Lane.F32;
+        var f32 = Fmt.Of<Float32>();
+        bool typed = StoredC(f);
+        ulong dcols = gpu.Rent((long)a.Rows * a.Cols * 4), ldw = typed ? dw : gpu.Rent(a.WValues * 4);
         try
         {
-            ulong lx = ToLane<TN>(x, a.XValues, rented), lw = ToLane<TN>(w, a.WValues, rented), ldy = ToLane<TN>(dy, a.YValues, rented);
-            ulong ldx = own ? dx : gpu.Rent(a.XValues * lane.Size), ldw = own ? dw : gpu.Rent(a.WValues * lane.Size);
-            if (!own) { rented.Add(ldx); rented.Add(ldw); }
-            if (lane.Wide) ConvBackwardIn<Float64>(a, lx, lw, ldy, ldx, ldw); else ConvBackwardIn<Float32>(a, lx, lw, ldy, ldx, ldw);
-            FromLane<TN>(ldx, dx, a.XValues);
-            FromLane<TN>(ldw, dw, a.WValues);
-            return lane.Name;
+            ProductStored(new ProductView(a.Rows, a.Cols, a.OC, true, false), lane, w, f, 0, dy, f, 0, dcols, null);
+            Layout<TN>(new LayoutArgs { Name = "col2im", X = [], P = a.P, Output = [], Count = (int)a.XValues, InputCount = a.Rows * a.Cols }, dcols, 0, dx, 0, f32);
+            var view = new ProductView(a.OC, a.Rows, a.Cols, false, true);
+            int micro = a.OC >= 128 && a.Rows >= 128 ? 8 : 4, tile = micro * 16;
+            bool runsA = f.IsBlock && a.Cols % micro == 0;                                // dy's rows as runs of their blocks
+            uint mb = Grid(a.OC, tile);
+            if (ProductSplit(view, lane, tile, ldw, typed ? f : null, out int slices, out int sliceBlocks))
+            {
+                // Split-k (the columns are long, dw small): the slices' partial dw joined in order, then stored as the type.
+                var st = new Ptx.GemmStored(f, f, null);
+                var fs = gpu.Cached($"gemmconvt_stored:{f.Name}:{micro}:{runsA}:k", (out string e) => Ptx.Gemm(gpu, lane, micro, out e, conv: true, stored: st, transB: true, runsA: runsA, split: true));
+                ulong parts = gpu.Rent((long)slices * a.WValues * 4), joined = typed ? gpu.Rent(a.WValues * 4) : ldw;
+                try
+                {
+                    Gpu.Launch(fs, Grid(a.Rows, tile), mb * (uint)slices, Ptx.GemmThreads, 1, 0, [dy, x, parts, Gpu.U(a.OC), Gpu.U(a.Rows), Gpu.U(a.Cols), .. ConvArgsOf(a), 0, 0, mb, Gpu.U(sliceBlocks)]);
+                    var join = gpu.Cached($"sum_slices:{lane.Name}", (out string e) => Ptx.SumSlices(gpu, lane, out e));
+                    Gpu.Launch(join, Grid(a.WValues / 4, 256), 1, 256, 1, 0, parts, joined, Gpu.U((int)a.WValues), Gpu.U(slices));
+                    Back(f, lane, joined, dw, a.WValues);
+                }
+                finally
+                {
+                    gpu.Return(parts);
+                    if (typed) gpu.Return(joined);
+                }
+            }
+            else
+            {
+                var stored = new Ptx.GemmStored(f, f, typed ? f : null);
+                var fn = gpu.Cached($"gemmconvt_stored:{f.Name}:{micro}:{runsA}", (out string e) => Ptx.Gemm(gpu, lane, micro, out e, conv: true, stored: stored, transB: true, runsA: runsA));
+                Gpu.Launch(fn, Grid(a.Rows, tile), mb, Ptx.GemmThreads, 1, 0, [dy, x, ldw, Gpu.U(a.OC), Gpu.U(a.Rows), Gpu.U(a.Cols), .. ConvArgsOf(a), 0, 0]);
+                if (!typed) Back(f, lane, ldw, dw, a.WValues);
+            }
         }
         finally
         {
-            foreach (var p in rented) gpu.Return(p);
+            gpu.Return(dcols);
+            if (!typed) gpu.Return(ldw);
         }
     }
 

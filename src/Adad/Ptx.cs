@@ -1733,26 +1733,34 @@ internal static partial class Ptx
 
     // ---------------------------------------------------------------- C = A·B in a lane (A m×k, B k×n, row-major lane arrays)
 
+    /// <summary>The formats of a product's operands as the stored mode reads them, and C's: null C is lane storage (the
+    /// sums), else a format of whole bytes and not blocks, stored by the kernel.</summary>
+    public sealed record GemmStored(Fmt A, Fmt B, Fmt? C);
+
     public const int GemmThreads = 256;
 
     /// <summary>Tiles of micro·16 × micro·16 values of C per block of 256 threads (micro² per thread), k in steps of 8 through shared memory.</summary>
     /// <summary>With conv (item 4g) B is the convolution's columns read from the image at p_b (C × H × W, in the lane's
     /// storage): the B tile's loads gather x[c][oh·sh − ph + kh·dh][ow·sw − pw + kw·dw] (0 off the image) for row
     /// kk = (c, kh, kw) and column j = (oh, ow) — the implicit im2col; the rest of the kernel unchanged.
-    /// stored: A and B are arrays of that format, not lane storage: each tile value decoded where it is stored (Codec.UnpackAt)
+    /// stored: A and B are arrays of their formats (a lane's own among them), not lane storage: each tile value decoded where it is stored (Codec.UnpackAt)
     /// at A[i][kk] = a[p_aoff + (transA ? kk·m + i : i·k + kk)], B[kk][j] = b[p_boff + (transB ? j·k + kk : kk·n + j)] (conv:
     /// the image's value), so no operand exists in lane storage; C is stored as the format (Codec.Pack: the conversion pass's
     /// bits) where its values are whole bytes and not blocks, else in the lane for the caller to encode.
     /// runsA, runsB (a block format; the operand's extent along its stored rows and its offsets multiples of micro): the
     /// operand's tile loaded as runs of micro values consecutive where it is stored (A's along k, or along m transposed;
-    /// B's along n, or along k transposed), each decoded with one read of its block's scales (Codec.UnpackRun).</summary>
-    public static string Gemm(Gpu gpu, Lane lane, int micro, out string entry, bool conv = false, Fmt? stored = null, bool transA = false, bool transB = false, bool runsA = false, bool runsB = false)
+    /// B's along n, or along k transposed), each decoded with one read of its block's scales (Codec.UnpackRun).
+    /// split (the stored mode, C lane storage; split-k): grid y = the m tiles × the slices; slice z = ctaid.y / p_mb takes
+    /// the k-blocks [z·p_kb, (z + 1)·p_kb) and stores its partial C at p_c + z·m·n lanes (SumSlices joins them in order).</summary>
+    public static string Gemm(Gpu gpu, Lane lane, int micro, out string entry, bool conv = false, GemmStored? stored = null, bool transA = false, bool transB = false, bool runsA = false, bool runsB = false, bool split = false)
     {
         int tile = micro * 16, bk = 16, e = lane.Size;
-        entry = conv ? $"gemmconv{tile}_{lane.Name}" : $"gemm{tile}_{lane.Name}";
-        if (stored is not null) entry += $"_s{stored.Name}{(transA ? "_ta" : "")}{(transB ? "_tb" : "")}{(runsA ? "_ra" : "")}{(runsB ? "_rb" : "")}";
-        if ((runsA || runsB) && (stored is null || !stored.IsBlock) || runsB && conv) throw new ArgumentException("runs: a block format's stored operands (B's not gathered)");
-        bool typedC = stored is not null && !stored.IsBlock && stored.Bits >= 8;
+        entry = conv ? $"gemmconv{(transB ? "t" : "")}{tile}_{lane.Name}" : $"gemm{tile}_{lane.Name}";
+        if (stored is not null) entry += $"_s{stored.A.Name}_{stored.B.Name}_{stored.C?.Name ?? "lane"}{(transA ? "_ta" : "")}{(transB ? "_tb" : "")}{(runsA ? "_ra" : "")}{(runsB ? "_rb" : "")}{(split ? "_k" : "")}";
+        if (split && (stored is null || stored.C is not null)) throw new ArgumentException("split: the stored mode's partial C in lane storage");
+        if (runsA && stored?.A.IsBlock != true || runsB && (stored?.B.IsBlock != true || conv)) throw new ArgumentException("runs: a block format's stored operands (B's not gathered)");
+        if (stored?.C is { } fc && (fc.IsBlock || fc.Bits < 8)) throw new ArgumentException($"C as {fc.Name}: a format of whole bytes, not blocks, is stored by the kernel");
+        bool typedC = stored?.C is not null;
         var b = new PtxBuilder();
         string tid = b.R(), bx = b.R(), by = b.R(), tx = b.R(), ty = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
@@ -1763,23 +1771,38 @@ internal static partial class Ptx
         string pa = Param64(b, "p_a"), pb = Param64(b, "p_b"), pc = Param64(b, "p_c"), m = Param32(b, "p_m"), n = Param32(b, "p_n"), k = Param32(b, "p_k");
         string[] g = conv ? [.. new[] { "h", "w", "kh", "kw", "sh", "sw", "ph", "pw", "dh", "dw", "ow" }.Select(name => Param32(b, "p_" + name))] : [];
         string aoff = stored is null ? "" : Param32(b, "p_aoff"), boff = stored is null ? "" : Param32(b, "p_boff");
+        string slice = "", sliceKb = "";
+        if (split)
+        {
+            // The slice: by = ctaid.y mod the m tiles; C's slice z at z·m·n lanes.
+            string mb = Param32(b, "p_mb"), cOff = b.RD(), mn = b.RD();
+            sliceKb = Param32(b, "p_kb");
+            slice = b.R();
+            b.L($"div.u32 {slice}, {by}, {mb};");
+            b.L($"rem.u32 {by}, {by}, {mb};");
+            b.L($"mul.wide.u32 {mn}, {m}, {n};");
+            b.L($"cvt.u64.u32 {cOff}, {slice};");
+            b.L($"mul.lo.u64 {cOff}, {cOff}, {mn};");
+            b.L($"mul.lo.u64 {cOff}, {cOff}, {e};");
+            b.L($"add.u64 {pc}, {pc}, {cOff};");
+        }
         // A stored value of the tile, or 0 where p is false (the index then the array's first value: every load in range).
-        string Decoded(string ptr, string index, string p, string first)
+        string Decoded(Fmt fmt, string ptr, string index, string p, string first)
         {
             string at = b.R(), z = lane.NewReg(b);
             b.L($"selp.u32 {at}, {index}, {first}, {p};");
-            string v = Codec.UnpackAt(b, stored!, ptr, at, lane);
+            string v = Codec.UnpackAt(b, fmt, ptr, at, lane);
             b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {z}, {v}, {lane.Zero}, {p};");
             return z;
         }
 
         // A run of micro stored values (each thread's share of a tile) from an aligned index, in range whole or not at all:
         // zeros where p is false.
-        string[] Run(string ptr, string index, string p, string first)
+        string[] Run(Fmt fmt, string ptr, string index, string p, string first)
         {
             string at = b.R();
             b.L($"selp.u32 {at}, {index}, {first}, {p};");
-            var vals = Codec.UnpackRun(b, stored!, ptr, at, micro, lane);
+            var vals = Codec.UnpackRun(b, fmt, ptr, at, micro, lane);
             var z = new string[vals.Length];
             for (int q = 0; q < vals.Length; q++)
             {
@@ -1840,10 +1863,19 @@ internal static partial class Ptx
         b.L($"mul.lo.u64 {t64}, {t64}, {e};");
         b.L($"add.u64 {aBase}, {pa}, {t64};");
 
-        string k0 = b.R(), pLoop = b.P();
-        b.L($"mov.u32 {k0}, 0;");
+        string k0 = b.R(), pLoop = b.P(), kStop = k;
+        if (split)
+        {
+            // This slice's k values [k0, kStop): its k-blocks.
+            kStop = b.R();
+            b.L($"mul.lo.u32 {k0}, {slice}, {sliceKb};");
+            b.L($"shl.b32 {k0}, {k0}, 4;");
+            b.L($"mad.lo.u32 {kStop}, {sliceKb}, {bk}, {k0};");
+            b.L($"min.u32 {kStop}, {kStop}, {k};");
+        }
+        else b.L($"mov.u32 {k0}, 0;");
         b.Label("KLOOP");
-        b.L($"setp.ge.u32 {pLoop}, {k0}, {k};");
+        b.L($"setp.ge.u32 {pLoop}, {k0}, {kStop};");
         b.L($"@{pLoop} bra KDONE;");
 
         // A's tile: this thread's perThread consecutive k values of row aRow at k0 + aCol, stored transposed As[kk][row]:
@@ -1864,7 +1896,7 @@ internal static partial class Ptx
                 b.L($"mad.lo.u32 {idx}, {kk}, {m}, {rowA};");
                 b.L($"add.u32 {idx}, {idx}, {aoff};");
                 b.L($"mad.lo.u32 {sOff}, {bRow}, {tile}, {bCol};");
-                Stash(asBase, Run(pa, idx, pRun, aoff), sOff, 1);
+                Stash(asBase, Run(stored!.A, pa, idx, pRun, aoff), sOff, 1);
             }
             else
             {
@@ -1874,7 +1906,7 @@ internal static partial class Ptx
                 b.L($"mad.lo.u32 {idx}, {gRow}, {k}, {kk};");
                 b.L($"add.u32 {idx}, {idx}, {aoff};");
                 b.L($"mad.lo.u32 {sOff}, {aCol}, {tile}, {aRow};");
-                Stash(asBase, Run(pa, idx, pRun, aoff), sOff, tile);
+                Stash(asBase, Run(stored!.A, pa, idx, pRun, aoff), sOff, tile);
             }
         }
         else if (stored is not null)
@@ -1889,7 +1921,7 @@ internal static partial class Ptx
                 b.L($"and.pred {pk}, {pk}, {pRow};");
                 if (transA) b.L($"mad.lo.u32 {idx}, {kk}, {m}, {gRow};"); else b.L($"mad.lo.u32 {idx}, {gRow}, {k}, {kk};");
                 b.L($"add.u32 {idx}, {idx}, {aoff};");
-                string v = Decoded(pa, idx, pk, aoff), sAddr = b.R(), sOff = b.R();
+                string v = Decoded(stored.A, pa, idx, pk, aoff), sAddr = b.R(), sOff = b.R();
                 b.L($"mad.lo.u32 {sOff}, {aCol}, {tile}, {aRow};");
                 b.L($"add.u32 {sOff}, {sOff}, {q * tile};");
                 b.L($"mad.lo.u32 {sAddr}, {sOff}, {e}, {asBase};");
@@ -1943,32 +1975,49 @@ internal static partial class Ptx
         // B's tile: row k0 + bRow, perThread consecutive columns at col0 + bCol, stored Bs[bRow][col].
         if (conv)
         {
-            // The implicit im2col: row kk = (c, kh, kw), column = (oh, ow), each value gathered from the image or 0.
-            string kk = b.R(), pk = b.P(), khw = b.R(), c = b.R(), r = b.R(), kh = b.R(), kw = b.R(), dih = b.R(), diw = b.R();
+            // The implicit im2col: row kk = (c, kh, kw), column = (oh, ow), each value gathered from the image or 0; with
+            // transB the columns' transpose (dw's product, dy · colsᵀ): row kk = (oh, ow), column = (c, kh, kw).
+            string kk = b.R(), pk = b.P(), khw = b.R();
             b.L($"add.u32 {kk}, {k0}, {bRow};");
             b.L($"setp.lt.u32 {pk}, {kk}, {k};");
             b.L($"mul.lo.u32 {khw}, {g[2]}, {g[3]};");
-            b.L($"div.u32 {c}, {kk}, {khw};");
-            b.L($"rem.u32 {r}, {kk}, {khw};");
-            b.L($"div.u32 {kh}, {r}, {g[3]};");
-            b.L($"rem.u32 {kw}, {r}, {g[3]};");
-            b.L($"mul.lo.s32 {dih}, {kh}, {g[8]};");
-            b.L($"sub.s32 {dih}, {dih}, {g[6]};");
-            b.L($"mul.lo.s32 {diw}, {kw}, {g[9]};");
-            b.L($"sub.s32 {diw}, {diw}, {g[7]};");
-            string cBase = b.R();
-            b.L($"mul.lo.u32 {cBase}, {c}, {g[0]};");
+            // A window row's channel's first value (c · H) and its offsets in the image, kh·dh − ph and kw·dw − pw.
+            (string CBase, string Dih, string Diw) Window(string at)
+            {
+                string c = b.R(), r = b.R(), kh = b.R(), kw = b.R(), dih = b.R(), diw = b.R(), cBase = b.R();
+                b.L($"div.u32 {c}, {at}, {khw};");
+                b.L($"rem.u32 {r}, {at}, {khw};");
+                b.L($"div.u32 {kh}, {r}, {g[3]};");
+                b.L($"rem.u32 {kw}, {r}, {g[3]};");
+                b.L($"mul.lo.s32 {dih}, {kh}, {g[8]};");
+                b.L($"sub.s32 {dih}, {dih}, {g[6]};");
+                b.L($"mul.lo.s32 {diw}, {kw}, {g[9]};");
+                b.L($"sub.s32 {diw}, {diw}, {g[7]};");
+                b.L($"mul.lo.u32 {cBase}, {c}, {g[0]};");
+                return (cBase, dih, diw);
+            }
+
+            (string Oh, string Ow) Position(string at)
+            {
+                string oh = b.R(), ow = b.R();
+                b.L($"div.u32 {oh}, {at}, {g[10]};");
+                b.L($"rem.u32 {ow}, {at}, {g[10]};");
+                return (oh, ow);
+            }
+
+            var rowWindow = transB ? default : Window(kk);
+            var rowPosition = transB ? Position(kk) : default;
             var bv0 = new string[perThread];
             for (int q = 0; q < perThread; q++)
             {
                 bv0[q] = lane.NewReg(b);
                 b.L($"mov.{lane.Reg} {bv0[q]}, {lane.Zero};");
-                string colq = b.R(), pq = b.P(), oh = b.R(), ow = b.R(), ih = b.R(), iw = b.R(), pin = b.P(), idx = b.R(), addr = b.RD();
+                string colq = b.R(), pq = b.P(), ih = b.R(), iw = b.R(), pin = b.P(), idx = b.R(), addr = b.RD();
                 b.L($"add.u32 {colq}, {gColB}, {q};");
                 b.L($"setp.lt.u32 {pq}, {colq}, {n};");
                 b.L($"and.pred {pq}, {pq}, {pk};");
-                b.L($"div.u32 {oh}, {colq}, {g[10]};");
-                b.L($"rem.u32 {ow}, {colq}, {g[10]};");
+                var (cBase, dih, diw) = transB ? Window(colq) : rowWindow;
+                var (oh, ow) = transB ? rowPosition : Position(colq);
                 b.L($"mad.lo.s32 {ih}, {oh}, {g[4]}, {dih};");
                 b.L($"mad.lo.s32 {iw}, {ow}, {g[5]}, {diw};");
                 b.L($"setp.lt.u32 {pin}, {ih}, {g[0]};");                       // a negative index reads as a large one
@@ -1981,7 +2030,7 @@ internal static partial class Ptx
                 {
                     string zero = b.R();
                     b.L($"mov.u32 {zero}, 0;");
-                    b.L($"mov.{lane.Reg} {bv0[q]}, {Decoded(pb, idx, pq, zero)};");
+                    b.L($"mov.{lane.Reg} {bv0[q]}, {Decoded(stored.B, pb, idx, pq, zero)};");
                     continue;
                 }
 
@@ -2016,7 +2065,7 @@ internal static partial class Ptx
                 b.L($"mad.lo.u32 {idx}, {colB}, {k}, {kk};");
                 b.L($"add.u32 {idx}, {idx}, {boff};");
                 b.L($"mad.lo.u32 {sOff}, {aCol}, {tile}, {aRow};");
-                Stash(bsBase, Run(pb, idx, pRun, boff), sOff, tile);
+                Stash(bsBase, Run(stored!.B, pb, idx, pRun, boff), sOff, tile);
             }
             else
             {
@@ -2027,7 +2076,7 @@ internal static partial class Ptx
                 b.L($"mad.lo.u32 {idx}, {kk}, {n}, {gColB};");
                 b.L($"add.u32 {idx}, {idx}, {boff};");
                 b.L($"mad.lo.u32 {sOff}, {bRow}, {tile}, {bCol};");
-                Stash(bsBase, Run(pb, idx, pRun, boff), sOff, 1);
+                Stash(bsBase, Run(stored!.B, pb, idx, pRun, boff), sOff, 1);
             }
         }
         else if (stored is not null)
@@ -2044,7 +2093,7 @@ internal static partial class Ptx
                 b.L($"and.pred {pq}, {pq}, {pk};");
                 if (transB) b.L($"mad.lo.u32 {idx}, {col}, {k}, {kk};"); else b.L($"mad.lo.u32 {idx}, {kk}, {n}, {col};");
                 b.L($"add.u32 {idx}, {idx}, {boff};");
-                bv0[q] = Decoded(pb, idx, pq, boff);
+                bv0[q] = Decoded(stored.B, pb, idx, pq, boff);
             }
 
             string sOff0 = b.R(), sAddr0 = b.R();
@@ -2172,7 +2221,7 @@ internal static partial class Ptx
                 b.L($"add.u64 {idx}, {idx}, {rowOff};");
                 if (typedC)
                 {
-                    StoreOne(b, stored!, lane, acc[r, c], pc, idx, addr, pcol, null);
+                    StoreOne(b, stored!.C!, lane, acc[r, c], pc, idx, addr, pcol, null);
                     continue;
                 }
 
@@ -2184,7 +2233,7 @@ internal static partial class Ptx
 
         b.L("ret;");
         string convParams = conv ? ", .param .u32 p_h, .param .u32 p_w, .param .u32 p_kh, .param .u32 p_kw, .param .u32 p_sh, .param .u32 p_sw, .param .u32 p_ph, .param .u32 p_pw, .param .u32 p_dh, .param .u32 p_dw, .param .u32 p_ow" : "";
-        string storedParams = stored is null ? "" : ", .param .u32 p_aoff, .param .u32 p_boff";
+        string storedParams = (stored is null ? "" : ", .param .u32 p_aoff, .param .u32 p_boff") + (split ? ", .param .u32 p_mb, .param .u32 p_kb" : "");
         return b.Finish(Header(gpu), entry, ".param .u64 p_a, .param .u64 p_b, .param .u64 p_c, .param .u32 p_m, .param .u32 p_n, .param .u32 p_k" + convParams + storedParams, asBytes + bsBytes);
     }
 

@@ -3,9 +3,11 @@
 
 using System.Diagnostics;
 // The device's attention (Attention.cs): the fused rows (the tensor rows for the types with a tensor kind, else the
-// FMA rows) or the composition in lane storage for rows of queries (widen once, the view products and the scaled masked
-// softmax per head, narrow once), the fused decode kernel for a few queries against a long cache, the backward's fused
-// kernels (d ≤ 128) or its composition.
+// FMA rows) or the composition for rows of queries (the view products and the scaled masked softmax per head), the fused
+// decode kernel for a few queries against a long cache, the backward's fused kernels (d ≤ 128) or its composition. Q, K,
+// V and dO are read where they are stored, as the type, by every route: the scores and their gradients (intermediates)
+// are lane storage, the outputs stored as the type (a block format's and a sub-byte one's: the lane's values, encoded
+// by blocks or words after).
 namespace Adad;
 
 public sealed partial class GpuOps
@@ -154,19 +156,16 @@ public sealed partial class GpuOps
         }
     }
 
-    /// <summary>O for rows of queries by the composition in lane storage; returns the lane's name.</summary>
+    /// <summary>O for rows of queries by the composition; returns the lane's name.</summary>
     public string AttentionComposed<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
         var rented = new List<ulong>();
         try
         {
-            ulong lq = ToLane<TN>(q, a.QValues, rented), lk = ToLane<TN>(k, a.KValues, rented), lv = ToLane<TN>(v, a.KValues, rented);
-            bool own = f.Is("float32") || f.Is("float64");
-            ulong lo = own ? o : gpu.Rent(a.QValues * RowLane(f).Size);
-            if (!own) rented.Add(lo);
-            if (Wide(f)) Compose<Float64>(a, lq, lk, lv, lo, rented); else Compose<Float32>(a, lq, lk, lv, lo, rented);
-            FromLane<TN>(lo, o, a.QValues);
+            if (f.Is("float64")) Compose<Float64>(a, q, k, v, o, rented);
+            else if (f.Is("float32")) Compose<Float32>(a, q, k, v, o, rented);
+            else ComposeStored(f, a, q, k, v, o, rented);
             return RowLane(f).Name;
         }
         finally
@@ -174,6 +173,36 @@ public sealed partial class GpuOps
             foreach (var p in rented) gpu.Return(p);
         }
     }
+
+    // The composition on the type's own tensors (f32 lane): S = Q·Kᵀ and O = P·V with Q, K, V read where they are stored
+    // (ProductStored), the scores and their softmax in f32 lane storage, O stored as the type.
+    private void ComposeStored(Fmt f, AttentionArgs a, ulong q, ulong k, ulong v, ulong o, List<ulong> rented)
+    {
+        var lane = Lane.F32;
+        var f32 = Fmt.Of<Float32>();
+        bool typed = StoredC(f);
+        ulong s = gpu.Rent((long)a.Lq * a.Lk * 4), lo = typed ? o : gpu.Rent(a.QValues * 4);
+        rented.Add(s);
+        if (!typed) rented.Add(lo);
+        ulong limits = Limits(a, rented);
+        var softmax = RowOps.Find("scale_mask_softmax");
+        var last = new int[a.Lq];
+        for (int i = 0; i < a.Lq; i++) last[i] = a.Limit(i) - 1;
+        Gpu.Upload<int>(last, limits);
+        ulong mask = SpanMask<Float32>(a, rented);
+        for (int h = 0; h < a.Heads; h++)
+        {
+            long qo = (long)h * a.Lq * a.D, ko = (long)h * a.Lk * a.D;
+            ProductStored(new ProductView(a.Lq, a.Lk, a.D, false, true), lane, q, f, qo, k, f, ko, s, null);
+            RowOp<Float32>(softmax, s, mask, 0, 0, 0, limits, s, 0, a.Lq, a.Lk, a.Scale, 1);
+            ProductStored(new ProductView(a.Lq, a.D, a.Lk, false, false), lane, s, f32, 0, v, f, ko, Out(o, lo, qo, f, typed), typed ? f : null);
+        }
+
+        if (!typed) Back(f, lane, lo, o, a.QValues);
+    }
+
+    // Value `at` of an output: of the type's storage where the kernels store it (typed), else of its f32 lane storage.
+    private static ulong Out(ulong typedPtr, ulong lanePtr, long at, Fmt f, bool typed) => typed ? typedPtr + (ulong)(at * f.Bits / 8) : lanePtr + (ulong)(at * 4);
 
     private void Compose<TS>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o, List<ulong> rented) where TS : struct, IFloatAdad<TS>
     {
@@ -239,10 +268,12 @@ public sealed partial class GpuOps
 
     // ---- backward: the fused kernels (Ptx.AttentionBackward.cs), or the composition
 
-    // The rows kernel (dQ, and each row's m, 1/l, D), then the keys kernel (dK, dV), over lane storage.
-    private void BackwardFused<TS>(AttentionArgs a, ulong q, ulong k, ulong v, ulong dO, ulong dq, ulong dk, ulong dv, List<ulong> rented) where TS : struct, IFloatAdad<TS>
+    // The rows kernel (dQ, and each row's m, 1/l, D), then the keys kernel (dK, dV), over lane storage (f null) or the
+    // type's tensors (the gradients as the type where the kernels store it, else lane storage).
+    private void BackwardFused(Lane lane, Fmt? f, AttentionArgs a, ulong q, ulong k, ulong v, ulong dO, ulong dq, ulong dk, ulong dv, List<ulong> rented)
     {
-        var lane = TS.Bits == 64 ? Lane.F64 : Lane.F32;
+        bool runs = f is { IsBlock: true } && a.D % 8 == 0;
+        string key = f is null ? lane.Name : $"{lane.Name}:{f.Name}:{runs}";
         int dCap = a.D <= 32 ? 32 : a.D <= 64 ? 64 : 128;
         var (br, bc) = Ptx.AttentionTile(lane);
         ulong limits = Limits(a, rented), starts = Starts(a, rented), rowRanges = KeyRanges(a, br, rented), keyRanges = QueryRanges(a, bc, rented);
@@ -250,10 +281,10 @@ public sealed partial class GpuOps
         rented.Add(stats);
         var scale = lane.Wide ? Gpu.D(a.Scale) : Gpu.F((float)a.Scale);
         int rowsShared = Ptx.AttentionBackRowsShared(lane, dCap), keysShared = Ptx.AttentionBackKeysShared(lane, dCap);
-        var fr = gpu.Cached($"attention_back_rows:{lane.Name}:{dCap}", (out string e) => Ptx.AttentionBackRows(gpu, lane, dCap, out e));
+        var fr = gpu.Cached($"attention_back_rows:{key}:{dCap}", (out string e) => Ptx.AttentionBackRows(gpu, lane, dCap, out e, f, runs));
         gpu.AllowShared(fr, rowsShared);
         Gpu.Launch(fr, (uint)((a.Lq + br - 1) / br), (uint)a.Heads, Ptx.RowsThreads, 1, Dynamic(rowsShared), q, k, v, dO, dq, stats, limits, starts, rowRanges, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), scale);
-        var fk = gpu.Cached($"attention_back_keys:{lane.Name}:{dCap}", (out string e) => Ptx.AttentionBackKeys(gpu, lane, dCap, out e));
+        var fk = gpu.Cached($"attention_back_keys:{key}:{dCap}", (out string e) => Ptx.AttentionBackKeys(gpu, lane, dCap, out e, f, runs));
         gpu.AllowShared(fk, keysShared);
         Gpu.Launch(fk, (uint)((a.Lk + bc - 1) / bc), (uint)a.Heads, Ptx.RowsThreads, 1, Dynamic(keysShared), q, k, v, dO, stats, dk, dv, limits, starts, keyRanges, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), scale);
     }
@@ -294,14 +325,22 @@ public sealed partial class GpuOps
             var kind = FusedBackward != false && MmaBackward != false && a.D <= FusedHeadMax && !f.IsBlock ? Ptx.AttentionKind(f) : null;
             if (kind is not null && MmaBackwardUsable(f, kind, a, q, k, v, dO)) { BackwardMma(f, kind, a, q, k, v, dO, dq, dk, dv, rented); BackwardRoute = "mma"; return kind.Name + "mma"; }
             var lane = RowLane(f);
-            bool own = f.Is("float32") || f.Is("float64");
-            ulong lq = ToLane<TN>(q, a.QValues, rented), lk = ToLane<TN>(k, a.KValues, rented), lv = ToLane<TN>(v, a.KValues, rented), ldo = ToLane<TN>(dO, a.QValues, rented);
-            ulong ldq = own ? dq : gpu.Rent(a.QValues * lane.Size), ldk = own ? dk : gpu.Rent(a.KValues * lane.Size), ldv = own ? dv : gpu.Rent(a.KValues * lane.Size);
-            if (!own) { rented.Add(ldq); rented.Add(ldk); rented.Add(ldv); }
-            if (Wide(f)) BackwardIn<Float64>(a, lq, lk, lv, ldo, ldq, ldk, ldv, rented); else BackwardIn<Float32>(a, lq, lk, lv, ldo, ldq, ldk, ldv, rented);
-            FromLane<TN>(ldq, dq, a.QValues);
-            FromLane<TN>(ldk, dk, a.KValues);
-            FromLane<TN>(ldv, dv, a.KValues);
+            if (f.Is("float64")) { BackwardIn<Float64>(a, q, k, v, dO, dq, dk, dv, rented); return lane.Name; }
+            if (f.Is("float32")) { BackwardIn<Float32>(a, q, k, v, dO, dq, dk, dv, rented); return lane.Name; }
+            // The type's own tensors, read where they are stored; the gradients stored as the type, or as the lane's values
+            // encoded after.
+            bool typed = StoredC(f);
+            ulong ldq = typed ? dq : gpu.Rent(a.QValues * 4), ldk = typed ? dk : gpu.Rent(a.KValues * 4), ldv = typed ? dv : gpu.Rent(a.KValues * 4);
+            if (!typed) { rented.Add(ldq); rented.Add(ldk); rented.Add(ldv); }
+            if (FusedBackward != false && a.D <= FusedHeadMax && FusedBackwardFits(lane, a.D)) { BackwardFused(lane, f, a, q, k, v, dO, ldq, ldk, ldv, rented); BackwardRoute = "fused"; }
+            else { BackwardStored(f, a, q, k, v, dO, ldq, ldk, ldv, typed, rented); BackwardRoute = "composed"; }
+            if (!typed)
+            {
+                Back(f, lane, ldq, dq, a.QValues);
+                Back(f, lane, ldk, dk, a.KValues);
+                Back(f, lane, ldv, dv, a.KValues);
+            }
+
             return lane.Name;
         }
         finally
@@ -375,7 +414,8 @@ public sealed partial class GpuOps
 
     private void BackwardIn<TS>(AttentionArgs a, ulong q, ulong k, ulong v, ulong dO, ulong dq, ulong dk, ulong dv, List<ulong> rented) where TS : struct, IFloatAdad<TS>
     {
-        if (FusedBackward != false && a.D <= FusedHeadMax && FusedBackwardFits(TS.Bits == 64 ? Lane.F64 : Lane.F32, a.D)) { BackwardFused<TS>(a, q, k, v, dO, dq, dk, dv, rented); BackwardRoute = "fused"; return; }
+        var tsLane = TS.Bits == 64 ? Lane.F64 : Lane.F32;
+        if (FusedBackward != false && a.D <= FusedHeadMax && FusedBackwardFits(tsLane, a.D)) { BackwardFused(tsLane, null, a, q, k, v, dO, dq, dk, dv, rented); BackwardRoute = "fused"; return; }
         BackwardRoute = "composed";
         int size = TS.Bits / 8;
         long sBytes = (long)a.Lq * a.Lk * size;
@@ -401,6 +441,38 @@ public sealed partial class GpuOps
             Map<TS>(scale, dp, 0, 0, dp, (int)((long)a.Lq * a.Lk), a.Scale, 0);                      // · scale
             MatMulView<TS>(new ProductView(a.Lq, a.D, a.Lk, false, false), dp, kh, dqh);            // dQ = dS·K
             MatMulView<TS>(new ProductView(a.Lk, a.D, a.Lq, true, false), dp, qh, dkh);             // dK = dSᵀ·Q
+        }
+    }
+
+    // The backward's composition on the type's own tensors (f32 lane): every product reads Q, K, V, dO where they are
+    // stored and P, dS as f32 lane storage (ProductStored); the gradients at dq, dk, dv as the type (typed) or f32 lanes.
+    private void BackwardStored(Fmt f, AttentionArgs a, ulong q, ulong k, ulong v, ulong dO, ulong dq, ulong dk, ulong dv, bool typed, List<ulong> rented)
+    {
+        var lane = Lane.F32;
+        var f32 = Fmt.Of<Float32>();
+        var fc = typed ? f : null;
+        long sBytes = (long)a.Lq * a.Lk * 4;
+        ulong p = gpu.Rent(sBytes), dp = gpu.Rent(sBytes);
+        rented.Add(p); rented.Add(dp);
+        ulong limits = Limits(a, rented);
+        var last = new int[a.Lq];
+        for (int i = 0; i < a.Lq; i++) last[i] = a.Limit(i) - 1;
+        Gpu.Upload<int>(last, limits);
+        ulong mask = SpanMask<Float32>(a, rented);
+        var softmax = RowOps.Find("scale_mask_softmax");
+        var softmaxBwd = RowOps.Find("softmax_bwd");
+        var scale = Adad.Ops.Find("scale");
+        for (int h = 0; h < a.Heads; h++)
+        {
+            long qo = (long)h * a.Lq * a.D, ko = (long)h * a.Lk * a.D;
+            ProductStored(new ProductView(a.Lq, a.Lk, a.D, false, true), lane, q, f, qo, k, f, ko, p, null);
+            RowOp<Float32>(softmax, p, mask, 0, 0, 0, limits, p, 0, a.Lq, a.Lk, a.Scale, 1);
+            ProductStored(new ProductView(a.Lk, a.D, a.Lq, true, false), lane, p, f32, 0, dO, f, qo, Out(dv, dv, ko, f, typed), fc);    // dV = Pᵀ·dO
+            ProductStored(new ProductView(a.Lq, a.Lk, a.D, false, true), lane, dO, f, qo, v, f, ko, dp, null);                          // dP = dO·Vᵀ
+            RowOp<Float32>(softmaxBwd, p, dp, 0, 0, 0, 0, dp, 0, a.Lq, a.Lk, 0, 0);                                                   // dS = P·(dP − Σ P·dP)
+            Map<Float32>(scale, dp, 0, 0, dp, (int)((long)a.Lq * a.Lk), a.Scale, 0);                                                   // · scale
+            ProductStored(new ProductView(a.Lq, a.D, a.Lk, false, false), lane, dp, f32, 0, k, f, ko, Out(dq, dq, qo, f, typed), fc);  // dQ = dS·K
+            ProductStored(new ProductView(a.Lk, a.D, a.Lq, true, false), lane, dp, f32, 0, q, f, qo, Out(dk, dk, ko, f, typed), fc);   // dK = dSᵀ·Q
         }
     }
 }
