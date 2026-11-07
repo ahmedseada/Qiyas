@@ -556,6 +556,19 @@ internal static partial class Ptx
             return BlockReduce(b, lane, Tid, acc, kind == "max" ? "max" : "add", threads);
         }
 
+        /// <summary>The row's one value (RowOut: a lane value at y2[row], when y2 is given) by thread 0; a replay makes none (its
+        /// statistics kernel did).</summary>
+        public void StoreRow(string v)
+        {
+            if (Mode == RowMode.Replay) return;
+            string skip = b.P(), addr = b.RD();
+            b.L($"setp.eq.u64 {skip}, {_dst2}, 0;");
+            b.L($"setp.ne.or.u32 {skip}, {Tid}, 0, {skip};");
+            b.L($"mul.wide.u32 {addr}, {Row}, {lane.Size};");
+            b.L($"add.u64 {addr}, {_dst2}, {addr};");
+            b.L($"@!{skip} st.global.{lane.Mem} [{addr}], {v};");
+        }
+
         /// <summary>The output row (or the second one) from value(q, i).</summary>
         public void Store(Func<int, int, string> value, bool second = false)
         {
@@ -593,6 +606,9 @@ internal static partial class Ptx
     }
 
     // ---------------------------------------------------------------- the operations
+
+    // The gain of an operation that scales by g + b (RowOp.Offset).
+    private static string Gain(RowCtx c, int q, int i) => c.Add(c.G(q, i), c.Bs);
 
     /// <summary>Softmax and rms_norm as row operations (their own kernels otherwise, Ptx.SoftmaxRegs and Ptx.RmsNormRegs, whose
     /// arithmetic these repeat): a block format's rows take them through RowStats and RowOpBlocks. rms_norm's eps is `a`.</summary>
@@ -646,17 +662,17 @@ internal static partial class Ptx
             case "rms_norm_affine":
             {
                 string rstd = Rstd(c, c.Reduce("add", (q, i) => c.Mul(c.X(q, i), c.X(q, i))), n, c.A);
-                c.Store((q, i) => c.Mul(c.Mul(c.X(q, i), rstd), c.G(q, i)));
+                c.Store((q, i) => c.Mul(c.Mul(c.X(q, i), rstd), Gain(c, q, i)));
                 return;
             }
 
             case "rms_norm_bwd":
             {
                 string ss = c.Reduce("add", (q, i) => c.Mul(c.X(q, i), c.X(q, i)));
-                string t = c.Reduce("add", (q, i) => c.Mul(c.Mul(c.G(q, i), c.X2(q, i)), c.X(q, i)));
+                string t = c.Reduce("add", (q, i) => c.Mul(c.Mul(Gain(c, q, i), c.X2(q, i)), c.X(q, i)));
                 string rstd = Rstd(c, ss, n, c.A);
-                string k2 = c.Mul(rstd, c.Div(c.Mul(rstd, t), n));                      // rstd · mean(g·dy·x̂)
-                c.Store((q, i) => c.Mul(c.Sub(c.Mul(c.G(q, i), c.X2(q, i)), c.Mul(c.X(q, i), k2)), rstd));
+                string k2 = c.Mul(rstd, c.Div(c.Mul(rstd, t), n));                      // rstd · mean(γ·dy·x̂)
+                c.Store((q, i) => c.Mul(c.Sub(c.Mul(Gain(c, q, i), c.X2(q, i)), c.Mul(c.X(q, i), k2)), rstd));
                 return;
             }
 
@@ -678,6 +694,17 @@ internal static partial class Ptx
                 string rstd = Rstd(c, v, n, c.A);
                 string m1 = c.Div(sgd, n), k2 = c.Mul(rstd, c.Div(c.Mul(rstd, sgdx), n));
                 c.Store((q, i) => c.Mul(c.Sub(c.Sub(c.Mul(c.G(q, i), c.X2(q, i)), m1), c.Mul(c.Sub(c.X(q, i), mu), k2)), rstd));
+                return;
+            }
+
+            case "weight_norm_bwd":
+            {
+                // dx = (s/n)·(dy − x·k), k = Σ dy·x / (Σ x² + a), n = √(Σ x² + a); the row's value (Σ dy·x)/n.
+                string ss = c.Reduce("add", (q, i) => c.Mul(c.X(q, i), c.X(q, i)));
+                string dot = c.Reduce("add", (q, i) => c.Mul(c.X2(q, i), c.X(q, i)));
+                string nn = c.Add(ss, c.A), nrm = c.Sqrt(nn), k = c.Div(dot, nn), fct = c.Div(c.S(), nrm);
+                c.Store((q, i) => c.Mul(c.Sub(c.X2(q, i), c.Mul(c.X(q, i), k)), fct));
+                c.StoreRow(c.Div(dot, nrm));
                 return;
             }
 
@@ -754,7 +781,7 @@ internal static partial class Ptx
                 // y = h·g / s, s = √(mean h² + eps): the quotient by its reciprocal and one residual step (h·g − y·s, exact
                 // by fma) — near-correctly rounded, two roundings fewer than h · (1/s) · g.
                 string s = c.Sqrt(c.Add(c.Div(c.Reduce("add", (q, i) => { string h = H(q, i); return c.Mul(h, h); }), n), c.A)), rstd = c.Rcp(s);
-                c.Store((q, i) => c.Quotient(c.Mul(H(q, i), c.G(q, i)), s, rstd));
+                c.Store((q, i) => c.Quotient(c.Mul(H(q, i), Gain(c, q, i)), s, rstd));
                 return;
             }
 

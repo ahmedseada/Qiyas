@@ -15,10 +15,12 @@ public sealed class RowCase
     public required double[] Y;              // the float64 reference (rows × cols)
     public double[]? Y2;
     public required double[] Scale;          // the error scale per row
+    public double B;                         // the operation's b (an offset of the gain: also 1)
 
     /// <summary>The operation's inputs for a shape (seeds fixed by the operation), with positions given when asked.</summary>
-    public static RowCase Make(RowOp op, string type, int rows, int cols, bool positions)
+    public static RowCase Make(RowOp op, string type, int rows, int cols, bool positions, double? b = null)
     {
+        double bv = b ?? op.B;
         int n = rows * cols;
         var x = Registry.Make(type, n, 51, op.XRange.Low, op.XRange.High);
         byte[]? x2 = null;
@@ -43,20 +45,36 @@ public sealed class RowCase
         var btv = bt is null ? null : Registry.Values(type, bt, cols);
         var sv = s is null ? null : Registry.Values(type, s, rows);
         var y = new double[n];
-        var y2 = op.SecondOut ? new double[n] : null;
+        var y2 = op.SecondOut ? new double[n] : op.RowOut ? new double[rows] : null;
         var scale = new double[rows];
         Parallel.For(0, rows, r =>
         {
             ReadOnlySpan<double> gs = gv is null ? default : gv.AsSpan();
             ReadOnlySpan<double> bts = btv is null ? default : btv.AsSpan();
             scale[r] = op.Reference(xv.AsSpan(r * cols, cols), x2v is null ? default : x2v.AsSpan(r * cols, cols), gs, bts,
-                sv is null ? 1 : sv[r], pos is null ? r : pos[r], r, op.A, op.B, y.AsSpan(r * cols, cols), y2 is null ? default : y2.AsSpan(r * cols, cols));
+                sv is null ? 1 : sv[r], pos is null ? r : pos[r], r, op.A, bv, y.AsSpan(r * cols, cols), y2 is null ? default : op.RowOut ? y2.AsSpan(r, 1) : y2.AsSpan(r * cols, cols));
         });
-        return new RowCase { Op = op, Type = type, Rows = rows, Cols = cols, X = x, X2 = x2, G = g, Bt = bt, S = s, Pos = pos, Y = y, Y2 = y2, Scale = scale };
+        return new RowCase { Op = op, Type = type, Rows = rows, Cols = cols, X = x, X2 = x2, G = g, Bt = bt, S = s, Pos = pos, Y = y, Y2 = y2, Scale = scale, B = bv };
     }
 
     /// <summary>The worst distance of an output from its reference, in steps of the type past the tolerance (0 when all within):
     /// a value's tolerance is the type's step at it plus Ulps lane ulps of the row's error scale.</summary>
+    /// <summary>A per-row output (RowOut: lane values) against its reference: the worst distance in its tolerances (Ulps lane ulps
+    /// of the row's error scale) past 1, 0 when all within.</summary>
+    public double WorstRow(byte[] got)
+    {
+        string lane = Type == "float64" ? "f64" : "f32";
+        var values = LaneValues.Decode(lane, got, Rows);
+        double laneEps = lane == "f64" ? Math.Pow(2, -52) : Math.Pow(2, -23), worst = 0;
+        for (int r = 0; r < Rows; r++)
+        {
+            double tol = Op.Ulps * laneEps * Scale[r], err = Math.Abs(values[r] - Y2![r]);
+            if (double.IsNaN(err) || err > tol) worst = Math.Max(worst, double.IsNaN(err) ? double.PositiveInfinity : err / tol);
+        }
+
+        return worst;
+    }
+
     public double Worst(byte[] got, bool second = false)
     {
         var reference = second ? Y2! : Y;

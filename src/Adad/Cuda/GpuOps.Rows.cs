@@ -74,7 +74,7 @@ public sealed partial class GpuOps
             Gpu.Launch(st, (uint)rows, 1, (uint)threads, 1, 0, args);
             var blocks = gpu.Cached($"rowblocks:{op.Name}:{f.Name}:{second}:False", (out string e) => Ptx.RowOpBlocks(gpu, f, lane, op, second, false, out e));
             Gpu.Launch(blocks, BlockGrid(f, (long)rows * cols), 1, 256, 1, 0, args);
-            if (y2 != 0)
+            if (y2 != 0 && !op.RowOut)
             {
                 var blocks2 = gpu.Cached($"rowblocks:{op.Name}:{f.Name}:{second}:True", (out string e) => Ptx.RowOpBlocks(gpu, f, lane, op, second, true, out e));
                 Gpu.Launch(blocks2, BlockGrid(f, (long)rows * cols), 1, 256, 1, 0, args);

@@ -123,6 +123,7 @@ internal static partial class Checks
         ok &= Elementwise(null);
         ok &= Group2(null);
         ok &= Rows(null);
+        ok &= Norms(null);
         ok &= Layouts(null);
         ok &= Products(null);
         ok &= Attentions(null);
@@ -1788,14 +1789,15 @@ internal static partial class Checks
             foreach (var (rows, cols) in new[] { (37, 1001), (5, 64), (3, 17), (3, 20011), (2, 16384), (2, 32768) })
             {
                 foreach (var op in RowOps.All)
-                {
-                    var k = Bench.RowCase.Make(op, type, rows, cols, positions: true);
-                    var y = new byte[k.X.Length];
-                    var y2 = op.SecondOut ? new byte[k.X.Length] : null;
-                    Bench.Registry.WithFloat(type, new RowOpRun(ops, op, k, y, y2));
-                    double worst = Math.Max(k.Worst(y), y2 is null ? 0 : k.Worst(y2, second: true));
-                    if (worst > 0) { Console.WriteLine($"check row {op.Name,-18} {where,-6} {type,-12} DIFFERS by {worst:0.##} steps ({rows} x {cols})"); ok = false; }
-                }
+                    foreach (double b in op.Offset ? new[] { op.B, 1.0 } : [op.B])
+                    {
+                        var k = Bench.RowCase.Make(op, type, rows, cols, positions: true, b);
+                        var y = new byte[k.X.Length];
+                        var y2 = op.SecondOut ? new byte[k.X.Length] : op.RowOut ? new byte[rows * (type == "float64" ? 8 : 4)] : null;
+                        Bench.Registry.WithFloat(type, new RowOpRun(ops, op, k, y, y2));
+                        double worst = Math.Max(k.Worst(y), y2 is null ? 0 : op.RowOut ? k.WorstRow(y2) : k.Worst(y2, second: true));
+                        if (worst > 0) { Console.WriteLine($"check row {op.Name,-18} {where,-6} {type,-12} DIFFERS by {worst:0.##} steps ({rows} x {cols}, b {b})"); ok = false; }
+                    }
 
                 foreach (bool centered in new[] { false, true })
                 {
@@ -1835,7 +1837,7 @@ internal static partial class Checks
     {
         public bool Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
         {
-            if (ops is null) { Kernels.RowOp<TN>(op, k.X, k.X2, k.G, k.Bt, k.S, k.Pos, y, y2, k.Rows, k.Cols, op.A, op.B); return true; }
+            if (ops is null) { Kernels.RowOp<TN>(op, k.X, k.X2, k.G, k.Bt, k.S, k.Pos, y, y2, k.Rows, k.Cols, op.A, k.B); return true; }
             var rented = new List<ulong>();
             ulong Up(byte[]? a) { if (a is null) return 0; ulong d = ops.Rent(a.Length + 16); rented.Add(d); ops.Upload(a, d); return d; }
             ulong dx = Up(k.X), dx2 = Up(k.X2), dg = Up(k.G), dbt = Up(k.Bt), ds = Up(k.S), dpos = 0;
@@ -1843,7 +1845,7 @@ internal static partial class Checks
             ulong dy = ops.Rent(y.Length + 16), dy2 = y2 is null ? 0 : ops.Rent(y2.Length + 16);
             rented.Add(dy);
             if (dy2 != 0) rented.Add(dy2);
-            ops.RowOp<TN>(op, dx, dx2, dg, dbt, ds, dpos, dy, dy2, k.Rows, k.Cols, op.A, op.B);
+            ops.RowOp<TN>(op, dx, dx2, dg, dbt, ds, dpos, dy, dy2, k.Rows, k.Cols, op.A, k.B);
             ops.Synchronize();
             ops.Download(dy, y);
             if (y2 is not null) ops.Download(dy2, y2);
@@ -2289,6 +2291,7 @@ internal static partial class Checks
         ok &= Elementwise(ops, "cuda");
         ok &= Group2(ops);
         ok &= Rows(ops);
+        ok &= Norms(ops, "cuda");
         ok &= Layouts(ops);
         ok &= Products(ops);
         ok &= Attentions(ops);

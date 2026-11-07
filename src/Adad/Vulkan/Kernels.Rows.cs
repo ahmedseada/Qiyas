@@ -278,6 +278,15 @@ internal static partial class VkKernels
             return result;
         }
 
+        /// <summary>The row's one value (RowOut: a lane value at y2[row], when y2 is given) by invocation 0 of the statistics pass;
+        /// a replay makes none.</summary>
+        public void StoreRow(V v)
+        {
+            if (mode == RowMode.Replay) return;
+            var row = Row;
+            b.If((Tid == 0) & (Dst2 != 0UL), () => b.Store(b.At(Dst2, row, lane.Size), v));
+        }
+
         /// <summary>The output (or the second output) from value(): captured in a replay, not made in the statistics pass.</summary>
         public void Store(Func<V> value, bool second = false)
         {
@@ -322,6 +331,9 @@ internal static partial class VkKernels
     // ---------------------------------------------------------------- the operations (CUDA's EmitRowOp, instruction for instruction)
 
     private static V Rstd(RowCtx c, V sumSq, V n, V eps) => c.Rcp(c.Sqrt(sumSq / n + eps));
+
+    // The gain of an operation that scales by g + b (RowOp.Offset).
+    private static V Gain(RowCtx c) => c.G() + c.Bs;
 
     private static void EmitRowOp(RowCtx c, RowOp op)
     {
@@ -370,17 +382,17 @@ internal static partial class VkKernels
             case "rms_norm_affine":
             {
                 var rstd = Rstd(c, c.Reduce("add", () => c.X() * c.X()), n, c.A);
-                c.Store(() => c.X() * rstd * c.G());
+                c.Store(() => c.X() * rstd * Gain(c));
                 return;
             }
 
             case "rms_norm_bwd":
             {
                 var ss = c.Reduce("add", () => c.X() * c.X());
-                var t = c.Reduce("add", () => c.G() * c.X2() * c.X());
+                var t = c.Reduce("add", () => Gain(c) * c.X2() * c.X());
                 var rstd = Rstd(c, ss, n, c.A);
-                var k2 = rstd * (rstd * t / n);                                          // rstd · mean(g·dy·x̂)
-                c.Store(() => (c.G() * c.X2() - c.X() * k2) * rstd);
+                var k2 = rstd * (rstd * t / n);                                          // rstd · mean(γ·dy·x̂)
+                c.Store(() => (Gain(c) * c.X2() - c.X() * k2) * rstd);
                 return;
             }
 
@@ -403,6 +415,20 @@ internal static partial class VkKernels
                 var m1 = sgd / n;
                 var k2 = rstd * (rstd * sgdx / n);
                 c.Store(() => (c.G() * c.X2() - m1 - (c.X() - mu) * k2) * rstd);
+                return;
+            }
+
+            case "weight_norm_bwd":
+            {
+                // dx = (s/n)·(dy − x·k), k = Σ dy·x / (Σ x² + a), n = √(Σ x² + a); the row's value (Σ dy·x)/n.
+                var ss = c.Reduce("add", () => c.X() * c.X());
+                var dot = c.Reduce("add", () => c.X2() * c.X());
+                var nn = ss + c.A;
+                var nrm = c.Sqrt(nn);
+                var k = dot / nn;
+                var fct = c.S() / nrm;
+                c.Store(() => (c.X2() - c.X() * k) * fct);
+                c.StoreRow(dot / nrm);
                 return;
             }
 
@@ -481,7 +507,7 @@ internal static partial class VkKernels
                 // by fma) — near-correctly rounded, two roundings fewer than h · (1/s) · g.
                 var s = c.Sqrt(c.Reduce("add", () => { var h = H(); return h * h; }) / n + c.A);
                 var rstd = c.Rcp(s);
-                c.Store(() => c.Quotient(H() * c.G(), s, rstd));
+                c.Store(() => c.Quotient(H() * Gain(c), s, rstd));
                 return;
             }
 

@@ -16,6 +16,7 @@ internal static partial class Checks
         ok &= Elementwise(ops, "vulkan");
         ok &= Group2(ops, "vulkan");
         ok &= Rows(ops, "vulkan");
+        ok &= Norms(ops, "vulkan");
         ok &= Layouts(ops, "vulkan");
         ok &= Products(ops, "vulkan");
         ok &= Optimizers(ops, "vulkan");

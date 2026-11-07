@@ -69,7 +69,7 @@ rents and driver allocations), the CPU product workspace's the same.
 broadcasts (`maprow:add`, `maprow:mul`), `transpose` (4096 × 4096) and `gemv`, `gemv_t` (8192 × 8192); `all` is the four
 core operations plus every formula, every reduction and every row operation; `rows` adds the row family (`row:<name>`
 for each of `RowOps.All` — log_softmax, the softmax backward passes, rms_norm_affine and its backward, layer_norm and
-its backward, weight_norm, rope, scale_mask_softmax, add_rms_norm, add_layer_norm — and `norm_params_bwd:rms|layer`,
+its backward (both with a gain offset), weight_norm and its backward, rope, scale_mask_softmax, add_rms_norm, add_layer_norm — and `norm_params_bwd:rms|layer`,
 4096 × 4096, float types); `layout` adds the layout operations (`layout:<name>` for each of `LayoutArgs.Names`: strided,
 one_hot, gather_rows, gather_cols, scatter_add_rows, im2col, col2im, interpolate_nearest, interpolate_bilinear, shift).
 `products` adds the products on views (`matmul_nt`, `matmul_tn`, `matmul_tt` at 4096³, `matmul_batched`: 16 × 1024³,
@@ -139,6 +139,7 @@ checkout (files listed in `.gitignore`); a clone runs the other subjects.
 | `src/Adad/Cpu/Kernels.cs` | the CPU kernels: add, product (GotoBLAS-shaped, dot lanes in groups), softmax, rms_norm |
 | `src/Adad/Abstraction/Map.cs`, `src/Adad/Cpu/Map.cs`, `src/Adad/Cuda/Ptx.Map.cs` | the element-wise family: the catalogue of formulas (with float64 references), the CPU kernel, the device kernel |
 | `src/Adad/Abstraction/Rows.cs`, `src/Adad/Cpu/Rows.cs`, `src/Adad/Cuda/Ptx.Rows.cs`, `src/Adad/Cuda/GpuOps.Rows.cs`, `src/Qiyas.Checks/Bench/RowInputs.cs` | the row family: the catalogue (references, error scales), the CPU kernels, the device kernels, the inputs and tolerance shared by the checks and the bench |
+| `src/Adad/Cpu/Norms.cs`, `src/Adad/Cuda/Ptx.Norms.cs`, `src/Adad/Cuda/GpuOps.Norms.cs`, `src/Adad/Vulkan/Kernels.Norms.cs`, `src/Adad/Vulkan/VulkanOps.Norms.cs`, `src/Qiyas.Checks/Checks.Norms.cs` | group normalization over `GroupShape` (batch, group, instance, a layer's over channels and positions; by given statistics for inference) and its backward, and the rotary embedding by tables (`RopeArgs`: half or interleaved pairs, partial, inverse, after an RMS normalization); their references sit in `Abstraction/Rows.cs` |
 | `src/Adad/Abstraction/Routing.cs`, `src/Adad/Cpu/Routing.cs`, `src/Adad/Cuda/Ptx.Routing.cs`, `src/Adad/Cuda/GpuOps.Routing.cs` | top-k, pick, sampling, the route, the cross-entropy loss per row (one pass); its backward is a row operation |
 | `src/Adad/Cuda/Ptx.Radix.cs`, `src/Adad/Cuda/GpuOps.Radix.cs` | the device's ordering by target for scatter-add and the route: counts, the multi-block exclusive scan, the stable LSD radix sort |
 | `src/Adad/Abstraction/Ctc.cs`, `src/Adad/Cpu/Ctc.cs`, `src/Adad/Cuda/Ptx.Ctc.cs`, `src/Adad/Cuda/GpuOps.Ctc.cs` | ctc: the arguments and the float64 reference, the CPU kernel, the device kernels (rows, then a block per sequence) |

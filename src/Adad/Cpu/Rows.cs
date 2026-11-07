@@ -307,6 +307,22 @@ internal static class RowKernels
         }
     }
 
+    // dx = (s/n)·(dy − x·k), k = (Σ dy·x)/(Σ x² + a), n = √(Σ x² + a); y2 (one lane value) = (Σ dy·x)/n.
+    public struct WeightNormBwd<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    {
+        public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
+        {
+            TLane nn = TL.Add(RowMath<TLane, TL>.SumSq(x, TL.Zero), a);
+            TLane dot = RowMath<TLane, TL>.Dot(x2, x);
+            TLane n = TL.Sqrt(nn), k = TL.Div(dot, nn), f = TL.Div(s, n);
+            int w = Vector<TLane>.Count, vec = x.Length / w * w, i = 0;
+            Vector<TLane> kv = new(k), fv = new(f);
+            for (; i < vec; i += w) ((new Vector<TLane>(x2[i..]) - new Vector<TLane>(x[i..]) * kv) * fv).CopyTo(y[i..]);
+            for (; i < x.Length; i++) y[i] = TL.Mul(TL.Sub(x2[i], TL.Mul(x[i], k)), f);
+            if (!y2.IsEmpty) y2[0] = TL.Div(dot, n);
+        }
+    }
+
     public struct Rope<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
@@ -438,6 +454,7 @@ internal sealed partial class Kernels
                 case "layer_norm": Go<TN, TLane, TL, RowKernels.LayerNorm<TLane, TL>>(); break;
                 case "layer_norm_bwd": Go<TN, TLane, TL, RowKernels.LayerNormBwd<TLane, TL>>(); break;
                 case "weight_norm": Go<TN, TLane, TL, RowKernels.WeightNorm<TLane, TL>>(); break;
+                case "weight_norm_bwd": Go<TN, TLane, TL, RowKernels.WeightNormBwd<TLane, TL>>(); break;
                 case "rope": Go<TN, TLane, TL, RowKernels.Rope<TLane, TL>>(); break;
                 case "scale_mask_softmax": Go<TN, TLane, TL, RowKernels.ScaleMaskSoftmax<TLane, TL>>(); break;
                 case "add_rms_norm": Go<TN, TLane, TL, RowKernels.AddRmsNorm<TLane, TL>>(); break;
@@ -466,13 +483,17 @@ internal sealed partial class Kernels
             var xl = TN.Direct ? null : pool.Rent(cols);
             var x2l = x2 is null || TN.Direct ? null : pool.Rent(cols);
             var yl = TN.Direct ? null : pool.Rent(cols);
-            var y2l = y2 is null || TN.Direct ? null : pool.Rent(cols);
+            var y2l = y2 is null || TN.Direct || op.RowOut ? null : pool.Rent(cols);
             var gl = g is null ? null : pool.Rent(cols);
             var btl = bt is null ? null : pool.Rent(cols);
             var sl = s is null ? null : pool.Rent(1);
             try
             {
-                if (g is not null) TN.Load(g, 0, gl.AsSpan(0, cols));
+                if (g is not null)
+                {
+                    TN.Load(g, 0, gl.AsSpan(0, cols));
+                    if (op.Offset) for (int c = 0; c < cols; c++) gl![c] = TL.Add(gl[c], b);     // the gain g + b, as the operation scales by it
+                }
                 if (bt is not null) TN.Load(bt, 0, btl.AsSpan(0, cols));
                 for (int r = first; r < last; r++)
                 {
@@ -483,7 +504,7 @@ internal sealed partial class Kernels
                         xs = MemoryMarshal.Cast<byte, TLane>(x.AsSpan()).Slice(r * cols, cols);
                         if (x2 is not null) x2s = MemoryMarshal.Cast<byte, TLane>(x2.AsSpan()).Slice(r * cols, cols);
                         ys = MemoryMarshal.Cast<byte, TLane>(y.AsSpan()).Slice(r * cols, cols);
-                        if (y2 is not null) y2s = MemoryMarshal.Cast<byte, TLane>(y2.AsSpan()).Slice(r * cols, cols);
+                        if (y2 is not null && !op.RowOut) y2s = MemoryMarshal.Cast<byte, TLane>(y2.AsSpan()).Slice(r * cols, cols);
                     }
                     else
                     {
@@ -491,8 +512,10 @@ internal sealed partial class Kernels
                         xs = xl.AsSpan(0, cols);
                         if (x2 is not null) { TN.Load(x2, r * cols, x2l.AsSpan(0, cols)); x2s = x2l.AsSpan(0, cols); }
                         ys = yl.AsSpan(0, cols);
-                        if (y2 is not null) y2s = y2l.AsSpan(0, cols);
+                        if (y2 is not null && !op.RowOut) y2s = y2l.AsSpan(0, cols);
                     }
+
+                    if (y2 is not null && op.RowOut) y2s = MemoryMarshal.Cast<byte, TLane>(y2.AsSpan()).Slice(r, 1);   // the row's value, lane storage
 
                     TLane sv = TL.From(1);
                     if (s is not null) { TN.Load(s, r, sl.AsSpan(0, 1)); sv = sl![0]; }
@@ -501,7 +524,7 @@ internal sealed partial class Kernels
                     if (!TN.Direct)
                     {
                         TN.Store(ys, y, r * cols);
-                        if (y2 is not null) TN.Store(y2s, y2, r * cols);
+                        if (y2 is not null && !op.RowOut) TN.Store(y2s, y2, r * cols);
                     }
                 }
             }

@@ -96,6 +96,14 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
     string IRows<byte[], int[]>.NormParamsBwd<TN>(byte[] x, byte[] dy, byte[] dgamma, byte[] dbeta, int rows, int cols, double eps, bool centered) =>
         NormParamsBwd<TN>(x, dy, dgamma, dbeta, rows, cols, eps, centered);
 
+    string IRows<byte[], int[]>.GroupNorm<TN>(byte[] x, byte[]? gamma, byte[]? beta, byte[]? mean, byte[]? variance, byte[] y, GroupShape shape, double eps, bool given) =>
+        GroupNorm<TN>(x, gamma, beta, mean, variance, y, shape, eps, given);
+
+    string IRows<byte[], int[]>.GroupNormBwd<TN>(byte[] x, byte[] dy, byte[]? gamma, byte[]? mean, byte[]? variance, byte[]? dx, byte[]? dgamma, byte[]? dbeta, GroupShape shape, double eps, bool given) =>
+        GroupNormBwd<TN>(x, dy, gamma, mean, variance, dx, dgamma, dbeta, shape, eps, given);
+
+    string IRows<byte[], int[]>.Rope<TN>(RopeArgs a, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] y) => Rope<TN>(a, x, gain, cos, sin, positions, y);
+
     // ---------------------------------------------------------------- layouts
 
     string ILayouts<byte[], int[]>.Layout<TN>(LayoutArgs k, byte[] x, int[]? index, byte[] output, byte[]? x2) => Layout<TN>(new LayoutArgs
