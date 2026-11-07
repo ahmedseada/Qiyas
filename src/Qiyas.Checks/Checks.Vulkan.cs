@@ -23,6 +23,7 @@ internal static partial class Checks
         ok &= Ctcs(ops, "vulkan", blocks: false);
         ok &= Attentions(ops, "vulkan", blocks: false);
         ok &= Convs(ops, "vulkan", blocks: false);
+        ok &= Recurrents(ops, "vulkan", blocks: false);
         return ok;
     }
 

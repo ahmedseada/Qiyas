@@ -514,13 +514,15 @@ internal static partial class Checks
 
     /// <summary>Every float type: LSTM and GRU steps over 37 rows (input 29, hidden 53) and 5 rows (input 7, hidden 11), forward
     /// (h', c') and backward (dx, dh, dc, dW, dU, db, dbh) against float64 within the products' rounding.</summary>
-    public static bool Recurrents(GpuOps? ops)
+    // blocks: false where the device refuses the block formats (said so, not proved).
+    public static bool Recurrents(IDevice<ulong, ulong>? ops, string device = "device", bool blocks = true)
     {
         bool ok = true;
-        string where = ops is null ? "cpu" : "device";
+        string where = ops is null ? "cpu" : device;
+        var dev = DeviceOf(ops);
         foreach (var type in Bench.Registry.Names)
         {
-            if (!Bench.Registry.IsFloat(type)) continue;
+            if (!Bench.Registry.IsFloat(type) || (!blocks && Bench.Registry.IsBlock(type))) continue;
             foreach (var kind in new[] { "lstm", "gru" })
             {
                 foreach (var (B, D, H) in new[] { (37, 29, 53), (5, 7, 11) })
@@ -567,7 +569,6 @@ internal static partial class Checks
             var (wantH, wantC) = Bench.RecurrentCase.LstmSequenceReference(a, T, V(x, T * a.B * a.D), V(h0, a.B * a.H), V(c0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH));
             var hOut = new byte[Bench.Registry.Bytes(type, T * a.B * a.H)]; var cOut = new byte[hOut.Length];
             var subject = new Bench.AdadSubject();
-            var dev = ops is null ? Bench.Device.Cpu : Bench.Device.Cuda;
             using (var run = subject.LstmSequence(dev, type, a, T, x, h0, c0, w, u, b, hOut, cOut, null, null, null, null, null, null)!) { run.Run(); run.Collect(); }
             ok &= Close(type, "lstm_seq h", where, hOut, wantH, T * a.B * a.H, T * (a.D + a.H));
             ok &= Close(type, "lstm_seq c", where, cOut, wantC, T * a.B * a.H, T * (a.D + a.H));
@@ -587,7 +588,7 @@ internal static partial class Checks
         // GRU sequences: 3 steps of 5 × 7 → 11 (h every step), every float type, the block formats through lane storage.
         foreach (var type in Bench.Registry.Names)
         {
-            if (!Bench.Registry.IsFloat(type)) continue;
+            if (!Bench.Registry.IsFloat(type) || (!blocks && Bench.Registry.IsBlock(type))) continue;
             var a = new CellArgs("gru", 5, 7, 11);
             const int T = 3;
             int GH = a.Gates * a.H;
@@ -598,7 +599,6 @@ internal static partial class Checks
             double[] V(byte[] s, int n) => Bench.Registry.Values(type, s, n);
             var wantH = Bench.RecurrentCase.GruSequenceReference(a, T, V(x, T * a.B * a.D), V(h0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH), V(bh, GH));
             var hOut = new byte[Bench.Registry.Bytes(type, T * a.B * a.H)];
-            var dev = ops is null ? Bench.Device.Cpu : Bench.Device.Cuda;
             using (var run = new Bench.AdadSubject().GruSequence(dev, type, a, T, x, h0, w, u, b, bh, hOut)!) { run.Run(); run.Collect(); }
             ok &= Close(type, "gru_seq h", where, hOut, wantH, T * a.B * a.H, T * (a.D + a.H));
         }
@@ -639,7 +639,7 @@ internal static partial class Checks
         // GRU sequence backward: 3 steps of 5 × 7 → 11 (dx, dh0, dW, dU, db, dbh), every float type, the block formats through lane storage.
         foreach (var type in Bench.Registry.Names)
         {
-            if (!Bench.Registry.IsFloat(type)) continue;
+            if (!Bench.Registry.IsFloat(type) || (!blocks && Bench.Registry.IsBlock(type))) continue;
             var a = new CellArgs("gru", 5, 7, 11);
             const int T = 3;
             int GH = a.Gates * a.H;
@@ -651,7 +651,6 @@ internal static partial class Checks
             double[] V(byte[] s, int n) => Bench.Registry.Values(type, s, n);
             var (wdx, wdh0, wdw, wdu, wdb, wdbh) = Bench.RecurrentCase.GruSequenceBackwardReference(a, T, V(x, T * a.B * a.D), V(h0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH), V(bh, GH), V(dhOut, T * a.B * a.H));
             var dx = new byte[x.Length]; var dh0 = new byte[h0.Length]; var dw = new byte[w.Length]; var du = new byte[u.Length]; var db = new byte[b.Length]; var dbh = new byte[bh.Length];
-            var dev = ops is null ? Bench.Device.Cpu : Bench.Device.Cuda;
             using (var run = new Bench.AdadSubject().GruSequenceBackward(dev, type, a, T, x, h0, w, u, b, bh, dhOut, dx, dh0, dw, du, db, dbh)!) { run.Run(); run.Collect(); }
             int terms = 8 * T * (a.D + a.H + GH + a.B);
             ok &= Close(type, "gru_seq_bwd dx", where, dx, wdx, T * a.B * a.D, terms);
@@ -662,17 +661,17 @@ internal static partial class Checks
             ok &= Close(type, "gru_seq_bwd dbh", where, dbh, wdbh, GH, terms);
         }
 
-        if (ok) Console.WriteLine($"check recurrent              {where,-6} every float type: LSTM and GRU steps, forward and backward, LSTM sequences and their backward, GRU sequences and their backward (block formats too; the backward's reference by central differences), within the products' rounding");
+        if (ok) Console.WriteLine($"check recurrent              {where,-6} every float type{(blocks ? "" : " but the block formats")}: LSTM and GRU steps, forward and backward, LSTM sequences and their backward, GRU sequences and their backward ({(blocks ? "block formats too; " : "")}the backward's reference by central differences), within the products' rounding");
         return ok;
     }
 
-    private sealed class RecurrentRun(GpuOps? ops, CellArgs a, Bench.RecurrentCase k, byte[] output, byte[]? unused) : Bench.IFloatTypeVisitor<bool>
+    private sealed class RecurrentRun(IDevice<ulong, ulong>? ops, CellArgs a, Bench.RecurrentCase k, byte[] output, byte[]? unused) : Bench.IFloatTypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
         {
             bool lstm = a.Kind == "lstm", backward = k.DhOut is not null;
             var subject = new Bench.AdadSubject();
-            using var run = subject.Recurrent(ops is null ? Bench.Device.Cpu : Bench.Device.Cuda, TN.Name, a, k.X, k.H, k.C, k.W, k.U, k.Bias, k.BiasH,
+            using var run = subject.Recurrent(DeviceOf(ops), TN.Name, a, k.X, k.H, k.C, k.W, k.U, k.Bias, k.BiasH,
                 backward ? k.DhOut! : output, backward ? k.DcOut : k.COut, backward ? output : null, k.Dh, k.Dc, k.Dw, k.Du, k.Db, k.Dbh)!;
             run.Run();
             run.Collect();

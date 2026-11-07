@@ -3,8 +3,9 @@
 
 // Vulkan as a device: Adad's operations over the contract (Abstraction/), on device addresses — buffers of stored values
 // and of indices alike — with the same lane rules as the CPU and CUDA: a type's own lane, its float lane for the float
-// formulas. A family whose kernels are not written for this device yet refuses (NotSupportedException, naming it): no
-// operation runs in another lane, or on another device, in its place.
+// formulas. Every family of the contract has its Vulkan kernels; the block formats are refused where they arrive (no
+// Vulkan block encoder yet: NotSupportedException, naming it), and so is a shape past a kernel's limits: no operation
+// runs in another lane, or on another device, in its place.
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
@@ -83,40 +84,4 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
         vk.Launch(k, Groups(f.Words(n), VkKernels.Threads), 1, x, v, output, Vulkan.U(n), Vulkan.U(cols));
         return lane.Name;
     }
-
-    // ---------------------------------------------------------------- the families not on Vulkan yet
-
-    public void CellGates<TN>(CellArgs a, ulong x, ulong w, ulong h, ulong u, ulong bias, ulong g) where TN : struct, IAdad<TN> => throw Missing("recurrent gates");
-
-    public string LstmCell<TN>(CellArgs a, ulong g, ulong c, ulong hOut, ulong cOut) where TN : struct, IFloatAdad<TN> => throw Missing("lstm cell");
-
-    public string LstmCellBackward<TN>(CellArgs a, ulong g, ulong c, ulong dh, ulong dcNext, ulong dg, ulong dc) where TN : struct, IFloatAdad<TN> => throw Missing("lstm cell backward");
-
-    public string GruCell<TN>(CellArgs a, ulong gx, ulong gh, ulong h, ulong hOut) where TN : struct, IFloatAdad<TN> => throw Missing("gru cell");
-
-    public string GruCellBackward<TN>(CellArgs a, ulong gx, ulong gh, ulong h, ulong dhOut, ulong dgx, ulong dgh, ulong dh) where TN : struct, IFloatAdad<TN> =>
-        throw Missing("gru cell backward");
-
-    public string LstmStep<TN>(CellArgs a, ulong x, ulong h, ulong c, ulong w, ulong u, ulong bias, ulong hOut, ulong cOut) where TN : struct, IFloatAdad<TN> => throw Missing("lstm step");
-
-    public string LstmStepBackward<TN>(CellArgs a, ulong x, ulong h, ulong c, ulong w, ulong u, ulong bias, ulong dhOut, ulong dcOut, ulong dx, ulong dh, ulong dc, ulong dw, ulong du, ulong db)
-        where TN : struct, IFloatAdad<TN> => throw Missing("lstm step backward");
-
-    public string GruStep<TN>(CellArgs a, ulong x, ulong h, ulong w, ulong u, ulong bias, ulong biasH, ulong hOut) where TN : struct, IFloatAdad<TN> => throw Missing("gru step");
-
-    public string GruStepBackward<TN>(CellArgs a, ulong x, ulong h, ulong w, ulong u, ulong bias, ulong biasH, ulong dhOut, ulong dx, ulong dh, ulong dw, ulong du, ulong db, ulong dbh)
-        where TN : struct, IFloatAdad<TN> => throw Missing("gru step backward");
-
-    public string LstmSequence<TN>(CellArgs a, int T, ulong x, ulong h0, ulong c0, ulong w, ulong u, ulong bias, ulong hOut, ulong cOut) where TN : struct, IFloatAdad<TN> =>
-        throw Missing("lstm sequence");
-
-    public string LstmSequenceBackward<TN>(CellArgs a, int T, ulong x, ulong h0, ulong c0, ulong w, ulong u, ulong bias, ulong dhOut, ulong dcLast, ulong dx, ulong dh0, ulong dc0, ulong dw, ulong du, ulong db)
-        where TN : struct, IFloatAdad<TN> => throw Missing("lstm sequence backward");
-
-    public string GruSequence<TN>(CellArgs a, int T, ulong x, ulong h0, ulong w, ulong u, ulong bias, ulong biasH, ulong hOut) where TN : struct, IFloatAdad<TN> =>
-        throw Missing("gru sequence");
-
-    public string GruSequenceBackward<TN>(CellArgs a, int T, ulong x, ulong h0, ulong w, ulong u, ulong bias, ulong biasH, ulong dhOut, ulong dx, ulong dh0, ulong dw, ulong du, ulong db, ulong dbh)
-        where TN : struct, IFloatAdad<TN> => throw Missing("gru sequence backward");
-
 }
