@@ -1,12 +1,13 @@
 #!/bin/sh
 # Proof that the repository's files use nothing of the lib: none may name a lib namespace or type. Run before every build.
 cd "$(dirname "$0")"
-# Every C# file of the repository: all of src/ (Abstractions/ and Bench/ too) and Program.cs except the three ignored files (the lib column and its host).
-files="$(ls src/*.cs src/Abstractions/*.cs src/Bench/*.cs Program.cs | grep -vE '^src/(CpuCurrent|CudaHost|BenchCuda)\.cs$' | tr '
+# Every C# file of the repository: Adad (src/Adad), its checks (src/Qiyas.Checks) and the bench (bench/Qiyas.Bench), except
+# the bench's three ignored files (the lib column and its host) and Lib/.
+files="$(ls src/Adad/*.cs src/Adad/Abstractions/*.cs src/Qiyas.Checks/*.cs src/Qiyas.Checks/Bench/*.cs bench/Qiyas.Bench/*.cs bench/Qiyas.Bench/Bench/*.cs | grep -vE '^bench/Qiyas.Bench/(CpuCurrent|CudaHost|BenchCuda)\.cs$' | tr '
 ' ' ')"
 pattern='Idrak|ElementType|ElementConversions|CpuBackend|CpuMath|CpuMatMul|CpuRanges|CpuTuning|CpuInfo|ComputeResources|HalfFloats|BFloat16Bits|PtxKernels|CudaDriver|Storage\b|CpuCurrent|CudaHost'
 if grep -nE "$pattern" $files; then
-  echo "guard: Qiyas references the lib (above). Not built."
+  echo "guard: the repository references the lib (above). Not built."
   exit 1
 fi
 # Every C# file opens with the license header (two lines; a byte-order mark or CRLF endings are allowed).
@@ -22,4 +23,4 @@ if [ -n "$missing" ]; then
   echo "guard: these files lack the license header:$missing"
   exit 1
 fi
-echo "guard: Qiyas files ($files) reference nothing of the lib and carry the license header."
+echo "guard: the repository's files ($files) reference nothing of the lib and carry the license header."

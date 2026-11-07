@@ -1,8 +1,8 @@
 # Idrak's code and the bench's lib column: not part of this repo.
 Lib/
-src/CpuCurrent.cs
-src/CudaHost.cs
-src/BenchCuda.cs
+bench/Qiyas.Bench/CpuCurrent.cs
+bench/Qiyas.Bench/CudaHost.cs
+bench/Qiyas.Bench/BenchCuda.cs
 
 # Build output and run logs
 bin/

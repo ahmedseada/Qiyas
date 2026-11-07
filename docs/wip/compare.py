@@ -2,8 +2,9 @@ import sys, re
 base, new = sys.argv[1], sys.argv[2]
 
 def parse(path):
-    # Each subject's columns (ms, x, lane, err) are found by the header's names ("qiyas ms", ...), so a run of some
-    # subjects only (--subjects qiyas) compares with a run of all of them.
+    # Each subject's columns (ms, x, lane, err) are found by the header's names ("adad ms", ...), so a run of some
+    # subjects only (--subjects adad) compares with a run of all of them. The library's column is "adad"; files from
+    # before it was named Adad call it "qiyas".
     rows = {}
     at = None
     for line in open(path, encoding='utf-8'):
@@ -13,7 +14,9 @@ def parse(path):
             continue
         if not line.startswith('| c') or at is None: continue
         device, op, typ = cells[:3]
-        rows[(device, op, typ)] = {name: tuple(cells[i:i + 4]) for name, i in at.items()}
+        cols = {name: tuple(cells[i:i + 4]) for name, i in at.items()}
+        if 'adad' not in cols and 'qiyas' in cols: cols['adad'] = cols['qiyas']
+        rows[(device, op, typ)] = cols
     return rows
 
 b, n = parse(base), parse(new)
@@ -21,7 +24,7 @@ print(f"{'cell':34} {'base ms':>9} {'new ms':>9} {'ratio':>7}  lanes  err base/n
 regress = []
 for key in n:
     if key not in b: print("new row", key); continue
-    bq, nq = b[key]['qiyas'], n[key]['qiyas']
+    bq, nq = b[key]['adad'], n[key]['adad']
     try:
         bm, nm = float(bq[0]), float(nq[0])
     except ValueError:

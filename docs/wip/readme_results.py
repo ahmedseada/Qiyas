@@ -1,5 +1,5 @@
 """The README's Results tables from a full `cuda,cpu` results file: one table per device, a row per type, the four core
-operations as lib / number / qiyas / x (x = lib / qiyas). Run from the repository root:
+operations as lib / number / adad / x (x = lib / adad). Run from the repository root:
     python docs/wip/readme_results.py results-qiyas-cuda-cpu.md
 and paste the output over the two tables in README.md; the per-family summary table follows them (every row of an
 --ops all run)."""
@@ -8,21 +8,24 @@ sys.stdout.reconfigure(encoding='utf-8')
 path = sys.argv[1]
 rows = collections.OrderedDict()
 types = []
+at = None
 for line in open(path, encoding='utf-8'):
-    if not line.startswith('| c'): continue
     cells = [c.strip() for c in line.strip().strip('|').split('|')]
+    # Each subject's ms column by the header's names; the library's is "adad" ("qiyas" in files from before it was Adad).
+    if line.startswith('| device'):
+        at = {c[:-3]: i for i, c in enumerate(cells) if c.endswith(' ms')}
+        continue
+    if not line.startswith('| c') or at is None: continue
     device, op, typ, shape = cells[:4]
-    rest = cells[4:]
-    subj = {}
-    for i, name in enumerate(['lib', 'number', 'qiyas']):
-        ms, x, lane, err = rest[4 * i: 4 * i + 4]
-        subj[name] = ms
+    subj = {name: cells[i] for name, i in at.items()}
+    if 'adad' not in subj and 'qiyas' in subj: subj['adad'] = subj['qiyas']
+    for name in ('lib', 'number'): subj.setdefault(name, '—')
     rows[(device, typ, op)] = subj
     if typ not in types: types.append(typ)
 ops = ['add', 'matmul', 'softmax', 'rms_norm']
 titles = {'cuda': 'CUDA (2048³ product, 16M-value add, 4096×4096 rows)', 'cpu': 'CPU (1024³ product, 16M-value add, 4096×4096 rows)'}
 for device in ('cuda', 'cpu'):
-    print(f"**{titles[device]}** — lib / number / **qiyas** / × (× = lib ÷ qiyas)\n")
+    print(f"**{titles[device]}** — lib / number / **adad** / × (× = lib ÷ adad)\n")
     print("| type | add | matmul | softmax | rms_norm |")
     print("|---|---|---|---|---|")
     for typ in types:
@@ -30,7 +33,7 @@ for device in ('cuda', 'cpu'):
         for op in ops:
             r = rows.get((device, typ, op))
             if r is None: cells.append(''); continue
-            lib, num, q = r['lib'], r['number'], r['qiyas']
+            lib, num, q = r['lib'], r['number'], r['adad']
             try: x = f"{float(lib) / float(q):.2f}×"
             except ValueError: x = '—'
             cells.append(f"{lib} / {num} / **{q}** / {x}")
@@ -38,7 +41,7 @@ for device in ('cuda', 'cpu'):
     print()
 
 # The per-family summary of every row of the run (--ops all): rows measured per device, and against the lib where it has
-# the row: the geometric mean of lib ÷ qiyas and on how many rows qiyas is ahead.
+# the row: the geometric mean of lib ÷ adad and on how many rows adad is ahead.
 import math
 def family(op):
     if op in ('add', 'matmul', 'softmax', 'rms_norm'): return 'core'
@@ -58,7 +61,7 @@ for (device, typ, op), r in rows.items():
     f = family(op)
     if f not in order: order.append(f)
     s = stats[(f, device)]
-    try: q = float(r['qiyas'])
+    try: q = float(r['adad'])
     except ValueError: continue
     s['rows'] += 1; s['ops'].add(op)
     try: lib = float(r['lib'])
@@ -70,7 +73,7 @@ def vs(s):
     n = len(s['logs'])
     if n == 0: return '—'
     return f"{math.exp(sum(s['logs']) / n):.2f}× (ahead on {s['ahead']} of {n})"
-print("**Every family** — rows measured (operation × type) and, where the lib has the row, the geometric mean of lib ÷ qiyas\n")
+print("**Every family** — rows measured (operation × type) and, where the lib has the row, the geometric mean of lib ÷ adad\n")
 print("| family | operations | CUDA rows | CUDA vs lib | CPU rows | CPU vs lib |")
 print("|---|---:|---:|---|---:|---|")
 for f in order:

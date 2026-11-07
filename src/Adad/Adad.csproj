@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Adad: every operation written once over the number type, implemented by each device (the CPU, CUDA) on its own buffers. -->
+  <PropertyGroup>
+    <RootNamespace>Adad</RootNamespace>
+    <Description>Numbers computed in their own types: every operation written once over the type, on the CPU and CUDA.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Qiyas.Checks" />
+    <InternalsVisibleTo Include="Qiyas.Bench" />
+  </ItemGroup>
+</Project>

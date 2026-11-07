@@ -1,3 +1,15 @@
 <Project>
-  <!-- Stops the repository's Directory.Build.props: this bench builds on its own. -->
+  <!-- The repository's build settings for its three projects (and the stop for any Directory.Build.props above it). -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <Authors>Ahmed Seada</Authors>
+    <Copyright>Copyright (c) 2026 Ahmed Seada</Copyright>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <NoWarn>$(NoWarn);CS1591;CS1573;CS1574;CS1584;CS1580;CS1658</NoWarn>
+  </PropertyGroup>
 </Project>

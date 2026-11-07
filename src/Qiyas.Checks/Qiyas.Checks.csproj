@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Qiyas's proofs of Adad (Checks.cs), and what they share with the bench: the subject they run Adad through, its
+       contract, the stored types by name and the cases. -->
+  <PropertyGroup>
+    <RootNamespace>Qiyas</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Adad\Adad.csproj" />
+    <InternalsVisibleTo Include="Qiyas.Bench" />
+    <Using Include="Adad" />
+    <!-- The stored integer types by their names, as inside the library (not System's). -->
+    <Using Include="Adad.Int64" Alias="Int64" />
+    <Using Include="Adad.Int32" Alias="Int32" />
+    <Using Include="Adad.Int16" Alias="Int16" />
+    <Using Include="Adad.UInt64" Alias="UInt64" />
+    <Using Include="Adad.UInt32" Alias="UInt32" />
+    <Using Include="Adad.UInt16" Alias="UInt16" />
+  </ItemGroup>
+</Project>

@@ -1,6 +1,7 @@
 # Qiyas
 
-Qiyas (قياس, "measure") is a generic number contract and the kernels over it: every stored type — float64, float32,
+Qiyas (قياس, "measure") is the bench and the proofs of **Adad** (عدد, "number"), the library in `src/Adad`. Adad is a
+generic number contract and the kernels over it: every stored type — float64, float32,
 float16, bfloat16, float8 (e4m3, e5m2), int64 down to int2, uint64 down to uint2, bool (one bit), and the block formats
 Q8_0, Q4_0, Q4_K, Q6_K (the GGUF layouts: values in blocks with shared f16 scales) — computed in the lane the hardware
 does best for it, chosen per operation from the data itself. No type is fixed anywhere: not for values, not for sums.
@@ -14,10 +15,14 @@ does best for it, chosen per operation from the data itself. No type is fixed an
 - **CPU and CUDA from the same contract.** The CPU side runs on its own thread team and `Vector<T>`; the CUDA side
   generates PTX per (type, lane) with its own driver binding — tensor-core, dot-product and plain GEMMs, row kernels,
   conversions — all from the type's description.
+- **One device contract.** Each operation family is an interface generic over the number type and the device's buffers
+  (`src/Adad/Abstractions/`: `IDevice<TBuffer, TIndex>` and its families, each operation under its own constraint —
+  `IAdad<TN>` for every type, `IFloatAdad<TN>` for the float formulas). The CPU (`Cpu.Device`: byte arrays) and CUDA
+  (`GpuOps`: device pointers) implement it, each with its own lanes; a device may implement a family at a time.
 - **Proven, not assumed.** Before anything is timed, every conversion is checked bit for bit against a scalar
   reference written from the format's definition, the dot lanes against scalar sums, exp against the runtime's, and
   the device's conversions against the CPU's; then every operation of every family runs over every type it applies to
-  on both devices, on small odd shapes, against float64 references (`src/Checks.cs`); the block codecs against blocks
+  on both devices, on small odd shapes, against float64 references (`src/Qiyas.Checks/Checks.cs`); the block codecs against blocks
   laid out by hand from the formats' specifications; the block-scaled products of Q8_0 / Q4_0 (A·Bᵀ and gemv, k in whole
   blocks) forced on both devices; the products on views at shapes where the packing reads transposed and batched
   operands where they are stored, on both devices; the products on the device under every tensor kind the device
@@ -43,9 +48,9 @@ does best for it, chosen per operation from the data itself. No type is fixed an
 
 ## The bench
 
-`Qiyas.dll [cpu|cuda|cuda,cpu] [--subjects a,b] [--types ...] [--ops add,matmul,softmax,rms_norm,map|reduce|rows|layout|products|attention|optimizers|conv|recurrent|routing|all] [--baseline name] [--shapes regular|odd] [--report] [--repeat N]`
+`Qiyas.Bench.dll [cpu|cuda|cuda,cpu] [--subjects a,b] [--types ...] [--ops add,matmul,softmax,rms_norm,map|reduce|rows|layout|products|attention|optimizers|conv|recurrent|routing|all] [--baseline name] [--shapes regular|odd] [--report] [--repeat N]`
 
-`--subjects` picks the columns (`qiyas`, `number`, and what you add), `--types` the stored types (the seventeen plain
+`--subjects` picks the columns (`adad`, `number`, and what you add), `--types` the stored types (the seventeen plain
 ones, `bool`, `q8_0`, `q4_0`, `q4_k`, `q6_k`), `--ops` the rows, `--baseline` a named earlier results file to
 compare against. `--repeat N` repeats the matmul rows N times and raises the repetitions of the gates that once
 failed intermittently (the block transpose; 20 by default): a stress for schedule-dependent faults.
@@ -87,9 +92,10 @@ value-wise stores in float32 storage and encodes by blocks — all four formats 
 CPU's); bool is a one-bit packed type held to 0/1 (division is n/a). Products with a Q8_0 or Q4_0 operand take the
 block-scaled integer dot (`s8dp blocks`).
 
-Every implementation in the assembly that implements `IBenchSubject` (`src/Bench/Contract.cs`) is found by reflection
-and becomes a column: `qiyas`, `number` (one implementation over .NET's `INumberBase<T>`, for the types .NET has a
-`T` for), and whatever you add. The harness makes the inputs (stored bytes of each type, from Qiyas's proven
+Every implementation in the loaded assemblies that implements `IBenchSubject` (`src/Qiyas.Checks/Bench/Contract.cs`) is
+found by reflection and becomes a column: `adad` (`src/Qiyas.Checks/Bench/AdadSubject.cs`: every operation once, over the
+device contract), `number` (one implementation over .NET's `INumberBase<T>`, for the types .NET has a
+`T` for), and whatever you add. The harness makes the inputs (stored bytes of each type, from Adad's proven
 conversions, so every subject sees the same bits), times `Run` (warmed until the runtime compiles nothing more and the
 time stops falling, then medians over an adaptive number of runs), reads the
 output after `Collect`, and scores it against float64 math on the same inputs. Results go to `results-qiyas-<devices>.md`.
@@ -99,51 +105,56 @@ To add an implementation: one class with a parameterless constructor implementin
 never an approximation. Inputs and outputs are stored bytes of the
 named type; `Run` must include your device synchronization; `Collect` writes the output; `Lane` says what you computed in.
 
-`profile`, `gpuprofile` and `team` are Qiyas's own diagnostics (matmul phases on each device; the thread team's dispatch cost).
+`profile`, `gpuprofile` and `team` are the bench's own diagnostics (matmul phases on each device; the thread team's dispatch cost).
 
 ## Building
 
-`dotnet build -c Release` (net10.0). The gates run at the start of every bench invocation; the regression gate is
+`dotnet build Qiyas.sln -c Release` (net10.0) builds three projects: `src/Adad` (the library), `src/Qiyas.Checks` (the
+proofs, and what they share with the bench: the subject they run Adad through, the float64 references, the stored types
+by name, the cases) and `bench/Qiyas.Bench` (the harness: `dotnet bench/Qiyas.Bench/bin/Release/net10.0/Qiyas.Bench.dll`,
+results written at the repository's root). The gates run at the start of every bench invocation; the regression gate is
 `python docs/wip/compare.py docs/wip/baseline.md results-qiyas-cuda-cpu.md` after a full `cuda,cpu` run (a cell more
 than 5 % slower, or an error that grew, is a regression). `sh guard.sh` proves that no file in the repository names anything of the library
-Qiyas is measured against; run it before every build. That library's column (`lib`) exists only in the author's local
+Adad is measured against; run it before every build. That library's column (`lib`) exists only in the author's local
 checkout (files listed in `.gitignore`); a clone runs the other subjects.
 
 ## Layout
 
 | file | what |
 |---|---|
-| `src/Numbers.cs` | the contract: `IQiyasNumber<TSelf>`, lanes, dot lanes, the visitors; exp on vectors |
-| `src/Types.cs` | the seventeen stored types and their lane rules |
-| `src/Blocks.cs`, `src/Ptx.Blocks.cs`, `src/BlockProducts.cs` | the block formats Q8_0, Q4_0, Q4_K, Q6_K and bool: the codecs (CPU and device encoders, a thread per block), the block-scaled integer gemv |
-| `src/MatMulBlocks.cs` | the block-scaled tiled product A·Bᵀ of Q8_0 / Q4_0 on the CPU (the s8 dot lane) and the device (the s8 tensor instruction at k = 32), and its measured choice against the decoded route |
-| `src/Report.cs` | `--report`: the facts and measured decisions of each device, the buffers' costs and steady state |
-| `src/Arena.cs` | the device's buffer arena: a scope's buffers bumped in one region, released from the top, the region grown between calls |
-| `src/Workspace.cs` | the CPU product's per-thread workspace (packed B, loaded A / B, C lanes, A panels) |
+| `src/Adad/Abstractions/` | the device contract: `IDevice<TBuffer, TIndex>` and its families (memory, element-wise, reductions, rows, layouts, products, attention, optimizers, convolution, recurrent, routing, ctc); `Fmt` and `Lane`, the stored formats and lanes described once for every device |
+| `src/Adad/Kernels.Device.cs`, `src/Adad/GpuOps.Device.cs` | the CPU and CUDA as devices: the contract on byte arrays and on device pointers |
+| `src/Adad/Numbers.cs` | the contract: `IAdad<TSelf>`, lanes, dot lanes, the visitors; exp on vectors |
+| `src/Adad/Types.cs` | the seventeen stored types and their lane rules |
+| `src/Adad/Blocks.cs`, `src/Adad/Ptx.Blocks.cs`, `src/Adad/BlockProducts.cs` | the block formats Q8_0, Q4_0, Q4_K, Q6_K and bool: the codecs (CPU and device encoders, a thread per block), the block-scaled integer gemv |
+| `src/Adad/MatMulBlocks.cs` | the block-scaled tiled product A·Bᵀ of Q8_0 / Q4_0 on the CPU (the s8 dot lane) and the device (the s8 tensor instruction at k = 32), and its measured choice against the decoded route |
+| `src/Adad/Report.cs` | `--report`: the facts and measured decisions of each device, the buffers' costs and steady state |
+| `src/Adad/Arena.cs` | the device's buffer arena: a scope's buffers bumped in one region, released from the top, the region grown between calls |
+| `src/Adad/Workspace.cs` | the CPU product's per-thread workspace (packed B, loaded A / B, C lanes, A panels) |
 | `docs/wip/` | the regression comparer (`compare.py`), the baseline run it compares against (`baseline.md`), the README Results generator (`readme_results.py`) |
-| `src/Convert.cs` | every load and store on vectors; `Widths`, any lane to any lane |
-| `src/Kernels.cs` | the CPU kernels: add, product (GotoBLAS-shaped, dot lanes in groups), softmax, rms_norm |
-| `src/Map.cs`, `src/Ptx.Map.cs` | the element-wise family: the catalogue of formulas (with float64 references), the CPU kernel, the device kernel |
-| `src/Rows.cs`, `src/Ptx.Rows.cs`, `src/GpuOps.Rows.cs`, `src/Bench/RowInputs.cs` | the row family: the catalogue (references, error scales), the CPU kernels, the device kernels, the inputs and tolerance shared by the checks and the bench |
-| `src/Routing.cs`, `src/Ptx.Routing.cs`, `src/GpuOps.Routing.cs` | top-k, pick, sampling, the route, the cross-entropy loss per row (one pass); its backward is a row operation |
-| `src/Ptx.Radix.cs`, `src/GpuOps.Radix.cs` | the device's ordering by target for scatter-add and the route: counts, the multi-block exclusive scan, the stable LSD radix sort |
-| `src/Ctc.cs`, `src/Ptx.Ctc.cs`, `src/GpuOps.Ctc.cs` | ctc: the arguments and the float64 reference, the CPU kernel, the device kernels (rows, then a block per sequence) |
-| `src/Recurrent.cs`, `src/Ptx.Recurrent.cs`, `src/GpuOps.Recurrent.cs`, `src/Bench/RecurrentCases.cs` | LSTM and GRU cells and steps, forward and backward |
-| `src/Conv.cs`, `src/GpuOps.Conv.cs` | convolution: the forward fused into the product's packing (implicit GEMM: the image read through the index map; on the device's plain lanes a measured choice against im2col), the backward as im2col / product / col2im compositions |
-| `src/Optimizers.cs`, `src/Ptx.Optimizers.cs`, `src/GpuOps.Optimizers.cs` | optimizer steps: sgd with momentum, adam, adamw |
-| `src/Attention.cs`, `src/Ptx.Attention.cs`, `src/GpuOps.Attention.cs` | attention: the measured choice, the composition in lane storage, the fused decode kernel, the backward composition; the lane-storage conversions |
-| `src/AttentionRows.cs`, `src/Ptx.AttentionRows.cs`, `src/Ptx.AttentionMma.cs` | attention's fused rows (flash: keys in tiles, the softmax online, no scores in memory) on the CPU and the device; on the device the tensor instructions for float16, bfloat16 and the 8-bit floats |
-| `src/Ptx.AttentionBackward.cs` | attention's fused backward on the device (dQ by the rows, dK and dV by the keys) |
-| `src/Products.cs`, `src/GpuOps.Products.cs` | products on views (transposed operands, batches) and the matmul backward: the product's packing reads the operands where they are stored (`Kernels.Operands`; the device's tensor and dot routes), otherwise through the strided copy |
-| `src/Layout.cs`, `src/Ptx.Layout.cs`, `src/GpuOps.Layout.cs`, `src/Bench/LayoutCases.cs` | layout and indexing: the references, the CPU kernels, the device kernels, the gate's and the bench's cases |
-| `src/Reduce.cs`, `src/Ptx.Reduce.cs` | reductions (sum, sum of squares, max, min, argmax: whole, rows, columns), row-vector broadcasts, transpose, gemv: the CPU kernels, the device kernels |
-| `src/Functions.cs` | log, sin, cos, expm1, tanh, sigmoid, erf, erfc on vectors: coefficient tables shared with the device emitter |
-| `src/Team.cs` | the CPU thread team (jobs closed on completion, so a late worker never takes a chunk under the next job's half-written description) |
-| `src/Gpu.cs`, `src/Ptx.cs`, `src/GpuOps.cs` | the CUDA side: driver binding, PTX generation, the operations |
-| `src/Checks.cs` | the proofs |
-| `src/CpuGeneric.cs`, `src/GenericPtx.cs` | the `INumberBase<T>` version (the `number` column) |
-| `src/Bench/` | the bench contract, the type registry, the subjects |
-| `Program.cs` | the harness |
+| `src/Adad/Convert.cs` | every load and store on vectors; `Widths`, any lane to any lane |
+| `src/Adad/Kernels.cs` | the CPU kernels: add, product (GotoBLAS-shaped, dot lanes in groups), softmax, rms_norm |
+| `src/Adad/Map.cs`, `src/Adad/Ptx.Map.cs` | the element-wise family: the catalogue of formulas (with float64 references), the CPU kernel, the device kernel |
+| `src/Adad/Rows.cs`, `src/Adad/Ptx.Rows.cs`, `src/Adad/GpuOps.Rows.cs`, `src/Qiyas.Checks/Bench/RowInputs.cs` | the row family: the catalogue (references, error scales), the CPU kernels, the device kernels, the inputs and tolerance shared by the checks and the bench |
+| `src/Adad/Routing.cs`, `src/Adad/Ptx.Routing.cs`, `src/Adad/GpuOps.Routing.cs` | top-k, pick, sampling, the route, the cross-entropy loss per row (one pass); its backward is a row operation |
+| `src/Adad/Ptx.Radix.cs`, `src/Adad/GpuOps.Radix.cs` | the device's ordering by target for scatter-add and the route: counts, the multi-block exclusive scan, the stable LSD radix sort |
+| `src/Adad/Ctc.cs`, `src/Adad/Ptx.Ctc.cs`, `src/Adad/GpuOps.Ctc.cs` | ctc: the arguments and the float64 reference, the CPU kernel, the device kernels (rows, then a block per sequence) |
+| `src/Adad/Recurrent.cs`, `src/Adad/Ptx.Recurrent.cs`, `src/Adad/GpuOps.Recurrent.cs`, `src/Qiyas.Checks/Bench/RecurrentCases.cs` | LSTM and GRU cells and steps, forward and backward |
+| `src/Adad/Conv.cs`, `src/Adad/GpuOps.Conv.cs` | convolution: the forward fused into the product's packing (implicit GEMM: the image read through the index map; on the device's plain lanes a measured choice against im2col), the backward as im2col / product / col2im compositions |
+| `src/Adad/Optimizers.cs`, `src/Adad/Ptx.Optimizers.cs`, `src/Adad/GpuOps.Optimizers.cs` | optimizer steps: sgd with momentum, adam, adamw |
+| `src/Adad/Attention.cs`, `src/Adad/Ptx.Attention.cs`, `src/Adad/GpuOps.Attention.cs` | attention: the measured choice, the composition in lane storage, the fused decode kernel, the backward composition; the lane-storage conversions |
+| `src/Adad/AttentionRows.cs`, `src/Adad/Ptx.AttentionRows.cs`, `src/Adad/Ptx.AttentionMma.cs` | attention's fused rows (flash: keys in tiles, the softmax online, no scores in memory) on the CPU and the device; on the device the tensor instructions for float16, bfloat16 and the 8-bit floats |
+| `src/Adad/Ptx.AttentionBackward.cs` | attention's fused backward on the device (dQ by the rows, dK and dV by the keys) |
+| `src/Adad/Products.cs`, `src/Adad/GpuOps.Products.cs` | products on views (transposed operands, batches) and the matmul backward: the product's packing reads the operands where they are stored (`Kernels.Operands`; the device's tensor and dot routes), otherwise through the strided copy |
+| `src/Adad/Layout.cs`, `src/Adad/Ptx.Layout.cs`, `src/Adad/GpuOps.Layout.cs`, `src/Qiyas.Checks/Bench/LayoutCases.cs` | layout and indexing: the references, the CPU kernels, the device kernels, the gate's and the bench's cases |
+| `src/Adad/Reduce.cs`, `src/Adad/Ptx.Reduce.cs` | reductions (sum, sum of squares, max, min, argmax: whole, rows, columns), row-vector broadcasts, transpose, gemv: the CPU kernels, the device kernels |
+| `src/Adad/Functions.cs` | log, sin, cos, expm1, tanh, sigmoid, erf, erfc on vectors: coefficient tables shared with the device emitter |
+| `src/Adad/Team.cs` | the CPU thread team (jobs closed on completion, so a late worker never takes a chunk under the next job's half-written description) |
+| `src/Adad/Gpu.cs`, `src/Adad/Ptx.cs`, `src/Adad/GpuOps.cs` | the CUDA side: driver binding, PTX generation, the operations |
+| `src/Qiyas.Checks/Checks.cs`, `src/Qiyas.Checks/References.cs` | the proofs; the float64 references the proofs and the bench score against |
+| `bench/Qiyas.Bench/CpuGeneric.cs`, `bench/Qiyas.Bench/GenericPtx.cs` | the `INumberBase<T>` version (the `number` column) |
+| `src/Qiyas.Checks/Bench/` | the bench contract, the type registry, the Adad subject |
+| `bench/Qiyas.Bench/Program.cs` | the harness |
 
 ## Results
 
@@ -153,17 +164,17 @@ driver 610.88, PTX target sm_80; Windows 11, .NET 10.0.12). The tables are assem
 (2026-11-07, the end of item 6): item 6's capped full run, stopped at the owner's request (its core-and-products
 invocation at every type and its lib-and-number invocation complete, the third partial), and the single-family runs of
 items 5 and 6, each cell taking each subject's newest reading of code that is in main and unchanged since; a cell none
-of those runs measured keeps item 4's reading (3512 of the 4234 rows' Qiyas cells). `docs/wip/baseline.md` names each
+of those runs measured keeps item 4's reading (3512 of the 4234 rows' Adad cells). `docs/wip/baseline.md` names each
 row's run in its source column. Compared cell by cell against item 4's baseline by `docs/wip/compare.py`: 93 cells
 slower by more than 5 %, 6 errors grown (each a lane change recorded in `COVERAGE.md`), 18 new rows (the CPU's q6_k
 and bool, q4_k's softmax and rms_norm); the slower cells are single readings, listed in `COVERAGE.md`'s "Known slow".
 Device bandwidth rows follow the driver's memory P-state (a row timed at P3 reads up to about 1.9× its P1 time);
 setting "Prefer maximum performance" for dotnet.exe in the NVIDIA control panel gives stable readings.
 
-The full table with every subject's lane and error is `docs/wip/baseline.md`; the three columns are the library Qiyas
+The full table with every subject's lane and error is `docs/wip/baseline.md`; the three columns are the library Adad
 is measured against (`lib`, present only in the author's checkout), the `INumberBase<T>` version (`number`, — where
-.NET has no such type) and Qiyas. Times are medians in ms. Every subject's error is against float64 math (products in
-double-double). Qiyas's error is equal to or below the library's on every row the two share except six CUDA rows. One
+.NET has no such type) and Adad (`qiyas` in that file: the library's name before it was Adad). Times are medians in ms. Every subject's error is against float64 math (products in
+double-double). Adad's error is equal to or below the library's on every row the two share except six CUDA rows. One
 was measured in this assembly: float16 softmax (9.54e-7 against 9.53e-7, both at float16's half step: an output near a
 rounding midpoint whose f32 value lands about one f32 step off). Five carry item 4's reading: float32 sin 7.99e-8
 against 7.09e-8, cos 7.96e-8 against 7.07e-8, silu 4.58e-7 against 4.57e-7, sum:rows bfloat16 1e-5 against 7.63e-6,
@@ -171,11 +182,11 @@ sum:whole float8_e5m2 3.66e-4 against 6.1e-5. Their code changed after item 4 (0
 it, but no run in this assembly re-timed those cells, so the file shows item 4's errors for them. Rows measured here
 that are below the library's: float32 gelu 2.42e-7 against 3.13e-7, sum:rows float16 3.81e-6 against 1.04e-5, and the
 whole sums with each thread's values compensated and the partials joined in float64: float32 4.87e-5 against 1.95e-4,
-float16 2.97e-5 against 9.08e-5. Qiyas's error is exact (0) wherever the lane is exact; the CUDA float64 product takes
+float16 2.97e-5 against 9.08e-5. Adad's error is exact (0) wherever the lane is exact; the CUDA float64 product takes
 the sliced 8-bit tensor route (`f64x`, proven exact, 4.15 ms against 23.1 in the float64 lane). The block formats and
 bool have no lib or number column (—): the lib has no such types.
 
-**CUDA (2048³ product, 16M-value add, 4096×4096 rows)** — lib / number / **qiyas** / × (× = lib ÷ qiyas)
+**CUDA (2048³ product, 16M-value add, 4096×4096 rows)** — lib / number / **adad** / × (× = lib ÷ adad)
 
 | type | add | matmul | softmax | rms_norm |
 |---|---|---|---|---|
@@ -203,7 +214,7 @@ bool have no lib or number column (—): the lib has no such types.
 | q6_k | — / — / **1.398** / — | — / — / **0.955** / — | — / — / **1.196** / — | — / — / **1.198** / — |
 | bool | — / — / **0.017** / — | — / — / **0.122** / — |  |  |
 
-**CPU (1024³ product, 16M-value add, 4096×4096 rows)** — lib / number / **qiyas** / × (× = lib ÷ qiyas)
+**CPU (1024³ product, 16M-value add, 4096×4096 rows)** — lib / number / **adad** / × (× = lib ÷ adad)
 
 | type | add | matmul | softmax | rms_norm |
 |---|---|---|---|---|
@@ -231,7 +242,7 @@ bool have no lib or number column (—): the lib has no such types.
 | q6_k | — / — / **10.344** / — | — / — / **10.107** / — | — / — / **11.383** / — | — / — / **5.618** / — |
 | bool | — / — / **4.923** / — | — / — / **1.358** / — |  |  |
 
-**Every family** — rows measured (operation × type) and, where the lib has the row, the geometric mean of lib ÷ qiyas
+**Every family** — rows measured (operation × type) and, where the lib has the row, the geometric mean of lib ÷ adad
 
 | family | operations | CUDA rows | CUDA vs lib | CPU rows | CPU vs lib |
 |---|---:|---:|---|---:|---|
@@ -247,7 +258,7 @@ bool have no lib or number column (—): the lib has no such types.
 | recurrent | 8 | 72 | — | 65 | — |
 | routing, losses | 8 | 86 | — | 72 | — |
 
-Where Qiyas is not ahead: the memory-bound adds of the 32- and 64-bit types, which move the same bytes (CUDA float32
+Where Adad is not ahead: the memory-bound adds of the 32- and 64-bit types, which move the same bytes (CUDA float32
 0.263 against 0.263; CPU float32 3.03 against 3.05, float64 6.91 against 6.25 from separate invocations of the run);
 the CUDA float32 row sums and transpose (0.089 and 0.192 against 0.089 and 0.191); and the CPU's bfloat16 add (1.17
 against the library's 1.14, its lib reading from item 4's run). The CUDA float64 product is exact where the library
@@ -269,6 +280,6 @@ comparison have confirmed.
 
 ## License
 
-Qiyas is licensed under the [Apache License, Version 2.0](LICENSE); see also [NOTICE](NOTICE).
+Qiyas and Adad are licensed under the [Apache License, Version 2.0](LICENSE); see also [NOTICE](NOTICE).
 Copyright (c) 2026 Ahmed Seada. Contributions are accepted under the [Contributor License Agreement](CLA.md);
 [CONTRIBUTING.md](CONTRIBUTING.md) explains how to sign it and what a pull request must pass.

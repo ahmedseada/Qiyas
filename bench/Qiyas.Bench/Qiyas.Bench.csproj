@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Qiyas, the bench: the proofs first, then Adad measured against the other subjects. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Qiyas</RootNamespace>
+    <TieredPGO>true</TieredPGO>
+    <ServerGarbageCollector>false</ServerGarbageCollector>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Adad\Adad.csproj" />
+    <ProjectReference Include="..\..\src\Qiyas.Checks\Qiyas.Checks.csproj" />
+    <Using Include="Adad" />
+    <!-- The stored integer types by their names, as inside the library (not System's). -->
+    <Using Include="Adad.Int64" Alias="Int64" />
+    <Using Include="Adad.Int32" Alias="Int32" />
+    <Using Include="Adad.Int16" Alias="Int16" />
+    <Using Include="Adad.UInt64" Alias="UInt64" />
+    <Using Include="Adad.UInt32" Alias="UInt32" />
+    <Using Include="Adad.UInt16" Alias="UInt16" />
+  </ItemGroup>
+</Project>
