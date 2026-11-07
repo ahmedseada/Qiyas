@@ -1062,10 +1062,12 @@ internal static partial class Checks
     /// between them is required) and apart, a blank other than class 0. The recursion runs 2T steps over log values up to
     /// |log P|, so the tolerance takes T · |log P| lane steps. A sequence no alignment fits (types with an infinity): loss
     /// +∞, gradient 0. The gradient of each frame sums to 0 (float32, float64).</summary>
-    public static bool Ctcs(GpuOps? ops)
+    // blocks: false where the device refuses the block formats (said so, not proved).
+    public static bool Ctcs(IDevice<ulong, ulong>? ops, string device = "device", bool blocks = true)
     {
         bool ok = true;
-        string where = ops is null ? "cpu" : "device";
+        string where = ops is null ? "cpu" : device;
+        var cuda = ops as GpuOps;
         var cases = new List<(CtcArgs A, bool Impossible)>
         {
             (new(11, 4, 7, 0, [11, 9, 11, 7], [3, 4, 0, 3], [1, 2, 3, 2, 2, 4, 5, 3, 1, 3]), false),
@@ -1096,12 +1098,12 @@ internal static partial class Checks
             if (worst > 1e-7) { Console.WriteLine($"check ctc reference T{a.T} B{a.B} C{a.C}: the gradient differs from the loss's differences by {worst:R}"); ok = false; }
         }
 
-        // The device: the one-state kernel (every case's states fit a thread each), then the general kernel.
-        foreach (bool? one in ops is null ? new bool?[] { null } : new bool?[] { null, false })
+        // CUDA: the one-state kernel (every case's states fit a thread each), then the general kernel.
+        foreach (bool? one in cuda is null ? new bool?[] { null } : new bool?[] { null, false })
         foreach (var type in Bench.Registry.Names)
         {
-            if (!Bench.Registry.IsFloat(type)) continue;
-            if (ops is not null) ops.CtcOneState = one;
+            if (!Bench.Registry.IsFloat(type) || (!blocks && Bench.Registry.IsBlock(type))) continue;
+            if (cuda is not null) cuda.CtcOneState = one;
             bool infinity = type is "float32" or "float64" or "float16" or "bfloat16";
             foreach (var (a, impossible) in cases)
             {
@@ -1148,24 +1150,23 @@ internal static partial class Checks
             }
         }
 
-        if (ops is not null) ops.CtcOneState = null;
-        if (ok) Console.WriteLine($"check ctc                    {where,-6} every float type: loss and gradient (the reference's gradient by central differences), short and 81-state sequences, empty and repeated labels, another blank, no alignment, within the recursion's rounding");
+        if (cuda is not null) cuda.CtcOneState = null;
+        if (ok) Console.WriteLine($"check ctc                    {where,-6} every float type{(blocks ? "" : " but the block formats")}: loss and gradient (the reference's gradient by central differences), short and 81-state sequences, empty and repeated labels, another blank, no alignment, within the recursion's rounding");
         return ok;
     }
 
-    private sealed class CtcRun(GpuOps? ops, CtcArgs a, byte[] x, byte[] loss, byte[]? grad) : Bench.IFloatTypeVisitor<bool>
+    private sealed class CtcRun(IDevice<ulong, ulong>? ops, CtcArgs a, byte[] x, byte[] loss, byte[]? grad) : Bench.IFloatTypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
         {
             if (ops is null) { Kernels.Ctc<TN>(a, x, loss, grad); return true; }
-            var gpu = ops.Gpu;
-            ulong dx = gpu.Rent(x.Length), dl = gpu.Rent(loss.Length), dg = grad is null ? 0 : gpu.Rent(grad.Length);
-            Adad.Cuda.Gpu.Upload<byte>(x, dx);
+            ulong dx = ops.Rent(x.Length + 16), dl = ops.Rent(loss.Length + 16), dg = grad is null ? 0 : ops.Rent(grad.Length + 16);
+            ops.Upload(x, dx);
             ops.Ctc<TN>(a, dx, dl, dg);
-            Adad.Cuda.Gpu.Synchronize();
-            Adad.Cuda.Gpu.Download<byte>(dl, loss);
-            if (grad is not null) { Adad.Cuda.Gpu.Download<byte>(dg, grad); gpu.Return(dg); }
-            gpu.Return(dx); gpu.Return(dl);
+            ops.Synchronize();
+            ops.Download(dl, loss);
+            if (grad is not null) { ops.Download(dg, grad); ops.Return(dg); }
+            ops.Return(dx); ops.Return(dl);
             return true;
         }
     }

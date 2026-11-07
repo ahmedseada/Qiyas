@@ -136,5 +136,4 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
     public string GruSequenceBackward<TN>(CellArgs a, int T, ulong x, ulong h0, ulong w, ulong u, ulong bias, ulong biasH, ulong dhOut, ulong dx, ulong dh0, ulong dw, ulong du, ulong db, ulong dbh)
         where TN : struct, IFloatAdad<TN> => throw Missing("gru sequence backward");
 
-    public string Ctc<TN>(CtcArgs a, ulong x, ulong loss, ulong grad) where TN : struct, IFloatAdad<TN> => throw Missing("ctc");
 }
