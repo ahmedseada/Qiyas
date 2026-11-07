@@ -15,8 +15,11 @@ public sealed partial class VulkanOps
     /// <summary>A layout operation (LayoutArgs.Names) from x (and the index array, and x2) into output, all on the device. Returns the lane's name.</summary>
     public string Layout<TN>(LayoutArgs k, ulong x, ulong idx, ulong output, ulong x2) where TN : struct, IAdad<TN>
     {
+        k = k.ForKernels();
         var f = Fmt.Of<TN>();
-        var (rows, cols) = LayoutArgs.OutputRows(k);
+        var (_, cols) = LayoutArgs.OutputRows(k);
+        // A six-dimensional view takes its own kernel (the four-dimensional one keeps its three divisions a value).
+        string kn = k.Name == "strided" && k.P.Length == 13 ? "strided6" : k.Name;
         Lane lane;
         if (LayoutArgs.Sums(k.Name))
         {
@@ -46,15 +49,15 @@ public sealed partial class VulkanOps
                 int windows = k.P[0] * OH * OW;
                 aux = vk.Rent(Math.Max(1, windows) * 4L);
                 var argmax = vk.Cached($"layout_argmax:{k.Name}:{f.Name}:{lane.Name}", () => VkKernels.LayoutWindowArgmax(vk, f, lane, k.Name));
-                if (windows > 0) vk.Launch(argmax, Groups(windows, VkKernels.Threads), 1, VkKernels.LayoutSlots(0, x2, 0, 0, aux, windows, 0, 0, k.P));
+                if (windows > 0) vk.Launch(argmax, Groups(windows, VkKernels.Threads), 1, VkKernels.LayoutSlots(0, x2, 0, 0, aux, windows, 0, k.P));
             }
 
             if (k.Count > 0 && f.IsBlock)
-                Encode(f, k.Count, vk.Cached($"block_layout:{k.Name}:{f.Name}:{lane.Name}", () => VkKernels.BlockLayout(vk, f, lane, k.Name)), output, VkKernels.LayoutSlots(x, x2, idx, aux, output, k.Count, rows, cols, k.P));
+                Encode(f, k.Count, vk.Cached($"block_layout:{kn}:{f.Name}:{lane.Name}", () => VkKernels.BlockLayout(vk, f, lane, kn)), output, VkKernels.LayoutSlots(x, x2, idx, aux, output, k.Count, cols, k.P));
             else if (k.Count > 0)
             {
-                var fn = vk.Cached($"layout:{k.Name}:{f.Name}:{lane.Name}", () => VkKernels.Layout(vk, f, lane, k.Name));
-                vk.Launch(fn, Groups(f.Words(k.Count), VkKernels.Threads), 1, VkKernels.LayoutSlots(x, x2, idx, aux, output, k.Count, rows, cols, k.P));
+                var fn = vk.Cached($"layout:{kn}:{f.Name}:{lane.Name}", () => VkKernels.Layout(vk, f, lane, kn));
+                vk.Launch(fn, Groups(f.Words(k.Count), VkKernels.Threads), 1, VkKernels.LayoutSlots(x, x2, idx, aux, output, k.Count, cols, k.P));
             }
         }
         finally

@@ -5,8 +5,8 @@
 // output word computes each of its values from the output index (a gather; the sums — scatter-add, col2im, the pools'
 // backwards, the depthwise convolution — in the sum lane, converted on the store), so every word is written by one
 // invocation and no format needs atomics. Inputs are read where they are stored (Codec.UnpackAt).
-// Arguments: x, x2, idx, aux, out (slots 0–4), count (5), rows (6), cols (7), then the operation's twelve integers
-// (LayoutArgs order) two to a slot, low half first (8–13).
+// Arguments: x, x2, idx, aux, out (slots 0–4), count and cols (5, cols in the high half), then the operation's sixteen
+// integers (LayoutArgs.KernelP) two to a slot, low half first (6–13): the slots a block encoder's source takes.
 // Scatter-add's ordering is built first: the sources counted per target (integer atomics: exact), the offsets by a
 // scan, the sources' stable order by target by the radix sort (Kernels.Radix.cs).
 using Adad.Abstraction;
@@ -16,19 +16,23 @@ namespace Adad.Vulkan;
 internal static partial class VkKernels
 {
     /// <summary>The layout arguments in their slots (see the file's note).</summary>
-    public static ulong[] LayoutSlots(ulong x, ulong x2, ulong idx, ulong aux, ulong output, int count, int rows, int cols, int[] p)
+    public static ulong[] LayoutSlots(ulong x, ulong x2, ulong idx, ulong aux, ulong output, int count, int cols, int[] p)
     {
-        var args = new ulong[14];
+        if (p.Length > LayoutParamCount) throw new ArgumentException($"layout: {p.Length} parameters (the kernels take {LayoutParamCount})");
+        var args = new ulong[6 + LayoutParamCount / 2];
         args[0] = x; args[1] = x2; args[2] = idx; args[3] = aux; args[4] = output;
-        args[5] = (uint)count; args[6] = (uint)rows; args[7] = (uint)cols;
-        for (int j = 0; j < 6; j++)
+        args[5] = (uint)count | (ulong)(uint)cols << 32;
+        for (int j = 0; j < LayoutParamCount / 2; j++)
         {
             uint lo = 2 * j < p.Length ? (uint)p[2 * j] : 0, hi = 2 * j + 1 < p.Length ? (uint)p[2 * j + 1] : 0;
-            args[8 + j] = lo | (ulong)hi << 32;
+            args[6 + j] = lo | (ulong)hi << 32;
         }
 
         return args;
     }
+
+    /// <summary>The integer parameters a layout kernel takes (LayoutArgs.KernelP: a six-dimensional view's thirteen the most).</summary>
+    public const int LayoutParamCount = 16;
 
     private readonly struct LayoutIn
     {
@@ -38,11 +42,12 @@ internal static partial class VkKernels
         public LayoutIn(Spv b)
         {
             X = b.Arg(0); X2 = b.Arg(1); Idx = b.Arg(2); Aux = b.Arg(3); Out = b.Arg(4);
-            Count = b.Arg(5, K.U32); Cols = b.Arg(7, K.U32);
-            P = new V[12];
-            for (int i = 0; i < 12; i++)
+            var sizes = b.Arg(5);
+            Count = b.Convert(sizes, K.U32); Cols = b.Convert(sizes >> 32, K.U32);
+            P = new V[LayoutParamCount];
+            for (int i = 0; i < LayoutParamCount; i++)
             {
-                var raw = b.Arg(8 + i / 2);
+                var raw = b.Arg(6 + i / 2);
                 P[i] = b.Convert(i % 2 == 0 ? raw : raw >> 32, K.U32);
             }
         }
@@ -93,8 +98,8 @@ internal static partial class VkKernels
         b.If(i < a.Count, () =>
         {
             V H = p[1], W = p[2];
-            var OH = adaptive ? p[3] : PoolSize(p[1], p[3], p[5], p[7], null);
-            var OW = adaptive ? p[4] : PoolSize(p[2], p[4], p[6], p[8], null);
+            var OH = adaptive ? p[3] : PoolSize(p[1], p[3], p[5], p[7], null, p[11]);
+            var OW = adaptive ? p[4] : PoolSize(p[2], p[4], p[6], p[8], null, p[11]);
             var ow = i % OW;
             var t = i / OW;
             var oh = t % OH;
@@ -165,12 +170,74 @@ internal static partial class VkKernels
         return (start, end - start);
     }
 
-    // A pool's (dilation 1) or a depthwise convolution's output size: (size + 2·pad − (k − 1)·d − 1) / s + 1.
-    private static V PoolSize(V size, V k, V s, V pad, V? d)
+    // A pool's (dilation 1) or a convolution's output size (LayoutArgs.PoolSize): (size + 2·pad − (k − 1)·d − 1) / s + 1, or
+    // with ceil (≠ 0) rounded up and the last window dropped when it starts past the input and its leading pad.
+    private static V PoolSize(V size, V k, V s, V pad, V? d, V? ceil = null)
     {
         var u = k - 1;
         if (d is V dd) u = u * dd;
-        return ((pad << 1) + size - u - 1) / s + 1;
+        var span = (pad << 1) + size - u - 1;
+        var floor = span / s + 1;
+        if (ceil is not V cm) return floor;
+        var b = size.B;
+        var up = (span + s - 1) / s;
+        up = b.Select(up * s >= size + pad, up, up + 1);
+        return b.Select(cm != 0, up, floor);
+    }
+
+    // LayoutArgs.PoolDivisor: window (oh, ow)'s divisor, its `inside` count or, counting the pads (p[12] ≠ 0), its positions up
+    // to H + ph, W + pw (signed: a window may start in the leading pad).
+    private static V PoolDivisor(Spv b, V[] p, V oh, V ow, V inside)
+    {
+        V Extent(V o, V size, V k, V s, V pad)
+        {
+            var hs = b.Bitcast(o * s - pad, K.S32);
+            var he = b.Min(hs + b.Bitcast(k, K.S32), b.Bitcast(size + pad, K.S32));
+            return b.Bitcast(he - hs, K.U32);
+        }
+
+        var d = Extent(oh, p[1], p[3], p[5], p[7]) * Extent(ow, p[2], p[4], p[6], p[8]);
+        return b.Select(p[12] != 0, d, inside);
+    }
+
+    // An interpolation axis as integers (LayoutArgs.InterpolateAxis): t = max(o·α + β, 0) (β may be negative), i0 = t / δ;
+    // past the input's last position both rows the last and the weight 0; f = (t − i0·δ) / δ in the lane, g = 1 − f.
+    private static (V I0, V I1, V F, V G) BilinearAxis(Spv b, K k, V o, V inp, V alpha, V beta, V delta)
+    {
+        var t = b.Bitcast(b.Max(b.Bitcast(o * alpha + beta, K.S32), b.S(0)), K.U32);
+        var i0 = t / delta;
+        var rem = t - i0 * delta;
+        var last = inp - 1;
+        var past = i0 >= last;
+        i0 = b.Min(i0, last);
+        var i1 = b.Min(i0 + 1, last);
+        var f = b.Convert(b.Select(past, b.U(0), rem), k) / b.Convert(delta, k);
+        return (i0, i1, f, b.C(k, 1) - f);
+    }
+
+    // A nearest axis: min((o·α + β) / δ, in − 1).
+    private static V NearestAxis(V o, V inp, V alpha, V beta, V delta) => o.B.Min((o * alpha + beta) / delta, inp - 1);
+
+    // The outputs [lo, end) whose source rows include input row i (LayoutArgs.InterpolateSources, its hi + 1).
+    private static (V Lo, V End) SourceRange(Spv b, bool bilinear, V i, V inp, V outp, V alpha, V beta, V delta)
+    {
+        var none = alpha == 0;                                                          // every output reads every row
+        var a1 = b.Select(none, b.U(1), alpha);
+        // ⌈n / α⌉ of a signed n, 0 where n ≤ 0 (the range starts at 0, or is empty).
+        V CeilPos(V n) => b.Select(b.Bitcast(n, K.S32) > b.S(0), (n + a1 - 1) / a1, b.U(0));
+        var lo = bilinear ? b.Select(i <= 1, b.U(0), CeilPos((i - 1) * delta - beta)) : CeilPos(i * delta - beta);
+        var end = b.Min(b.Select(i == inp - 1, outp, CeilPos((i + 1) * delta - beta)), outp);
+        return (b.Select(none, b.U(0), lo), b.Select(none, outp, end));
+    }
+
+    // The weight output o of an axis gives input position i: nearest 1 where it reads i; bilinear g where its first row is
+    // i, else f where its second is. Returns whether it reads i at all.
+    private static (V Has, V W) AxisWeight(Spv b, K k, bool bilinear, V o, V i, V inp, V alpha, V beta, V delta)
+    {
+        if (!bilinear) return (NearestAxis(o, inp, alpha, beta, delta) == i, b.C(k, 1));
+        var (i0, i1, f, g) = BilinearAxis(b, k, o, inp, alpha, beta, delta);
+        var first = i0 == i;
+        return (first | (i1 == i), b.Select(first, g, f));
     }
 
     // The value of output v (row r, column c) as a lane value.
@@ -199,6 +266,21 @@ internal static partial class VkKernels
                 src = i2 * p[6] + src;
                 src = i3 * p[7] + src;
                 return Load(src);
+            }
+
+            case "strided6":
+            {
+                // Six dimensions (LayoutArgs.StridedKernel): v = ((((i0·d1 + i1)·d2 + i2)·d3 + i3)·d4 + i4)·d5 + i5; source = base + Σ i_d · s_d.
+                var t = v;
+                var src = p[12];
+                for (int d = 5; d >= 1; d--)
+                {
+                    var i = t % p[d];
+                    t = t / p[d];
+                    src = i * p[6 + d] + src;
+                }
+
+                return Load(t * p[6] + src);
             }
 
             case "one_hot":
@@ -262,25 +344,47 @@ internal static partial class VkKernels
 
             case "interpolate_nearest":
             {
-                // r = ch·OH + oh, c = ow: ih = min(H − 1, ((2·oh + 1)·H) / (2·OH)), iw likewise.
-                V H = p[1], W = p[2], OH = p[3], OW = p[4];
+                // r = ch·OH + oh, c = ow; p: C H W OH OW αh βh δh αw βw δw: ih = min((oh·αh + βh) / δh, H − 1), iw likewise.
+                V H = p[1], W = p[2], OH = p[3];
                 var oh = r % OH;
                 var ch = r / OH;
-                var ih = b.Min(((oh << 1) + 1) * H / (OH << 1), H - 1);
-                var iw = b.Min(((c << 1) + 1) * W / (OW << 1), W - 1);
+                var ih = NearestAxis(oh, H, p[5], p[6], p[7]);
+                var iw = NearestAxis(c, W, p[8], p[9], p[10]);
                 return Load((ch * H + ih) * W + iw);
+            }
+
+            case "interpolate_nearest_bwd":
+            case "interpolate_bilinear_bwd":
+            {
+                // Output (ch, ih, iw = c), r = ch·H + ih; x = dy (C × OH × OW): the outputs whose source rows and columns include
+                // the position (oh, then ow ascending; LayoutArgs.InterpolateSources), each dy by its weight: acc = fma(dy, wy·wx, acc).
+                bool bilinear = name == "interpolate_bilinear_bwd";
+                V H = p[1], W = p[2], OH = p[3], OW = p[4];
+                var ih = r % H;
+                var ch = r / H;
+                var (h0, h1) = SourceRange(b, bilinear, ih, H, OH, p[5], p[6], p[7]);
+                var (w0, w1) = SourceRange(b, bilinear, c, W, OW, p[8], p[9], p[10]);
+                var acc = b.Local(Zero());
+                b.For(h0, h1, oh =>
+                {
+                    var (hasY, wy) = AxisWeight(b, k, bilinear, oh, ih, H, p[5], p[6], p[7]);
+                    b.If(hasY, () => b.For(w0, w1, ow =>
+                    {
+                        var (hasX, wx) = AxisWeight(b, k, bilinear, ow, c, W, p[8], p[9], p[10]);
+                        b.If(hasX, () => acc.V = b.Fma(Load((ch * OH + oh) * OW + ow), wy * wx, acc.V));
+                    }));
+                });
+                return acc.V;
             }
 
             case "interpolate_bilinear":
             {
-                // sy = max((oh + ½)·H/OH − ½, 0) in the lane; y0 = min(floor sy, H − 1), y1 = min(y0 + 1, H − 1); x likewise.
-                V H = p[1], W = p[2], OH = p[3], OW = p[4];
+                // p: C H W OH OW αh βh δh αw βw δw: each axis's two rows and weight exactly (BilinearAxis).
+                V H = p[1], W = p[2], OH = p[3];
                 var oh = r % OH;
                 var ch = r / OH;
-                var (y0, y1, fy) = Axis(b, k, oh, H, OH);
-                var (x0, x1, fx) = Axis(b, k, c, W, OW);
-                var gy = b.C(k, 1) - fy;
-                var gx = b.C(k, 1) - fx;
+                var (y0, y1, fy, gy) = BilinearAxis(b, k, oh, H, p[5], p[6], p[7]);
+                var (x0, x1, fx, gx) = BilinearAxis(b, k, c, W, p[8], p[9], p[10]);
                 V Pixel(V yy, V xx) => Load((ch * H + yy) * W + xx);
                 var top = b.Fma(Pixel(y0, x1), fx, Pixel(y0, x0) * gx);
                 var bottom = b.Fma(Pixel(y1, x1), fx, Pixel(y1, x0) * gx);
@@ -310,7 +414,7 @@ internal static partial class VkKernels
                 bool max = name == "maxpool", conv = name == "depthwise_conv";
                 V H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8];
                 V dh = conv ? p[9] : b.U(1), dw = conv ? p[10] : b.U(1);
-                var OH = PoolSize(p[1], p[3], p[5], p[7], conv ? p[9] : null);
+                var OH = PoolSize(p[1], p[3], p[5], p[7], conv ? p[9] : null, p[11]);
                 var oh = r % OH;
                 var ch = r / OH;
                 var acc = b.Local(max ? Identity(b, k, "max") : Zero());
@@ -334,7 +438,7 @@ internal static partial class VkKernels
                 if (conv) return acc.V;
                 var empty = n.V == 0;
                 if (max) return b.Select(empty, Zero(), acc.V);
-                return b.Select(empty, Zero(), acc.V / b.Convert(n.V, k));
+                return b.Select(empty, Zero(), acc.V / b.Convert(PoolDivisor(b, p, oh, c, n.V), k));
             }
 
             case "maxpool_bwd":
@@ -343,8 +447,8 @@ internal static partial class VkKernels
                 // Output (ch, ih, iw = c), r = ch·H + ih; x = dy (C × OH × OW), aux = each window's first largest (maxpool).
                 bool max = name == "maxpool_bwd";
                 V H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8];
-                var OH = PoolSize(p[1], p[3], p[5], p[7], null);
-                var OW = PoolSize(p[2], p[4], p[6], p[8], null);
+                var OH = PoolSize(p[1], p[3], p[5], p[7], null, p[11]);
+                var OW = PoolSize(p[2], p[4], p[6], p[8], null, p[11]);
                 var ih = r % H;
                 var ch = r / H;
                 var me = (ch * H + ih) * W + c;
@@ -381,7 +485,7 @@ internal static partial class VkKernels
                                     b.If(ww < W, () => cnt.V = cnt.V + 1);
                                 }));
                             });
-                            acc.V = acc.V + dy / b.Convert(cnt.V, k);
+                            acc.V = acc.V + dy / b.Convert(PoolDivisor(b, p, oh, ow, cnt.V), k);
                         });
                     }));
                 });
@@ -437,18 +541,6 @@ internal static partial class VkKernels
 
             default: throw new NotSupportedException($"vulkan: layout {name} has no Vulkan kernels yet");
         }
-    }
-
-    // One axis of a bilinear resize: (i0, i1, fraction) for output index o over `inp` input and `outp` output pixels.
-    private static (V I0, V I1, V F) Axis(Spv b, K k, V o, V inp, V outp)
-    {
-        var s = (b.Convert(o, k) + 0.5) * b.Convert(inp, k);
-        s = s / b.Convert(outp, k);
-        s = b.Max(s - 0.5, b.C(k, 0));
-        var last = inp - 1;
-        var i0 = b.Min(b.Convert(b.Floor(s), K.U32), last);
-        var i1 = b.Min(i0 + 1, last);
-        return (i0, i1, s - b.Convert(i0, k));
     }
 
     // ---------------------------------------------------------------- scatter-add's ordering

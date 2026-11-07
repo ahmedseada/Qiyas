@@ -4,16 +4,19 @@
 // The device's layout operations (Layout.cs): a thread per output word computes each of its values from the output
 // index by the operation's rule (a gather; the sums — scatter-add, col2im — in the sum lane, converted on the store),
 // so every word is written by one thread and no format needs atomics. Parameters: the input, the index array, an
-// auxiliary buffer (scatter-add's row offsets and ordered sources), the output, the counts and twelve integers in the
-// operation's order (LayoutArgs).
+// auxiliary buffer (scatter-add's row offsets and ordered sources), the output, the counts and sixteen integers in the
+// operation's order as the kernels take them (LayoutArgs.KernelP).
 using Adad.Abstraction;
 
 namespace Adad.Cuda;
 
 internal static partial class Ptx
 {
-    private const string LayoutParams = ".param .u64 p_x, .param .u64 p_x2, .param .u64 p_idx, .param .u64 p_aux, .param .u64 p_out, .param .u32 p_count, .param .u32 p_rows, .param .u32 p_cols, "
-        + ".param .u32 p_p0, .param .u32 p_p1, .param .u32 p_p2, .param .u32 p_p3, .param .u32 p_p4, .param .u32 p_p5, .param .u32 p_p6, .param .u32 p_p7, .param .u32 p_p8, .param .u32 p_p9, .param .u32 p_p10, .param .u32 p_p11";
+    /// <summary>The integer parameters a layout kernel takes (LayoutArgs.KernelP: a six-dimensional view's thirteen the most).</summary>
+    public const int LayoutParamCount = 16;
+
+    private static readonly string LayoutParams = ".param .u64 p_x, .param .u64 p_x2, .param .u64 p_idx, .param .u64 p_aux, .param .u64 p_out, .param .u32 p_count, .param .u32 p_rows, .param .u32 p_cols, "
+        + string.Join(", ", Enumerable.Range(0, LayoutParamCount).Select(k => $".param .u32 p_p{k}"));
 
     public static string Layout(Gpu gpu, Fmt f, Lane lane, string name, out string entry) => Layout(gpu, f, lane, name, false, out entry);
 
@@ -35,8 +38,8 @@ internal static partial class Ptx
         b.L($"mad.lo.u32 {word}, {bid}, 256, {tid};");
         string x = Param64(b, "p_x"), x2 = Param64(b, "p_x2"), idx = Param64(b, "p_idx"), aux = Param64(b, "p_aux"), outp = Param64(b, "p_out");
         string count = Param32(b, "p_count"), cols = Param32(b, "p_cols");
-        var p = new string[12];
-        for (int k = 0; k < 12; k++) p[k] = Param32(b, $"p_p{k}");
+        var p = new string[LayoutParamCount];
+        for (int k = 0; k < LayoutParamCount; k++) p[k] = Param32(b, $"p_p{k}");
         string words = b.R(), pw = b.P();
         if (f.WordBits == 64) b.L($"mov.u32 {words}, {count};");
         else { b.L($"add.u32 {words}, {count}, {f.Per - 1};"); b.L($"div.u32 {words}, {words}, {f.Per};"); }
@@ -82,8 +85,8 @@ internal static partial class Ptx
         var b = new PtxBuilder();
         string x = Param64(b, "p_x"), x2 = Param64(b, "p_x2"), idx = Param64(b, "p_idx"), aux = Param64(b, "p_aux"), outp = Param64(b, "p_out");
         string count = Param32(b, "p_count"), cols = Param32(b, "p_cols");
-        var p = new string[12];
-        for (int k = 0; k < 12; k++) p[k] = Param32(b, $"p_p{k}");
+        var p = new string[LayoutParamCount];
+        for (int k = 0; k < LayoutParamCount; k++) p[k] = Param32(b, $"p_p{k}");
         int tag = 0;
         string Value(string at, string _)
         {
@@ -115,8 +118,8 @@ internal static partial class Ptx
         b.L($"mad.lo.u32 {at}, {bid}, 256, {tid};");
         string x = Param64(b, "p_x"), x2 = Param64(b, "p_x2"), idx = Param64(b, "p_idx"), aux = Param64(b, "p_aux"), outp = Param64(b, "p_out");
         string count = Param32(b, "p_count"), cols = Param32(b, "p_cols");
-        var p = new string[12];
-        for (int k = 0; k < 12; k++) p[k] = Param32(b, $"p_p{k}");
+        var p = new string[LayoutParamCount];
+        for (int k = 0; k < LayoutParamCount; k++) p[k] = Param32(b, $"p_p{k}");
         // Every launched thread runs to the shuffles (a warp's lanes all take part); past the count a thread computes the
         // last value (dropped) and past the last word stores nothing.
         string words = b.R(), word = b.R(), slot = b.R(), last = b.R(), v = b.R(), pv = b.P(), pw = b.P(), r = b.R(), c = b.R(), t = b.R();
@@ -173,8 +176,8 @@ internal static partial class Ptx
         b.L($"mov.u32 {bid}, %ctaid.x;");
         b.L($"mad.lo.u32 {i}, {bid}, 256, {tid};");
         string x2 = Param64(b, "p_x2"), outp = Param64(b, "p_out"), count = Param32(b, "p_count");
-        var p = new string[12];
-        for (int k = 0; k < 12; k++) p[k] = Param32(b, $"p_p{k}");
+        var p = new string[LayoutParamCount];
+        for (int k = 0; k < LayoutParamCount; k++) p[k] = Param32(b, $"p_p{k}");
         b.L($"setp.ge.u32 {pd}, {i}, {count};");
         b.L($"@{pd} bra DONE;");
         string H = p[1], W = p[2], OH = adaptive ? p[3] : PoolHeight(b, p, false), OW = adaptive ? p[4] : PoolWidth(b, p, false);
@@ -415,42 +418,84 @@ internal static partial class Ptx
                 return acc;
             }
 
+            case "strided6":
+            {
+                // Six dimensions (LayoutArgs.StridedKernel): v = ((((i0·d1 + i1)·d2 + i2)·d3 + i3)·d4 + i4)·d5 + i5; source = base + Σ i_d · s_d.
+                string t = b.R(), src = b.R();
+                b.L($"mov.u32 {t}, {v};");
+                b.L($"mov.u32 {src}, {p[12]};");
+                for (int d = 5; d >= 1; d--)
+                {
+                    string i = b.R();
+                    b.L($"rem.u32 {i}, {t}, {p[d]};");
+                    b.L($"div.u32 {t}, {t}, {p[d]};");
+                    b.L($"mad.lo.u32 {src}, {i}, {p[6 + d]}, {src};");
+                }
+
+                b.L($"mad.lo.u32 {src}, {t}, {p[6]}, {src};");
+                return Load(src);
+            }
+
             case "interpolate_nearest":
             {
-                // r = ch·OH + oh, c = ow: ih = min(H − 1, ((2·oh + 1)·H) / (2·OH)), iw likewise.
-                string H = p[1], W = p[2], OH = p[3], OW = p[4], oh = b.R(), ch = b.R(), ih = b.R(), iw = b.R(), t = b.R(), hm1 = b.R(), wm1 = b.R(), src = b.R();
+                // r = ch·OH + oh, c = ow; p: C H W OH OW αh βh δh αw βw δw: ih = min((oh·αh + βh) / δh, H − 1), iw likewise.
+                string H = p[1], W = p[2], OH = p[3], oh = b.R(), ch = b.R(), src = b.R();
                 b.L($"rem.u32 {oh}, {r}, {OH};");
                 b.L($"div.u32 {ch}, {r}, {OH};");
-                b.L($"shl.b32 {t}, {oh}, 1;");
-                b.L($"add.u32 {t}, {t}, 1;");
-                b.L($"mul.lo.u32 {t}, {t}, {H};");
-                b.L($"shl.b32 {ih}, {OH}, 1;");
-                b.L($"div.u32 {ih}, {t}, {ih};");
-                b.L($"sub.u32 {hm1}, {H}, 1;");
-                b.L($"min.u32 {ih}, {ih}, {hm1};");
-                b.L($"shl.b32 {t}, {c}, 1;");
-                b.L($"add.u32 {t}, {t}, 1;");
-                b.L($"mul.lo.u32 {t}, {t}, {W};");
-                b.L($"shl.b32 {iw}, {OW}, 1;");
-                b.L($"div.u32 {iw}, {t}, {iw};");
-                b.L($"sub.u32 {wm1}, {W}, 1;");
-                b.L($"min.u32 {iw}, {iw}, {wm1};");
+                string ih = NearestAxis(b, oh, H, p[5], p[6], p[7]), iw = NearestAxis(b, c, W, p[8], p[9], p[10]);
                 b.L($"mad.lo.u32 {src}, {ch}, {H}, {ih};");
                 b.L($"mad.lo.u32 {src}, {src}, {W}, {iw};");
                 return Load(src);
             }
 
+            case "interpolate_nearest_bwd":
+            case "interpolate_bilinear_bwd":
+            {
+                // Output (ch, ih, iw = c), r = ch·H + ih; x = dy (C × OH × OW): the outputs whose source rows and columns include
+                // the position (oh, then ow ascending; LayoutArgs.InterpolateSources), each dy by its weight: acc = fma(dy, wy·wx, acc).
+                bool bilinear = name == "interpolate_bilinear_bwd";
+                string H = p[1], W = p[2], OH = p[3], OW = p[4], ih = b.R(), ch = b.R(), acc = lane.NewReg(b);
+                b.L($"rem.u32 {ih}, {r}, {H};");
+                b.L($"div.u32 {ch}, {r}, {H};");
+                var (h0, h1) = SourceRange(b, bilinear, ih, H, OH, p[5], p[6], p[7]);
+                var (w0, w1) = SourceRange(b, bilinear, c, W, OW, p[8], p[9], p[10]);
+                b.L($"mov.{lane.Reg} {acc}, {lane.Zero};");
+                string oh = b.R(), ow = b.R(), pa = b.P(), pb = b.P(), dyIdx = b.R();
+                b.L($"mov.u32 {oh}, {h0};");
+                b.Label($"IA{tag}");
+                b.L($"setp.gt.s32 {pa}, {oh}, {h1};");
+                b.L($"@{pa} bra IA{tag}_END;");
+                var (hasY, wy) = AxisWeight(b, lane, bilinear, oh, ih, H, p[5], p[6], p[7]);
+                b.L($"@!{hasY} bra IA{tag}_NEXT;");
+                b.L($"mov.u32 {ow}, {w0};");
+                b.Label($"IB{tag}");
+                b.L($"setp.gt.s32 {pb}, {ow}, {w1};");
+                b.L($"@{pb} bra IA{tag}_NEXT;");
+                var (hasX, wx) = AxisWeight(b, lane, bilinear, ow, c, W, p[8], p[9], p[10]);
+                b.L($"@!{hasX} bra IB{tag}_NEXT;");
+                b.L($"mad.lo.u32 {dyIdx}, {ch}, {OH}, {oh};");
+                b.L($"mad.lo.u32 {dyIdx}, {dyIdx}, {OW}, {ow};");
+                string w = lane.NewReg(b);
+                b.L(lane.Mul(w, wy, wx));
+                b.L(lane.Fma(acc, Load(dyIdx), w, acc));
+                b.Label($"IB{tag}_NEXT");
+                b.L($"add.u32 {ow}, {ow}, 1;");
+                b.L($"bra IB{tag};");
+                b.Label($"IA{tag}_NEXT");
+                b.L($"add.u32 {oh}, {oh}, 1;");
+                b.L($"bra IA{tag};");
+                b.Label($"IA{tag}_END");
+                return acc;
+            }
+
             case "interpolate_bilinear":
             {
-                // sy = max((oh + ½)·H/OH − ½, 0) in the lane; y0 = min(floor sy, H − 1), y1 = min(y0 + 1, H − 1); x likewise.
-                string H = p[1], W = p[2], OH = p[3], OW = p[4], oh = b.R(), ch = b.R();
+                // p: C H W OH OW αh βh δh αw βw δw: each axis's two rows and weight exactly (BilinearAxis).
+                string H = p[1], W = p[2], OH = p[3], oh = b.R(), ch = b.R();
                 b.L($"rem.u32 {oh}, {r}, {OH};");
                 b.L($"div.u32 {ch}, {r}, {OH};");
-                var (y0, y1, fy) = Axis(b, lane, oh, H, OH);
-                var (x0, x1, fx) = Axis(b, lane, c, W, OW);
-                string gy = lane.NewReg(b), gx = lane.NewReg(b), one = lane.Literal(1);
-                b.L($"sub.rn.{lane.Op} {gy}, {one}, {fy};");
-                b.L($"sub.rn.{lane.Op} {gx}, {one}, {fx};");
+                var (y0, y1, fy, gy) = BilinearAxis(b, lane, oh, H, p[5], p[6], p[7]);
+                var (x0, x1, fx, gx) = BilinearAxis(b, lane, c, W, p[8], p[9], p[10]);
                 string Pixel(string yy, string xx) { string s = b.R(); b.L($"mad.lo.u32 {s}, {ch}, {H}, {yy};"); b.L($"mad.lo.u32 {s}, {s}, {W}, {xx};"); return Load(s); }
                 string top = lane.NewReg(b), bottom = lane.NewReg(b), o = lane.NewReg(b), t1 = lane.NewReg(b), t2 = lane.NewReg(b);
                 b.L(lane.Mul(t1, Pixel(y0, x0), gx));
@@ -540,7 +585,7 @@ internal static partial class Ptx
                 b.L($"setp.eq.u32 {pNone}, {n}, 0;");
                 if (max) return Sel(pNone, Zero(), acc);
                 string nf = lane.NewReg(b), mean = lane.NewReg(b);
-                b.L($"cvt.rn.{lane.Op}.u32 {nf}, {n};");
+                b.L($"cvt.rn.{lane.Op}.u32 {nf}, {PoolDivisor(b, p, oh, c, n)};");
                 b.L($"div.rn.{lane.Op} {mean}, {acc}, {nf};");
                 return Sel(pNone, Zero(), mean);
             }
@@ -629,7 +674,7 @@ internal static partial class Ptx
                     b.L($"bra WA{tag};");
                     b.Label($"WA{tag}_END");
                     string nf = lane.NewReg(b), share = lane.NewReg(b);
-                    b.L($"cvt.rn.{lane.Op}.u32 {nf}, {cnt};");
+                    b.L($"cvt.rn.{lane.Op}.u32 {nf}, {PoolDivisor(b, p, oh, ow, cnt)};");
                     b.L($"div.rn.{lane.Op} {share}, {dy}, {nf};");
                     b.L(lane.Add(acc, acc, share));
                 }
@@ -764,45 +809,168 @@ internal static partial class Ptx
     }
 
     // One axis of a bilinear resize: (i0, i1, fraction) for output index o over `inp` input and `outp` output pixels.
-    private static (string I0, string I1, string F) Axis(PtxBuilder b, Lane lane, string o, string inp, string outp)
+    // An interpolation axis as integers (LayoutArgs.InterpolateAxis): t = max(o·α + β, 0), i0 = t / δ; past the input's
+    // last position both rows the last and the weight 0; f = (t − i0·δ) / δ in the lane (one rounding), g = 1 − f.
+    private static (string I0, string I1, string F, string G) BilinearAxis(PtxBuilder b, Lane lane, string o, string inp, string alpha, string beta, string delta)
     {
-        string of = lane.NewReg(b), inF = lane.NewReg(b), outF = lane.NewReg(b), s = lane.NewReg(b), half = lane.Literal(0.5), zero = lane.Zero;
-        b.L($"cvt.rn.{lane.Op}.u32 {of}, {o};");
-        b.L($"cvt.rn.{lane.Op}.u32 {inF}, {inp};");
-        b.L($"cvt.rn.{lane.Op}.u32 {outF}, {outp};");
-        b.L($"add.rn.{lane.Op} {s}, {of}, {half};");
-        b.L(lane.Mul(s, s, inF));
-        b.L($"div.rn.{lane.Op} {s}, {s}, {outF};");
-        b.L($"sub.rn.{lane.Op} {s}, {s}, {half};");
-        b.L($"max.{lane.Op} {s}, {s}, {zero};");
-        string fl = lane.NewReg(b), i0 = b.R(), i1 = b.R(), m1 = b.R(), fr = lane.NewReg(b), i0f = lane.NewReg(b);
-        b.L($"cvt.rmi.{lane.Op}.{lane.Op} {fl}, {s};");
-        b.L($"cvt.rzi.u32.{lane.Op} {i0}, {fl};");
-        b.L($"sub.u32 {m1}, {inp}, 1;");
-        b.L($"min.u32 {i0}, {i0}, {m1};");
+        string t = b.R(), i0 = b.R(), i1 = b.R(), last = b.R(), rem = b.R(), past = b.P();
+        b.L($"mad.lo.s32 {t}, {o}, {alpha}, {beta};");
+        b.L($"max.s32 {t}, {t}, 0;");
+        b.L($"div.u32 {i0}, {t}, {delta};");
+        b.L($"mul.lo.u32 {rem}, {i0}, {delta};");
+        b.L($"sub.u32 {rem}, {t}, {rem};");
+        b.L($"sub.u32 {last}, {inp}, 1;");
+        b.L($"setp.ge.u32 {past}, {i0}, {last};");
+        b.L($"min.u32 {i0}, {i0}, {last};");
         b.L($"add.u32 {i1}, {i0}, 1;");
-        b.L($"min.u32 {i1}, {i1}, {m1};");
-        b.L($"cvt.rn.{lane.Op}.u32 {i0f}, {i0};");
-        b.L($"sub.rn.{lane.Op} {fr}, {s}, {i0f};");
-        return (i0, i1, fr);
+        b.L($"min.u32 {i1}, {i1}, {last};");
+        b.L($"selp.u32 {rem}, 0, {rem}, {past};");
+        string rf = lane.NewReg(b), df = lane.NewReg(b), f = lane.NewReg(b), g = lane.NewReg(b);
+        b.L($"cvt.rn.{lane.Op}.u32 {rf}, {rem};");
+        b.L($"cvt.rn.{lane.Op}.u32 {df}, {delta};");
+        b.L($"div.rn.{lane.Op} {f}, {rf}, {df};");
+        b.L($"sub.rn.{lane.Op} {g}, {lane.Literal(1)}, {f};");
+        return (i0, i1, f, g);
+    }
+
+    // A nearest axis: min((o·α + β) / δ, in − 1).
+    private static string NearestAxis(PtxBuilder b, string o, string inp, string alpha, string beta, string delta)
+    {
+        string i = b.R(), last = b.R();
+        b.L($"mad.lo.u32 {i}, {o}, {alpha}, {beta};");
+        b.L($"div.u32 {i}, {i}, {delta};");
+        b.L($"sub.u32 {last}, {inp}, 1;");
+        b.L($"min.u32 {i}, {i}, {last};");
+        return i;
+    }
+
+    // The outputs [lo, hi] (s32) whose source rows include input row i (LayoutArgs.InterpolateSources).
+    private static (string Lo, string Hi) SourceRange(PtxBuilder b, bool bilinear, string i, string inp, string outp, string alpha, string beta, string delta)
+    {
+        // ceil(n / α) of a signed n (α > 0): n ≥ 0 ? (n + α − 1) / α : −(−n / α).
+        string CeilDiv(string n)
+        {
+            string pos = b.R(), neg = b.R(), q = b.R(), pn = b.P(), am1 = b.R();
+            b.L($"sub.s32 {am1}, {alpha}, 1;");
+            b.L($"add.s32 {pos}, {n}, {am1};");
+            b.L($"div.s32 {pos}, {pos}, {alpha};");
+            b.L($"neg.s32 {neg}, {n};");
+            b.L($"div.s32 {neg}, {neg}, {alpha};");
+            b.L($"neg.s32 {neg}, {neg};");
+            b.L($"setp.ge.s32 {pn}, {n}, 0;");
+            b.L($"selp.b32 {q}, {pos}, {neg}, {pn};");
+            return q;
+        }
+
+        string lo = b.R(), hi = b.R(), n = b.R(), m = b.R(), last = b.R(), om1 = b.R(), pz = b.P(), pl = b.P(), pa = b.P();
+        b.L($"setp.eq.u32 {pa}, {alpha}, 0;");
+        // a safe divisor where α is 0 (every output then; selected below)
+        string a1 = b.R();
+        b.L($"selp.u32 {a1}, 1, {alpha}, {pa};");
+        alpha = a1;
+        if (bilinear)
+        {
+            b.L($"sub.s32 {n}, {i}, 1;");
+            b.L($"mul.lo.s32 {n}, {n}, {delta};");
+            b.L($"sub.s32 {n}, {n}, {beta};");
+            string c0 = CeilDiv(n);
+            b.L($"setp.le.u32 {pz}, {i}, 1;");
+            b.L($"selp.b32 {lo}, 0, {c0}, {pz};");
+        }
+        else
+        {
+            b.L($"mul.lo.s32 {n}, {i}, {delta};");
+            b.L($"sub.s32 {n}, {n}, {beta};");
+            b.L($"mov.b32 {lo}, {CeilDiv(n)};");
+        }
+
+        b.L($"add.s32 {m}, {i}, 1;");
+        b.L($"mul.lo.s32 {m}, {m}, {delta};");
+        b.L($"sub.s32 {m}, {m}, {beta};");
+        b.L($"sub.s32 {hi}, {CeilDiv(m)}, 1;");
+        b.L($"sub.u32 {last}, {inp}, 1;");
+        b.L($"sub.u32 {om1}, {outp}, 1;");
+        b.L($"setp.eq.u32 {pl}, {i}, {last};");
+        b.L($"selp.b32 {hi}, {om1}, {hi}, {pl};");
+        b.L($"max.s32 {lo}, {lo}, 0;");
+        b.L($"min.s32 {hi}, {hi}, {om1};");
+        b.L($"selp.b32 {lo}, 0, {lo}, {pa};");
+        b.L($"selp.b32 {hi}, {om1}, {hi}, {pa};");
+        return (lo, hi);
+    }
+
+    // The weight output o of an axis gives input position i (LayoutArgs.InterpolateSources' outputs): nearest 1 where it reads
+    // i; bilinear g where its first row is i, else f where its second is. Returns whether it reads i at all.
+    private static (string Has, string W) AxisWeight(PtxBuilder b, Lane lane, bool bilinear, string o, string i, string inp, string alpha, string beta, string delta)
+    {
+        string has = b.P(), w = lane.NewReg(b);
+        if (!bilinear)
+        {
+            b.L($"setp.eq.u32 {has}, {NearestAxis(b, o, inp, alpha, beta, delta)}, {i};");
+            b.L($"mov.{lane.Reg} {w}, {lane.Literal(1)};");
+            return (has, w);
+        }
+
+        var (i0, i1, f, g) = BilinearAxis(b, lane, o, inp, alpha, beta, delta);
+        string first = b.P(), second = b.P();
+        b.L($"setp.eq.u32 {first}, {i0}, {i};");
+        b.L($"setp.eq.u32 {second}, {i1}, {i};");
+        b.L($"or.pred {has}, {first}, {second};");
+        b.L($"selp.{lane.Op} {w}, {g}, {f}, {first};");
+        return (has, w);
     }
 
     // A pool's (dilation 1) or a depthwise convolution's output height / width: C H W kh kw sh sw ph pw [dh dw].
-    private static string PoolHeight(PtxBuilder b, string[] p, bool dilated) => PoolSize(b, p[1], p[3], p[5], p[7], dilated ? p[9] : null);
-    private static string PoolWidth(PtxBuilder b, string[] p, bool dilated) => PoolSize(b, p[2], p[4], p[6], p[8], dilated ? p[10] : null);
+    private static string PoolHeight(PtxBuilder b, string[] p, bool dilated) => PoolSize(b, p[1], p[3], p[5], p[7], dilated ? p[9] : null, p[11]);
+    private static string PoolWidth(PtxBuilder b, string[] p, bool dilated) => PoolSize(b, p[2], p[4], p[6], p[8], dilated ? p[10] : null, p[11]);
 
-    private static string PoolSize(PtxBuilder b, string size, string k, string s, string pad, string? d)
+    // LayoutArgs.PoolSize: (size + 2·pad − d·(k − 1) − 1) / s + 1, or with ceil (p[11] ≠ 0) rounded up and the last window
+    // dropped when it starts past the input and its leading pad.
+    private static string PoolSize(PtxBuilder b, string size, string k, string s, string pad, string? d, string ceil)
     {
-        string t = b.R(), u = b.R();
+        string t = b.R(), u = b.R(), up = b.R(), sm1 = b.R(), start = b.R(), end = b.R(), past = b.P(), pc = b.P();
         b.L($"shl.b32 {t}, {pad}, 1;");
         b.L($"add.u32 {t}, {t}, {size};");
         b.L($"sub.u32 {u}, {k}, 1;");
         if (d is not null) b.L($"mul.lo.u32 {u}, {u}, {d};");
         b.L($"sub.u32 {t}, {t}, {u};");
         b.L($"sub.u32 {t}, {t}, 1;");
+        b.L($"sub.u32 {sm1}, {s}, 1;");
+        b.L($"add.u32 {up}, {t}, {sm1};");
+        b.L($"div.u32 {up}, {up}, {s};");
+        b.L($"mul.lo.u32 {start}, {up}, {s};");
+        b.L($"add.u32 {end}, {size}, {pad};");
+        b.L($"setp.ge.u32 {past}, {start}, {end};");
+        b.L($"add.u32 {up}, {up}, 1;");
+        b.L($"@{past} sub.u32 {up}, {up}, 1;");
         b.L($"div.u32 {t}, {t}, {s};");
         b.L($"add.u32 {t}, {t}, 1;");
+        b.L($"setp.ne.u32 {pc}, {ceil}, 0;");
+        b.L($"selp.u32 {t}, {up}, {t}, {pc};");
         return t;
+    }
+
+    // LayoutArgs.PoolDivisor: window (oh, ow)'s divisor, its `inside` count or, counting the pads (p[12] ≠ 0), its positions up
+    // to H + ph, W + pw.
+    private static string PoolDivisor(PtxBuilder b, string[] p, string oh, string ow, string inside)
+    {
+        string Extent(string o, string size, string k, string s, string pad)
+        {
+            string hs = b.R(), he = b.R(), lim = b.R();
+            b.L($"mul.lo.s32 {hs}, {o}, {s};");
+            b.L($"sub.s32 {hs}, {hs}, {pad};");
+            b.L($"add.s32 {he}, {hs}, {k};");
+            b.L($"add.s32 {lim}, {size}, {pad};");
+            b.L($"min.s32 {he}, {he}, {lim};");
+            b.L($"sub.s32 {he}, {he}, {hs};");
+            return he;
+        }
+
+        string eh = Extent(oh, p[1], p[3], p[5], p[7]), ew = Extent(ow, p[2], p[4], p[6], p[8]), d = b.R(), pc = b.P();
+        b.L($"mul.lo.u32 {d}, {eh}, {ew};");
+        b.L($"setp.ne.u32 {pc}, {p[12]}, 0;");
+        b.L($"selp.u32 {d}, {d}, {inside}, {pc};");
+        return d;
     }
 
     // OH or OW of a convolution's output from the twelve parameters (C H W kh kw sh sw ph pw dh dw).

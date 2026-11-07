@@ -4,19 +4,22 @@
 // Layout and indexing: data movement by index arithmetic, exact in every type (the value moves as stored; the lane is
 // the type's own; where values are summed — scatter-add, col2im — the sum lane by the bounds, stored as the type).
 //
-//   strided    a contiguous copy of a strided view: output[i0, i1, i2, i3] = x[base + Σ i_d · stride_d] (permutes,
-//              transposed views, slices, broadcasts with a zero stride)
+//   strided    a contiguous copy of a strided view of up to six dimensions: output[i0, …] = x[base + Σ i_d · stride_d]
+//              (permutes, transposed views, slices, broadcasts with a zero stride); canonical first (LayoutArgs.StridedKernel)
 //   one_hot    output[i][c] = (c == index[i]) ? 1 : 0 over `classes` columns
 //   gather_rows   output[i] = x[index[i]] (a row each); gather_cols output[r][j] = x[r][index[j]]
 //   scatter_add_rows   output[index[i]] += x[i] (the embedding gradient): every output row sums its sources in source
 //              order (deterministic on both devices)
 //   im2col     x (C × H × W) to columns ((C·kh·kw) × (OH·OW)) for a kernel kh × kw, strides, pads, dilations;
 //   col2im     the reverse sum (each input pixel gathers its column entries in kernel order: exact order)
-//   interpolate   x (C × H × W) resized to (C × OH × OW), nearest or bilinear (half-pixel centers)
+//   interpolate   x (C × H × W) resized to (C × OH × OW), nearest or bilinear, its source positions exact in integers
+//              (half-pixel, align-corners or asymmetric coordinates, the scales given or in/out); its backward gathers
+//              each input position's outputs (LayoutArgs.InterpolateSources) with their weights
 //   shift      output[r][c] = x[r][c − k] inside the row, 0 outside (k may be negative)
 //   pad2d      rows × cols into rows × newCols: the row's values then zeros (the operands of a product whose shape the
 //              product kernels' vector loads cannot take as stored)
-//   maxpool / avgpool   x (C × H × W) over kh × kw windows at strides and pads (pads excluded from a window's count)
+//   maxpool / avgpool   x (C × H × W) over kh × kw windows at strides and pads (pads excluded from a window's count unless
+//              counted: LayoutArgs.PoolDivisor; ceil mode by LayoutArgs.PoolOut)
 //   maxpool_bwd / avgpool_bwd   dx from dy: each input pixel gathers the windows it lies in (the first largest wins a
 //              maxpool tie, recomputed: deterministic)
 //   adaptive_maxpool / adaptive_avgpool   x (C × H × W) to C × OH × OW with windows [⌊i·H/OH⌋, ⌈(i + 1)·H/OH⌉)
@@ -35,6 +38,7 @@ internal sealed partial class Kernels
     /// <summary>A layout operation on the CPU; returns the lane's name (the type's own, or the sum lane where values are summed).</summary>
     public static string Layout<TN>(LayoutArgs k) where TN : struct, IAdad<TN>
     {
+        k = k.ForKernels();
         if (LayoutArgs.Sums(k.Name))
         {
             // The bounds choose an integer type's sum lane; a float type's lane is its float lane whatever the values, so its
@@ -255,6 +259,27 @@ internal sealed partial class Kernels
 
     private static (int Rows, int Cols) OutputRows(LayoutArgs k) => LayoutArgs.OutputRows(k);
 
+    // A bilinear axis's weights in the lane: f = rem / δ (one rounding), g = 1 − f.
+    private static (TLane F, TLane G) Weights<TLane, TL>(int rem, int delta) where TLane : unmanaged where TL : struct, ILane<TL, TLane>
+    {
+        var f = TL.Div(new Vector<TLane>(TL.From(rem)), new Vector<TLane>(TL.From(delta)));
+        return (f[0], TL.Sub(new Vector<TLane>(TL.From(1)), f)[0]);
+    }
+
+    // The weight output o of an interpolation axis gives input position i: nearest 1 where it reads i; bilinear the first
+    // row's weight g where its first row is i, else f where its second is (both are i only past the input's end, f then 0).
+    private static bool InterpolateWeight<TLane, TL>(bool bilinear, int o, int i, int inp, int alpha, int beta, int delta, out TLane w)
+        where TLane : unmanaged where TL : struct, ILane<TL, TLane>
+    {
+        w = TL.From(1);
+        if (!bilinear) return LayoutArgs.NearestAt(o, inp, alpha, beta, delta) == i;
+        var (i0, i1, rem) = LayoutArgs.BilinearAt(o, inp, alpha, beta, delta);
+        if (i0 != i && i1 != i) return false;
+        var (f, g) = Weights<TLane, TL>(rem, delta);
+        w = i0 == i ? g : f;
+        return true;
+    }
+
     /// <summary>A strided copy whose output rows run across the input (the last dimension's stride not 1) while one of the
     /// three outer dimensions has stride 1 (a transposition): taken by tiles of output rows along that dimension (see
     /// StridedTileBody). Rows ending on whole bytes only (each row stored by one thread), values read in place or through
@@ -262,7 +287,7 @@ internal sealed partial class Kernels
     private static bool StridedTiled<TN, TLane>(LayoutArgs k, int cols, out int dim) where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
     {
         dim = -1;
-        if (k.Name != "strided" || k.P[7] == 1 || (long)cols * TN.Bits % 8 != 0) return false;
+        if (k.Name != "strided" || k.P.Length != 9 || k.P[7] == 1 || (long)cols * TN.Bits % 8 != 0) return false;   // the four-dimensional form
         for (int j = 2; j >= 0; j--) if (k.P[4 + j] == 1 && k.P[j] > 1) { dim = j; return true; }
         return false;
     }
@@ -422,9 +447,12 @@ internal sealed partial class Kernels
                     {
                         case "strided":
                         {
-                            int i2 = r % p[2], i1 = r / p[2] % p[1], i0 = r / (p[2] * p[1]);
-                            long b = p[8] + (long)i0 * p[4] + (long)i1 * p[5] + (long)i2 * p[6];
-                            for (int c = 0; c < cols; c++) o[c] = input[b + (long)c * p[7]];
+                            // Row r over the outer dimensions (three, or five of a six-dimensional view), the row along the last.
+                            int rank = (p.Length - 1) / 2;
+                            long b = p[2 * rank];
+                            for (int d = rank - 2, t = r; d >= 0; d--) { b += (long)(t % p[d]) * p[rank + d]; t /= p[d]; }
+                            long step = p[2 * rank - 1];
+                            for (int c = 0; c < cols; c++) o[c] = input[b + c * step];
                             break;
                         }
 
@@ -507,17 +535,13 @@ internal sealed partial class Kernels
 
                         case "interpolate_nearest":
                         {
+                            // p: C H W OH OW αh βh δh αw βw δw (LayoutArgs.InterpolateAxis).
                             int H = p[1], W = p[2], OH = p[3], OW = p[4];
                             int oh = r % OH, c = r / OH;
-                            int ih = Math.Min(H - 1, (2 * oh + 1) * H / (2 * OH));
+                            int ih = LayoutArgs.NearestAt(oh, H, p[5], p[6], p[7]);
                             source ??= pool.Rent(W);
                             var line = input.Span(((long)c * H + ih) * W, W, source);
-                            for (int ow = 0; ow < OW; ow++)
-                            {
-                                int iw = Math.Min(W - 1, (2 * ow + 1) * W / (2 * OW));
-                                o[ow] = line[iw];
-                            }
-
+                            for (int ow = 0; ow < OW; ow++) o[ow] = line[LayoutArgs.NearestAt(ow, W, p[8], p[9], p[10])];
                             break;
                         }
 
@@ -525,9 +549,8 @@ internal sealed partial class Kernels
                         {
                             int H = p[1], W = p[2], OH = p[3], OW = p[4];
                             int oh = r % OH, c = r / OH;
-                            double sy = Math.Max((oh + 0.5) * H / OH - 0.5, 0);
-                            int y0 = Math.Min((int)Math.Floor(sy), H - 1), y1 = Math.Min(y0 + 1, H - 1);
-                            TLane fy = TL.From(sy - y0), gy = TL.From(1 - (sy - y0));
+                            var (y0, y1, ry) = LayoutArgs.BilinearAt(oh, H, p[5], p[6], p[7]);
+                            var (fy, gy) = Weights<TLane, TL>(ry, p[7]);
                             // The two input rows read in place or loaded once each.
                             source ??= pool.Rent(W);
                             source2 ??= pool.Rent(W);
@@ -535,12 +558,40 @@ internal sealed partial class Kernels
                             var row1 = input.Span(((long)c * H + y1) * W, W, source2);
                             for (int ow = 0; ow < OW; ow++)
                             {
-                                double sx = Math.Max((ow + 0.5) * W / OW - 0.5, 0);
-                                int x0 = Math.Min((int)Math.Floor(sx), W - 1), x1 = Math.Min(x0 + 1, W - 1);
-                                TLane fx = TL.From(sx - x0), gx = TL.From(1 - (sx - x0));
+                                var (x0, x1, rx) = LayoutArgs.BilinearAt(ow, W, p[8], p[9], p[10]);
+                                var (fx, gx) = Weights<TLane, TL>(rx, p[10]);
                                 TLane top = TL.Fma(row0[x1], fx, TL.Mul(row0[x0], gx));
                                 TLane bottom = TL.Fma(row1[x1], fx, TL.Mul(row1[x0], gx));
                                 o[ow] = TL.Fma(bottom, fy, TL.Mul(top, gy));
+                            }
+
+                            break;
+                        }
+
+                        case "interpolate_nearest_bwd":
+                        case "interpolate_bilinear_bwd":
+                        {
+                            // Input position (c, ih, iw = col): the outputs whose source rows and columns include it (oh, then ow
+                            // ascending), each dy by its weight there: acc = fma(dy, wy·wx, acc).
+                            int H = p[1], W = p[2], OH = p[3], OW = p[4];
+                            int ih = r % H, c = r / H;
+                            bool bilinear = k.Name == "interpolate_bilinear_bwd";
+                            var (h0, h1) = LayoutArgs.InterpolateSources(bilinear, ih, H, OH, p[5], p[6], p[7]);
+                            for (int iw = 0; iw < W; iw++)
+                            {
+                                var (w0, w1) = LayoutArgs.InterpolateSources(bilinear, iw, W, OW, p[8], p[9], p[10]);
+                                TLane acc = TL.Zero;
+                                for (int oh = h0; oh <= h1; oh++)
+                                {
+                                    if (!InterpolateWeight<TLane, TL>(bilinear, oh, ih, H, p[5], p[6], p[7], out TLane wy)) continue;
+                                    for (int ow = w0; ow <= w1; ow++)
+                                    {
+                                        if (!InterpolateWeight<TLane, TL>(bilinear, ow, iw, W, p[8], p[9], p[10], out TLane wx)) continue;
+                                        acc = TL.Fma(input[((long)c * OH + oh) * OW + ow], TL.Mul(wy, wx), acc);
+                                    }
+                                }
+
+                                o[iw] = acc;
                             }
 
                             break;
@@ -578,7 +629,7 @@ internal sealed partial class Kernels
                                     }
                                 }
 
-                                o[ow] = n == 0 ? TL.Zero : max ? acc : TL.Mul(acc, TL.From(1.0 / n));
+                                o[ow] = n == 0 ? TL.Zero : max ? acc : TL.Mul(acc, TL.From(1.0 / LayoutArgs.PoolDivisor(p, oh, ow, n)));
                             }
 
                             break;
@@ -631,7 +682,7 @@ internal sealed partial class Kernels
                                         {
                                             int n = 0;
                                             for (int aa = 0; aa < kh; aa++) { int hh = oh * sh - ph + aa; if ((uint)hh >= (uint)H) continue; for (int bb = 0; bb < kw; bb++) { int ww = ow * sw - pw + bb; if ((uint)ww < (uint)W) n++; } }
-                                            acc = TL.Add(acc, TL.Mul(dy, TL.From(1.0 / n)));
+                                            acc = TL.Add(acc, TL.Mul(dy, TL.From(1.0 / LayoutArgs.PoolDivisor(p, oh, ow, n))));
                                             continue;
                                         }
 

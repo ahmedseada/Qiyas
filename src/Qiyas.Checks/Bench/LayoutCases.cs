@@ -24,21 +24,31 @@ public static class LayoutCases
 
     public static string Shape(LayoutArgs k) => k.Name switch
     {
-        "strided" => $"{k.P[0]}x{k.P[1]}x{k.P[2]}x{k.P[3]}",
+        "strided" => string.Join("x", k.P.Take((k.P.Length - 1) / 2)),
         "one_hot" => $"{k.P[0]}x{k.P[1]}",
         "gather_rows" => $"{k.P[2]} of {k.P[0]}x{k.P[1]}",
         "gather_cols" => $"{k.P[2]} of {k.P[0]}x{k.P[1]}",
         "scatter_add_rows" => $"{k.P[0]} into {k.P[2]}x{k.P[1]}",
         "im2col" or "col2im" => $"{k.P[0]}x{k.P[1]}x{k.P[2]} k{k.P[3]}x{k.P[4]}",
-        "interpolate_nearest" or "interpolate_bilinear" => $"{k.P[0]}x{k.P[1]}x{k.P[2]} to {k.P[3]}x{k.P[4]}",
+        "interpolate_nearest" or "interpolate_bilinear" or "interpolate_nearest_bwd" or "interpolate_bilinear_bwd" =>
+            $"{k.P[0]}x{k.P[1]}x{k.P[2]} to {k.P[3]}x{k.P[4]}{(k.P.Length > 5 ? $" mode {k.P[5]}" : "")}{(k.P.Length > 9 ? $" scale {k.P[6]}/{k.P[7]}, {k.P[8]}/{k.P[9]}" : "")}",
         "shift" => $"{k.P[0]}x{k.P[1]} by {k.P[2]}",
         "pad2d" => $"{k.P[0]}x{k.P[1]} to {k.P[2]}",
-        "maxpool" or "avgpool" or "maxpool_bwd" or "avgpool_bwd" or "depthwise_conv" => $"{k.P[0]}x{k.P[1]}x{k.P[2]} k{k.P[3]}x{k.P[4]} s{k.P[5]} p{k.P[7]}",
+        "maxpool" or "avgpool" or "maxpool_bwd" or "avgpool_bwd" or "depthwise_conv" =>
+            $"{k.P[0]}x{k.P[1]}x{k.P[2]} k{k.P[3]}x{k.P[4]} s{k.P[5]} p{k.P[7]}{(k.P.Length > 11 && k.P[11] != 0 ? " ceil" : "")}{(k.P.Length > 12 && k.P[12] != 0 ? " counting pads" : "")}",
         "adaptive_maxpool" or "adaptive_avgpool" or "adaptive_maxpool_bwd" or "adaptive_avgpool_bwd" => $"{k.P[0]}x{k.P[1]}x{k.P[2]} to {k.P[3]}x{k.P[4]}",
         _ => "",
     };
 
     private static int ConvCols(int[] p) { var (oh, ow) = LayoutArgs.ConvOut(p); return p[0] * p[3] * p[4] * oh * ow; }
+
+    // The pools' gate shapes: C H W kh kw sh sw ph pw [dh dw ceil countIncludePad] — ceil mode (a last window past the input
+    // and its pad), the pads counted by the divisor, both.
+    private static readonly int[][] PoolShapes =
+    [
+        [3, 7, 9, 3, 3, 2, 2, 1, 1], [2, 11, 5, 2, 3, 1, 2, 0, 1], [1, 6, 6, 4, 4, 4, 4, 2, 2],
+        [3, 7, 9, 3, 3, 2, 2, 1, 1, 1, 1, 1, 1], [2, 11, 5, 2, 3, 1, 2, 0, 1, 1, 1, 0, 1], [1, 6, 7, 3, 3, 2, 2, 0, 0, 1, 1, 1, 0], [2, 8, 8, 3, 2, 3, 3, 0, 1, 1, 1, 1, 0],
+    ];
 
     /// <summary>The gate's cases for an operation: odd dimensions, transposed and broadcast views, pads and strides, duplicates.</summary>
     public static IEnumerable<LayoutArgs> Gate(string name, string type)
@@ -53,6 +63,11 @@ public static class LayoutCases
                 // Transpositions along the middle and the third dimension (stride 1 there, not last): the tiled copy, partial tiles.
                 yield return Make(name, type, 360, null, [3, 4, 5, 6, 120, 1, 24, 4, 0], 360, 66);
                 yield return Make(name, type, 360, null, [3, 4, 5, 6, 120, 30, 1, 5, 0], 360, 67);
+                // Six dimensions: a pixel shuffle's (n, c, r, r, h, w) read as (n, c, h, r, w, r) (n and c merge: five left), a full
+                // permutation of six, and one that merges to a single contiguous run.
+                yield return Make(name, type, 480, null, [2, 3, 5, 2, 4, 2, 240, 80, 4, 40, 1, 20, 0], 480, 68);
+                yield return Make(name, type, 144, null, [2, 3, 3, 2, 2, 2, 1, 4, 24, 2, 12, 72, 0], 144, 69);
+                yield return Make(name, type, 130, null, [1, 2, 1, 3, 4, 5, 0, 60, 0, 20, 5, 1, 7], 120, 60);
                 break;
             case "one_hot":
                 yield return Make(name, type, 1, Indices(37, 17, 64), [37, 17], 37 * 17, 64);
@@ -83,10 +98,24 @@ public static class LayoutCases
 
             case "interpolate_nearest":
             case "interpolate_bilinear":
-                yield return Make(name, type, 3 * 7 * 9, null, [3, 7, 9, 5, 11], 3 * 5 * 11, 72);
-                yield return Make(name, type, 2 * 7 * 9, null, [2, 7, 9, 13, 4], 2 * 13 * 4, 73);
-                yield return Make(name, type, 1 * 4 * 6, null, [1, 4, 6, 8, 12], 8 * 12, 74);
+            case "interpolate_nearest_bwd":
+            case "interpolate_bilinear_bwd":
+            {
+                // Half-pixel (the default, and by given scales: 2 exactly, 3/2 where in/out is 5/7), align corners (bilinear),
+                // asymmetric (PyTorch's nearest), down and up.
+                bool bilinear = name.StartsWith("interpolate_bilinear", StringComparison.Ordinal), backward = name.EndsWith("_bwd", StringComparison.Ordinal);
+                var shapes = new List<int[]> { new[] { 3, 7, 9, 5, 11 }, new[] { 2, 7, 9, 13, 4 }, new[] { 1, 4, 6, 8, 12 },
+                    new[] { 1, 4, 6, 8, 12, 0, 1, 2, 1, 2 }, new[] { 1, 5, 5, 7, 7, 0, 2, 3, 2, 3 }, new[] { 2, 7, 9, 13, 4, 2 }, new[] { 2, 5, 5, 7, 7, 2, 2, 3, 2, 3 } };
+                if (bilinear) { shapes.Add([3, 7, 9, 5, 11, 1]); shapes.Add([2, 4, 6, 9, 1, 1]); }
+                int seed = 72;
+                foreach (var p in shapes)
+                {
+                    int image = p[0] * p[1] * p[2], resized = p[0] * p[3] * p[4];
+                    yield return backward ? Make(name, type, resized, null, p, image, seed++) : Make(name, type, image, null, p, resized, seed++);
+                }
+
                 break;
+            }
             case "shift":
                 yield return Make(name, type, 37 * 1001, null, [37, 1001, 5], 37 * 1001, 75);
                 yield return Make(name, type, 37 * 1001, null, [37, 1001, -3], 37 * 1001, 76);
@@ -98,16 +127,14 @@ public static class LayoutCases
             case "maxpool":
             case "avgpool":
             {
-                int[][] shapes = [[3, 7, 9, 3, 3, 2, 2, 1, 1], [2, 11, 5, 2, 3, 1, 2, 0, 1], [1, 6, 6, 4, 4, 4, 4, 2, 2]];
-                foreach (var p in shapes) yield return Make(name, type, p[0] * p[1] * p[2], null, p, PoolCount(p), 92);
+                foreach (var p in PoolShapes) yield return Make(name, type, p[0] * p[1] * p[2], null, p, PoolCount(p), 92);
                 break;
             }
 
             case "maxpool_bwd":
             case "avgpool_bwd":
             {
-                int[][] shapes = [[3, 7, 9, 3, 3, 2, 2, 1, 1], [2, 11, 5, 2, 3, 1, 2, 0, 1], [1, 6, 6, 4, 4, 4, 4, 2, 2]];
-                foreach (var p in shapes) yield return Make(name, type, PoolCount(p), null, p, p[0] * p[1] * p[2], 93, p[0] * p[1] * p[2]);
+                foreach (var p in PoolShapes) yield return Make(name, type, PoolCount(p), null, p, p[0] * p[1] * p[2], 93, p[0] * p[1] * p[2]);
                 break;
             }
 
@@ -145,6 +172,8 @@ public static class LayoutCases
         "col2im" => Make(name, type, ConvCols([64, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 0]), null, [64, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 0], 64 * 128 * 128, 87),
         "interpolate_nearest" => Make(name, type, 16 * 512 * 512, null, [16, 512, 512, 1024, 1024], 16 * 1024 * 1024, 88),
         "interpolate_bilinear" => Make(name, type, 16 * 512 * 512, null, [16, 512, 512, 1024, 1024], 16 * 1024 * 1024, 89),
+        "interpolate_nearest_bwd" => Make(name, type, 16 * 1024 * 1024, null, [16, 512, 512, 1024, 1024], 16 * 512 * 512, 88),
+        "interpolate_bilinear_bwd" => Make(name, type, 16 * 1024 * 1024, null, [16, 512, 512, 1024, 1024], 16 * 512 * 512, 89),
         "shift" => Make(name, type, 4096 * 4096, null, [4096, 4096, 3], 4096 * 4096, 90),
         "pad2d" => Make(name, type, 4096 * 4093, null, [4096, 4093, 4096], 4096 * 4096, 91),
         // 64 channels of 256 × 256: 2 × 2 windows at stride 2 (the common pool), 3 × 3 depthwise at stride 1

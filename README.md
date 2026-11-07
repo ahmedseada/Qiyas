@@ -41,8 +41,9 @@ does best for it, chosen per operation from the data itself. No type is fixed an
 - **The operation surface.** `COVERAGE.md` is the list, one row per operation with the lane rule on each device:
   element-wise formulas and their backward passes; reductions, broadcasts, transposes, gemv; the row family
   (softmax, log_softmax, the norms and their backward passes, rope, masked softmax, cross-entropy's backward); layout
-  and indexing (strided copies, one-hot, gathers, scatter-add, im2col/col2im, interpolation, shift, pad, the pools and
-  their backward, depthwise convolution); products on views (transposed, batched) and the matmul backward; attention
+  and indexing (strided copies of up to six dimensions, one-hot, gathers, scatter-add, im2col/col2im, interpolation
+  (half-pixel, align-corners or asymmetric, given scales) and its backward, shift, pad, the pools (ceil mode, counting the
+  pads) and their backward, depthwise convolution); products on views (transposed, batched) and the matmul backward; attention
   (rows by the composition or the fused rows, whichever is measured faster; causal, spans, decode, backward); convolution forward and backward; the optimizer steps; LSTM and GRU cells and
   steps with their backward passes, LSTM and GRU sequences with theirs; top-k, pick, sampling, routing, cross-entropy and ctc (loss and
   gradient); and the block formats and bool
@@ -71,7 +72,7 @@ core operations plus every formula, every reduction and every row operation; `ro
 for each of `RowOps.All` — log_softmax, the softmax backward passes, rms_norm_affine and its backward, layer_norm and
 its backward (both with a gain offset), weight_norm and its backward, rope, scale_mask_softmax, add_rms_norm, add_layer_norm — and `norm_params_bwd:rms|layer`,
 4096 × 4096, float types); `layout` adds the layout operations (`layout:<name>` for each of `LayoutArgs.Names`: strided,
-one_hot, gather_rows, gather_cols, scatter_add_rows, im2col, col2im, interpolate_nearest, interpolate_bilinear, shift).
+one_hot, gather_rows, gather_cols, scatter_add_rows, im2col, col2im, interpolate_nearest, interpolate_bilinear, their `_bwd`, shift).
 `products` adds the products on views (`matmul_nt`, `matmul_tn`, `matmul_tt` at 4096³, `matmul_batched`: 16 × 1024³,
 `matmul_bwd`: dA and dB at 4096³, `matmul_blocks`: A·Bᵀ of two Q8_0 / Q4_0 operands by the block-scaled product alone);
 `attention` adds `attention`, `attention_causal` (16 heads, 2048 × 2048, d = 128),
