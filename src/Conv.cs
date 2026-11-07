@@ -31,7 +31,7 @@ public sealed record ConvArgs(int C, int H, int W, int OC, int Kh, int Kw, int S
     public double[] Reference(double[] x, double[] w)
     {
         var cols = LayoutArgs.Reference("im2col", x, null, P, Rows * Cols);
-        return global::References.MatMul(w, cols, OC, Cols, Rows);
+        return ProductView.Reference(w, cols, OC, Cols, Rows);
     }
 
     /// <summary>The float64 references of dx and dw.</summary>
@@ -40,11 +40,11 @@ public sealed record ConvArgs(int C, int H, int W, int OC, int Kh, int Kw, int S
         var cols = LayoutArgs.Reference("im2col", x, null, P, Rows * Cols);
         var wt = new double[Rows * OC];
         for (int r = 0; r < OC; r++) for (int c = 0; c < Rows; c++) wt[c * OC + r] = w[r * Rows + c];
-        var dcols = global::References.MatMul(wt, dy, Rows, Cols, OC);
+        var dcols = ProductView.Reference(wt, dy, Rows, Cols, OC);
         var dx = LayoutArgs.Reference("col2im", dcols, null, P, (int)XValues);
         var colsT = new double[Cols * Rows];
         for (int r = 0; r < Rows; r++) for (int c = 0; c < Cols; c++) colsT[c * Rows + r] = cols[r * Cols + c];
-        var dw = global::References.MatMul(dy, colsT, OC, Rows, Cols);
+        var dw = ProductView.Reference(dy, colsT, OC, Rows, Cols);
         return (dx, dw);
     }
 }

@@ -196,9 +196,11 @@ public sealed unsafe partial class Gpu : IDisposable
         return function;
     }
 
-    /// <summary>Whether the device's JIT accepts <paramref name="ptx"/> (a kernel using an instruction the device may lack); the answer is remembered.</summary>
-    public bool Accepts(string ptx, string entry)
+    /// <summary>Whether the device's JIT accepts <paramref name="ptx"/> (a kernel using an instruction the device may lack); the answer is remembered.
+    /// <paramref name="reason"/>: the JIT's first lines when it refuses the kernel now, null when accepted or refused before.</summary>
+    public bool Accepts(string ptx, string entry, out string? reason)
     {
+        reason = null;
         if (_refused.Contains(entry)) return false;
         try
         {
@@ -208,8 +210,7 @@ public sealed unsafe partial class Gpu : IDisposable
         catch (InvalidOperationException e)
         {
             _refused.Add(entry);
-            string reason = string.Join(" | ", e.Message.Split((char)10).Take(3));
-            Console.WriteLine($"device refuses {entry}: {reason}");
+            reason = string.Join(" | ", e.Message.Split((char)10).Take(3));
             return false;
         }
     }

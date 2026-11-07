@@ -249,7 +249,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             int s = MatSize(device);
             var a = Registry.Make(type, s * s, 3, -1, 1);
             var b = Registry.Make(type, s * s, 4, -1, 1);
-            var reference = References.MatMul(Registry.Values(type, a, s * s), Registry.Values(type, b, s * s), s, s, s);
+            var reference = ProductView.Reference(Registry.Values(type, a, s * s), Registry.Values(type, b, s * s), s, s, s);
             for (int rep = 0; rep < options.Repeat; rep++) Measure(device, "matmul", type, $"{s}x{s}x{s}", reference, (subject, c) => subject.MatMul(device, type, a, b, c, s, s, s), a.Length);
         }
 
@@ -696,7 +696,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
     {
         if (!LayoutArgs.Applies(name, Registry.IsFloat(type))) return;
         var k = LayoutCases.Bench(name, type);
-        var reference = LayoutArgs.Reference(name, Registry.Values(type, k.X, k.InputCount), k.Index, k.P, k.Count, k.X2 is null ? null : Registry.Values(type, k.X2, LayoutCases.SecondCount(k)));
+        var reference = LayoutArgs.Reference(name, Registry.Values(type, k.X, k.InputCount), k.Index, k.P, k.Count, k.X2 is null ? null : Registry.Values(type, k.X2, k.SecondCount));
         Measure(device, "layout:" + name, type, LayoutCases.Shape(k), reference, (s, o) => s.Layout(device, type, k.With(o)), (int)Registry.Bytes(type, k.Count));
     }
 
@@ -988,34 +988,6 @@ internal static class References
         });
 
         return r;
-    }
-
-    /// <summary>The float64 reference product, accumulated in double-double (each product exact by a fused multiply-add,
-    /// each sum with its error term), so a lane that is exact reads 0 and a float64 lane shows its own rounding.</summary>
-    public static double[] MatMul(double[] a, double[] b, int m, int n, int k)
-    {
-        var c = new double[m * n];
-        Parallel.For(0, m, i =>
-        {
-            var hi = new double[n];
-            var lo = new double[n];
-            for (int p = 0; p < k; p++)
-            {
-                double x = a[i * k + p];
-                var bp = b.AsSpan(p * n, n);
-                for (int j = 0; j < n; j++)
-                {
-                    double y = bp[j], ph = x * y, pl = Math.FusedMultiplyAdd(x, y, -ph);
-                    double h = hi[j], sum = h + ph, bv = sum - h, err = (h - (sum - bv)) + (ph - bv);
-                    hi[j] = sum;
-                    lo[j] += err + pl;
-                }
-            }
-
-            var row = c.AsSpan(i * n, n);
-            for (int j = 0; j < n; j++) row[j] = hi[j] + lo[j];
-        });
-        return c;
     }
 
     public static double[] Softmax(double[] x, int rows, int cols)

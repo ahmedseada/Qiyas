@@ -39,10 +39,38 @@ public sealed record ProductView(int M, int N, int K, bool TransA, bool TransB, 
             long baseA = i * StrideAOrDefault, baseB = i * StrideBOrDefault;
             for (int r = 0; r < M; r++) for (int q = 0; q < K; q++) ai[r * K + q] = TransA ? a[baseA + q * M + r] : a[baseA + r * K + q];
             for (int q = 0; q < K; q++) for (int s = 0; s < N; s++) bi[q * N + s] = TransB ? b[baseB + s * K + q] : b[baseB + q * N + s];
-            var ci = global::References.MatMul(ai, bi, M, N, K);
+            var ci = Reference(ai, bi, M, N, K);
             Array.Copy(ci, 0, c, i * StrideCOrDefault, M * N);
         }
 
+        return c;
+    }
+
+    /// <summary>The float64 reference product (A m × k, B k × n), accumulated in double-double (each product exact by a fused
+    /// multiply-add, each sum with its error term), so a lane that is exact reads 0 and a float64 lane shows its own rounding.</summary>
+    public static double[] Reference(double[] a, double[] b, int m, int n, int k)
+    {
+        var c = new double[m * n];
+        Parallel.For(0, m, i =>
+        {
+            var hi = new double[n];
+            var lo = new double[n];
+            for (int p = 0; p < k; p++)
+            {
+                double x = a[i * k + p];
+                var bp = b.AsSpan(p * n, n);
+                for (int j = 0; j < n; j++)
+                {
+                    double y = bp[j], ph = x * y, pl = Math.FusedMultiplyAdd(x, y, -ph);
+                    double h = hi[j], sum = h + ph, bv = sum - h, err = (h - (sum - bv)) + (ph - bv);
+                    hi[j] = sum;
+                    lo[j] += err + pl;
+                }
+            }
+
+            var row = c.AsSpan(i * n, n);
+            for (int j = 0; j < n; j++) row[j] = hi[j] + lo[j];
+        });
         return c;
     }
 }

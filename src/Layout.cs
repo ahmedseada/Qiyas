@@ -41,6 +41,14 @@ public sealed class LayoutArgs
     public required int Count;
     public int InputCount;
 
+    /// <summary>The second input's values: the forward input of a maxpool backward, the weights of a depthwise convolution.</summary>
+    public int SecondCount => Name switch
+    {
+        "maxpool_bwd" or "avgpool_bwd" or "adaptive_maxpool_bwd" or "adaptive_avgpool_bwd" => P[0] * P[1] * P[2],
+        "depthwise_conv" => P[0] * P[3] * P[4],
+        _ => 0,
+    };
+
     public static readonly string[] Names = ["strided", "one_hot", "gather_rows", "gather_cols", "scatter_add_rows", "im2col", "col2im", "interpolate_nearest", "interpolate_bilinear", "shift", "pad2d",
         "maxpool", "avgpool", "maxpool_bwd", "avgpool_bwd", "adaptive_maxpool", "adaptive_avgpool", "depthwise_conv", "adaptive_maxpool_bwd", "adaptive_avgpool_bwd"];
 

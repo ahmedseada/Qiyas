@@ -190,6 +190,27 @@ internal static partial class Kernels
         }
     }
 
+    /// <summary>Values stored as TS, each through TS's float lane (exact for the values the lane holds: a span mask's 0 and −400).</summary>
+    internal static byte[] StoreValues<TS>(double[] values) where TS : struct, IQiyasFloat<TS>
+    {
+        var v = new StoreValuesVisitor(values);
+        TS.Float(ref v);
+        return v.Result!;
+    }
+
+    private struct StoreValuesVisitor(double[] values) : IFloatLaneVisitor
+    {
+        public byte[]? Result;
+
+        public void Run<TN, TLane, TL>() where TN : struct, IQiyasNumber<TN, TLane> where TLane : unmanaged where TL : struct, IQiyasFloatLane<TL, TLane>
+        {
+            var lanes = new TLane[values.Length];
+            for (int i = 0; i < lanes.Length; i++) lanes[i] = TL.From(values[i]);
+            Result = new byte[TN.Bytes(values.Length)];
+            TN.Store(lanes, Result, 0);
+        }
+    }
+
     // ---------------------------------------------------------------- the composition, in lane storage
 
     private static readonly Dictionary<string, bool> s_fusedFaster = [];
@@ -256,7 +277,7 @@ internal static partial class Kernels
         if (a.SpanStarts is null) return null;
         var m = new double[(long)a.Lq * a.Lk];
         for (int i = 0; i < a.Lq; i++) for (int j = 0; j < a.Start(i); j++) m[(long)i * a.Lk + j] = -400;
-        return Bench.Registry.Encode(TS.Name, m);
+        return StoreValues<TS>(m);
     }
 
     private static byte[] Slice(byte[] x, long offset, long length)

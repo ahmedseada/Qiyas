@@ -20,14 +20,6 @@ public static class LayoutCases
         Index = index, P = p, Count = count, InputCount = inputCount, Output = new byte[Registry.Bytes(type, count)],
     };
 
-    /// <summary>The second input's values: the forward input of a maxpool backward, the weights of a depthwise convolution.</summary>
-    public static int SecondCount(LayoutArgs k) => k.Name switch
-    {
-        "maxpool_bwd" or "avgpool_bwd" or "adaptive_maxpool_bwd" or "adaptive_avgpool_bwd" => k.P[0] * k.P[1] * k.P[2],
-        "depthwise_conv" => k.P[0] * k.P[3] * k.P[4],
-        _ => 0,
-    };
-
     private static int PoolCount(int[] p) { var (oh, ow) = LayoutArgs.PoolOut(p); return p[0] * oh * ow; }
 
     public static string Shape(LayoutArgs k) => k.Name switch

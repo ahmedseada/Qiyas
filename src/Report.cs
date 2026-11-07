@@ -56,6 +56,14 @@ public sealed partial class GpuOps
     /// <summary>A decision taken from a measurement or a refusal, kept for the report.</summary>
     internal void Note(string decision) { if (!_decisions.Contains(decision)) _decisions.Add(decision); }
 
+    /// <summary>Whether the device's JIT accepts the kernel (Gpu.Accepts), a refusal noted for the report.</summary>
+    private bool Accepts(string ptx, string entry)
+    {
+        if (gpu.Accepts(ptx, entry, out string? reason)) return true;
+        if (reason is not null) Note($"refuses {entry}: {reason}");
+        return false;
+    }
+
     /// <summary>The device decisions taken from measurements so far (the bench takes most of them after the report is printed).</summary>
     public string Measured()
     {

@@ -1434,7 +1434,7 @@ internal static class Checks
                 foreach (var k in Bench.LayoutCases.Gate(name, type))
                 {
                     if (Environment.GetEnvironmentVariable("QIYAS_MAP_DEBUG") == "1") Console.WriteLine($"  layout {name} {type} {Bench.LayoutCases.Shape(k)} ({where})");
-                    var reference = LayoutArgs.Reference(name, Bench.Registry.Values(type, k.X, k.InputCount), k.Index, k.P, k.Count, k.X2 is null ? null : Bench.Registry.Values(type, k.X2, Bench.LayoutCases.SecondCount(k)));
+                    var reference = LayoutArgs.Reference(name, Bench.Registry.Values(type, k.X, k.InputCount), k.Index, k.P, k.Count, k.X2 is null ? null : Bench.Registry.Values(type, k.X2, k.SecondCount));
                     Bench.Registry.With(type, new LayoutRun(ops, k));
                     // Sums round over their terms; a bilinear value is four weighted terms of the inputs' magnitude (not the result's); a pool's mean over its window.
                     int terms = name is "scatter_add_rows" or "col2im" or "maxpool_bwd" or "depthwise_conv" or "adaptive_maxpool_bwd" ? LayoutArgs.Terms(name, k.P) : name == "interpolate_bilinear" ? 4 : name is "avgpool" or "avgpool_bwd" ? k.P[3] * k.P[4] : name is "adaptive_avgpool" or "adaptive_avgpool_bwd" ? (k.P[1] / k.P[3] + 2) * (k.P[2] / k.P[4] + 2) : 0;

@@ -189,16 +189,12 @@ public sealed partial class GpuOps
         for (int i = 0; i < a.Lq; i++) last[i] = a.Limit(i) - 1;
         Gpu.Upload<int>(last, limits);
         ulong mask = SpanMask<TS>(a, rented);
-        bool debug = Environment.GetEnvironmentVariable("QIYAS_MAP_DEBUG") == "1";
         for (int h = 0; h < a.Heads; h++)
         {
             ulong qh = q + (ulong)((long)h * a.Lq * a.D * size), kh = k + (ulong)((long)h * a.Lk * a.D * size), vh = v + (ulong)((long)h * a.Lk * a.D * size), oh = o + (ulong)((long)h * a.Lq * a.D * size);
             MatMulView<TS>(new ProductView(a.Lq, a.Lk, a.D, false, true), qh, kh, s);
-            if (debug) { Gpu.Synchronize(); Console.WriteLine($"  attention head {h}: scores done"); }
             RowOp<TS>(softmax, s, mask, 0, 0, 0, limits, s, 0, a.Lq, a.Lk, a.Scale, 1);
-            if (debug) { Gpu.Synchronize(); Console.WriteLine($"  attention head {h}: softmax done"); }
             MatMulView<TS>(new ProductView(a.Lq, a.D, a.Lk, false, false), s, vh, oh);
-            if (debug) { Gpu.Synchronize(); Console.WriteLine($"  attention head {h}: context done"); }
         }
     }
 
@@ -208,7 +204,7 @@ public sealed partial class GpuOps
         if (a.SpanStarts is null) return 0;
         var m = new double[(long)a.Lq * a.Lk];
         for (int i = 0; i < a.Lq; i++) for (int j = 0; j < a.Start(i); j++) m[(long)i * a.Lk + j] = -400;
-        var bytes = Bench.Registry.Encode(TS.Name, m);
+        var bytes = Kernels.StoreValues<TS>(m);
         ulong d = gpu.Rent(bytes.Length);
         rented.Add(d);
         Gpu.Upload<byte>(bytes, d);
@@ -342,7 +338,7 @@ public sealed partial class GpuOps
     {
         if (_attnAccepted.TryGetValue(key, out bool known)) return known;
         string ptx = make(out string entry);
-        return _attnAccepted[key] = gpu.Accepts(ptx, entry);
+        return _attnAccepted[key] = Accepts(ptx, entry);
     }
 
     // The tensor backward where both kernels' shared memory fits the limit and the device builds both.

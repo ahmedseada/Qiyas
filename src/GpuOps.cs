@@ -464,7 +464,7 @@ public sealed partial class GpuOps(Gpu gpu)
         string key = $"{kind.Tag}:{cfg}";
         if (_accepted.TryGetValue(key, out bool known)) return known;
         int shared = Ptx.MmaShared(cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle);
-        bool ok = shared <= gpu.SharedOptIn && gpu.Accepts(Ptx.GemmMma(gpu, kind, cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle, out string entry), entry);
+        bool ok = shared <= gpu.SharedOptIn && Accepts(Ptx.GemmMma(gpu, kind, cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle, out string entry), entry);
         if (ok) gpu.AllowShared(gpu.Cached($"mma:{kind.Tag}:{cfg}", (out string e) => Ptx.GemmMma(gpu, kind, cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle, out e)), shared);
         return _accepted[key] = ok;
     }
@@ -484,7 +484,7 @@ public sealed partial class GpuOps(Gpu gpu)
             int shared = Ptx.MmaShared(cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle);
             if (shared > gpu.SharedOptIn) continue;
             string ptx = Ptx.GemmMma(gpu, kind, cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle, out string entry);
-            if (!gpu.Accepts(ptx, entry)) continue;
+            if (!Accepts(ptx, entry)) continue;
             var fn = gpu.Cached($"mma:{kind.Tag}:{cfg}", (out string e) => Ptx.GemmMma(gpu, kind, cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle, out e));
             gpu.AllowShared(fn, shared);
             double ms = TimeMma(fn, Dynamic(shared), cfg.Bn, x, y, z, Size, kp);
@@ -493,7 +493,7 @@ public sealed partial class GpuOps(Gpu gpu)
         }
 
         gpu.Return(x); gpu.Return(y); gpu.Return(z);
-        if (best is { } shape) Console.WriteLine($"device measured {kind.Tag} tensor kernel at {Size}³: {string.Join(", ", report)}: rows {shape.RowBytes} B × {shape.Stages} stages × {shape.Bn} wide{(shape.Swizzle ? " swizzled" : "")} kept");
+        if (best is { } shape) Note($"{kind.Tag} tensor kernel at {Size}³: {string.Join(", ", report)}: rows {shape.RowBytes} B × {shape.Stages} stages × {shape.Bn} wide{(shape.Swizzle ? " swizzled" : "")} kept");
         return _shapes[kind.Tag] = best;
     }
 
@@ -565,7 +565,6 @@ public sealed partial class GpuOps(Gpu gpu)
         var fb = MmaFunction(b, out uint sb, out int bnb);
         double ta = TimeMma(fa, sa, bna, x, y, z, size, kp), tb = TimeMma(fb, sb, bnb, x, y, z, size, kp);
         gpu.Return(x); gpu.Return(y); gpu.Return(z);
-        Console.WriteLine($"device measured {a.Tag} tensor kernel {ta:0.000} ms against {b.Tag} {tb:0.000} ms at {size}³: {(ta < tb ? a.Tag : b.Tag)} kept");
         Note($"{a.Tag} {ta:0.000} ms against {b.Tag} {tb:0.000} ms at {size}³ (k = {kp}): {(ta < tb ? a.Tag : b.Tag)}");
         return _faster[key] = ta < tb;
     }
@@ -583,7 +582,7 @@ public sealed partial class GpuOps(Gpu gpu)
     private bool Dp4aSupported(bool signed)
     {
         if (_supported.TryGetValue("dp4a:" + signed, out bool known)) return known;
-        return _supported["dp4a:" + signed] = gpu.Accepts(Ptx.GemmDot(gpu, signed, out string entry), entry);
+        return _supported["dp4a:" + signed] = Accepts(Ptx.GemmDot(gpu, signed, out string entry), entry);
     }
 
     private static Lane LaneOf(string name) => name switch
@@ -792,7 +791,6 @@ public sealed partial class GpuOps(Gpu gpu)
         double sliced = Time(() => { if (!MatMulSliced(a, b, c, m, n, k)) refused = true; });
         if (refused) { Note($"sliced float64 product refused at {key} (exponents beyond the slicing scale): the f64 lane"); return _slicedFaster[key] = false; }
         Note($"float64 product at {key}: f64 lane {plain:0.000} ms, sliced {sliced:0.000} ms: {(sliced < plain ? "sliced" : "f64 lane")}");
-        Console.WriteLine($"device measured float64 product at {key}: float64 lane {plain:0.000} ms, sliced 8-bit tensor lane {sliced:0.000} ms: {(sliced < plain ? "sliced" : "float64")} kept");
         return _slicedFaster[key] = sliced < plain;
     }
 
@@ -902,7 +900,7 @@ public sealed partial class GpuOps(Gpu gpu)
             int shared = Ptx.Gemm2Shared(stages);
             if (shared > gpu.SharedOptIn) continue;
             string ptx = Ptx.Gemm2(gpu, lane, stages, out string entry);
-            if (!gpu.Accepts(ptx, entry)) continue;
+            if (!Accepts(ptx, entry)) continue;
             var fn = gpu.Cached($"gemm2:{lane.Name}:{stages}", (out string e) => Ptx.Gemm2(gpu, lane, stages, out e));
             gpu.AllowShared(fn, shared);
             Gpu.Launch(fn, Grid(n, 128), Grid(m, 128), Ptx.GemmThreads, 1, Dynamic(shared), la, lb, lc, Gpu.U(m), Gpu.U(n), Gpu.U(k));
@@ -915,8 +913,8 @@ public sealed partial class GpuOps(Gpu gpu)
             if (ms < bestMs) (bestMs, best) = (ms, stages);
         }
 
-        Console.WriteLine(best > 0 ? $"device measured {lane.Name} staged product at {m}x{n}x{k}: {string.Join(", ", report)}: {best} stages kept"
-            : $"device takes no staged {lane.Name} product (its shared memory or asynchronous copies): the register-tiled kernel");
+        Note(best > 0 ? $"{lane.Name} staged product at {m}x{n}x{k}: {string.Join(", ", report)}: {best} stages kept"
+            : $"no staged {lane.Name} product (its shared memory or asynchronous copies): the register-tiled kernel");
         return _gemm2Stages[lane.Name] = best;
     }
 

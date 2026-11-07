@@ -26,7 +26,7 @@ public sealed partial class GpuOps
             var r = new List<ulong>();
             try
             {
-                ulong lx = Lanes(f, Lane.F32, x, k.InputCount, r), lx2 = x2 == 0 ? 0 : Lanes(f, Lane.F32, x2, Bench.LayoutCases.SecondCount(k), r), lo = gpu.Rent(k.Count * 4L);
+                ulong lx = Lanes(f, Lane.F32, x, k.InputCount, r), lx2 = x2 == 0 ? 0 : Lanes(f, Lane.F32, x2, k.SecondCount, r), lo = gpu.Rent(k.Count * 4L);
                 r.Add(lo);
                 Layout<Float32>(k, lx, idx, lo, lx2);
                 Back(f, Lane.F32, lo, output, k.Count);
