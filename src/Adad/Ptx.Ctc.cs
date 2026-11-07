@@ -29,9 +29,11 @@ internal static partial class Ptx
 
     /// <summary>Each (frame, sequence) row's log-sum-exp over the classes, a warp per row; for the gradient the row's softmax
     /// (and 0 for the rows past the sequence's frames).</summary>
-    public static string CtcRows(Gpu gpu, Lane lane, bool backward, out string entry)
+    /// <summary>fx: the logits' format (null: lane storage), each read where it is stored; fo: the gradient's (whole bytes,
+    /// not blocks; null: lane storage).</summary>
+    public static string CtcRows(Gpu gpu, Lane lane, bool backward, out string entry, Fmt? fx = null, Fmt? fo = null)
     {
-        entry = $"ctc_rows_{lane.Name}_{(backward ? "bwd" : "fwd")}";
+        entry = $"ctc_rows_{lane.Name}_{(backward ? "bwd" : "fwd")}{CtcSuffix(fx, fo)}";
         int size = lane.Size;
         string op = lane.Op, mem = lane.Mem, negInf = lane.Literal(double.NegativeInfinity), zero = lane.Literal(0);
         var b = new PtxBuilder();
@@ -44,6 +46,20 @@ internal static partial class Ptx
         string x = Param64(b, "p_x"), lseG = Param64(b, "p_lse"), ilen = Param64(b, "p_ilen"), grad = Param64(b, "p_grad");
         string T = Param32(b, "p_t"), B = Param32(b, "p_b"), C = Param32(b, "p_c");
         string rows = b.R(), pOut = b.P();
+        // A logit (decoded where it is stored when fx), a gradient value (stored as fo when given).
+        string LoadX(string idx)
+        {
+            if (fx is not null) return Codec.UnpackAt(b, fx, x, idx, lane);
+            string v = lane.NewReg(b);
+            b.L($"ld.global.{mem} {v}, [{Addr(x, idx, size)}];");
+            return v;
+        }
+
+        void StoreOut(string ptr, string idx, string val)
+        {
+            if (fo is not null) StoreAs(b, fo, lane, val, ptr, idx);
+            else b.L($"st.global.{mem} [{Addr(ptr, idx, size)}], {val};");
+        }
         b.L($"mul.lo.u32 {rows}, {T}, {B};");
         b.L($"setp.ge.u32 {pOut}, {r}, {rows};");
         b.L($"@{pOut} bra DONE;");
@@ -100,7 +116,7 @@ internal static partial class Ptx
             b.L($"setp.ge.u32 {pC}, {c}, {C};");
             b.L($"@{pC} bra DONE;");
             b.L($"add.u32 {i}, {row}, {c};");
-            b.L($"st.global.{mem} [{Addr(grad, i, size)}], {zero};");
+            StoreOut(grad, i, zero);
             b.L($"add.u32 {c}, {c}, 32;");
             b.L("bra ZERO_C;");
         }
@@ -114,8 +130,7 @@ internal static partial class Ptx
         b.L($"setp.ge.u32 {pC}, {c}, {C};");
         b.L($"@{pC} bra MAX_END;");
         b.L($"add.u32 {i}, {row}, {c};");
-        string v = lane.NewReg(b);
-        b.L($"ld.global.{mem} {v}, [{Addr(x, i, size)}];");
+        string v = LoadX(i);
         b.L($"max.{op} {m}, {m}, {v};");
         b.L($"add.u32 {c}, {c}, 32;");
         b.L("bra MAX;");
@@ -127,8 +142,7 @@ internal static partial class Ptx
         b.L($"setp.ge.u32 {pC}, {c}, {C};");
         b.L($"@{pC} bra SUM_END;");
         b.L($"add.u32 {i}, {row}, {c};");
-        string v2 = lane.NewReg(b);
-        b.L($"ld.global.{mem} {v2}, [{Addr(x, i, size)}];");
+        string v2 = LoadX(i);
         string ev = Codec.Exp(b, lane, Sub(v2, m));
         b.L(lane.Add(sum, sum, ev));
         b.L($"add.u32 {c}, {c}, 32;");
@@ -146,10 +160,9 @@ internal static partial class Ptx
             b.L($"setp.ge.u32 {pC}, {c}, {C};");
             b.L($"@{pC} bra DONE;");
             b.L($"add.u32 {i}, {row}, {c};");
-            string a = Addr(x, i, size), v3 = lane.NewReg(b);
-            b.L($"ld.global.{mem} {v3}, [{a}];");
+            string v3 = LoadX(i);
             string y = Codec.Exp(b, lane, Sub(v3, res));
-            b.L($"st.global.{mem} [{Addr(grad, i, size)}], {y};");
+            StoreOut(grad, i, y);
             b.L($"add.u32 {c}, {c}, 32;");
             b.L("bra Y;");
         }
@@ -161,14 +174,19 @@ internal static partial class Ptx
 
     public static string Ctc(Gpu gpu, Lane lane, int cap, bool backward, out string entry) => Ctc(gpu, lane, cap, backward, false, out entry);
 
+    private static string CtcSuffix(Fmt? fx, Fmt? fo) => (fx is null ? "" : "_x" + fx.Name) + (fo is null ? "" : "_o" + fo.Name);
+
     /// <summary>oneState (states up to cap ≤ CtcThreads: a thread per state): each state's class and flags read once into
     /// registers, the next frame's logit, log-sum-exp (and α, backward) loaded before the frame's barrier, and in the
     /// backward the blank's sum over the even states by the warps' shuffles (fixed order), a label class's by its states'
     /// links (flags bits 2 up, CtcArgs.States) instead of a scan over every later state.</summary>
-    public static string Ctc(Gpu gpu, Lane lane, int cap, bool backward, bool oneState, out string entry)
+    /// <summary>fx: the logits' format (null: lane storage); fo: the loss's and the gradient's (whole bytes, not blocks; null:
+    /// lane storage).</summary>
+    public static string Ctc(Gpu gpu, Lane lane, int cap, bool backward, bool oneState, out string entry, Fmt? fx = null, Fmt? fo = null)
     {
         if (oneState && cap > CtcThreads) throw new NotSupportedException($"ctc: the one-state kernel takes up to {CtcThreads} states, not {cap}");
-        entry = $"ctc{(oneState ? "1" : "")}_{lane.Name}_{(backward ? "bwd" : "fwd")}_{cap}";
+        if (fo is { } o && (o.IsBlock || o.Bits < 8)) throw new ArgumentException($"ctc: {o.Name} outputs are stored from the lane");
+        entry = $"ctc{(oneState ? "1" : "")}_{lane.Name}_{(backward ? "bwd" : "fwd")}_{cap}{CtcSuffix(fx, fo)}";
         int size = lane.Size, bufBytes = (cap + 2) * size, gOff = 2 * bufBytes, pOff = gOff + cap * size;
         string op = lane.Op, mem = lane.Mem, negInf = lane.Literal(double.NegativeInfinity), zero = lane.Literal(0);
         var b = new PtxBuilder();
@@ -190,9 +208,16 @@ internal static partial class Ptx
 
         string LdG(string basePtr, string index)
         {
+            if (basePtr == x && fx is not null) return Codec.UnpackAt(b, fx, x, index, lane);
             string v = lane.NewReg(b);
             b.L($"ld.global.{mem} {v}, [{Addr(basePtr, index, size)}];");
             return v;
+        }
+
+        void StoreOut(string ptr, string idx, string val)
+        {
+            if (fo is not null) StoreAs(b, fo, lane, val, ptr, idx);
+            else b.L($"st.global.{mem} [{Addr(ptr, idx, size)}], {val};");
         }
 
         string LdU(string basePtr, string index)
@@ -380,7 +405,7 @@ internal static partial class Ptx
                 string logP = Lse3(a1, a2, negInf), nl = lane.NewReg(b);
                 b.L($"st.shared.{mem} [{sm}+{pOff}], {logP};");
                 b.L($"neg.{op} {nl}, {logP};");
-                b.L($"st.global.{mem} [{Addr(loss, seq, size)}], {nl};");
+                StoreOut(loss, seq, nl);
                 b.Label("A1_LOSS_END");
                 b.L("bar.sync 0;");
             }
@@ -404,7 +429,7 @@ internal static partial class Ptx
                     b.L($"setp.ge.u32 {pC}, {c}, {C};");
                     b.L($"@{pC} bra Z1_C_END;");
                     b.L($"add.u32 {i}, {row}, {c};");
-                    b.L($"st.global.{mem} [{Addr(grad, i, size)}], {zero};");
+                    StoreOut(grad, i, zero);
                     b.L($"add.u32 {c}, {c}, {CtcThreads};");
                     b.L("bra Z1_C;");
                     b.Label("Z1_C_END");
@@ -534,7 +559,7 @@ internal static partial class Ptx
                         string y = Codec.Exp(b, lane, e), ci = b.R();
                         b.L($"sub.rn.{op} {y}, {y}, {sum};");
                         b.L($"add.u32 {ci}, {row}, {myCls};");
-                        b.L($"st.global.{mem} [{Addr(grad, ci, size)}], {y};");
+                        StoreOut(grad, ci, y);
                     }
 
                     b.Label("B1_CLS_END");
@@ -608,7 +633,7 @@ internal static partial class Ptx
             string logP = Lse3(a1, a2, negInf), nl = lane.NewReg(b);
             b.L($"st.shared.{mem} [{sm}+{pOff}], {logP};");
             b.L($"neg.{op} {nl}, {logP};");
-            b.L($"st.global.{mem} [{Addr(loss, seq, size)}], {nl};");
+            StoreOut(loss, seq, nl);
             b.Label("LOSS_END");
             b.L("bar.sync 0;");
         }
@@ -632,7 +657,7 @@ internal static partial class Ptx
                 b.L($"setp.ge.u32 {pC}, {c}, {C};");
                 b.L($"@{pC} bra ZERO_C_END;");
                 b.L($"add.u32 {i}, {row}, {c};");
-                b.L($"st.global.{mem} [{Addr(grad, i, size)}], {zero};");
+                StoreOut(grad, i, zero);
                 b.L($"add.u32 {c}, {c}, {CtcThreads};");
                 b.L("bra ZERO_C;");
                 b.Label("ZERO_C_END");
@@ -724,7 +749,7 @@ internal static partial class Ptx
                     b.L($"add.u32 {ci}, {row}, {myc};");
                     string y = Codec.Exp(b, lane, Sub(LdG(x, ci), lseT));
                     b.L($"sub.rn.{op} {y}, {y}, {sum};");
-                    b.L($"st.global.{mem} [{Addr(grad, ci, size)}], {y};");
+                    StoreOut(grad, ci, y);
                 }
 
                 b.Label("CLS_NEXT");
