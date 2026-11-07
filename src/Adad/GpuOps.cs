@@ -601,9 +601,14 @@ public sealed partial class GpuOps(Gpu gpu)
     {
         var f = Fmt.Of<TN>();
         if ((transA || transB) && !PackedRoute<TN>(bounds, m, n, k)) throw new InvalidOperationException("transposed operands are read in place by the tensor and dot routes at whole tiles only");
-        if (m % 128 != 0 || n % 256 != 0 || k % 128 != 0) return MatMulPadded<TN>(a, b, c, m, n, k, in bounds);
         string laneName = ProductLane<TN>(bounds);
         var lane = LaneOf(laneName);
+        // A plain lane that is not the type's storage (a block format's f32 among them): the operands read where they are
+        // stored, at any shape (no padding: the kernel's edges are guarded, and a block format's copies would re-encode).
+        bool packed = laneName.EndsWith("mma", StringComparison.Ordinal) || laneName.EndsWith("dp", StringComparison.Ordinal);
+        bool direct = f.Natural == lane && f.Bits == lane.Size * 8 && (f.IsFloat == lane.IsFloat);
+        if (!packed && !direct && !(f.Is("float64") && SlicedProven)) return MatMulStored<TN>(new ProductView(m, n, k, false, false), a, b, c, lane);
+        if (m % 128 != 0 || n % 256 != 0 || k % 128 != 0) return MatMulPadded<TN>(a, b, c, m, n, k, in bounds);
         var rented = new List<ulong>();
         try
         {
@@ -632,11 +637,8 @@ public sealed partial class GpuOps(Gpu gpu)
 
             // The sliced route's kernels take shapes in multiples of 8 (their slices and tiles); other shapes take the float64 lane.
             if (f.Is("float64") && SlicedProven && m % 8 == 0 && n % 8 == 0 && k % 8 == 0 && SlicedFaster(m, n, k, a, b, c) && MatMulSliced(a, b, c, m, n, k)) return "f64x";
-            bool direct = f.Natural == lane && f.Bits == lane.Size * 8 && (f.IsFloat == lane.IsFloat);
-            ulong la = direct ? a : Lanes(f, lane, a, (long)m * k, rented);
-            ulong lb = direct ? b : Lanes(f, lane, b, (long)k * n, rented);
-            ulong lcl = direct ? c : gpu.Rent((long)m * n * lane.Size);
-            if (!direct) rented.Add(lcl);
+            if (!direct) return MatMulStored<TN>(new ProductView(m, n, k, false, false), a, b, c, lane);
+            ulong la = a, lb = b, lcl = c;
             // The staged kernel where the device builds it (cp.async), its pipeline depth measured once per lane; 0: none.
             int stages = Staged != false && !lane.Wide && k % 4 == 0 && n % 4 == 0 ? Gemm2Stages(lane, la, lb, lcl, m, n, k) : 0;
             if (stages > 0)
@@ -670,13 +672,46 @@ public sealed partial class GpuOps(Gpu gpu)
                 Gpu.Launch(g, Grid(n, tile), Grid(m, tile), Ptx.GemmThreads, 1, 0, la, lb, lcl, Gpu.U(m), Gpu.U(n), Gpu.U(k));
                 Gpu.Flush();
             }
-            if (!direct) Back(f, lane, lcl, c, (long)m * n);
             return laneName;
         }
         finally
         {
             foreach (var p in rented) gpu.Return(p);
         }
+    }
+
+    /// <summary>C = op(A)·op(B) over the view's batches with A and B read where they are stored (Ptx.Gemm's stored mode: each
+    /// tile value decoded, no operand in lane storage) and C stored as the type by the kernel; a block format's C (and a
+    /// sub-byte type's) is the products' sums in the lane, its blocks (words) encoded from them after, as a value's block
+    /// may span tiles. The plain lanes of every type whose storage is not the lane's, and every product of a block format
+    /// but the block-scaled one.</summary>
+    private string MatMulStored<TN>(ProductView v, ulong a, ulong b, ulong c, Lane lane) where TN : struct, IAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        bool typedC = !f.IsBlock && f.Bits >= 8;
+        int micro = v.M >= 128 && v.N >= 128 && !lane.Wide ? 8 : 4, tile = micro * 16;
+        // A block format's operand as runs of micro values where they are aligned runs of its stored rows.
+        bool runsA = f.IsBlock && (v.TransA ? v.M : v.K) % micro == 0 && v.StrideAOrDefault % micro == 0;
+        bool runsB = f.IsBlock && (v.TransB ? v.K : v.N) % micro == 0 && v.StrideBOrDefault % micro == 0;
+        var fn = gpu.Cached($"gemm_stored:{f.Name}:{lane.Name}:{micro}:{v.TransA}:{v.TransB}:{runsA}:{runsB}", (out string e) => Ptx.Gemm(gpu, lane, micro, out e, false, f, v.TransA, v.TransB, runsA, runsB));
+        ulong lc = typedC ? 0 : gpu.Rent(v.ValuesC * lane.Size);
+        try
+        {
+            for (int i = 0; i < v.Batch; i++)
+            {
+                long cOff = i * v.StrideCOrDefault;
+                ulong ci = typedC ? c + (ulong)(cOff * f.Bits / 8) : lc + (ulong)(cOff * lane.Size);
+                Gpu.Launch(fn, Grid(v.N, tile), Grid(v.M, tile), Ptx.GemmThreads, 1, 0, a, b, ci, Gpu.U(v.M), Gpu.U(v.N), Gpu.U(v.K), Gpu.U((int)(i * v.StrideAOrDefault)), Gpu.U((int)(i * v.StrideBOrDefault)));
+            }
+
+            if (!typedC) Back(f, lane, lc, c, v.ValuesC);
+        }
+        finally
+        {
+            if (lc != 0) gpu.Return(lc);
+        }
+
+        return f.IsBlock ? $"{lane.Name} (blocks in place)" : lane.Name;
     }
 
     /// <summary>The gate's override: false takes the register-tiled kernel as on a device that refuses the staged one.</summary>

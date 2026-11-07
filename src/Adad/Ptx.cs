@@ -124,9 +124,18 @@ internal static class Codec
     }
 
     // ---- block formats: the value at a linear index, decoded from its block (byte loads), as f32
-    private static string BlockDecode(PtxBuilder b, Fmt f, string basePtr, string index)
+    private static string BlockDecode(PtxBuilder b, Fmt f, string basePtr, string index) => BlockRun(b, f, basePtr, index, 1)[0];
+
+    /// <summary>BlockRun's values as lane registers.</summary>
+    public static string[] UnpackRun(PtxBuilder b, Fmt f, string basePtr, string index, int count, Lane lane) =>
+        [.. BlockRun(b, f, basePtr, index, count).Select(v => Convert(b, Lane.F32, v, lane, f))];
+
+    /// <summary>`count` consecutive values from the linear index of a block-format array, as f32 (count 1, 2, 4 or 8, the run's
+    /// start a multiple of count, so the run lies in one block and one sub-block): the block's and the sub-block's scales read
+    /// once, then each value's code. A value's arithmetic is the same as alone.</summary>
+    private static string[] BlockRun(PtxBuilder b, Fmt f, string basePtr, string index, int count)
     {
-        string blk = b.R(), off = b.R(), bAddr = b.RD(), t = b.R(), v = b.F();
+        string blk = b.R(), off = b.R(), bAddr = b.RD(), t = b.R();
         b.L($"div.u32 {blk}, {index}, {f.BlockValues};");
         b.L($"mul.lo.u32 {t}, {blk}, {f.BlockValues};");
         b.L($"sub.u32 {off}, {index}, {t};");
@@ -135,35 +144,47 @@ internal static class Codec
         string HalfAt(int at) { string h = b.H(), r = b.F(); b.L($"ld.global.u16 {h}, [{bAddr}+{at}];"); b.L($"cvt.f32.f16 {r}, {h};"); return r; }
         string ByteAt(string offset, int at) { string a = b.RD(), r = b.R(); b.L($"cvt.u64.u32 {a}, {offset};"); b.L($"add.u64 {a}, {bAddr}, {a};"); b.L($"ld.global.u8 {r}, [{a}+{at}];"); return r; }
         string I2F(string r) { string fr = b.F(); b.L($"cvt.rn.f32.s32 {fr}, {r};"); return fr; }
+        var v = new string[count];
         switch (f.Name)
         {
             case "q8_0":
             {
-                string d = HalfAt(0), q = ByteAt(off, 2), qs = b.R();
-                b.L($"cvt.s32.s8 {qs}, {q};");
-                b.L($"mul.rn.f32 {v}, {d}, {I2F(qs)};");
+                string d = HalfAt(0);
+                for (int k = 0; k < count; k++)
+                {
+                    string q = ByteAt(off, 2 + k), qs = b.R();
+                    v[k] = b.F();
+                    b.L($"cvt.s32.s8 {qs}, {q};");
+                    b.L($"mul.rn.f32 {v[k]}, {d}, {I2F(qs)};");
+                }
+
                 return v;
             }
 
             case "q4_0":
             {
                 // value i: the low nibble of byte i (i < 16), the high nibble of byte i − 16.
-                string d = HalfAt(0), lo = b.R(), pHi = b.P(), nib = b.R(), q = b.R(), byteOff = b.R();
+                string d = HalfAt(0), pHi = b.P(), byteOff = b.R();
                 b.L($"and.b32 {byteOff}, {off}, 15;");
-                string by = ByteAt(byteOff, 2);
                 b.L($"setp.ge.u32 {pHi}, {off}, 16;");
-                b.L($"and.b32 {lo}, {by}, 15;");
-                b.L($"shr.u32 {nib}, {by}, 4;");
-                b.L($"selp.u32 {q}, {nib}, {lo}, {pHi};");
-                b.L($"sub.s32 {q}, {q}, 8;");
-                b.L($"mul.rn.f32 {v}, {d}, {I2F(q)};");
+                for (int k = 0; k < count; k++)
+                {
+                    string by = ByteAt(byteOff, 2 + k), lo = b.R(), nib = b.R(), q = b.R();
+                    b.L($"and.b32 {lo}, {by}, 15;");
+                    b.L($"shr.u32 {nib}, {by}, 4;");
+                    b.L($"selp.u32 {q}, {nib}, {lo}, {pHi};");
+                    b.L($"sub.s32 {q}, {q}, 8;");
+                    v[k] = b.F();
+                    b.L($"mul.rn.f32 {v[k]}, {d}, {I2F(q)};");
+                }
+
                 return v;
             }
 
             case "q4_k":
             {
                 // sub-block j = off / 32 (pair j/2, the low nibbles for even j, the high for odd); scale_j, min_j from the 12 bytes at 4.
-                string d = HalfAt(0), dmin = HalfAt(2), j = b.R(), i = b.R(), pair = b.R(), pOdd = b.R(), byteOff = b.R(), lo = b.R(), hi = b.R(), q = b.R(), pIsOdd = b.P();
+                string d = HalfAt(0), dmin = HalfAt(2), j = b.R(), i = b.R(), pair = b.R(), pOdd = b.R(), byteOff = b.R(), pIsOdd = b.P();
                 b.L($"shr.u32 {j}, {off}, 5;");
                 b.L($"and.b32 {i}, {off}, 31;");
                 b.L($"shr.u32 {pair}, {j}, 1;");
@@ -171,10 +192,6 @@ internal static class Codec
                 b.L($"setp.ne.u32 {pIsOdd}, {pOdd}, 0;");
                 b.L($"shl.b32 {byteOff}, {pair}, 5;");
                 b.L($"add.u32 {byteOff}, {byteOff}, {i};");
-                string by = ByteAt(byteOff, 16);
-                b.L($"and.b32 {lo}, {by}, 15;");
-                b.L($"shr.u32 {hi}, {by}, 4;");
-                b.L($"selp.u32 {q}, {hi}, {lo}, {pIsOdd};");
                 // scale, min: j < 4: sc[j] & 63, sc[j+4] & 63; else (sc[j+4] & 0xF) | (sc[j-4] >> 6) << 4, (sc[j+4] >> 4) | (sc[j] >> 6) << 4
                 string pLow = b.P(), sA = b.R(), sB = b.R(), sC = b.R(), scale = b.R(), min = b.R(), jp4 = b.R(), jm4 = b.R(), jc = b.R();
                 b.L($"setp.lt.u32 {pLow}, {j}, 4;");
@@ -196,11 +213,20 @@ internal static class Codec
                 b.L($"or.b32 {highM}, {sC}, {sB};");
                 b.L($"selp.u32 {scale}, {lowS}, {highS}, {pLow};");
                 b.L($"selp.u32 {min}, {lowM}, {highM}, {pLow};");
-                string ds = b.F(), dm = b.F(), prod = b.F();
+                string ds = b.F(), dm = b.F();
                 b.L($"mul.rn.f32 {ds}, {d}, {I2F(scale)};");
                 b.L($"mul.rn.f32 {dm}, {dmin}, {I2F(min)};");
-                b.L($"mul.rn.f32 {prod}, {ds}, {I2F(q)};");
-                b.L($"sub.rn.f32 {v}, {prod}, {dm};");
+                for (int k = 0; k < count; k++)
+                {
+                    string by = ByteAt(byteOff, 16 + k), lo = b.R(), hi = b.R(), q = b.R(), prod = b.F();
+                    b.L($"and.b32 {lo}, {by}, 15;");
+                    b.L($"shr.u32 {hi}, {by}, 4;");
+                    b.L($"selp.u32 {q}, {hi}, {lo}, {pIsOdd};");
+                    b.L($"mul.rn.f32 {prod}, {ds}, {I2F(q)};");
+                    v[k] = b.F();
+                    b.L($"sub.rn.f32 {v[k]}, {prod}, {dm};");
+                }
+
                 return v;
             }
 
@@ -216,26 +242,16 @@ internal static class Codec
                 b.L($"shl.b32 {hBase}, {half}, 5;");
                 b.L($"shl.b32 {sBase}, {half}, 3;");
                 // ql byte: l (quarters 0, 2) or l + 32 (quarters 1, 3); the nibble: low (quarters 0, 1) or high (2, 3); qh shift = 2·quarter.
-                string qlOff = b.R(), odd = b.R(), pOdd = b.P(), pHigh = b.P(), qlo = b.R(), qhi = b.R(), qn = b.R(), qhOff = b.R(), shiftH = b.R(), hbits = b.R(), q = b.R();
+                string qlOff = b.R(), odd = b.R(), pOdd = b.P(), pHigh = b.P(), qhOff = b.R(), shiftH = b.R();
                 b.L($"and.b32 {odd}, {quarter}, 1;");
                 b.L($"setp.ne.u32 {pOdd}, {odd}, 0;");
                 b.L($"setp.ge.u32 {pHigh}, {quarter}, 2;");
                 b.L($"add.u32 {qlOff}, {lBase}, {l};");
                 b.L($"@{pOdd} add.u32 {qlOff}, {qlOff}, 32;");
-                string qlByte = ByteAt(qlOff, 0);
-                b.L($"and.b32 {qlo}, {qlByte}, 15;");
-                b.L($"shr.u32 {qhi}, {qlByte}, 4;");
-                b.L($"selp.u32 {qn}, {qhi}, {qlo}, {pHigh};");
                 b.L($"add.u32 {qhOff}, {hBase}, {l};");
-                string qhByte = ByteAt(qhOff, 128);
                 b.L($"shl.b32 {shiftH}, {quarter}, 1;");
-                b.L($"shr.u32 {hbits}, {qhByte}, {shiftH};");
-                b.L($"and.b32 {hbits}, {hbits}, 3;");
-                b.L($"shl.b32 {hbits}, {hbits}, 4;");
-                b.L($"or.b32 {q}, {qn}, {hbits};");
-                b.L($"sub.s32 {q}, {q}, 32;");
                 // scale index: sBase + (l / 16) + 2·quarter
-                string sIdx = b.R(), sc = b.R(), scS = b.R();
+                string sIdx = b.R(), scS = b.R();
                 b.L($"shr.u32 {sIdx}, {l}, 4;");
                 b.L($"add.u32 {sIdx}, {sIdx}, {sBase};");
                 b.L($"mad.lo.u32 {sIdx}, {quarter}, 2, {sIdx};");
@@ -243,8 +259,22 @@ internal static class Codec
                 b.L($"cvt.s32.s8 {scS}, {scByte};");
                 string ds = b.F();
                 b.L($"mul.rn.f32 {ds}, {d}, {I2F(scS)};");
-                b.L($"mul.rn.f32 {v}, {ds}, {I2F(q)};");
-                _ = sc;
+                for (int k = 0; k < count; k++)
+                {
+                    string qlByte = ByteAt(qlOff, k), qlo = b.R(), qhi = b.R(), qn = b.R(), hbits = b.R(), q = b.R();
+                    b.L($"and.b32 {qlo}, {qlByte}, 15;");
+                    b.L($"shr.u32 {qhi}, {qlByte}, 4;");
+                    b.L($"selp.u32 {qn}, {qhi}, {qlo}, {pHigh};");
+                    string qhByte = ByteAt(qhOff, 128 + k);
+                    b.L($"shr.u32 {hbits}, {qhByte}, {shiftH};");
+                    b.L($"and.b32 {hbits}, {hbits}, 3;");
+                    b.L($"shl.b32 {hbits}, {hbits}, 4;");
+                    b.L($"or.b32 {q}, {qn}, {hbits};");
+                    b.L($"sub.s32 {q}, {q}, 32;");
+                    v[k] = b.F();
+                    b.L($"mul.rn.f32 {v[k]}, {ds}, {I2F(q)};");
+                }
+
                 return v;
             }
 
@@ -1708,11 +1738,21 @@ internal static partial class Ptx
     /// <summary>Tiles of micro·16 × micro·16 values of C per block of 256 threads (micro² per thread), k in steps of 8 through shared memory.</summary>
     /// <summary>With conv (item 4g) B is the convolution's columns read from the image at p_b (C × H × W, in the lane's
     /// storage): the B tile's loads gather x[c][oh·sh − ph + kh·dh][ow·sw − pw + kw·dw] (0 off the image) for row
-    /// kk = (c, kh, kw) and column j = (oh, ow) — the implicit im2col; the rest of the kernel unchanged.</summary>
-    public static string Gemm(Gpu gpu, Lane lane, int micro, out string entry, bool conv = false)
+    /// kk = (c, kh, kw) and column j = (oh, ow) — the implicit im2col; the rest of the kernel unchanged.
+    /// stored: A and B are arrays of that format, not lane storage: each tile value decoded where it is stored (Codec.UnpackAt)
+    /// at A[i][kk] = a[p_aoff + (transA ? kk·m + i : i·k + kk)], B[kk][j] = b[p_boff + (transB ? j·k + kk : kk·n + j)] (conv:
+    /// the image's value), so no operand exists in lane storage; C is stored as the format (Codec.Pack: the conversion pass's
+    /// bits) where its values are whole bytes and not blocks, else in the lane for the caller to encode.
+    /// runsA, runsB (a block format; the operand's extent along its stored rows and its offsets multiples of micro): the
+    /// operand's tile loaded as runs of micro values consecutive where it is stored (A's along k, or along m transposed;
+    /// B's along n, or along k transposed), each decoded with one read of its block's scales (Codec.UnpackRun).</summary>
+    public static string Gemm(Gpu gpu, Lane lane, int micro, out string entry, bool conv = false, Fmt? stored = null, bool transA = false, bool transB = false, bool runsA = false, bool runsB = false)
     {
         int tile = micro * 16, bk = 16, e = lane.Size;
         entry = conv ? $"gemmconv{tile}_{lane.Name}" : $"gemm{tile}_{lane.Name}";
+        if (stored is not null) entry += $"_s{stored.Name}{(transA ? "_ta" : "")}{(transB ? "_tb" : "")}{(runsA ? "_ra" : "")}{(runsB ? "_rb" : "")}";
+        if ((runsA || runsB) && (stored is null || !stored.IsBlock || conv)) throw new ArgumentException("runs: a block format's stored operands");
+        bool typedC = stored is not null && !stored.IsBlock && stored.Bits >= 8;
         var b = new PtxBuilder();
         string tid = b.R(), bx = b.R(), by = b.R(), tx = b.R(), ty = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
@@ -1722,6 +1762,50 @@ internal static partial class Ptx
         b.L($"shr.u32 {ty}, {tid}, 4;");
         string pa = Param64(b, "p_a"), pb = Param64(b, "p_b"), pc = Param64(b, "p_c"), m = Param32(b, "p_m"), n = Param32(b, "p_n"), k = Param32(b, "p_k");
         string[] g = conv ? [.. new[] { "h", "w", "kh", "kw", "sh", "sw", "ph", "pw", "dh", "dw", "ow" }.Select(name => Param32(b, "p_" + name))] : [];
+        string aoff = stored is null ? "" : Param32(b, "p_aoff"), boff = stored is null ? "" : Param32(b, "p_boff");
+        // A stored value of the tile, or 0 where p is false (the index then the array's first value: every load in range).
+        string Decoded(string ptr, string index, string p, string first)
+        {
+            string at = b.R(), z = lane.NewReg(b);
+            b.L($"selp.u32 {at}, {index}, {first}, {p};");
+            string v = Codec.UnpackAt(b, stored!, ptr, at, lane);
+            b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {z}, {v}, {lane.Zero}, {p};");
+            return z;
+        }
+
+        // A run of micro stored values (each thread's share of a tile) from an aligned index, in range whole or not at all:
+        // zeros where p is false.
+        string[] Run(string ptr, string index, string p, string first)
+        {
+            string at = b.R();
+            b.L($"selp.u32 {at}, {index}, {first}, {p};");
+            var vals = Codec.UnpackRun(b, stored!, ptr, at, micro, lane);
+            var z = new string[vals.Length];
+            for (int q = 0; q < vals.Length; q++)
+            {
+                z[q] = lane.NewReg(b);
+                b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {z[q]}, {vals[q]}, {lane.Zero}, {p};");
+            }
+
+            return z;
+        }
+
+        // A run's values into the shared tile at value offsets off0 + q·step: vector stores where step is 1.
+        void Stash(string bas, string[] vals, string off0, int step)
+        {
+            string sAddr0 = b.R();
+            b.L($"mad.lo.u32 {sAddr0}, {off0}, {e}, {bas};");
+            int perVec = e == 4 ? 4 : 2;
+            if (step == 1)
+                for (int q = 0; q < vals.Length; q += perVec)
+                {
+                    string regs = perVec == 4 ? $"{{{vals[q]}, {vals[q + 1]}, {vals[q + 2]}, {vals[q + 3]}}}" : $"{{{vals[q]}, {vals[q + 1]}}}";
+                    b.L($"st.shared.v{perVec}.{lane.Mem} [{sAddr0}+{q * e}], {regs};");
+                }
+            else
+                for (int q = 0; q < vals.Length; q++) b.L($"st.shared.{lane.Mem} [{sAddr0}+{q * step * e}], {vals[q]};");
+        }
+
         string row0 = b.R(), col0 = b.R();
         b.L($"mul.lo.u32 {row0}, {by}, {tile};");
         b.L($"mul.lo.u32 {col0}, {bx}, {tile};");
@@ -1763,7 +1847,56 @@ internal static partial class Ptx
         b.L($"@{pLoop} bra KDONE;");
 
         // A's tile: this thread's perThread consecutive k values of row aRow at k0 + aCol, stored transposed As[kk][row]:
-        // whole vectors when the row's values are in range and aligned, else one by one (guarded).
+        // whole vectors when the row's values are in range and aligned, else one by one (guarded); a stored format's decoded.
+        if (runsA)
+        {
+            // A run of perThread values, all in range or none (the extent along it a multiple of perThread): along k at row
+            // aRow (the threads as for the plain tile), or transposed along m at k row bRow from row bCol (as B's threads).
+            string kk = b.R(), pRun = b.P(), idx = b.R(), sOff = b.R();
+            if (transA)
+            {
+                string rowA = b.R(), pIn = b.P();
+                b.L($"add.u32 {kk}, {k0}, {bRow};");
+                b.L($"add.u32 {rowA}, {row0}, {bCol};");
+                b.L($"setp.lt.u32 {pRun}, {kk}, {k};");
+                b.L($"setp.lt.u32 {pIn}, {rowA}, {m};");
+                b.L($"and.pred {pRun}, {pRun}, {pIn};");
+                b.L($"mad.lo.u32 {idx}, {kk}, {m}, {rowA};");
+                b.L($"add.u32 {idx}, {idx}, {aoff};");
+                b.L($"mad.lo.u32 {sOff}, {bRow}, {tile}, {bCol};");
+                Stash(asBase, Run(pa, idx, pRun, aoff), sOff, 1);
+            }
+            else
+            {
+                b.L($"add.u32 {kk}, {k0}, {aCol};");
+                b.L($"setp.lt.u32 {pRun}, {kk}, {k};");
+                b.L($"and.pred {pRun}, {pRun}, {pRow};");
+                b.L($"mad.lo.u32 {idx}, {gRow}, {k}, {kk};");
+                b.L($"add.u32 {idx}, {idx}, {aoff};");
+                b.L($"mad.lo.u32 {sOff}, {aCol}, {tile}, {aRow};");
+                Stash(asBase, Run(pa, idx, pRun, aoff), sOff, tile);
+            }
+        }
+        else if (stored is not null)
+        {
+            string kk0 = b.R();
+            b.L($"add.u32 {kk0}, {k0}, {aCol};");
+            for (int q = 0; q < perThread; q++)
+            {
+                string kk = b.R(), pk = b.P(), idx = b.R();
+                b.L($"add.u32 {kk}, {kk0}, {q};");
+                b.L($"setp.lt.u32 {pk}, {kk}, {k};");
+                b.L($"and.pred {pk}, {pk}, {pRow};");
+                if (transA) b.L($"mad.lo.u32 {idx}, {kk}, {m}, {gRow};"); else b.L($"mad.lo.u32 {idx}, {gRow}, {k}, {kk};");
+                b.L($"add.u32 {idx}, {idx}, {aoff};");
+                string v = Decoded(pa, idx, pk, aoff), sAddr = b.R(), sOff = b.R();
+                b.L($"mad.lo.u32 {sOff}, {aCol}, {tile}, {aRow};");
+                b.L($"add.u32 {sOff}, {sOff}, {q * tile};");
+                b.L($"mad.lo.u32 {sAddr}, {sOff}, {e}, {asBase};");
+                b.L($"st.shared.{lane.Mem} [{sAddr}], {v};");
+            }
+        }
+        else
         {
             var av0 = new string[perThread];
             for (int q = 0; q < perThread; q++) { av0[q] = lane.NewReg(b); b.L($"mov.{lane.Reg} {av0[q]}, {lane.Zero};"); }
@@ -1844,9 +1977,74 @@ internal static partial class Ptx
                 b.L($"and.pred {pq}, {pq}, {pin};");
                 b.L($"add.u32 {idx}, {cBase}, {ih};");
                 b.L($"mad.lo.u32 {idx}, {idx}, {g[1]}, {iw};");
+                if (stored is not null)
+                {
+                    string zero = b.R();
+                    b.L($"mov.u32 {zero}, 0;");
+                    b.L($"mov.{lane.Reg} {bv0[q]}, {Decoded(pb, idx, pq, zero)};");
+                    continue;
+                }
+
                 b.L($"mul.wide.u32 {addr}, {idx}, {e};");
                 b.L($"add.u64 {addr}, {pb}, {addr};");
                 b.L($"@{pq} ld.global.{lane.Mem} {bv0[q]}, [{addr}];");
+            }
+
+            string sOff0 = b.R(), sAddr0 = b.R();
+            int perVec = e == 4 ? 4 : 2;
+            b.L($"mad.lo.u32 {sOff0}, {bRow}, {tile}, {bCol};");
+            b.L($"mad.lo.u32 {sAddr0}, {sOff0}, {e}, {bsBase};");
+            for (int q = 0; q < perThread; q += perVec)
+            {
+                string regs = perVec == 4 ? $"{{{bv0[q]}, {bv0[q + 1]}, {bv0[q + 2]}, {bv0[q + 3]}}}" : $"{{{bv0[q]}, {bv0[q + 1]}}}";
+                b.L($"st.shared.v{perVec}.{lane.Mem} [{sAddr0}+{q * e}], {regs};");
+            }
+        }
+        else if (runsB)
+        {
+            // A run of perThread values, all in range or none: along n at k row bRow (the threads as for the plain tile), or
+            // transposed along k from k0 + aCol at column aRow (as A's threads), stored Bs[kk][col].
+            string kk = b.R(), pRun = b.P(), pIn = b.P(), idx = b.R(), sOff = b.R();
+            if (transB)
+            {
+                string colB = b.R();
+                b.L($"add.u32 {kk}, {k0}, {aCol};");
+                b.L($"add.u32 {colB}, {col0}, {aRow};");
+                b.L($"setp.lt.u32 {pRun}, {kk}, {k};");
+                b.L($"setp.lt.u32 {pIn}, {colB}, {n};");
+                b.L($"and.pred {pRun}, {pRun}, {pIn};");
+                b.L($"mad.lo.u32 {idx}, {colB}, {k}, {kk};");
+                b.L($"add.u32 {idx}, {idx}, {boff};");
+                b.L($"mad.lo.u32 {sOff}, {aCol}, {tile}, {aRow};");
+                Stash(bsBase, Run(pb, idx, pRun, boff), sOff, tile);
+            }
+            else
+            {
+                b.L($"add.u32 {kk}, {k0}, {bRow};");
+                b.L($"setp.lt.u32 {pRun}, {kk}, {k};");
+                b.L($"setp.lt.u32 {pIn}, {gColB}, {n};");
+                b.L($"and.pred {pRun}, {pRun}, {pIn};");
+                b.L($"mad.lo.u32 {idx}, {kk}, {n}, {gColB};");
+                b.L($"add.u32 {idx}, {idx}, {boff};");
+                b.L($"mad.lo.u32 {sOff}, {bRow}, {tile}, {bCol};");
+                Stash(bsBase, Run(pb, idx, pRun, boff), sOff, 1);
+            }
+        }
+        else if (stored is not null)
+        {
+            string kk = b.R(), pk = b.P();
+            b.L($"add.u32 {kk}, {k0}, {bRow};");
+            b.L($"setp.lt.u32 {pk}, {kk}, {k};");
+            var bv0 = new string[perThread];
+            for (int q = 0; q < perThread; q++)
+            {
+                string col = b.R(), pq = b.P(), idx = b.R();
+                b.L($"add.u32 {col}, {gColB}, {q};");
+                b.L($"setp.lt.u32 {pq}, {col}, {n};");
+                b.L($"and.pred {pq}, {pq}, {pk};");
+                if (transB) b.L($"mad.lo.u32 {idx}, {col}, {k}, {kk};"); else b.L($"mad.lo.u32 {idx}, {kk}, {n}, {col};");
+                b.L($"add.u32 {idx}, {idx}, {boff};");
+                bv0[q] = Decoded(pb, idx, pq, boff);
             }
 
             string sOff0 = b.R(), sAddr0 = b.R();
@@ -1972,6 +2170,12 @@ internal static partial class Ptx
                 b.L($"and.pred {pcol}, {pcol}, {pr};");
                 b.L($"cvt.u64.u32 {idx}, {col};");
                 b.L($"add.u64 {idx}, {idx}, {rowOff};");
+                if (typedC)
+                {
+                    StoreOne(b, stored!, lane, acc[r, c], pc, idx, addr, pcol, null);
+                    continue;
+                }
+
                 b.L($"mul.lo.u64 {idx}, {idx}, {e};");
                 b.L($"add.u64 {addr}, {pc}, {idx};");
                 b.L($"@{pcol} st.global.{lane.Mem} [{addr}], {acc[r, c]};");
@@ -1980,7 +2184,8 @@ internal static partial class Ptx
 
         b.L("ret;");
         string convParams = conv ? ", .param .u32 p_h, .param .u32 p_w, .param .u32 p_kh, .param .u32 p_kw, .param .u32 p_sh, .param .u32 p_sw, .param .u32 p_ph, .param .u32 p_pw, .param .u32 p_dh, .param .u32 p_dw, .param .u32 p_ow" : "";
-        return b.Finish(Header(gpu), entry, ".param .u64 p_a, .param .u64 p_b, .param .u64 p_c, .param .u32 p_m, .param .u32 p_n, .param .u32 p_k" + convParams, asBytes + bsBytes);
+        string storedParams = stored is null ? "" : ", .param .u32 p_aoff, .param .u32 p_boff";
+        return b.Finish(Header(gpu), entry, ".param .u64 p_a, .param .u64 p_b, .param .u64 p_c, .param .u32 p_m, .param .u32 p_n, .param .u32 p_k" + convParams + storedParams, asBytes + bsBytes);
     }
 
     /// <summary>Shared bytes the 32-bit-lane product takes: A 128 rows × 80 B and B 16 rows × 512 B per stage.</summary>

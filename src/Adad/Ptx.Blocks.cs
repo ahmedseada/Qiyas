@@ -88,6 +88,42 @@ internal static partial class Ptx
         else EncodeQ0(e, f, vals[0]);
     }
 
+    /// <summary>Whether a kernel whose values are costly (a window or a gather each) takes a CTA per block of f: the formats of
+    /// more values than a warp's lanes, whose warp per block would give each lane BlockValues / 32 of them in turn.</summary>
+    public static bool BlockByCta(Fmt f) => f.BlockValues > 32;
+
+    /// <summary>A CTA per block of f (BlockValues threads, the kernel's shared bytes BlockValues · 4): each thread evaluates
+    /// one value of the block (value(at, pIn) as EncodeBlock's source) into shared memory, then the first warp encodes the
+    /// block from them. The other warps go to DONE.</summary>
+    internal static void EncodeBlockByCta(PtxBuilder b, Fmt f, string outp, string n, Func<string, string, string> value)
+    {
+        string blk = b.R(), t = b.R(), first = b.R(), idx = b.R(), last = b.R(), at = b.R(), pIn = b.P(), smem = b.R(), sAddr = b.R();
+        b.L($"mov.u32 {blk}, %ctaid.x;");
+        b.L($"mov.u32 {t}, %tid.x;");
+        b.L($"mul.lo.u32 {first}, {blk}, {f.BlockValues};");
+        b.L($"add.u32 {idx}, {first}, {t};");
+        b.L($"sub.u32 {last}, {n}, 1;");
+        b.L($"setp.le.u32 {pIn}, {idx}, {last};");
+        b.L($"min.u32 {at}, {idx}, {last};");
+        string raw = value(at, pIn), v = b.F();
+        b.L($"selp.f32 {v}, {raw}, 0f00000000, {pIn};");
+        b.L($"mov.u32 {smem}, smem;");
+        b.L($"mad.lo.u32 {sAddr}, {t}, 4, {smem};");
+        b.L($"st.shared.f32 [{sAddr}], {v};");
+        b.L("bar.sync 0;");
+        string pRest = b.P();
+        b.L($"setp.ge.u32 {pRest}, {t}, 32;");
+        b.L($"@{pRest} bra DONE;");
+        EncodeBlock(b, f, outp, (blk, t), n, a =>
+        {
+            string o = b.R(), ad = b.R(), r = b.F();
+            b.L($"sub.u32 {o}, {a}, {first};");
+            b.L($"mad.lo.u32 {ad}, {o}, 4, {smem};");
+            b.L($"ld.shared.f32 {r}, [{ad}];");
+            return r;
+        });
+    }
+
     // The encoders' instructions: butterflies over the warp, shuffles, rounding, stores at the block's bytes.
     private sealed class BlockEmit(PtxBuilder b, string bAddr, string lane)
     {

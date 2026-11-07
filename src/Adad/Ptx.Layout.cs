@@ -68,6 +68,36 @@ internal static partial class Ptx
         return b.Finish(Header(gpu), entry, LayoutParams);
     }
 
+    /// <summary>A layout operation's output as blocks of f: each value the operation's own (LayoutValue, its inputs decoded
+    /// where they are stored, in f32), the block encoded from them: a warp per block, or a CTA per block (a thread a value)
+    /// for the formats of more values than a warp's lanes (BlockByCta), a value's window or gather being costly.</summary>
+    public static string LayoutBlocks(Gpu gpu, Fmt f, string name, out string entry)
+    {
+        entry = $"layout_{name}_{f.Name}_blocks";
+        var lane = Lane.F32;
+        var b = new PtxBuilder();
+        string x = Param64(b, "p_x"), x2 = Param64(b, "p_x2"), idx = Param64(b, "p_idx"), aux = Param64(b, "p_aux"), outp = Param64(b, "p_out");
+        string count = Param32(b, "p_count"), cols = Param32(b, "p_cols");
+        var p = new string[12];
+        for (int k = 0; k < 12; k++) p[k] = Param32(b, $"p_p{k}");
+        int tag = 0;
+        string Value(string at, string _)
+        {
+            string r = b.R(), c = b.R(), t = b.R();
+            b.L($"div.u32 {r}, {at}, {cols};");
+            b.L($"mul.lo.u32 {t}, {r}, {cols};");
+            b.L($"sub.u32 {c}, {at}, {t};");
+            return LayoutValue(b, f, lane, name, x, x2, idx, aux, p, cols, at, r, c, tag++);     // its own labels a value
+        }
+
+        bool cta = BlockByCta(f);
+        if (cta) EncodeBlockByCta(b, f, outp, count, Value);
+        else EncodeBlock(b, f, outp, BlockWarp(b, f, count), count, Value);
+        b.Label("DONE");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, LayoutParams, cta ? f.BlockValues * 4 : 0);
+    }
+
     /// <summary>A format the per-value layout kernel packs: whole values filling a 32-bit word, 2 to 32 of them.</summary>
     public static bool PerValueFits(Fmt f) => !f.IsBlock && f.WordBits == 32 && f.Per >= 2 && f.Per * f.Bits == 32;
 

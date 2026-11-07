@@ -25,21 +25,9 @@ public sealed partial class GpuOps
         var f = Fmt.Of<TN>();
         string lane = "";
         bool direct = v.Batch == 1 && !v.TransA && !v.TransB;
-        if (f.IsBlock && !direct)
-        {
-            // A block format's values are addressed by blocks: the views are taken in float32 storage (the values decoded
-            // once, no re-encoding of the operands' copies), the result encoded by blocks.
-            var r = new List<ulong>();
-            try
-            {
-                ulong la = Lanes(f, Lane.F32, a, v.ValuesA, r), lb = Lanes(f, Lane.F32, b, v.ValuesB, r), lc = gpu.Rent(v.ValuesC * 4);
-                r.Add(lc);
-                MatMulView<Float32>(v, la, lb, lc);
-                Back(f, Lane.F32, lc, c, v.ValuesC);
-                return "f32 (blocks through lane storage)";
-            }
-            finally { foreach (var p in r) gpu.Return(p); }
-        }
+        // A block format's values are addressed by blocks (a copy of a view's operand would re-encode them): every batch's
+        // operands read where they are stored, transposed or at their offsets, by the product kernel itself.
+        if (f.IsBlock) return MatMulStored<TN>(v, a, b, c, Lane.F32);
 
         long bytesA = f.Words((long)v.M * v.K) * (f.WordBits / 8), bytesB = f.Words((long)v.K * v.N) * (f.WordBits / 8), bytesC = f.Words((long)v.M * v.N) * (f.WordBits / 8);
         // A batch's operands read where they are stored (Aᵀ, Bᵀ, a batch's offset on the pointer) where the product's packing

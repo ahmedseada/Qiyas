@@ -21,20 +21,8 @@ public sealed partial class GpuOps
     public string Layout<TN>(LayoutArgs k, ulong x, ulong idx, ulong output, ulong x2 = 0) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsBlock)
-        {
-            var r = new List<ulong>();
-            try
-            {
-                ulong lx = Lanes(f, Lane.F32, x, k.InputCount, r), lx2 = x2 == 0 ? 0 : Lanes(f, Lane.F32, x2, k.SecondCount, r), lo = gpu.Rent(k.Count * 4L);
-                r.Add(lo);
-                Layout<Float32>(k, lx, idx, lo, lx2);
-                Back(f, Lane.F32, lo, output, k.Count);
-                return "f32 (blocks through lane storage)";
-            }
-            finally { foreach (var p in r) gpu.Return(p); }
-        }
-
+        // A block format takes the same lanes (f32: a float type's) with its inputs decoded where they are stored, and its
+        // output written by a warp or a CTA per block (Ptx.LayoutBlocks).
         var (rows, cols) = LayoutArgs.OutputRows(k);
         Lane lane;
         if (LayoutArgs.Sums(k.Name))
@@ -78,9 +66,17 @@ public sealed partial class GpuOps
                 if (windows > 0) Gpu.Launch(argmax, Grid(windows, 256), 1, 256, 1, 0, args);
             }
 
+            args[0] = x; args[1] = x2; args[2] = idx; args[3] = aux; args[4] = output; args[5] = Gpu.U(k.Count); args[6] = Gpu.U(rows); args[7] = Gpu.U(cols);
+            if (f.IsBlock)
+            {
+                var fb = gpu.Cached($"layout_blocks:{k.Name}:{f.Name}", (out string e) => Ptx.LayoutBlocks(gpu, f, k.Name, out e));
+                if (k.Count > 0 && Ptx.BlockByCta(f)) Gpu.Launch(fb, (uint)((k.Count + f.BlockValues - 1) / f.BlockValues), 1, (uint)f.BlockValues, 1, 0, args);
+                else if (k.Count > 0) Gpu.Launch(fb, BlockGrid(f, k.Count), 1, 256, 1, 0, args);
+                return "f32 (blocks in place)";
+            }
+
             bool perValue = PerValueLayout(f, k.Count);
             var fn = gpu.Cached($"layout:{k.Name}:{f.Name}:{lane.Name}{(perValue ? ":v" : "")}", (out string e) => Ptx.Layout(gpu, f, lane, k.Name, perValue, out e));
-            args[0] = x; args[1] = x2; args[2] = idx; args[3] = aux; args[4] = output; args[5] = Gpu.U(k.Count); args[6] = Gpu.U(rows); args[7] = Gpu.U(cols);
             Gpu.Launch(fn, Grid(perValue ? (long)f.Words(k.Count) * f.Per : f.Words(k.Count), 256), 1, 256, 1, 0, args);
         }
         finally
