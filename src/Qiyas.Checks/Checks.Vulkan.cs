@@ -18,6 +18,7 @@ internal static partial class Checks
         ok &= Rows(ops, "vulkan");
         ok &= Layouts(ops, "vulkan", blocks: false);
         ok &= Products(ops, "vulkan", blocks: false);
+        ok &= Optimizers(ops, "vulkan", blocks: false);
         return ok;
     }
 

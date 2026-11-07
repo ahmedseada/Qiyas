@@ -97,8 +97,6 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
     public string AttentionBackward<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong dO, ulong dq, ulong dk, ulong dv) where TN : struct, IFloatAdad<TN> =>
         throw Missing("attention backward");
 
-    public string Optimizer<TN>(OptimizerArgs a, ulong p, ulong g, ulong m, ulong v, int n) where TN : struct, IFloatAdad<TN> => throw Missing("optimizers");
-
     public string Conv<TN>(ConvArgs a, ulong x, ulong w, ulong y) where TN : struct, IAdad<TN> => throw Missing("conv");
 
     public string ConvComposed<TN>(ConvArgs a, ulong x, ulong w, ulong y) where TN : struct, IAdad<TN> => throw Missing("conv (composed)");

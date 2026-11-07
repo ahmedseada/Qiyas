@@ -835,13 +835,14 @@ internal static partial class Checks
 
     /// <summary>Every float type, 1001 and 37 values, each step at step counts 1 and 7: p against float64 within the lane's
     /// rounding of the update (several operations: 16 lane ulps of the update's magnitude), m and v within 4 lane ulps.</summary>
-    public static bool Optimizers(GpuOps? ops)
+    // blocks: false where the device refuses the block formats (said so, not proved).
+    public static bool Optimizers(IDevice<ulong, ulong>? ops, string device = "device", bool blocks = true)
     {
         bool ok = true;
-        string where = ops is null ? "cpu" : "device";
+        string where = ops is null ? "cpu" : device;
         foreach (var type in Bench.Registry.Names)
         {
-            if (!Bench.Registry.IsFloat(type)) continue;
+            if (!Bench.Registry.IsFloat(type) || (!blocks && Bench.Registry.IsBlock(type))) continue;
             int size = type == "float64" ? 8 : 4;
             foreach (var name in OptimizerArgs.Names)
             {
@@ -868,7 +869,7 @@ internal static partial class Checks
             }
         }
 
-        if (ok) Console.WriteLine($"check optimizers             {where,-6} every float type at 1001 and 37 values: p, m, v within the lane's rounding");
+        if (ok) Console.WriteLine($"check optimizers             {where,-6} every float type{(blocks ? "" : " but the block formats")} at 1001 and 37 values: p, m, v within the lane's rounding");
         return ok;
     }
 
@@ -894,21 +895,20 @@ internal static partial class Checks
         return worst == 0;
     }
 
-    private sealed class OptimizerRun(GpuOps? ops, OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) : Bench.IFloatTypeVisitor<bool>
+    private sealed class OptimizerRun(IDevice<ulong, ulong>? ops, OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) : Bench.IFloatTypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
         {
             if (ops is null) { Kernels.Optimizer<TN>(a, p, g, m, v, n); return true; }
-            var gpu = ops.Gpu;
-            ulong dp = gpu.Rent(p.Length), dg = gpu.Rent(g.Length), dm = gpu.Rent(m.Length), dv = v is null ? 0 : gpu.Rent(v.Length);
-            Adad.Cuda.Gpu.Upload<byte>(p, dp); Adad.Cuda.Gpu.Upload<byte>(g, dg); Adad.Cuda.Gpu.Upload<byte>(m, dm);
-            if (v is not null) Adad.Cuda.Gpu.Upload<byte>(v, dv);
+            ulong dp = ops.Rent(p.Length + 16), dg = ops.Rent(g.Length + 16), dm = ops.Rent(m.Length + 16), dv = v is null ? 0 : ops.Rent(v.Length + 16);
+            ops.Upload(p, dp); ops.Upload(g, dg); ops.Upload(m, dm);
+            if (v is not null) ops.Upload(v, dv);
             ops.Optimizer<TN>(a, dp, dg, dm, dv, n);
-            Adad.Cuda.Gpu.Synchronize();
-            Adad.Cuda.Gpu.Download<byte>(dp, p); Adad.Cuda.Gpu.Download<byte>(dm, m);
-            if (v is not null) Adad.Cuda.Gpu.Download<byte>(dv, v);
-            gpu.Return(dp); gpu.Return(dg); gpu.Return(dm);
-            if (v is not null) gpu.Return(dv);
+            ops.Synchronize();
+            ops.Download(dp, p); ops.Download(dm, m);
+            if (v is not null) ops.Download(dv, v);
+            ops.Return(dp); ops.Return(dg); ops.Return(dm);
+            if (v is not null) ops.Return(dv);
             return true;
         }
     }
