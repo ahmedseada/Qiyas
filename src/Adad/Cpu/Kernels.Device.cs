@@ -111,6 +111,9 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
         Name = k.Name, X = x, X2 = x2, Index = index, P = k.P, Output = output, Count = k.Count, InputCount = k.InputCount,
     });
 
+    string ILayouts<byte[], int[]>.Resample<TIn, TN>(ResampleArgs a, byte[] x, int[] bounds, byte[] weights, byte[]? values, byte[] y) =>
+        Resample<TIn, TN>(a, x, bounds, weights, values, y);
+
     // ---------------------------------------------------------------- products
 
     string IProducts<byte[]>.MatMul<TN>(byte[] a, byte[] b, byte[] c, int m, int n, int k)

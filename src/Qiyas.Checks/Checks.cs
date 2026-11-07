@@ -124,6 +124,7 @@ internal static partial class Checks
         ok &= Group2(null);
         ok &= Rows(null);
         ok &= Norms(null);
+        ok &= Resamples(null);
         ok &= Layouts(null);
         ok &= Products(null);
         ok &= Attentions(null);
@@ -2293,6 +2294,7 @@ internal static partial class Checks
         ok &= Group2(ops);
         ok &= Rows(ops);
         ok &= Norms(ops, "cuda");
+        ok &= Resamples(ops, "cuda");
         ok &= Layouts(ops);
         ok &= Products(ops);
         ok &= Attentions(ops);
