@@ -15,12 +15,17 @@ internal static partial class VkKernels
 {
     public const int TileM = 64, TileN = 64, TileK = 16, TileSide = 16;
 
-    /// <summary>The product kernel. Arguments: a, b, c (lane values at C's positions), m, n, k, strideA, strideB, strideC
-    /// (values), tilesM; workgroups (⌈n/64⌉, ⌈m/64⌉ · batch).</summary>
-    public static SpvKernel MatMul(Vulkan vk, Fmt f, Lane lane, bool transA, bool transB)
+    /// <summary>The product kernel, A and B of one format. Arguments: a, b, c (lane values at C's positions), m, n, k,
+    /// strideA, strideB, strideC (values), tilesM, offsetA, offsetB (values: A's and B's first); workgroups (⌈n/64⌉,
+    /// ⌈m/64⌉ · batch).</summary>
+    public static SpvKernel MatMul(Vulkan vk, Fmt f, Lane lane, bool transA, bool transB) => MatMul(vk, f, f, lane, transA, transB);
+
+    /// <summary>The product kernel with A stored as fa and B as fb (attention's P in lane storage against V as stored).</summary>
+    public static SpvKernel MatMul(Vulkan vk, Fmt fa, Fmt fb, Lane lane, bool transA, bool transB)
     {
         var k = Kinds.Of(lane);
-        var b = new Spv($"matmul_{f.Name}_{lane.Name}{(transA ? "_ta" : "")}{(transB ? "_tb" : "")}", TileSide, vk.Controls, TileSide);
+        string formats = fa.Name == fb.Name ? fa.Name : $"{fa.Name}_{fb.Name}";
+        var b = new Spv($"matmul_{formats}_{lane.Name}{(transA ? "_ta" : "")}{(transB ? "_tb" : "")}", TileSide, vk.Controls, TileSide);
         var pa = b.Arg(0);
         var pb = b.Arg(1);
         var pc = b.Arg(2);
@@ -31,6 +36,8 @@ internal static partial class VkKernels
         var strideB = b.Arg(7, K.U32);
         var strideC = b.Arg(8, K.U32);
         var tilesM = b.Arg(9, K.U32);
+        var offsetA = b.Arg(10, K.U32);
+        var offsetB = b.Arg(11, K.U32);
         var tx = b.LocalIdX;
         var ty = b.LocalIdY;
         var tid = ty * TileSide + tx;
@@ -38,8 +45,8 @@ internal static partial class VkKernels
         var batch = gy / tilesM;
         var row0 = (gy - batch * tilesM) * TileM;
         var col0 = b.GroupX * TileN;
-        var baseA = batch * strideA;
-        var baseB = batch * strideB;
+        var baseA = batch * strideA + offsetA;
+        var baseB = batch * strideB + offsetB;
         var baseC = batch * strideC;
         var sa = b.Shared(k, TileK * TileM);                                         // sa[kk·64 + i] = A(row0 + i, k0 + kk)
         var sb = b.Shared(k, TileK * TileN);                                         // sb[kk·64 + j] = B(k0 + kk, col0 + j)
@@ -59,7 +66,7 @@ internal static partial class VkKernels
                 var gk = k0 + kk;
                 var inside = (gr < M) & (gk < Kd);
                 var at = transA ? gk * M + gr : gr * Kd + gk;
-                sa[kk * TileM + ii] = b.Select(inside, Codec.UnpackAt(b, f, pa, baseA + b.Select(inside, at, b.U(0)), lane), zero);
+                sa[kk * TileM + ii] = b.Select(inside, Codec.UnpackAt(b, fa, pa, baseA + b.Select(inside, at, b.U(0)), lane), zero);
             }
 
             for (int l = 0; l < TileK * TileN / threads; l++)
@@ -71,7 +78,7 @@ internal static partial class VkKernels
                 var gc = col0 + jj;
                 var inside = (gk < Kd) & (gc < N);
                 var at = transB ? gc * Kd + gk : gk * N + gc;
-                sb[kk * TileN + jj] = b.Select(inside, Codec.UnpackAt(b, f, pb, baseB + b.Select(inside, at, b.U(0)), lane), zero);
+                sb[kk * TileN + jj] = b.Select(inside, Codec.UnpackAt(b, fb, pb, baseB + b.Select(inside, at, b.U(0)), lane), zero);
             }
 
             b.Barrier();

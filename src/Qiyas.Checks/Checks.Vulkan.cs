@@ -21,6 +21,7 @@ internal static partial class Checks
         ok &= Optimizers(ops, "vulkan", blocks: false);
         ok &= Routings(ops, "vulkan", blocks: false);
         ok &= Ctcs(ops, "vulkan", blocks: false);
+        ok &= Attentions(ops, "vulkan", blocks: false);
         return ok;
     }
 

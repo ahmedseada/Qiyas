@@ -86,17 +86,6 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
 
     // ---------------------------------------------------------------- the families not on Vulkan yet
 
-    public string Attention<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IFloatAdad<TN> => throw Missing("attention");
-
-    public string AttentionComposed<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IFloatAdad<TN> => throw Missing("attention (composed)");
-
-    public string AttentionRows<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IFloatAdad<TN> => throw Missing("attention (fused rows)");
-
-    public string AttentionDecode<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IFloatAdad<TN> => throw Missing("attention decode");
-
-    public string AttentionBackward<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong dO, ulong dq, ulong dk, ulong dv) where TN : struct, IFloatAdad<TN> =>
-        throw Missing("attention backward");
-
     public string Conv<TN>(ConvArgs a, ulong x, ulong w, ulong y) where TN : struct, IAdad<TN> => throw Missing("conv");
 
     public string ConvComposed<TN>(ConvArgs a, ulong x, ulong w, ulong y) where TN : struct, IAdad<TN> => throw Missing("conv (composed)");

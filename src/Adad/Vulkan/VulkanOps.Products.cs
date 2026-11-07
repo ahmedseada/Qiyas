@@ -32,7 +32,7 @@ public sealed partial class VulkanOps
             var fn = vk.Cached($"matmul:{f.Name}:{lane.Name}:{v.TransA}:{v.TransB}", () => VkKernels.MatMul(vk, f, lane, v.TransA, v.TransB));
             int tilesM = (v.M + VkKernels.TileM - 1) / VkKernels.TileM;
             vk.Launch(fn, Groups(v.N, VkKernels.TileN), (uint)((long)tilesM * v.Batch), a, b, lanes, Vulkan.U(v.M), Vulkan.U(v.N), Vulkan.U(v.K),
-                Vulkan.U(v.StrideAOrDefault), Vulkan.U(v.StrideBOrDefault), Vulkan.U(v.StrideCOrDefault), Vulkan.U(tilesM));
+                Vulkan.U(v.StrideAOrDefault), Vulkan.U(v.StrideBOrDefault), Vulkan.U(v.StrideCOrDefault), Vulkan.U(tilesM), 0, 0);
             if (!direct)
             {
                 // C's values between the batches' regions (a stride past m·n) kept as they are stored.

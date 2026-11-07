@@ -923,13 +923,16 @@ internal static partial class Checks
 
     /// <summary>Every float type: 2 heads, 37 queries over 53 keys at d = 24 and d = 17 (plain, causal, spans), decode
     /// (3 queries over 1001 keys), and the backward pass, against float64 within the lane's rounding over the keys.</summary>
-    public static bool Attentions(GpuOps? ops)
+    // blocks: false where the device refuses the block formats (said so, not proved).
+    public static bool Attentions(IDevice<ulong, ulong>? ops, string device = "device", bool blocks = true)
     {
         bool ok = true;
-        string where = ops is null ? "cpu" : "device";
+        string where = ops is null ? "cpu" : device;
+        var cuda = ops as GpuOps;
+        var vulkan = ops as Adad.Vulkan.VulkanOps;
         foreach (var type in Bench.Registry.Names)
         {
-            if (!Bench.Registry.IsFloat(type)) continue;
+            if (!Bench.Registry.IsFloat(type) || (!blocks && Bench.Registry.IsBlock(type))) continue;
             var cases = new List<(AttentionArgs A, bool Decode)>
             {
                 (new(2, 37, 53, 24, 0.2, false), false), (new(2, 37, 53, 24, 0.2, true), false), (new(2, 37, 53, 17, 0.2, false), false),
@@ -950,7 +953,8 @@ internal static partial class Checks
             }
 
             // The fused rows forced, at every head-dimension capacity (32, 64, 128) and tile edge: queries and keys not in
-            // whole tiles, causal, spans with starts, a row block whose rows see no key.
+            // whole tiles, causal, spans with starts, a row block whose rows see no key; the composition forced on the same
+            // cases (the measured choice may never take it).
             var fusedCases = new List<AttentionArgs>
             {
                 new(2, 37, 53, 24, 0.2, false), new(2, 37, 53, 17, 0.2, true), new(3, 37, 100, 64, 0.1, false), new(2, 33, 71, 128, 0.08, true),
@@ -958,27 +962,30 @@ internal static partial class Checks
                 new(2, 40, 53, 24, 0.2, false, Enumerable.Range(0, 40).Select(i => i < 16 ? 0 : 1 + i).ToArray()),
             };
             foreach (var a in fusedCases)
+            foreach (bool composed in new[] { false, true })
             {
                 var q = Bench.Registry.Make(type, (int)a.QValues, 41, -1, 1);
                 var k = Bench.Registry.Make(type, (int)a.KValues, 42, -1, 1);
                 var v = Bench.Registry.Make(type, (int)a.KValues, 43, -1, 1);
                 var o = new byte[q.Length];
                 var want = a.Reference(Bench.Registry.Values(type, q, (int)a.QValues), Bench.Registry.Values(type, k, (int)a.KValues), Bench.Registry.Values(type, v, (int)a.KValues));
-                Bench.Registry.WithFloat(type, new AttentionRun(ops, a, q, k, v, o, false, null, null, null, fused: true));
-                ok &= Close(type, $"attention fused{(a.Causal ? " causal" : "")}{(a.Spans is not null ? " spans" : "")}{(a.SpanStarts is not null ? " starts" : "")} {a.Heads}h {a.Lq}x{a.Lk} d{a.D}", where, o, want, (int)a.QValues, a.Lk + a.D);
+                Bench.Registry.WithFloat(type, new AttentionRun(ops, a, q, k, v, o, false, null, null, null, fused: !composed, composed: composed));
+                ok &= Close(type, $"attention {(composed ? "composed" : "fused")}{(a.Causal ? " causal" : "")}{(a.Spans is not null ? " spans" : "")}{(a.SpanStarts is not null ? " starts" : "")} {a.Heads}h {a.Lq}x{a.Lk} d{a.D}", where, o, want, (int)a.QValues, a.Lk + a.D);
             }
 
             // The backward: the case it had, and the fused rows' cases (head-dimension capacities, tile edges, causal, spans
             // with starts, rows that see no key); on the device the fused kernels and the composition each.
             const int Limited = 48 * 1024;
             foreach (var a in fusedCases.Prepend(new AttentionArgs(2, 37, 53, 24, 0.2, true)))
-            foreach (int mode in ops is null ? new[] { 0, 1 } : [0, 1, 2, 3])
+            foreach (int mode in ops is null || cuda is null ? new[] { 0, 1 } : [0, 1, 2, 3])
             {
-                // CPU: 0 the fused passes, 1 the composition. Device: 0 the default (the tensor backward for a type with a
+                // CPU: 0 the fused passes, 1 the composition. CUDA: 0 the default (the tensor backward for a type with a
                 // tensor kind), 1 the composition, 2 the FMA fused kernels, 3 the default as on a device whose blocks may
-                // opt into 48 KB of shared memory only (a kernel past it not taken: the next route instead).
+                // opt into 48 KB of shared memory only (a kernel past it not taken: the next route instead). Vulkan: 0 the
+                // default (the fused kernels where both fit its workgroup memory), 1 the composition.
                 bool? fusedBack = mode == 0 ? (ops is null ? true : null) : mode == 1 ? false : true;
-                if (ops is not null) { ops.FusedBackward = mode == 1 ? false : null; ops.MmaBackward = mode == 2 ? false : null; ops.AttentionSharedLimit = mode == 3 ? Limited : null; ops.BackwardRoute = null; }
+                if (cuda is not null) { cuda.FusedBackward = mode == 1 ? false : null; cuda.MmaBackward = mode == 2 ? false : null; cuda.AttentionSharedLimit = mode == 3 ? Limited : null; cuda.BackwardRoute = null; }
+                else if (vulkan is not null) { vulkan.FusedBackward = mode == 1 ? false : null; vulkan.BackwardRoute = null; }
                 else Kernels.FusedBackwardCpu = fusedBack;
                 var q = Bench.Registry.Make(type, (int)a.QValues, 41, -1, 1);
                 var k = Bench.Registry.Make(type, (int)a.KValues, 42, -1, 1);
@@ -989,11 +996,26 @@ internal static partial class Checks
                 var dk = new byte[k.Length];
                 var dv = new byte[v.Length];
                 Bench.Registry.WithFloat(type, new AttentionRun(ops, a, q, k, v, dO, false, dq, dk, dv));
-                string tag = $"{(mode == 1 ? " composed" : ops is not null && mode == 2 ? " fma" : mode == 3 ? " shared 48 KB" : "")}{(a.Causal ? " causal" : "")}{(a.Spans is not null ? " spans" : "")}{(a.SpanStarts is not null ? " starts" : "")} {a.Heads}h {a.Lq}x{a.Lk} d{a.D}";
+                string tag = $"{(mode == 1 ? " composed" : cuda is not null && mode == 2 ? " fma" : mode == 3 ? " shared 48 KB" : "")}{(a.Causal ? " causal" : "")}{(a.Spans is not null ? " spans" : "")}{(a.SpanStarts is not null ? " starts" : "")} {a.Heads}h {a.Lq}x{a.Lk} d{a.D}";
                 ok &= Close(type, "attention_bwd dQ" + tag, where, dq, wq, (int)a.QValues, 2 * (a.Lk + a.D));
                 ok &= Close(type, "attention_bwd dK" + tag, where, dk, wk, (int)a.KValues, 2 * (a.Lq + a.D));
                 ok &= Close(type, "attention_bwd dV" + tag, where, dv, wv, (int)a.KValues, a.Lq + a.D);
-                if (mode == 3 && ops is not null)
+                if (vulkan is not null)
+                {
+                    // The route: the composition when asked, else the fused kernels where both fit the workgroup memory.
+                    int dCap = Adad.Vulkan.VkKernels.AttentionCap(a.D);
+                    var lane = type == "float64" ? Lane.F64 : Lane.F32;
+                    int max = vulkan.Vk.MaxSharedBytes;
+                    bool fits = Adad.Vulkan.VkKernels.AttentionBackRowsShared(lane, dCap) <= max && Adad.Vulkan.VkKernels.AttentionBackKeysShared(lane, dCap) <= max;
+                    string want = mode == 1 || !fits ? "composed" : "fused";
+                    if (vulkan.BackwardRoute != want)
+                    {
+                        Console.WriteLine($"check attention_bwd{tag} {where} {type,-12} took the {vulkan.BackwardRoute} route, not {want}");
+                        ok = false;
+                    }
+                }
+
+                if (mode == 3 && cuda is not null)
                 {
                     // The route the limit leaves: the tensor kernels where both fit, else the FMA fused kernels where both fit,
                     // else the composition.
@@ -1002,22 +1024,24 @@ internal static partial class Checks
                     bool tensor = Ptx.AttentionKind(new Fmt(type, 16, true, true)) is not null && Ptx.AttentionMmaShared(dCap) <= Limited && Ptx.AttentionBackKeysMmaShared(dCap) <= Limited;
                     bool fma = Ptx.AttentionBackRowsShared(lane, dCap) <= Limited && Ptx.AttentionBackKeysShared(lane, dCap) <= Limited;
                     string want = tensor ? "mma" : fma ? "fused" : "composed";
-                    if (ops.BackwardRoute != want)
+                    if (cuda.BackwardRoute != want)
                     {
-                        Console.WriteLine($"check attention_bwd{tag} {where} {type,-12} took the {ops.BackwardRoute} route, not {want}");
+                        Console.WriteLine($"check attention_bwd{tag} {where} {type,-12} took the {cuda.BackwardRoute} route, not {want}");
                         ok = false;
                     }
                 }
 
-                if (ops is not null) { ops.FusedBackward = null; ops.MmaBackward = null; ops.AttentionSharedLimit = null; } else Kernels.FusedBackwardCpu = null;
+                if (cuda is not null) { cuda.FusedBackward = null; cuda.MmaBackward = null; cuda.AttentionSharedLimit = null; }
+                else if (vulkan is not null) vulkan.FusedBackward = null;
+                else Kernels.FusedBackwardCpu = null;
             }
         }
 
-        if (ok) Console.WriteLine($"check attention              {where,-6} every float type: rows (composed and fused), causal, spans, decode and the backward pass within the lane's rounding");
+        if (ok) Console.WriteLine($"check attention              {where,-6} every float type{(blocks ? "" : " but the block formats")}: rows (composed and fused), causal, spans, decode and the backward pass within the lane's rounding");
         return ok;
     }
 
-    private sealed class AttentionRun(GpuOps? ops, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o, bool decode, byte[]? dq, byte[]? dk, byte[]? dv, bool fused = false) : Bench.IFloatTypeVisitor<bool>
+    private sealed class AttentionRun(IDevice<ulong, ulong>? ops, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o, bool decode, byte[]? dq, byte[]? dk, byte[]? dv, bool fused = false, bool composed = false) : Bench.IFloatTypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
         {
@@ -1027,30 +1051,30 @@ internal static partial class Checks
                 if (backward) Kernels.AttentionBackward<TN>(a, q, k, v, o, dq!, dk!, dv!);
                 else if (decode) Kernels.AttentionDecode<TN>(a, q, k, v, o);
                 else if (fused) Kernels.AttentionRows<TN>(a, q, k, v, o);
+                else if (composed) Kernels.AttentionComposed<TN>(a, q, k, v, o);
                 else Kernels.Attention<TN>(a, q, k, v, o);
                 return true;
             }
 
-            var gpu = ops.Gpu;
-            ulong dQ = gpu.Rent(q.Length), dK = gpu.Rent(k.Length), dV = gpu.Rent(v.Length), dO = gpu.Rent(o.Length);
-            Adad.Cuda.Gpu.Upload<byte>(q, dQ); Adad.Cuda.Gpu.Upload<byte>(k, dK); Adad.Cuda.Gpu.Upload<byte>(v, dV);
+            ulong dQ = ops.Rent(q.Length + 16), dK = ops.Rent(k.Length + 16), dV = ops.Rent(v.Length + 16), dO = ops.Rent(o.Length + 16);
+            ops.Upload(q, dQ); ops.Upload(k, dK); ops.Upload(v, dV);
             if (backward)
             {
-                Adad.Cuda.Gpu.Upload<byte>(o, dO);
-                ulong gq = gpu.Rent(dq!.Length), gk = gpu.Rent(dk!.Length), gv = gpu.Rent(dv!.Length);
+                ops.Upload(o, dO);
+                ulong gq = ops.Rent(dq!.Length + 16), gk = ops.Rent(dk!.Length + 16), gv = ops.Rent(dv!.Length + 16);
                 ops.AttentionBackward<TN>(a, dQ, dK, dV, dO, gq, gk, gv);
-                Adad.Cuda.Gpu.Synchronize();
-                Adad.Cuda.Gpu.Download<byte>(gq, dq); Adad.Cuda.Gpu.Download<byte>(gk, dk); Adad.Cuda.Gpu.Download<byte>(gv, dv);
-                gpu.Return(gq); gpu.Return(gk); gpu.Return(gv);
+                ops.Synchronize();
+                ops.Download(gq, dq); ops.Download(gk, dk); ops.Download(gv, dv);
+                ops.Return(gq); ops.Return(gk); ops.Return(gv);
             }
             else
             {
-                if (decode) ops.AttentionDecode<TN>(a, dQ, dK, dV, dO); else if (fused) ops.AttentionRows<TN>(a, dQ, dK, dV, dO); else ops.Attention<TN>(a, dQ, dK, dV, dO);
-                Adad.Cuda.Gpu.Synchronize();
-                Adad.Cuda.Gpu.Download<byte>(dO, o);
+                if (decode) ops.AttentionDecode<TN>(a, dQ, dK, dV, dO); else if (fused) ops.AttentionRows<TN>(a, dQ, dK, dV, dO); else if (composed) ops.AttentionComposed<TN>(a, dQ, dK, dV, dO); else ops.Attention<TN>(a, dQ, dK, dV, dO);
+                ops.Synchronize();
+                ops.Download(dO, o);
             }
 
-            gpu.Return(dQ); gpu.Return(dK); gpu.Return(dV); gpu.Return(dO);
+            ops.Return(dQ); ops.Return(dK); ops.Return(dV); ops.Return(dO);
             return true;
         }
     }
