@@ -14,20 +14,7 @@ public sealed partial class GpuOps
 {
     private static bool Wide(Fmt f) => f.Bits == 64;
 
-    // ---- lane storage on the device
-
-    /// <summary>x (format TN, count values) as lane storage: x itself when the type is the lane's, else a rented buffer (returned by the caller).</summary>
-    private ulong ToLane<TN>(ulong x, long count, List<ulong> rented) where TN : struct, IAdad<TN>
-    {
-        var f = Fmt.Of<TN>();
-        if (f.Is("float32") || f.Is("float64")) return x;
-        var lane = RowLane(f);
-        ulong wide = gpu.Rent(count * lane.Size);
-        rented.Add(wide);
-        var fn = gpu.Cached($"widen:{f.Name}:{lane.Name}", (out string e) => Ptx.Widen(gpu, f, lane, out e));
-        Gpu.Launch(fn, Grid(count, 256), 1, 256, 1, 0, x, wide, Gpu.U((int)count));
-        return wide;
-    }
+    // ---- lane storage on the device: a lane's values into the type's storage (the outputs the kernels do not store as the type)
 
     private void FromLane<TN>(ulong lanes, ulong output, long count) where TN : struct, IAdad<TN>
     {
