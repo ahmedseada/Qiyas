@@ -16,6 +16,7 @@ internal static partial class Checks
         ok &= Maps(ops, "vulkan");
         ok &= Group2(ops, "vulkan", blocks: false);
         ok &= Rows(ops, "vulkan");
+        ok &= Layouts(ops, "vulkan", blocks: false);
         return ok;
     }
 

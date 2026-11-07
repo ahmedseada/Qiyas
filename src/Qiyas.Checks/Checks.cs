@@ -1441,15 +1441,18 @@ internal static partial class Checks
 
     /// <summary>Every type, every layout operation on small odd shapes (LayoutCases.Gate): exact for the moves (the value
     /// moves as stored), the sums within the lane's rounding over their terms, bilinear within 4 lane ulps.</summary>
-    public static bool Layouts(GpuOps? ops)
+    // blocks: false where the device refuses the block formats (said so, not proved).
+    public static bool Layouts(IDevice<ulong, ulong>? ops, string device = "device", bool blocks = true)
     {
         bool ok = true;
-        string where = ops is null ? "cpu" : "device";
-        // The device: packed types by the output's size (the gate's small shapes: a thread per value), then by the word kernel.
-        foreach (bool? perValue in ops is null ? new bool?[] { null } : new bool?[] { null, false })
+        string where = ops is null ? "cpu" : device;
+        var cuda = ops as GpuOps;
+        // CUDA: packed types by the output's size (the gate's small shapes: a thread per value), then by the word kernel.
+        foreach (bool? perValue in cuda is null ? new bool?[] { null } : new bool?[] { null, false })
         foreach (var type in Bench.Registry.Names)
         {
-            if (ops is not null) ops.LayoutPerValue = perValue;
+            if (!blocks && Bench.Registry.IsBlock(type)) continue;
+            if (cuda is not null) cuda.LayoutPerValue = perValue;
             foreach (var name in LayoutArgs.Names)
             {
                 if (!LayoutArgs.Applies(name, Bench.Registry.IsFloat(type))) continue;
@@ -1465,27 +1468,26 @@ internal static partial class Checks
             }
         }
 
-        if (ops is not null) ops.LayoutPerValue = null;
-        if (ok) Console.WriteLine($"check layouts                {where,-6} every type: moves exact, sums and resizes within the lane's rounding");
+        if (cuda is not null) cuda.LayoutPerValue = null;
+        if (ok) Console.WriteLine($"check layouts                {where,-6} every type{(blocks ? "" : " but the block formats")}: moves exact, sums and resizes within the lane's rounding");
         return ok;
     }
 
-    private sealed class LayoutRun(GpuOps? ops, LayoutArgs k) : Bench.ITypeVisitor<bool>
+    private sealed class LayoutRun(IDevice<ulong, ulong>? ops, LayoutArgs k) : Bench.ITypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IAdad<TN, float>
         {
             if (ops is null) { Kernels.Layout<TN>(k); return true; }
-            var gpu = ops.Gpu;
-            ulong dx = gpu.Rent(k.X.Length), dout = gpu.Rent(k.Output.Length), didx = k.Index is null ? 0 : gpu.Rent(k.Index.Length * 4L), dx2 = k.X2 is null ? 0 : gpu.Rent(k.X2.Length);
-            Adad.Cuda.Gpu.Upload<byte>(k.X, dx);
-            if (k.Index is not null) Adad.Cuda.Gpu.Upload<int>(k.Index, didx);
-            if (k.X2 is not null) Adad.Cuda.Gpu.Upload<byte>(k.X2, dx2);
+            ulong dx = ops.Rent(k.X.Length + 16), dout = ops.Rent(k.Output.Length + 16), didx = k.Index is null ? 0 : ops.RentIndices(k.Index.Length), dx2 = k.X2 is null ? 0 : ops.Rent(k.X2.Length + 16);
+            ops.Upload(k.X, dx);
+            if (k.Index is not null) ops.UploadIndices(k.Index, didx);
+            if (k.X2 is not null) ops.Upload(k.X2, dx2);
             ops.Layout<TN>(k, dx, didx, dout, dx2);
-            Adad.Cuda.Gpu.Synchronize();
-            Adad.Cuda.Gpu.Download<byte>(dout, k.Output);
-            gpu.Return(dx); gpu.Return(dout);
-            if (didx != 0) gpu.Return(didx);
-            if (dx2 != 0) gpu.Return(dx2);
+            ops.Synchronize();
+            ops.Download(dout, k.Output);
+            ops.Return(dx); ops.Return(dout);
+            if (didx != 0) ops.ReturnIndices(didx);
+            if (dx2 != 0) ops.Return(dx2);
             return true;
         }
     }

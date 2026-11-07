@@ -86,8 +86,6 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
 
     // ---------------------------------------------------------------- the families not on Vulkan yet
 
-    public string Layout<TN>(LayoutArgs k, ulong x, ulong index, ulong output, ulong x2) where TN : struct, IAdad<TN> => throw Missing($"layout {k.Name}");
-
     public string MatMul<TN>(ulong a, ulong b, ulong c, int m, int n, int k) where TN : struct, IAdad<TN> => throw Missing("matmul");
 
     public string MatMulView<TN>(ProductView v, ulong a, ulong b, ulong c) where TN : struct, IAdad<TN> => throw Missing("matmul (view)");
