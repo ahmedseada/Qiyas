@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The device's block encoders (Blocks.cs): float32 lane storage into Q8_0 / Q4_0 blocks, a thread per block (the
 // block's max, its scale as f16, the values rounded to the integers). Q4_K and Q6_K are decoded on the device (Codec) and
 // encoded on the CPU; their device encoders are the step past this.

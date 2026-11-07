@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The device's convolution (Conv.cs). The forward is fused (item 4g, implicit GEMM: no columns in memory):
 //   the tensor and dot routes   the image packed straight into the kind's packed rows (Ptx.PackTransposed with conv: the
 //                               index map in place of the load), the weights packed by rows, the same kernel, padding

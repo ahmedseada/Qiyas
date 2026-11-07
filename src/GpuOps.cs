@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The operations on the device over the contract: the same lane rules as the CPU (Types.cs), with the device's lanes
 // and the device's measured facts (whether its JIT takes dp4a; which product tile is faster for a shape).
 using System.Diagnostics;

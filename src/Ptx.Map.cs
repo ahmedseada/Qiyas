@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The device side of the element-wise family: the transcendental functions as PTX (the same tables and reductions as
 // Funcs, evaluated by fused multiply-adds on the device), the formulas of the catalogue emitted over a lane, and the
 // map kernel: a thread per stored word, each value unpacked into the lane, the formula applied, the result packed.

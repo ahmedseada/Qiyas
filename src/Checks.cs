@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Proof before timing: every vector conversion against an independent scalar reference written from the format's
 // definition (IEEE 754 binary16 and binary32, bfloat16, the OCP fp8 formats, two's complement; rounding to nearest,
 // ties to even), on every fp8 code, every 2- and 4-bit pattern, 4M random float32 bit patterns (every exponent, NaNs

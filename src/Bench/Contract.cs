@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The bench contract. A subject is one implementation under measurement; the harness knows nothing about how it
 // computes. It hands the subject stored bytes of a named type (made by Qiyas's proven conversions, so every subject
 // sees the same bits), times Run, reads the output after Collect, and scores it against float64 math.

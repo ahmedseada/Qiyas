@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Qiyas's own worker team: one thread per logical processor less the caller, kept for the process. A job is a struct
 // body cut into chunks; the caller and the workers take chunks from one counter, and the caller returns the moment
 // the last chunk completes: a worker that wakes late finds no chunk left and delays nothing. Waiting workers spin

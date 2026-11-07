@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The block-scaled tiled product: C = A·Bᵀ for A (m × k) and B (n × k) both Q8_0 or both Q4_0, k in whole blocks of 32
 // along each row (a linear layer's weights stored n × k). C_ij = Σ_blocks dA·dB·(Σ_32 qA·qB): every 32-term dot an
 // exact integer, the block scales applied in float32 — gemv's semantics on a tile, nothing decoded to a float per value.

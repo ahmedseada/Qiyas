@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The CPU kernels over Qiyas numbers: each written once over <TN, TLane, TL>, run on the Team (struct bodies: nothing
 // allocated per call), in place where the stored bytes are the lanes, through tiles on the stack otherwise.
 //

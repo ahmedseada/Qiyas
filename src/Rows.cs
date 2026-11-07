@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Row operations ("rows"): one formula over each row of a rows × cols array whose result needs the row's statistics
 // (a max, a sum, a sum of squares, a dot product): the normalizations and their backward passes, log-softmax and the
 // softmax backward passes, weight normalization, rotary embedding, scaled and masked softmax, the fused residual-add +

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The stored types by name, and generic dispatch on a name: a visitor's Visit<TN> runs with the type's struct.
 using System.Numerics;
 

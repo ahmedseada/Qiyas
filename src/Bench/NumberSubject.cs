@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The INumberBase<T> version as a bench subject: one implementation over T : INumberBase<T> (CpuGeneric.cs on the
 // CPU, GenericPtx.cs on the device), for the types .NET has such a T for. Stored bytes of those types are the .NET
 // layout, so they are used in place.

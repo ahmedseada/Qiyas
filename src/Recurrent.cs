@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Recurrent cells: LSTM and GRU over rows (a batch of B rows, hidden size H, input size D), in the type's float lane.
 //
 //   The gates by Qiyas's products on views and the row-vector broadcast: g = x·Wᵀ + h·Uᵀ + b (LSTM: 4H columns in the

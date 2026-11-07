@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The device's recurrent cells and steps (Recurrent.cs): the cells by one kernel each, the gates by the products on
 // views and the broadcast add, the steps and backward passes as the same compositions on device buffers.
 namespace Qiyas;

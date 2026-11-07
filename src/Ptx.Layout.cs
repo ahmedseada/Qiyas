@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The device's layout operations (Layout.cs): a thread per output word computes each of its values from the output
 // index by the operation's rule (a gather; the sums — scatter-add, col2im — in the sum lane, converted on the store),
 // so every word is written by one thread and no format needs atomics. Parameters: the input, the index array, an

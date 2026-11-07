@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Optimizer steps: the parameters and gradients stored as the type, the moments in the type's float lane storage
 // (float32 for the narrow floats, float64 for float64) — the lane rule applied to state that accumulates. Every
 // step is one pass over the arrays, written once over <TN, TLane, TL>:

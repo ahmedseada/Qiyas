@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The device's attention decode kernel (Attention.cs) and the lane-storage conversions.
 //
 // Decode: a block per (head, query); the query in shared memory; the keys in chunks of 256, a thread a key: its

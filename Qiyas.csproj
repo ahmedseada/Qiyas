@@ -9,6 +9,9 @@
     <TieredPGO>true</TieredPGO>
     <ServerGarbageCollector>false</ServerGarbageCollector>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <Authors>Ahmed Seada</Authors>
+    <Copyright>Copyright (c) 2026 Ahmed Seada</Copyright>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <NoWarn>$(NoWarn);CS1591;CS1573;CS1574;CS1584;CS1580;CS1658</NoWarn>
   </PropertyGroup>
 </Project>

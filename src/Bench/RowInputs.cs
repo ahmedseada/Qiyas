@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The inputs, references and tolerance of a row operation (Rows.cs), shared by the checks and the bench.
 namespace Qiyas.Bench;
 

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // What a run of Qiyas is made of on this machine: the facts the kernels were chosen by (measured, or taken from the
 // runtime's reports — nothing assumed about a vendor, a width or a capability), for --report.
 using System.Numerics;

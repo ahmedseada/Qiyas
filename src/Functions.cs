@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The transcendental functions on vectors, for the float lanes (f32 and f64), written once as coefficient tables
 // and reductions that the CPU (here) and the device (Ptx.Funcs) evaluate the same way: fused multiply-adds over an
 // exactly reduced argument. Every function is proven against a scalar reference in Checks before anything is timed.

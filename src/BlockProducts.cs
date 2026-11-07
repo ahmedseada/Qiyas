@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Block-scaled integer products: the block formats' own fast path. A row of Q8_0 (or Q4_0) against a vector of the same
 // format is Σ over blocks of d_a·d_x·(Σ_i q_a,i · q_x,i): the inner sum is an integer dot of 32 products (exact in s32,
 // the s8 dot lane where the CPU has it), the outer sum the float lane. Nothing is decoded to a float per value.

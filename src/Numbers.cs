@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Qiyas: numbers computed in the lane the hardware does best for them. Two parts:
 //
 //   - a number (IQiyasNumber<TSelf>): a stored type of any width (64 bits down to 2; floats of 64 down to 8; values

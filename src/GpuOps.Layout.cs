@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The device's layout operations (Layout.cs): the lane by the operation (the type's own for moves, the float lane for
 // bilinear interpolation, the sum lane by the bounds for scatter-add and col2im), scatter-add's ordering built on the
 // device (counts, offsets, ordered sources), then one kernel with a thread per output word.

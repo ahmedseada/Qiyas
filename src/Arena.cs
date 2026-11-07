@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The device's buffer arena: inside a scope every Rent bumps a pointer in one region reserved from the shapes of earlier
 // calls, and Return releases from the top (a buffer returned below the top is released when everything above it is), so a
 // call's buffers are a stack in one allocation with no pool lookup and no driver call. A rent the region cannot hold comes

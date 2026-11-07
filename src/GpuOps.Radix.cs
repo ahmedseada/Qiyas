@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Scatter-add's ordering on the device (item 4f): counts by integer atomics (exact), offsets by the multi-block scan,
 // the sources' order by target by the stable LSD radix sort of (target, source) pairs (Ptx.Radix.cs) — linear in the
 // sources, for any number of targets; before 4f the order took a quadratic rank loop and the offsets one thread.

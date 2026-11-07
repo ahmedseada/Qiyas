@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The device side of reductions, row-vector broadcasts, transposes and matrix-vector products. Values are addressed
 // by index (Codec.UnpackAt), so every shape works for every format, packed ones included; rows need not end on a word.
 namespace Qiyas;

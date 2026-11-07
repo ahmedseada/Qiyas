@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Scatter-add's ordering at any size (item 4f): the sources' order by target as a stable LSD radix sort of the
 // (target, source) pairs, 8-bit digits; and the exclusive scan over many blocks that the offsets and the radix passes
 // need. Every step is deterministic: the same order as the CPU's stable counting sort, no atomics on the order.

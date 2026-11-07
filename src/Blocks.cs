@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Block formats: values stored in blocks with shared scales (the GGUF layouts Q8_0, Q4_0, Q4_K, Q6_K) and the 1-bit
 // bool, as stored types of the contract. A block type's Load decodes whole blocks into the float lane; its Store
 // encodes whole blocks (a partial block re-encodes the block with the new values: lossy, as the type is). The lane is

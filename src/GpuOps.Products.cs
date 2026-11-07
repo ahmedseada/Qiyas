@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The device's products on views (Products.cs): where the product takes the tensor or dot route at whole tiles, each
 // batch's operands are read where they are stored (Aᵀ and Bᵀ by the packing's two orientations, a batch's offset on the
 // pointer, C written in place); otherwise each operand of a batch made contiguous by the strided-copy kernel (exact,

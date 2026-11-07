@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The device's fused attention backward (item 6i): two kernels over the lane storage of Q, K, V and dO (f32, f64 for
 // float64), no scores in memory, no atomics (each output value written by one thread: the same result every run).
 //

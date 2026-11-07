@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The numbers: every per-value type (bool aside: not arithmetic). Each is one struct: its description and the lanes
 // it offers. Sums take the cheapest lane that is exact for the bounds measured on the run's data, in this order:
 //

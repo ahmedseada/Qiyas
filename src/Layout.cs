@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Layout and indexing: data movement by index arithmetic, exact in every type (the value moves as stored; the lane is
 // the type's own; where values are summed — scatter-add, col2im — the sum lane by the bounds, stored as the type).
 //

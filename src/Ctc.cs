@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // ctc: the connectionist temporal classification loss and its gradient, for a batch of B sequences of T frames over C
 // classes (one of them the blank). The input is logits (T × B × C, frame-major as the usual layout); log_softmax is taken
 // inside. Sequence b sees its first InputLengths[b] frames and its LabelLengths[b] labels (Labels flat, sequences one

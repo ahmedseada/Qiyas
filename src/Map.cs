@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Element-wise operations ("map"): one formula applied to every value, written once over <TN, TLane, TL>. A formula
 // takes up to three inputs (x, y, z) and two scalars (a, b) and gives one value; the catalogue (Ops) names each,
 // gives its float64 reference and its device emitter, and says which lanes it has (every lane, or float lanes only).

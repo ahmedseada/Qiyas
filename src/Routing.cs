@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Routing, sampling and losses: operations whose results are indices, or whose inputs are.
 //
 //   topk_rows       the k largest of each row (values as the type, indices s32), largest first; ties by the lower index

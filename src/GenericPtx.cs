@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The generic GPU side: one PTX generator per operation, written once and specialized by T at run time (the GPU's
 // counterpart of a C# generic the JIT specializes per T). T's PTX names come from its description (PtxType.Of<T>), never
 // from a per-type copy of the kernel. Where PTX has no instruction for T (no f64 exp, no f16 div/sqrt/rcp), the generator

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Qiyas's own CUDA driver binding: the driver API functions the kernels need, the device's facts as it reports them
 // (compute capability, multiprocessors), PTX modules JIT-compiled once per text, device memory with a free-list so a
 // buffer of a size seen before costs no driver call, and launches with every argument in a 64-bit slot.

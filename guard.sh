@@ -9,4 +9,17 @@ if grep -nE "$pattern" $files; then
   echo "guard: Qiyas references the lib (above). Not built."
   exit 1
 fi
-echo "guard: Qiyas files ($files) reference nothing of the lib."
+# Every C# file opens with the license header (two lines; a byte-order mark or CRLF endings are allowed).
+h1='// Copyright (c) 2026 Ahmed Seada'
+h2='// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.'
+missing=""
+for f in $files; do
+  l1="$(sed -n 1p "$f" | tr -d '\r' | sed 's/^\xEF\xBB\xBF//')"
+  l2="$(sed -n 2p "$f" | tr -d '\r')"
+  if [ "$l1" != "$h1" ] || [ "$l2" != "$h2" ]; then missing="$missing $f"; fi
+done
+if [ -n "$missing" ]; then
+  echo "guard: these files lack the license header:$missing"
+  exit 1
+fi
+echo "guard: Qiyas files ($files) reference nothing of the lib and carry the license header."

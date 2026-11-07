@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Attention rows fused (flash): O for rows of queries without the Lq × Lk scores in memory. Per task a head's block of
 // query rows; the keys walked in tiles: the tile's scores in the float lane (Kᵀ's tile laid so a key run is a vector:
 // S[r][c..c+w) = Σ_t q[r][t]·Kᵀ[t][c..c+w), no horizontal sums), the softmax online (the running max m and sum l per

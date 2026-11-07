@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The generic CPU side: one implementation per operation over T : INumberBase<T> (softmax and rms_norm need exp and sqrt:
 // T : IFloatingPointIeee754<T>). Each runs Vector<T> where the runtime supports T (every primitive number; not Half) and
 // T's own operators otherwise, split across threads by Parallel.For with simple cut-overs, so only the kernel differs.

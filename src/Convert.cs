@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Every load and store of Qiyas's types on vectors (Vector<T>: the width the processor reports). Rounding is to
 // nearest, ties to even, and stores are held to the target's range; the float encoders follow IEEE 754 (binary16),
 // bfloat16 and the OCP fp8 formats (E4M3: no infinity, 0x7F NaN; E5M2: IEEE-shaped). Checks proves each against an

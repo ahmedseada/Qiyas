@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The device's ctc (Ctc.cs): a block of 256 threads per sequence, on lane storage (f32; f64 for float64).
 //   1. (CtcRows, a kernel of its own over every row) each (frame, sequence) row's log-sum-exp over the classes: a warp
 //      per row (the classes strided over its lanes, max and sum by shuffles); for the gradient the row's softmax y_t(c),

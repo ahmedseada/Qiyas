@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Products on views: C = op(A)·op(B) over batches, where op transposes a stored operand, and each batch is at a
 // stride in values; the matmul backward passes dA = dC·Bᵀ and dB = Aᵀ·dC. The product kernel reads a view's operands
 // where they are stored — Aᵀ's k-rows straight into its A blocks, Bᵀ's rows into its packed strips, a batch's offset as

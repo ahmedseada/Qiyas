@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The layout operations' inputs: small odd shapes for the gate, realistic shapes for the bench.
 namespace Qiyas.Bench;
 

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The device's recurrent cells (Recurrent.cs): a thread per output word (its Per hidden units of one row), the gate
 // values read by index, the lane's sigmoid and tanh (Functions.cs); the cell backward likewise.
 namespace Qiyas;

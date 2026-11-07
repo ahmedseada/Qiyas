@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Convolution as the composition of Qiyas's own operations: the image to columns (im2col, exact in any type), the
 // product with the weights (the product kernel: tensor and dot lanes by the bounds), and back (col2im for the input's
 // gradient). One image at a time (C × H × W; the weights OC × C·kh·kw; the output OC × OH × OW):

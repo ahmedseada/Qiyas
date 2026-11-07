@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Qiyas on CUDA: PTX generated once per (stored format, lane) from the number's description — the same contract as the
 // CPU side, in the device's terms. A stored format (Fmt) says how values sit in 32-bit words (64-bit words for the
 // 64-bit types) and emits the instructions that take one value out of a word into a lane register or put a lane value

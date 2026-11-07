@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The one way a choice between two paths is measured, on either device: which of two runs that give the same result is
 // faster on this machine at this shape. A single timed call says little: code the runtime has not yet compiled to its
 // final tier, a processor or device still raising its clocks, a team of threads waking, the timer's own grain at short

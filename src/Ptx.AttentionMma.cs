@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The device's fused attention rows on the tensor instructions (item 6i): Q, K and V in the f16 or bf16 kind (exact: the
 // float16, bfloat16 and 8-bit float formats' values are the kind's), the scores and the context accumulated in f32.
 // A block of 4 warps per (head, 64 query rows), each warp 16 rows; the keys walked in tiles of 64 through shared memory.

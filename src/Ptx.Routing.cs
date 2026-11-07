@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The device's routing and sampling kernels (Routing.cs): a block per row for top-k (k passes of the block's argmax
 // over the values not yet taken) and for sampling (each thread's chunk summed, the chunks' prefix by the first thread,
 // the first crossing found per chunk and the least taken); pick as a thread per row.

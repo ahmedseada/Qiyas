@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The device's row operations (Rows.cs): one block per row, the row's values in registers (each thread `perThread`
 // words at tid, tid + threads, …, as the softmax kernel holds them), the row's statistics by block reductions (up to
 // two rounds, each of up to three sums or a max), the outputs packed and stored once. Rows that do not end on a word

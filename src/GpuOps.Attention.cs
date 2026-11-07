@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 using System.Diagnostics;
 // The device's attention (Attention.cs): the fused rows (the tensor rows for the types with a tensor kind, else the
 // FMA rows) or the composition in lane storage for rows of queries (widen once, the view products and the scaled masked

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Attention backward fused (CPU, item 6j): dQ, dK, dV without the composition's five full products. Two passes over a
 // group of heads, no reductions across tasks (deterministic):
 //

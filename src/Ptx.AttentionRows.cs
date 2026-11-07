@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The device's fused attention rows (flash): a block per (head, Br query rows); the rows' queries in shared memory once;
 // the keys walked in tiles of Bc through shared memory (K, then V in the same space); the scores, the online softmax
 // and the context accumulated without the scores leaving the block. 256 threads: a row's tpr = 256 / Br threads share

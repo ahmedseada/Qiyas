@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // The device's fused attention backward on the tensor instructions (item 6j): Q, K, V and dO in the f16 or bf16 kind
 // (exact, as the tensor rows: float16, bfloat16 and the 8-bit floats), every product accumulated in f32, no scores in
 // memory, no atomics (each output value written by one thread). Two kernels, as the FMA backward (Ptx.AttentionBackward):

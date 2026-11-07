@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ahmed Seada
+// Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
+
 // Qiyas as a bench subject: the CPU kernels (Kernels.cs) and the device operations (GpuOps.cs) over the contract.
 using System.Numerics;
 
