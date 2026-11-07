@@ -11,7 +11,7 @@ using System.Runtime.InteropServices;
 
 namespace Qiyas;
 
-internal static class Checks
+internal static partial class Checks
 {
     public static bool Run()
     {
@@ -1818,13 +1818,15 @@ internal static class Checks
     /// <summary>Repetitions of the gates that once failed intermittently (a schedule-dependent store): raised by --repeat.</summary>
     public static int Stress = 20;
 
-    public static bool Group2(GpuOps? ops)
+    // blocks: false where the device refuses the block formats (said so, not proved).
+    public static bool Group2(IDevice<ulong, ulong>? ops, string device = "device", bool blocks = true)
     {
         bool ok = true;
-        string where = ops is null ? "cpu" : "device";
+        string where = ops is null ? "cpu" : device;
         const int R = 37, C = 1001;
         foreach (var type in Bench.Registry.Names)
         {
+            if (!blocks && Bench.Registry.IsBlock(type)) continue;
             var data = Bench.Registry.Make(type, R * C, 41, -1, 1);
             var values = Bench.Registry.Values(type, data, R * C);
             bool integer = !Bench.Registry.IsFloat(type);
@@ -1885,7 +1887,7 @@ internal static class Checks
             }
         }
 
-        if (ok) Console.WriteLine($"check reductions, broadcasts, transposes, gemv {where,-6} every type at 37 × 1001: as the references");
+        if (ok) Console.WriteLine($"check reductions, broadcasts, transposes, gemv {where,-6} every type{(blocks ? "" : " but the block formats")} at 37 × 1001: as the references");
         return ok;
     }
 
@@ -1952,69 +1954,65 @@ internal static class Checks
         return worst == 0;
     }
 
-    private sealed class ReduceRun(GpuOps? ops, string op, Axis axis, byte[] x, int rows, int cols) : Bench.ITypeVisitor<(byte[], string)>
+    private sealed class ReduceRun(IDevice<ulong, ulong>? ops, string op, Axis axis, byte[] x, int rows, int cols) : Bench.ITypeVisitor<(byte[], string)>
     {
         public (byte[], string) Visit<TN>() where TN : struct, IAdad<TN, float>
         {
             if (ops is null) return Kernels.Reduce<TN>(op, axis, x, rows, cols);
-            var gpu = ops.Gpu;
             int count = axis == Axis.Whole ? 1 : axis == Axis.Rows ? rows : cols;
-            ulong dx = gpu.Rent(x.Length), dout = gpu.Rent(count * 8L);
-            Adad.Cuda.Gpu.Upload<byte>(x, dx);
+            ulong dx = ops.Rent(x.Length + 16), dout = ops.Rent(count * 8L + 16);
+            ops.Upload(x, dx);
             string lane = ops.Reduce<TN>(op, axis, dx, rows, cols, dout);
-            Adad.Cuda.Gpu.Synchronize();
+            ops.Synchronize();
             var output = new byte[count * 8];
-            Adad.Cuda.Gpu.Download<byte>(dout, output);
-            gpu.Return(dx); gpu.Return(dout);
+            ops.Download(dout, output);
+            ops.Return(dx); ops.Return(dout);
             return (output, lane);
         }
     }
 
-    private sealed class MapRowRun(GpuOps? ops, MapOp op, byte[] x, byte[] v, byte[] output, int rows, int cols) : Bench.ITypeVisitor<bool>
+    private sealed class MapRowRun(IDevice<ulong, ulong>? ops, MapOp op, byte[] x, byte[] v, byte[] output, int rows, int cols) : Bench.ITypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IAdad<TN, float>
         {
             if (ops is null) { Kernels.MapRow<TN>(op.Name, x, v, output, rows, cols); return true; }
-            var gpu = ops.Gpu;
-            ulong dx = gpu.Rent(x.Length), dv = gpu.Rent(v.Length), dout = gpu.Rent(output.Length);
-            Adad.Cuda.Gpu.Upload<byte>(x, dx); Adad.Cuda.Gpu.Upload<byte>(v, dv);
+            ulong dx = ops.Rent(x.Length + 16), dv = ops.Rent(v.Length + 16), dout = ops.Rent(output.Length + 16);
+            ops.Upload(x, dx); ops.Upload(v, dv);
             ops.MapRow<TN>(op, dx, dv, dout, rows, cols);
-            Adad.Cuda.Gpu.Synchronize();
-            Adad.Cuda.Gpu.Download<byte>(dout, output);
-            gpu.Return(dx); gpu.Return(dv); gpu.Return(dout);
+            ops.Synchronize();
+            ops.Download(dout, output);
+            ops.Return(dx); ops.Return(dv); ops.Return(dout);
             return true;
         }
     }
 
-    private sealed class TransposeRun(GpuOps? ops, byte[] x, byte[] output, int rows, int cols) : Bench.ITypeVisitor<bool>
+    private sealed class TransposeRun(IDevice<ulong, ulong>? ops, byte[] x, byte[] output, int rows, int cols) : Bench.ITypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IAdad<TN, float>
         {
             if (ops is null) { Kernels.Transpose<TN>(x, output, rows, cols); return true; }
-            var gpu = ops.Gpu;
-            ulong dx = gpu.Rent(x.Length), dout = gpu.Rent(output.Length);
-            Adad.Cuda.Gpu.Upload<byte>(x, dx);
-            Adad.Cuda.Gpu.Clear(dout, output.Length);
+            ulong dx = ops.Rent(x.Length + 16), dout = ops.Rent(output.Length + 16);
+            ops.Upload(x, dx);
+            ops.Upload(new byte[output.Length + 16], dout);
             ops.Transpose<TN>(dx, dout, rows, cols);
-            Adad.Cuda.Gpu.Synchronize();
-            Adad.Cuda.Gpu.Download<byte>(dout, output);
-            gpu.Return(dx); gpu.Return(dout);
+            ops.Synchronize();
+            ops.Download(dout, output);
+            ops.Return(dx); ops.Return(dout);
             return true;
         }
     }
 
-    private sealed class GemvRun(GpuOps? ops, byte[] a, byte[] x, byte[] y, int rows, int cols, bool transposed) : Bench.ITypeVisitor<bool>
+    private sealed class GemvRun(IDevice<ulong, ulong>? ops, byte[] a, byte[] x, byte[] y, int rows, int cols, bool transposed) : Bench.ITypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IAdad<TN, float>
         {
             if (ops is null) { Kernels.Gemv<TN>(a, x, y, rows, cols, transposed); return true; }
-            var gpu = ops.Gpu;
-            ulong da = gpu.Rent(a.Length), dx = gpu.Rent(x.Length), dy = gpu.Rent(y.Length);
-            Adad.Cuda.Gpu.Upload<byte>(a, da); Adad.Cuda.Gpu.Upload<byte>(x, dx);
+            ulong da = ops.Rent(a.Length + 16), dx = ops.Rent(x.Length + 16), dy = ops.Rent(y.Length + 16);
+            ops.Upload(a, da); ops.Upload(x, dx);
             ops.Gemv<TN>(da, dx, dy, rows, cols, transposed);
-            Adad.Cuda.Gpu.Synchronize();
-            Adad.Cuda.Gpu.Download<byte>(dy, y);
-            gpu.Return(da); gpu.Return(dx); gpu.Return(dy);
+            ops.Synchronize();
+            ops.Download(dy, y);
+            ops.Return(da); ops.Return(dx); ops.Return(dy);
             return true;
         }
     }
@@ -2071,11 +2069,11 @@ internal static class Checks
     /// <summary>Each formula over 1001 values of each of its types, on the CPU (ops null) or the device, against the float64
     /// reference rounded as the type rounds: integer types exact; float types within one step of the type plus a few ulps of
     /// the lane (the transcendental functions' own error).</summary>
-    public static bool Maps(GpuOps? ops)
+    public static bool Maps(IDevice<ulong, ulong>? ops, string device = "device")
     {
         const int N = 1001;
         bool ok = true;
-        string where = ops is null ? "cpu" : "device";
+        string where = ops is null ? "cpu" : device;
         foreach (var op in Ops.All)
         {
             double worst = 0;
@@ -2164,27 +2162,27 @@ internal static class Checks
         }
     }
 
-    private sealed class DeviceMap(GpuOps ops, MapOp op, byte[]? x, byte[]? y, byte[]? z, byte[] output, int n) : Bench.ITypeVisitor<bool>
+    // On any GPU device: its buffers padded to whole 16-byte words (its kernels address whole words).
+    private sealed class DeviceMap(IDevice<ulong, ulong> ops, MapOp op, byte[]? x, byte[]? y, byte[]? z, byte[] output, int n) : Bench.ITypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IAdad<TN, float>
         {
-            var gpu = ops.Gpu;
             var rented = new List<ulong>();
             ulong Up(byte[]? array)
             {
                 if (array is null) return 0;
-                ulong d = gpu.Rent(array.Length);
+                ulong d = ops.Rent(array.Length + 16);
                 rented.Add(d);
-                Adad.Cuda.Gpu.Upload<byte>(array, d);
+                ops.Upload(array, d);
                 return d;
             }
 
-            ulong dx = Up(x), dy = Up(y), dz = Up(z), dout = gpu.Rent(output.Length);
+            ulong dx = Up(x), dy = Up(y), dz = Up(z), dout = ops.Rent(output.Length + 16);
             rented.Add(dout);
             ops.Map<TN>(op, dx, dy, dz, dout, n, op.A, op.B);
-            Adad.Cuda.Gpu.Synchronize();
-            Adad.Cuda.Gpu.Download<byte>(dout, output);
-            foreach (var p in rented) gpu.Return(p);
+            ops.Synchronize();
+            ops.Download(dout, output);
+            foreach (var p in rented) ops.Return(p);
             return true;
         }
     }

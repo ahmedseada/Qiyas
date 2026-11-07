@@ -72,6 +72,21 @@ foreach (var device in options.Devices)
         if (options.Report) Console.WriteLine(Devices.Ops.Report());
     }
 
+    if (device == Device.Vulkan)
+    {
+        if (!Devices.HasVulkan)
+        {
+            Console.WriteLine($"vulkan: {Devices.VulkanReason}; skipped.");
+            continue;
+        }
+
+        if (!Checks.Vulkan(Devices.Vk))
+        {
+            Console.WriteLine("A device check failed: no timing until it is fixed.");
+            return 1;
+        }
+    }
+
     foreach (var s in subjects)
     {
         if (s.Describe(device) is { } line) Console.WriteLine(line);
@@ -168,7 +183,7 @@ internal sealed class Options
                 case "profile" or "gpuprofile" or "team": o.Mode = a; break;
                 default:
                     o.Devices = [.. a.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                        .Select(d => d switch { "cpu" => Device.Cpu, "cuda" => Device.Cuda, _ => throw new ArgumentException($"unknown device {d}") })];
+                        .Select(d => d switch { "cpu" => Device.Cpu, "cuda" => Device.Cuda, "vulkan" => Device.Vulkan, _ => throw new ArgumentException($"unknown device {d}") })];
                     break;
             }
         }
@@ -478,7 +493,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var output = new int[reference.Length];
             using var run = prepare(subject, output);
             if (run is null) { cells.Add(null); continue; }
-            double ms = Time(Scoped(device, subject, run));
+            if (TimeOrRefused(device, subject, run) is not { } ms) { cells.Add(null); continue; }
             run.Collect();
             double worst = extra?.Invoke() ?? 0;
             for (int i = 0; i < reference.Length; i++) worst = Math.Max(worst, Math.Abs((double)output[i] - reference[i]));
@@ -733,7 +748,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var output = new byte[count * 8];
             using var run = prepare(subject, output);
             if (run is null) { cells.Add(null); continue; }
-            double ms = Time(Scoped(device, subject, run));
+            if (TimeOrRefused(device, subject, run) is not { } ms) { cells.Add(null); continue; }
             run.Collect();
             var got = LaneValues.Decode(run.Lane, output, count);
             double worst = 0;
@@ -765,7 +780,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var output = new byte[outputBytes];
             using var run = prepare(subject, output);
             if (run is null) { cells.Add(null); continue; }
-            double ms = Time(Scoped(device, subject, run));
+            if (TimeOrRefused(device, subject, run) is not { } ms) { cells.Add(null); continue; }
             run.Collect();
             cells.Add(new Cell(subject.Name, run.Lane, ms, Err(type, output, reference)));
         }
@@ -790,6 +805,20 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
 
     // Adad on the device: each timed call inside one arena scope (src/Adad/Arena.cs), so its buffers come from one region with no
     // pool lookup; the buffers prepared outside the call stay the pool's.
+    // The run's time, or null when its device refuses the operation (a family it has no kernels for, a lane it lacks):
+    // a blank cell, the refusal said once.
+    private static double? TimeOrRefused(Device device, IBenchSubject subject, IBenchRun run)
+    {
+        try { return Time(Scoped(device, subject, run)); }
+        catch (NotSupportedException e)
+        {
+            if (s_refused.Add(e.Message)) Console.WriteLine($"  {subject.Name} on {device.ToString().ToLowerInvariant()}: {e.Message}");
+            return null;
+        }
+    }
+
+    private static readonly HashSet<string> s_refused = [];
+
     private static Action Scoped(Device device, IBenchSubject subject, IBenchRun run) =>
         device == Device.Cuda && subject is AdadSubject ? () => { using var scope = Devices.Ops.Scope(); run.Run(); } : run.Run;
 

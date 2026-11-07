@@ -19,6 +19,7 @@ public enum Device
 {
     Cpu,
     Cuda,
+    Vulkan,
 }
 
 /// <summary>One prepared operation.</summary>
@@ -184,14 +185,27 @@ public sealed class BenchRun(Action run, Action? collect = null, Action? dispose
     public void Dispose() => dispose?.Invoke();
 }
 
-/// <summary>The CUDA device the subjects share (created on first use; null when the machine has no driver).</summary>
+/// <summary>The GPU devices the subjects share (each created on first use): CUDA, and Vulkan.</summary>
 public static class Devices
 {
     private static GpuOps? s_ops;
+    private static Adad.Vulkan.VulkanOps? s_vk;
+    private static bool? s_hasVulkan;
+    private static string s_vulkanReason = "";
 
     public static bool HasCuda => Driver.Available;
 
     public static GpuOps Ops => s_ops ??= new GpuOps(new Gpu());
 
     public static Gpu Gpu => Ops.Gpu;
+
+    /// <summary>Whether this machine has a Vulkan device Adad can use (VulkanReason says why not).</summary>
+    public static bool HasVulkan => s_hasVulkan ??= Adad.Vulkan.Vulkan.TryAvailable(out s_vulkanReason);
+
+    public static string VulkanReason => s_vulkanReason;
+
+    public static Adad.Vulkan.VulkanOps Vk => s_vk ??= new Adad.Vulkan.VulkanOps(new Adad.Vulkan.Vulkan());
+
+    /// <summary>The device a GPU subject runs on.</summary>
+    public static IDevice<ulong, ulong> Of(Device device) => device == Device.Vulkan ? Vk : Ops;
 }
