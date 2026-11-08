@@ -224,6 +224,39 @@ internal static partial class Ptx
             return y;
         }
 
+        /// <summary>atan by Funcs.Atan's reduction and series.</summary>
+        public static string Atan(PtxBuilder b, Lane lane, string x)
+        {
+            bool w = lane.Wide;
+            string op = lane.Op, a = lane.NewReg(b), rc = lane.NewReg(b), u = lane.NewReg(b), num = lane.NewReg(b), den = lane.NewReg(b), q = lane.NewReg(b);
+            string t = lane.NewReg(b), t2 = lane.NewReg(b), r = lane.NewReg(b), rm = lane.NewReg(b), ri = lane.NewReg(b), y = lane.NewReg(b), ny = lane.NewReg(b);
+            string pInv = b.P(), pMid = b.P(), pNeg = b.P();
+            b.L($"abs.{op} {a}, {x};");
+            b.L($"setp.gt.{op} {pInv}, {a}, {L(lane, 1)};");
+            b.L($"div.rn.{op} {rc}, {L(lane, 1)}, {a};");
+            b.L($"selp.{op} {u}, {rc}, {a}, {pInv};");
+            b.L($"setp.gt.{op} {pMid}, {u}, {L(lane, Funcs.TanPiTwelfth)};");
+            double s3 = w ? Funcs.Sqrt3 : Funcs.Sqrt3F, s3lo = w ? Funcs.Sqrt3Lo : Funcs.Sqrt3LoF;
+            b.L($"fma.rn.{op} {num}, {u}, {L(lane, s3)}, {L(lane, -1)};");
+            b.L($"fma.rn.{op} {num}, {u}, {L(lane, s3lo)}, {num};");
+            b.L($"add.rn.{op} {den}, {u}, {L(lane, s3)};");
+            b.L($"div.rn.{op} {q}, {num}, {den};");
+            b.L($"selp.{op} {t}, {q}, {u}, {pMid};");
+            b.L($"mul.rn.{op} {t2}, {t}, {t};");
+            string p = Poly(b, lane, t2, Funcs.AtanSeries, w ? Funcs.AtanTerms64 : Funcs.AtanTerms32, 0);
+            b.L($"mul.rn.{op} {r}, {p}, {t};");
+            b.L($"add.rn.{op} {rm}, {r}, {L(lane, w ? Funcs.PiSixthLo : Funcs.PiSixthLoF)};");
+            b.L($"add.rn.{op} {rm}, {rm}, {L(lane, w ? Funcs.PiSixth : Funcs.PiSixthF)};");
+            b.L($"selp.{op} {r}, {rm}, {r}, {pMid};");
+            b.L($"sub.rn.{op} {ri}, {L(lane, w ? Funcs.PiHalf : Funcs.PiHalfF)}, {r};");
+            b.L($"add.rn.{op} {ri}, {ri}, {L(lane, w ? Funcs.PiHalfLo : Funcs.PiHalfLoF)};");
+            b.L($"selp.{op} {y}, {ri}, {r}, {pInv};");
+            b.L($"neg.{op} {ny}, {y};");
+            b.L($"setp.lt.{op} {pNeg}, {x}, {L(lane, 0)};");
+            b.L($"selp.{op} {y}, {ny}, {y}, {pNeg};");
+            return y;
+        }
+
         public static string Sigmoid(PtxBuilder b, Lane lane, string x)
         {
             string op = lane.Op, nx = lane.NewReg(b), d = lane.NewReg(b), y = lane.NewReg(b);
@@ -382,6 +415,13 @@ internal static partial class Ptx
             return p;
         }
 
+        public string Equal(string x, string y)
+        {
+            string p = b.P();
+            b.L($"setp.eq.{_op} {p}, {x}, {y};");
+            return p;
+        }
+
         public string NotZero(string x)
         {
             string p = b.P();
@@ -414,6 +454,7 @@ internal static partial class Ptx
         public string Log(string x) => Fn.Log(b, lane, x);
         public string Sqrt(string x) => Fn.Sqrt(b, lane, x);
         public string Tanh(string x) => Fn.Tanh(b, lane, x);
+        public string Atan(string x) => Fn.Atan(b, lane, x);
         public string Sigmoid(string x) => Fn.Sigmoid(b, lane, x);
         public string Erf(string x) => Fn.Erf(b, lane, x);
         public string Erfc(string x) => Fn.Erfc(b, lane, x);
@@ -522,6 +563,7 @@ internal static partial class Ptx
             case "sin": return Fn.Sin(b, lane, x);
             case "cos": return Fn.Cos(b, lane, x);
             case "tanh": return e.Tanh(x);
+            case "atan": return e.Atan(x);
             case "sigmoid": return e.Sigmoid(x);
             case "erf": return e.Erf(x);
             case "gelu": return e.Gelu(x);

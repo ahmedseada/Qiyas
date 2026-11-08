@@ -116,6 +116,7 @@ public static class Ops
         new("sin", 1, true, (x, y, z, a, b) => Math.Sin(x), Wide, Any, 0, 0),
         new("cos", 1, true, (x, y, z, a, b) => Math.Cos(x), Wide, Any, 0, 0),
         new("tanh", 1, true, (x, y, z, a, b) => Math.Tanh(x), Any, Any, 0, 0),
+        new("atan", 1, true, (x, y, z, a, b) => Math.Atan(x), Wide, Any, 0, 0, "|x| past 1 by π/2 − atan(1/|x|), past tan(π/12) by π/6 + atan((u√3 − 1)/(u + √3)), then the series"),
         new("sigmoid", 1, true, (x, y, z, a, b) => Sigmoid(x), Any, Any, 0, 0),
         new("erf", 1, true, (x, y, z, a, b) => Funcs.ErfReference(x), Any, Any, 0, 0),
         new("gelu", 1, true, (x, y, z, a, b) => Gelu(x), Any, Any, 0, 0, "the tanh form" + Cond, Ulps: 64),

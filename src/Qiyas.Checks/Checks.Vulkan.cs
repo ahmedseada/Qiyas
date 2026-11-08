@@ -18,6 +18,7 @@ internal static partial class Checks
         ok &= Rows(ops, "vulkan");
         ok &= Norms(ops, "vulkan");
         ok &= Resamples(ops, "vulkan");
+        ok &= BoxLosses(ops, "vulkan");
         ok &= Layouts(ops, "vulkan");
         ok &= Products(ops, "vulkan");
         ok &= Optimizers(ops, "vulkan");

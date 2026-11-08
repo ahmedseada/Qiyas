@@ -27,12 +27,21 @@ public static class Funcs
     public const double PiHalf1 = 1.57079632673412561417e+00, PiHalf2 = 6.07710050630396597660e-11, PiHalf3 = 2.02226624871116645580e-21;
     public const float PiHalf1F = 1.5707963705062866f, PiHalf2F = -4.3711388286737929e-08f, PiHalf3F = -1.7151245100059e-15f;
     public const double TwoOverSqrtPi = 1.1283791670955126, InvSqrtPi = 0.5641895835477563;
+    // atan's reduction: π/2 − atan(1/u) past 1, π/6 + atan((u√3 − 1)/(u + √3)) past tan(π/12) = 2 − √3; π/2, π/6 and √3 each
+    // as the lane's nearest value and the rest (hi + lo), so the reduction and the sums add no rounding of the constants.
+    public const double PiHalf = 1.5707963267948966, PiHalfLo = 6.123233995736766e-17, PiSixth = 0.5235987755982989, PiSixthLo = -5.360408832255455e-17;
+    public const double Sqrt3 = 1.7320508075688772, Sqrt3Lo = 1.0035084221806903e-16, TanPiTwelfth = 0.26794919243112270;
+    public const float PiHalfF = 1.5707963705062866f, PiHalfLoF = -4.3711390001862426e-08f, PiSixthF = 0.5235987901687622f, PiSixthLoF = -1.4570463333954142e-08f;
+    public const float Sqrt3F = 1.7320507764816284f, Sqrt3LoF = 3.10872488755587e-08f;
 
     /// <summary>1/n! for n = 0 .. Count − 1 (the exp series).</summary>
     public static readonly double[] InvFact = Build(26, n => 1.0 / Factorial(n));
 
     /// <summary>2/(2k+1) for k = 0 .. : the atanh series 2·Σ t^(2k+1)/(2k+1).</summary>
     public static readonly double[] Atanh = Build(16, k => 2.0 / (2 * k + 1));
+
+    /// <summary>(−1)^k/(2k+1): the atan series Σ (−1)^k t^(2k+1)/(2k+1), kept to |t| ≤ tan(π/12) (t² ≤ 0.072).</summary>
+    public static readonly double[] AtanSeries = Build(16, k => (k % 2 == 0 ? 1.0 : -1.0) / (2 * k + 1));
 
     /// <summary>(−1)^k / (2k+1)! for sin, (−1)^k / (2k)! for cos.</summary>
     public static readonly double[] SinSeries = Build(12, k => (k % 2 == 0 ? 1.0 : -1.0) / Factorial(2 * k + 1));
@@ -43,6 +52,8 @@ public static class Funcs
 
     /// <summary>Series terms and continued-fraction depth each lane uses (past its last bit at the series' bound).</summary>
     public const int ExpTerms32 = 8, ExpTerms64 = 14, AtanhTerms32 = 6, AtanhTerms64 = 12, SinTerms32 = 6, SinTerms64 = 11;
+    /// <summary>atan's terms: the first left out is below 2^−26 (f32) and 2^−58 (f64) of the result at tan(π/12).</summary>
+    public const int AtanTerms32 = 6, AtanTerms64 = 14;
     public const int ErfTerms32 = 16, ErfTerms64 = 30, ErfDepth32 = 48, ErfDepth64 = 100;
     public const float ErfBound32 = 1.0f;
     public const double ErfBound64 = 1.5;
@@ -203,6 +214,26 @@ public static class Funcs
     }
 
     public static Vector<float> Sigmoid(Vector<float> x) => Vector<float>.One / (Vector<float>.One + Exps.Exp(-x));
+
+    /// <summary>atan: u = |x| (1/|x| past 1), t = u or, past tan(π/12), (u√3 − 1)/(u + √3); the series in t²; π/6 and π/2 −
+    /// added back; the sign of x (NaN kept, ±∞ to ±π/2).</summary>
+    public static Vector<float> Atan(Vector<float> x)
+    {
+        var a = Vector.Abs(x);
+        var inv = Vector.GreaterThan(a, Vector<float>.One);
+        var u = Vector.ConditionalSelect(inv, Vector<float>.One / a, a);
+        var mid = Vector.GreaterThan(u, new Vector<float>((float)TanPiTwelfth));
+        var s3 = new Vector<float>(Sqrt3F);
+        var num = Vector.FusedMultiplyAdd(u, new Vector<float>(Sqrt3LoF), Vector.FusedMultiplyAdd(u, s3, -Vector<float>.One));
+        var t = Vector.ConditionalSelect(mid, num / (u + s3), u);
+        var t2 = t * t;
+        var p = new Vector<float>((float)AtanSeries[AtanTerms32 - 1]);
+        for (int k = AtanTerms32 - 2; k >= 0; k--) p = Vector.FusedMultiplyAdd(p, t2, new Vector<float>((float)AtanSeries[k]));
+        var r = p * t;
+        r = Vector.ConditionalSelect(mid, (r + new Vector<float>(PiSixthLoF)) + new Vector<float>(PiSixthF), r);
+        r = Vector.ConditionalSelect(inv, (new Vector<float>(PiHalfF) - r) + new Vector<float>(PiHalfLoF), r);
+        return Vector.ConditionalSelect(Vector.LessThan(x, Vector<float>.Zero), -r, r);
+    }
 
     // erfc |x| for |x| ≥ 0.75 on the f32 lane: e^(−x²) (x² carried with its rounding, x2lo) · t · S(u) (ErfcTail32).
     private static Vector<float> ErfcTail(Vector<float> ax, Vector<float> x2)
@@ -368,6 +399,24 @@ public static class Funcs
     }
 
     public static Vector<double> Sigmoid(Vector<double> x) => Vector<double>.One / (Vector<double>.One + Exps.Exp(-x));
+
+    public static Vector<double> Atan(Vector<double> x)
+    {
+        var a = Vector.Abs(x);
+        var inv = Vector.GreaterThan(a, Vector<double>.One);
+        var u = Vector.ConditionalSelect(inv, Vector<double>.One / a, a);
+        var mid = Vector.GreaterThan(u, new Vector<double>(TanPiTwelfth));
+        var s3 = new Vector<double>(Sqrt3);
+        var num = Vector.FusedMultiplyAdd(u, new Vector<double>(Sqrt3Lo), Vector.FusedMultiplyAdd(u, s3, -Vector<double>.One));
+        var t = Vector.ConditionalSelect(mid, num / (u + s3), u);
+        var t2 = t * t;
+        var p = new Vector<double>(AtanSeries[AtanTerms64 - 1]);
+        for (int k = AtanTerms64 - 2; k >= 0; k--) p = Vector.FusedMultiplyAdd(p, t2, new Vector<double>(AtanSeries[k]));
+        var r = p * t;
+        r = Vector.ConditionalSelect(mid, (r + new Vector<double>(PiSixthLo)) + new Vector<double>(PiSixth), r);
+        r = Vector.ConditionalSelect(inv, (new Vector<double>(PiHalf) - r) + new Vector<double>(PiHalfLo), r);
+        return Vector.ConditionalSelect(Vector.LessThan(x, Vector<double>.Zero), -r, r);
+    }
 
     // The continued fraction f = x + (depth/2) / f, …, down to f = x + ½ / f (f starting at x), as a ratio P / Q: each level
     // P' = x·P + (d/2)·Q, Q' = P — two multiply-adds, no division — the pair rescaled to (1, Q/P) every 16th level (one

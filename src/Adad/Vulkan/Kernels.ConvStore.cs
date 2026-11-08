@@ -16,6 +16,14 @@ internal static partial class VkKernels
         var b = new Spv($"conv_store_{f.Name}_{lane.Name}_{act ?? "none"}{(bias ? "_b" : "")}", Threads, vk.Controls);
         V ps = b.Arg(0), pb = b.Arg(1), py = b.Arg(2);
         V n = b.Arg(3, K.U32), cols = b.Arg(4, K.U32), oc = b.Arg(5, K.U32), pa = b.Arg(6, k);
+        StoreEach(b, f, lane, py, n, at => ConvStoreValue(b, f, lane, k, act, bias, ps, pb, cols, oc, pa, at));
+        return b.Build();
+    }
+
+    /// <summary>The n values of f at py from value(at) (a lane value; at below n), an invocation a stored word, each rounded to
+    /// the type once (a block format's go through BlockEncoder instead).</summary>
+    internal static void StoreEach(Spv b, Fmt f, Lane lane, V py, V n, Func<V, V> value)
+    {
         var gid = b.GlobalX;
         var natural = f.Natural;
         var nk = Kinds.Of(natural);
@@ -27,14 +35,13 @@ internal static partial class VkKernels
             {
                 // A word's values past the count take the last value's addresses (dropped).
                 var at = gid * (double)f.Per + i;
-                var value = ConvStoreValue(b, f, lane, k, act, bias, ps, pb, cols, oc, pa, b.Min(at, last));
-                var stored = lane.Name == natural.Name ? value : Codec.Convert(b, lane, value, natural);
+                var v = value(b.Min(at, last));
+                var stored = lane.Name == natural.Name ? v : Codec.Convert(b, lane, v, natural);
                 word = Codec.Pack(b, f, b.Select(at < n, stored, b.C(nk, 0)), natural, i, word);
             }
 
             b.Store(b.At(py, gid, f.WordBits / 8), word);
         });
-        return b.Build();
     }
 
     /// <summary>The store into blocks (f32). Slots: sums, bias, cols, oc, the activation's parameter (f32).</summary>

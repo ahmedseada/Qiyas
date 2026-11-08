@@ -117,6 +117,11 @@ internal static partial class Checks
         ok &= Function64("sigmoid f64", Funcs.Sigmoid, x => 1 / (1 + Math.Exp(-x)), -20, 20, 3, random);
         ok &= Function32("erf f32", Funcs.Erf, Funcs.ErfReference, -5, 5, 4, random);
         ok &= Function64("erf f64", Funcs.Erf, Funcs.ErfReference, -6, 6, 4, random);
+        var atanRandom = new Random(73);                                   // its own draws: the checks after keep theirs
+        ok &= Function32("atan f32", Funcs.Atan, Math.Atan, -2, 2, 3, atanRandom);
+        ok &= Function64("atan f64", Funcs.Atan, Math.Atan, -2, 2, 3, atanRandom);
+        ok &= Function32("atan f32 wide", Funcs.Atan, Math.Atan, -1e6, 1e6, 3, atanRandom);
+        ok &= Function64("atan f64 wide", Funcs.Atan, Math.Atan, -1e6, 1e6, 3, atanRandom);
         ok &= Function32("erfc f32", Funcs.Erfc, Funcs.ErfcReference, -4, 9, 4, random);
         ok &= Function64("erfc f64", Funcs.Erfc, Funcs.ErfcReference, -4, 26, 4, random);
         ok &= Maps(null);
@@ -125,6 +130,7 @@ internal static partial class Checks
         ok &= Rows(null);
         ok &= Norms(null);
         ok &= Resamples(null);
+        ok &= BoxLosses(null);
         ok &= Layouts(null);
         ok &= Products(null);
         ok &= Attentions(null);
@@ -2314,6 +2320,7 @@ internal static partial class Checks
         ok &= Rows(ops);
         ok &= Norms(ops, "cuda");
         ok &= Resamples(ops, "cuda");
+        ok &= BoxLosses(ops, "cuda");
         ok &= Layouts(ops);
         ok &= Products(ops);
         ok &= Attentions(ops);

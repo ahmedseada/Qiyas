@@ -158,6 +158,23 @@ internal static partial class VkKernels
 
         public static V Sigmoid(Spv b, V x) => b.C(x.Kind, 1) / (Exp(b, -x) + 1.0);
 
+        /// <summary>atan by Funcs.Atan's reduction and series.</summary>
+        public static V Atan(Spv b, V x)
+        {
+            bool w = x.Kind == K.F64;
+            var a = b.Abs(x);
+            var inv = a > 1.0;
+            var u = b.Select(inv, b.C(x.Kind, 1) / a, a);
+            var mid = u > Funcs.TanPiTwelfth;
+            var s3 = b.C(x.Kind, w ? Funcs.Sqrt3 : Funcs.Sqrt3F);
+            var num = b.Fma(u, b.C(x.Kind, w ? Funcs.Sqrt3Lo : Funcs.Sqrt3LoF), b.Fma(u, s3, b.C(x.Kind, -1)));
+            var t = b.Select(mid, num / (u + s3), u);
+            var r = Poly(b, t * t, Funcs.AtanSeries, w ? Funcs.AtanTerms64 : Funcs.AtanTerms32, 0) * t;
+            r = b.Select(mid, (r + (w ? Funcs.PiSixthLo : Funcs.PiSixthLoF)) + (w ? Funcs.PiSixth : Funcs.PiSixthF), r);
+            r = b.Select(inv, (b.C(x.Kind, w ? Funcs.PiHalf : Funcs.PiHalfF) - r) + (w ? Funcs.PiHalfLo : Funcs.PiHalfLoF), r);
+            return b.Select(x < 0.0, -r, r);
+        }
+
         public static V Erf(Spv b, V x)
         {
             bool w = x.Kind == K.F64;
@@ -305,6 +322,7 @@ internal static partial class VkKernels
             case "sin": return Fn.Sin(b, x);
             case "cos": return Fn.Cos(b, x);
             case "tanh": return Fn.Tanh(b, x);
+            case "atan": return Fn.Atan(b, x);
             case "sigmoid": return e.Sigmoid(x);
             case "erf": return Fn.Erf(b, x);
             case "gelu": return e.Gelu(x);

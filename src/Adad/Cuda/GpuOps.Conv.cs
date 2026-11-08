@@ -53,13 +53,20 @@ public sealed partial class GpuOps
                     w, f, (long)g * a.OCg * a.Rows, cols, lf, (long)g * a.Rows * a.Cols, sums + (ulong)((long)g * a.OCg * a.Cols * lane.Size), null);
             var store = gpu.Cached($"conv_store:{f.Name}:{lane.Name}:{a.Act}:{bias != 0}", (out string e) => Ptx.ConvStore(gpu, f, lane, a.Act, bias != 0, out e));
             ulong[] args = [sums, bias, y, Gpu.U((int)a.YValues), Gpu.U(a.Cols), Gpu.U(a.OC), lane.Wide ? Gpu.D(a.ActA) : Gpu.F((float)a.ActA)];
-            if (f.IsBlock && Ptx.BlockByCta(f)) Gpu.Launch(store, (uint)((a.YValues + f.BlockValues - 1) / f.BlockValues), 1, (uint)f.BlockValues, 1, 0, args);
-            else if (f.IsBlock) Gpu.Launch(store, BlockGrid(f, a.YValues), 1, 256, 1, 0, args);
-            else Gpu.Launch(store, Grid(f.Words(a.YValues), 256), 1, 256, 1, 0, args);
+            LaunchEach(store, f, a.YValues, args);
         }
         finally { foreach (var p in rented) gpu.Return(p); }
 
         return lane.Name;
+    }
+
+    /// <summary>A Ptx.StoreEach kernel over count values of f: a thread per stored word, a warp (a CTA) per block.</summary>
+    private static void LaunchEach(IntPtr fn, Fmt f, long count, params ulong[] args)
+    {
+        if (count == 0) return;
+        if (f.IsBlock && Ptx.BlockByCta(f)) Gpu.Launch(fn, (uint)((count + f.BlockValues - 1) / f.BlockValues), 1, (uint)f.BlockValues, 1, 0, args);
+        else if (f.IsBlock) Gpu.Launch(fn, BlockGrid(f, count), 1, 256, 1, 0, args);
+        else Gpu.Launch(fn, Grid(f.Words(count), 256), 1, 256, 1, 0, args);
     }
 
     // The float lane's own format.

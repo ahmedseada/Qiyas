@@ -162,6 +162,8 @@ public interface IFloatLane<TSelf, T> : ILane<TSelf, T> where TSelf : struct, IF
 
     static abstract Vector<T> Tanh(Vector<T> x);
 
+    static abstract Vector<T> Atan(Vector<T> x);
+
     static abstract Vector<T> Sigmoid(Vector<T> x);
 
     static abstract Vector<T> Erf(Vector<T> x);
@@ -248,6 +250,7 @@ public readonly struct F32 : IFloatLane<F32, float>
     public static Vector<float> Cos(Vector<float> x) => Funcs.Cos(x);
     public static (Vector<float> Sin, Vector<float> Cos) SinCos(Vector<float> x) => Funcs.SinCos(x);
     public static Vector<float> Tanh(Vector<float> x) => Funcs.Tanh(x);
+    public static Vector<float> Atan(Vector<float> x) => Funcs.Atan(x);
     public static Vector<float> Sigmoid(Vector<float> x) => Funcs.Sigmoid(x);
     public static Vector<float> Erf(Vector<float> x) => Funcs.Erf(x);
     public static Vector<float> Erfc(Vector<float> x) => Funcs.Erfc(x);
@@ -281,6 +284,7 @@ public readonly struct F64 : IFloatLane<F64, double>
     public static Vector<double> Cos(Vector<double> x) => Funcs.Cos(x);
     public static (Vector<double> Sin, Vector<double> Cos) SinCos(Vector<double> x) => Funcs.SinCos(x);
     public static Vector<double> Tanh(Vector<double> x) => Funcs.Tanh(x);
+    public static Vector<double> Atan(Vector<double> x) => Funcs.Atan(x);
     public static Vector<double> Sigmoid(Vector<double> x) => Funcs.Sigmoid(x);
     public static Vector<double> Erf(Vector<double> x) => Funcs.Erf(x);
     public static Vector<double> Erfc(Vector<double> x) => Funcs.Erfc(x);

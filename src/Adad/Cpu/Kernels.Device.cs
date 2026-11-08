@@ -204,6 +204,11 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
 
     string IRouting<byte[], int[]>.CrossEntropy<TN>(byte[] x, int rows, int cols, int[] targets, byte[]? weights, byte[] output) => CrossEntropy<TN>(x, rows, cols, targets, weights, output);
 
+    string IBoxes<byte[]>.BoxLoss<TN>(BoxOverlap overlap, byte[] predicted, byte[] target, byte[] loss, int count, double eps) => BoxLoss<TN>(overlap, predicted, target, loss, count, eps);
+
+    string IBoxes<byte[]>.BoxLossBackward<TN>(BoxOverlap overlap, byte[] predicted, byte[] target, byte[] dloss, byte[] dpredicted, int count, double eps) =>
+        BoxLossBackward<TN>(overlap, predicted, target, dloss, dpredicted, count, eps);
+
     void IRouting<byte[], int[]>.Route(int[] index, int count, int buckets, int[] counts, int[] offsets, int[] order) =>
         Route(count == index.Length ? index : index[..count], buckets, counts, offsets, order);
 

@@ -66,6 +66,11 @@ public sealed partial class GpuOps : IDevice<ulong, ulong>
 
     string IRouting<ulong, ulong>.CrossEntropy<TN>(ulong x, int rows, int cols, ulong targets, ulong weights, ulong output) => CrossEntropy<TN>(x, rows, cols, targets, weights, output);
 
+    string IBoxes<ulong>.BoxLoss<TN>(BoxOverlap overlap, ulong predicted, ulong target, ulong loss, int count, double eps) => BoxLoss<TN>(overlap, predicted, target, loss, count, eps);
+
+    string IBoxes<ulong>.BoxLossBackward<TN>(BoxOverlap overlap, ulong predicted, ulong target, ulong dloss, ulong dpredicted, int count, double eps) =>
+        BoxLossBackward<TN>(overlap, predicted, target, dloss, dpredicted, count, eps);
+
     string IRecurrent<ulong>.LstmCell<TN>(CellArgs a, ulong g, ulong c, ulong hOut, ulong cOut) => LstmCell<TN>(a, g, c, hOut, cOut);
 
     string IRecurrent<ulong>.LstmCellBackward<TN>(CellArgs a, ulong g, ulong c, ulong dh, ulong dcNext, ulong dg, ulong dc) => LstmCellBackward<TN>(a, g, c, dh, dcNext, dg, dc);

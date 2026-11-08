@@ -135,6 +135,7 @@ internal static class MapOps
     public struct Sin<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Sin(x); }
     public struct Cos<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Cos(x); }
     public struct Tanh<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Tanh(x); }
+    public struct Atan<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Atan(x); }
     public struct Sigmoid<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Sigmoid(x); }
     public struct Erf<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Erf(x); }
     public struct Gelu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => GeluF<T, TL>(x); }
@@ -277,6 +278,7 @@ internal static class MapOps
             case "sin": use.Use<Sin<T, TL>>(); return true;
             case "cos": use.Use<Cos<T, TL>>(); return true;
             case "tanh": use.Use<Tanh<T, TL>>(); return true;
+            case "atan": use.Use<Atan<T, TL>>(); return true;
             case "sigmoid": use.Use<Sigmoid<T, TL>>(); return true;
             case "erf": use.Use<Erf<T, TL>>(); return true;
             case "gelu": use.Use<Gelu<T, TL>>(); return true;
