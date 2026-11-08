@@ -32,8 +32,8 @@ public static class Routing
         return y;
     }
 
-    /// <summary>The cross-entropy loss per row in float64: max + log Σ exp(x − max) − x[target].</summary>
-    public static double[] CrossEntropyReference(double[] x, int rows, int cols, int[] targets)
+    /// <summary>The cross-entropy loss per row in float64: w[r]·(max + log Σ exp(x − max) − x[target]), w absent 1.</summary>
+    public static double[] CrossEntropyReference(double[] x, int rows, int cols, int[] targets, double[]? weights = null)
     {
         var y = new double[rows];
         for (int r = 0; r < rows; r++)
@@ -41,7 +41,7 @@ public static class Routing
             double m = double.NegativeInfinity, sum = 0;
             for (int c = 0; c < cols; c++) m = Math.Max(m, x[r * cols + c]);
             for (int c = 0; c < cols; c++) sum += Math.Exp(x[r * cols + c] - m);
-            y[r] = m + Math.Log(sum) - x[r * cols + targets[r]];
+            y[r] = (m + Math.Log(sum) - x[r * cols + targets[r]]) * (weights?[r] ?? 1);
         }
 
         return y;

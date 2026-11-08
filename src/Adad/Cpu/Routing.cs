@@ -175,16 +175,16 @@ internal sealed partial class Kernels
         return Widths.Compare(a, b) > 0;
     }
 
-    /// <summary>loss[r] = log Σ exp(x[r]) − x[r][t[r]] as the type, in the type's float lane: a row's max, its Σ exp(x − max),
-    /// then (max − x[t]) + log Σ.</summary>
-    public static string CrossEntropy<TN>(byte[] x, int rows, int cols, int[] targets, byte[] output) where TN : struct, IFloatAdad<TN>
+    /// <summary>loss[r] = w[r]·(log Σ exp(x[r]) − x[r][t[r]]) as the type, in the type's float lane: a row's max, its Σ exp(x − max),
+    /// then ((max − x[t]) + log Σ)·w[r] (weights as the type, absent 1).</summary>
+    public static string CrossEntropy<TN>(byte[] x, int rows, int cols, int[] targets, byte[]? weights, byte[] output) where TN : struct, IFloatAdad<TN>
     {
-        var v = new CrossEntropyVisitor(x, rows, cols, targets, output);
+        var v = new CrossEntropyVisitor(x, rows, cols, targets, weights, output);
         TN.Float(ref v);
         return v.Lane;
     }
 
-    private struct CrossEntropyVisitor(byte[] x, int rows, int cols, int[] targets, byte[] output) : IFloatLaneVisitor
+    private struct CrossEntropyVisitor(byte[] x, int rows, int cols, int[] targets, byte[]? weights, byte[] output) : IFloatLaneVisitor
     {
         public string Lane = "";
 
@@ -193,6 +193,13 @@ internal sealed partial class Kernels
             Lane = TL.Name;
             var losses = new TLane[rows];
             Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)rows * cols * 4, new CrossEntropyBody<TN, TLane, TL>(x, cols, targets, losses));
+            if (weights is not null)
+            {
+                var w = new TLane[rows];
+                TN.Load(weights, 0, w);
+                for (int r = 0; r < rows; r++) losses[r] = TL.Mul(losses[r], w[r]);
+            }
+
             TN.Store(losses, output, 0);
         }
     }

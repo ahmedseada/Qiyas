@@ -183,10 +183,11 @@ internal static partial class Ptx
     /// row, any row length, stored as the type: one pass, each thread's running max m and Σ exp(x − m) (a larger value
     /// rescales the sum: one exp a value, e = exp(−|x − m|)), the threads' pairs joined by the same rule, then
     /// (m − x[t]) + log Σ.</summary>
-    /// <summary>Each row's loss as the type; a block format's as f32 (one a row, the rows' result before its blocks are encoded).</summary>
-    public static string CrossEntropyRows(Gpu gpu, Fmt f, Lane lane, out string entry)
+    /// <summary>Each row's loss as the type; a block format's as f32 (one a row, the rows' result before its blocks are encoded);
+    /// weighted: times the row's weight (p_w, as the type).</summary>
+    public static string CrossEntropyRows(Gpu gpu, Fmt f, Lane lane, bool weighted, out string entry)
     {
-        entry = $"cross_entropy_rows_{f.Name}_{lane.Name}";
+        entry = $"cross_entropy_rows_{f.Name}_{lane.Name}{(weighted ? "_w" : "")}";
         var b = new PtxBuilder();
         string tid = b.R(), row = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
@@ -221,10 +222,16 @@ internal static partial class Ptx
         b.L($"sub.rn.{lane.Op} {d}, {bm}, {xt};");
         string ls = Fn.Log(b, lane, bs);
         b.L($"add.rn.{lane.Op} {loss}, {d}, {ls};");
+        if (weighted)
+        {
+            string wv = Codec.UnpackAt(b, f, Param64(b, "p_w"), row, lane);
+            b.L($"mul.rn.{lane.Op} {loss}, {loss}, {wv};");
+        }
+
         StoreAnyValue(b, f.IsBlock ? LaneFormat(Lane.F32) : f, lane, loss, outp, row);
         b.Label("OUT");
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_t, .param .u64 p_out, .param .u32 p_cols", ReduceBytes * 2);
+        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_t, .param .u64 p_out, .param .u32 p_cols, .param .u64 p_w", ReduceBytes * 2);
     }
 
     private static string Lowest(Lane lane) => lane.Literal(lane.Wide ? -double.MaxValue : -float.MaxValue);

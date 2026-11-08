@@ -761,15 +761,19 @@ internal static partial class Ptx
             }
 
             case "cross_entropy_bwd":
+            case "weighted_cross_entropy_bwd":
             {
+                // Weighted: (softmax − one_hot)·(a·s), the target's p − 1 before the scaling.
                 string m = c.Reduce("max", c.X);
                 string sum = c.Reduce("add", (q, i) => c.Exp(c.Sub(c.X(q, i), m)));
                 string inv = c.Rcp(sum), posInt = c.PosInt();
+                string? factor = op.Name == "weighted_cross_entropy_bwd" ? c.Mul(c.A, c.S()) : null;
                 c.Store((q, i) =>
                 {
                     string p = c.Mul(c.Exp(c.Sub(c.X(q, i), m)), inv), pTarget = c.B.P();
                     c.B.L($"setp.eq.s32 {pTarget}, {c.Col(q, i)}, {posInt};");
-                    return c.Sel(pTarget, c.Sub(p, c.Lit(1)), p);
+                    string d = c.Sel(pTarget, c.Sub(p, c.Lit(1)), p);
+                    return factor is null ? d : c.Mul(d, factor);
                 });
                 return;
             }

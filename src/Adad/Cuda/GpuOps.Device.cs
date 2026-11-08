@@ -64,7 +64,7 @@ public sealed partial class GpuOps : IDevice<ulong, ulong>
 
     string IRouting<ulong, ulong>.Sample<TN>(ulong x, int rows, int cols, ulong u, ulong picks) => Sample<TN>(x, rows, cols, u, picks);
 
-    string IRouting<ulong, ulong>.CrossEntropy<TN>(ulong x, int rows, int cols, ulong targets, ulong output) => CrossEntropy<TN>(x, rows, cols, targets, output);
+    string IRouting<ulong, ulong>.CrossEntropy<TN>(ulong x, int rows, int cols, ulong targets, ulong weights, ulong output) => CrossEntropy<TN>(x, rows, cols, targets, weights, output);
 
     string IRecurrent<ulong>.LstmCell<TN>(CellArgs a, ulong g, ulong c, ulong hOut, ulong cOut) => LstmCell<TN>(a, g, c, hOut, cOut);
 

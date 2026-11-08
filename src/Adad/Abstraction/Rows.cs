@@ -93,6 +93,7 @@ public static class RowOps
         new("add_rms_norm", true, true, false, false, false, true, Eps, 0, AddRmsNorm, "h = x + x2 (written to y2); y = rms_norm_affine(h)") { SecondRange = (-4, 4), Offset = true },
         new("add_layer_norm", true, true, true, false, false, true, Eps, 0, AddLayerNorm, "h = x + x2 (written to y2); y = layer_norm(h)") { SecondRange = (-4, 4) },
         new("cross_entropy_bwd", false, false, false, false, true, false, 0, 0, CrossEntropyBwd, "softmax(x) − one_hot(the row's position: the target class); the loss is −log_softmax(x) picked at the target (pick_rows)"),
+        new("weighted_cross_entropy_bwd", false, false, false, true, true, false, 0.25, 0, WeightedCrossEntropyBwd, "a·s·(softmax(x) − one_hot(the row's position)): s the row's weight, a the loss's scale (1 / the normalizer); the loss is cross_entropy with the weights"),
     ];
 
     public static RowOp Find(string name) => Array.Find(All, o => o.Name == name) ?? throw new ArgumentException($"unknown row operation {name}");
@@ -228,6 +229,13 @@ public static class RowOps
         for (int i = 0; i < x.Length; i++) sum += y[i] = Math.Exp(x[i] - m);
         for (int i = 0; i < x.Length; i++) y[i] = y[i] / sum - (i == pos ? 1 : 0);
         return 1 + MaxAbs(x);
+    }
+
+    private static double WeightedCrossEntropyBwd(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)
+    {
+        double scale = CrossEntropyBwd(x, x2, g, bt, s, pos, row, a, b, y, y2);
+        for (int i = 0; i < y.Length; i++) y[i] *= a * s;
+        return scale * Math.Abs(a * s);
     }
 
     private static double AddRmsNorm(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)

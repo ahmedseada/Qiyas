@@ -16,7 +16,9 @@ public interface IRouting<TBuffer, TIndex>
     string Sample<TN>(TBuffer x, int rows, int cols, TBuffer u, TIndex picks) where TN : struct, IFloatAdad<TN>;
 
     /// <summary>output[r] = log Σ exp(x[r]) − x[r, targets[r]].</summary>
-    string CrossEntropy<TN>(TBuffer x, int rows, int cols, TIndex targets, TBuffer output) where TN : struct, IFloatAdad<TN>;
+    /// <summary>loss[r] = w[r]·(log Σ exp(x[r]) − x[r][t[r]]): weights (one a row, stored as the type) absent, 1. The gradient
+    /// is a row operation: cross_entropy_bwd, weighted_cross_entropy_bwd (the same weights, and the loss's scale).</summary>
+    string CrossEntropy<TN>(TBuffer x, int rows, int cols, TIndex targets, TBuffer? weights, TBuffer output) where TN : struct, IFloatAdad<TN>;
 
     /// <summary>counts (buckets), offsets (buckets + 1) and order (count: the sources grouped by bucket, in source order) of
     /// count indices into buckets.</summary>

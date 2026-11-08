@@ -460,6 +460,14 @@ internal static partial class Checks
                 var loss = new byte[Bench.Registry.Bytes(type, rows)];
                 using (var ce = new Bench.AdadSubject().CrossEntropy(DeviceOf(ops), type, x, rows, cols, index, loss)!) { ce.Run(); ce.Collect(); }
                 ok &= Close(type, "cross_entropy", where, loss, Routing.CrossEntropyReference(xv, rows, cols, index), rows, terms: cols);
+                // Weighted (a token's weight a row, as the type; 0 among them, a masked token).
+                var weights = Bench.Registry.Make(type, rows, 97, 0, 2);
+                var wv = Bench.Registry.Values(type, weights, rows);
+                for (int r = 0; r < rows; r += 5) wv[r] = 0;
+                weights = Bench.Registry.Encode(type, wv);
+                wv = Bench.Registry.Values(type, weights, rows);
+                using (var ce = new Bench.AdadSubject().CrossEntropy(DeviceOf(ops), type, x, rows, cols, index, weights, loss)!) { ce.Run(); ce.Collect(); }
+                ok &= Close(type, "cross_entropy weighted", where, loss, Routing.CrossEntropyReference(xv, rows, cols, index, wv), rows, terms: cols);
             }
         }
 
@@ -502,7 +510,7 @@ internal static partial class Checks
 
         if (cuda is not null) cuda.TableCounts = null;
 
-        if (ok) Console.WriteLine($"check routing                {where,-6} every type{(blocks ? "" : " but the block formats")}: top-k, pick, sampling and the cross-entropy loss (float types) and the route as the references (also 1M into 64, 1 000 003 into 100 000, all into one, descending into 65 536)");
+        if (ok) Console.WriteLine($"check routing                {where,-6} every type{(blocks ? "" : " but the block formats")}: top-k, pick, sampling and the cross-entropy loss (float types; unweighted and with a weight a row, zeros among them) and the route as the references (also 1M into 64, 1 000 003 into 100 000, all into one, descending into 65 536)");
         return ok;
     }
 

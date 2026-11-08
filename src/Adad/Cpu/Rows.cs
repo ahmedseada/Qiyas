@@ -408,6 +408,16 @@ internal static class RowKernels
         }
     }
 
+    public struct WeightedCrossEntropyBwd<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    {
+        public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
+        {
+            // (softmax − one_hot) first, then the factor a·s: the target's p − 1 keeps its digits before the scaling.
+            CrossEntropyBwd<TLane, TL>.Row(x, x2, g, bt, s, pos, row, a, b, y, y2);
+            RowMath<TLane, TL>.Scale(y, TL.Zero, TL.Mul(a, s), y);
+        }
+    }
+
     public struct AddRmsNorm<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
@@ -460,6 +470,7 @@ internal sealed partial class Kernels
                 case "add_rms_norm": Go<TN, TLane, TL, RowKernels.AddRmsNorm<TLane, TL>>(); break;
                 case "add_layer_norm": Go<TN, TLane, TL, RowKernels.AddLayerNorm<TLane, TL>>(); break;
                 case "cross_entropy_bwd": Go<TN, TLane, TL, RowKernels.CrossEntropyBwd<TLane, TL>>(); break;
+                case "weighted_cross_entropy_bwd": Go<TN, TLane, TL, RowKernels.WeightedCrossEntropyBwd<TLane, TL>>(); break;
                 default: throw new NotSupportedException($"row operation {op.Name}");
             }
         }

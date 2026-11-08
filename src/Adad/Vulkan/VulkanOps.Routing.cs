@@ -46,8 +46,9 @@ public sealed partial class VulkanOps
         vk.Launch(gather, Groups(f.Words(n), VkKernels.Threads), 1, x, index, output, Vulkan.U(rows), Vulkan.U(cols), Vulkan.U(k));
     }
 
-    /// <summary>loss[r] = log Σ exp(x[r]) − x[r][t[r]] as the type (t: s32 targets), in the type's float lane: a workgroup per row.</summary>
-    public string CrossEntropy<TN>(ulong x, int rows, int cols, ulong targets, ulong output) where TN : struct, IFloatAdad<TN>
+    /// <summary>loss[r] = w[r]·(log Σ exp(x[r]) − x[r][t[r]]) as the type (t: s32 targets; weights as the type, 0 for none), in
+    /// the type's float lane: a workgroup per row.</summary>
+    public string CrossEntropy<TN>(ulong x, int rows, int cols, ulong targets, ulong weights, ulong output) where TN : struct, IFloatAdad<TN>
     {
         var f = Fmt.Of<TN>();
         var lane = RowLane(f);
@@ -55,8 +56,10 @@ public sealed partial class VulkanOps
         ulong losses = vk.Rent(rows * (long)lane.Size);
         try
         {
-            var fn = vk.Cached($"cross_entropy:{f.Name}", () => VkKernels.CrossEntropyRows(vk, f, lane));
-            vk.Launch(fn, (uint)rows, 1, x, targets, losses, Vulkan.U(cols));
+            bool weighted = weights != 0;
+            var fn = vk.Cached($"cross_entropy:{f.Name}{(weighted ? ":w" : "")}", () => VkKernels.CrossEntropyRows(vk, f, lane, weighted));
+            if (weighted) vk.Launch(fn, (uint)rows, 1, x, targets, losses, Vulkan.U(cols), weights);
+            else vk.Launch(fn, (uint)rows, 1, x, targets, losses, Vulkan.U(cols));
             Back(f, lane, losses, output, rows);
         }
         finally

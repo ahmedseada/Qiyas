@@ -442,18 +442,22 @@ public sealed class AdadSubject : IBenchSubject
         }
     }
 
-    public IBenchRun? CrossEntropy(Device device, string type, byte[] x, int rows, int cols, int[] targets, byte[] loss) =>
-        Registry.IsFloat(type) ? Registry.WithFloat(type, new CrossEntropyVisitor(device, x, rows, cols, targets, loss)) : null;
+    public IBenchRun? CrossEntropy(Device device, string type, byte[] x, int rows, int cols, int[] targets, byte[] loss) => CrossEntropy(device, type, x, rows, cols, targets, null, loss);
 
-    private sealed class CrossEntropyVisitor(Device device, byte[] x, int rows, int cols, int[] targets, byte[] loss) : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+    /// <summary>The loss with a weight a row (as the type), absent 1.</summary>
+    public IBenchRun? CrossEntropy(Device device, string type, byte[] x, int rows, int cols, int[] targets, byte[]? weights, byte[] loss) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new CrossEntropyVisitor(device, x, rows, cols, targets, weights, loss)) : null;
+
+    private sealed class CrossEntropyVisitor(Device device, byte[] x, int rows, int cols, int[] targets, byte[]? weights, byte[] loss) : IFloatTypeVisitor<IBenchRun?>, IFloatRun
     {
         public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, CrossEntropyVisitor>(device, this);
 
         public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
         {
             TB dx = s.In(x), dl = s.Out(loss);
+            TB? dw = s.InOrNone(weights);
             TI dt = s.Index(targets);
-            return s.Run(() => s.D.CrossEntropy<TN>(dx, rows, cols, dt, dl));
+            return s.Run(() => s.D.CrossEntropy<TN>(dx, rows, cols, dt, dw, dl));
         }
     }
 

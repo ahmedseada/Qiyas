@@ -202,7 +202,7 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
 
     string IRouting<byte[], int[]>.Sample<TN>(byte[] x, int rows, int cols, byte[] u, int[] picks) => Sample<TN>(x, rows, cols, u, picks);
 
-    string IRouting<byte[], int[]>.CrossEntropy<TN>(byte[] x, int rows, int cols, int[] targets, byte[] output) => CrossEntropy<TN>(x, rows, cols, targets, output);
+    string IRouting<byte[], int[]>.CrossEntropy<TN>(byte[] x, int rows, int cols, int[] targets, byte[]? weights, byte[] output) => CrossEntropy<TN>(x, rows, cols, targets, weights, output);
 
     void IRouting<byte[], int[]>.Route(int[] index, int count, int buckets, int[] counts, int[] offsets, int[] order) =>
         Route(count == index.Length ? index : index[..count], buckets, counts, offsets, order);

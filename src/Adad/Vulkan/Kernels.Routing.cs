@@ -125,12 +125,12 @@ internal static partial class VkKernels
         return (b.Max(m, v), b.Select(d > 0, up, keep));
     }
 
-    /// <summary>loss[r] = log Σ_c exp(x[r][c]) − x[r][t[r]] as lane values (stored as the type after), a workgroup per row.
-    /// Arguments: x, targets, losses, cols.</summary>
-    public static SpvKernel CrossEntropyRows(Vulkan vk, Fmt f, Lane lane)
+    /// <summary>loss[r] = log Σ_c exp(x[r][c]) − x[r][t[r]] as lane values (stored as the type after), a workgroup per row;
+    /// weighted: times the row's weight (as the type). Arguments: x, targets, losses, cols (, weights).</summary>
+    public static SpvKernel CrossEntropyRows(Vulkan vk, Fmt f, Lane lane, bool weighted)
     {
         var k = Kinds.Of(lane);
-        var b = new Spv($"cross_entropy_rows_{f.Name}_{lane.Name}", ReduceThreads, vk.Controls);
+        var b = new Spv($"cross_entropy_rows_{f.Name}_{lane.Name}{(weighted ? "_w" : "")}", ReduceThreads, vk.Controls);
         var x = b.Arg(0);
         var targets = b.Arg(1);
         var losses = b.Arg(2);
@@ -171,6 +171,7 @@ internal static partial class VkKernels
             var t = b.Bitcast(b.Load(K.S32, b.At(targets, row, 4)), K.U32);
             var xt = Codec.UnpackAt(b, f, x, start + t, lane);
             var loss = (shM[0] - xt) + Fn.Log(b, shS[0]);
+            if (weighted) loss = loss * Codec.UnpackAt(b, f, b.Arg(4), row, lane);
             b.Store(b.At(losses, row, lane.Size), loss);
         });
         return b.Build();

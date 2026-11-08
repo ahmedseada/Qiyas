@@ -70,19 +70,21 @@ public sealed partial class GpuOps
         }
     }
 
-    /// <summary>loss[r] = log Σ exp(x[r]) − x[r][t[r]] as the type (t: s32 targets), in the type's float lane: a block per row.</summary>
-    public string CrossEntropy<TN>(ulong x, int rows, int cols, ulong targets, ulong output) where TN : struct, IAdad<TN>
+    /// <summary>loss[r] = w[r]·(log Σ exp(x[r]) − x[r][t[r]]) as the type (t: s32 targets; weights as the type, 0 for none), in
+    /// the type's float lane: a block per row.</summary>
+    public string CrossEntropy<TN>(ulong x, int rows, int cols, ulong targets, ulong weights, ulong output) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
         var lane = RowLane(f);
-        var fn = gpu.Cached($"cross_entropy:{f.Name}", (out string e) => Ptx.CrossEntropyRows(gpu, f, lane, out e));
+        bool weighted = weights != 0;
+        var fn = gpu.Cached($"cross_entropy:{f.Name}{(weighted ? ":w" : "")}", (out string e) => Ptx.CrossEntropyRows(gpu, f, lane, weighted, out e));
         if (f.IsBlock)
         {
             // A block format: the rows read in place, each row's loss in f32 (one a row), those encoded by blocks.
             ulong losses = gpu.Rent(rows * 4L);
             try
             {
-                Gpu.Launch(fn, (uint)rows, 1, Ptx.ReduceThreads, 1, 0, x, targets, losses, Gpu.U(cols));
+                Gpu.Launch(fn, (uint)rows, 1, Ptx.ReduceThreads, 1, 0, x, targets, losses, Gpu.U(cols), weights);
                 Back(f, Lane.F32, losses, output, rows);
             }
             finally { gpu.Return(losses); }
@@ -90,7 +92,7 @@ public sealed partial class GpuOps
         }
 
         if (f.Bits < 8) Gpu.Clear(output, f.Words(rows) * 4);
-        Gpu.Launch(fn, (uint)rows, 1, Ptx.ReduceThreads, 1, 0, x, targets, output, Gpu.U(cols));
+        Gpu.Launch(fn, (uint)rows, 1, Ptx.ReduceThreads, 1, 0, x, targets, output, Gpu.U(cols), weights);
         return lane.Name;
     }
 

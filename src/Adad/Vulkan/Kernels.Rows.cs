@@ -486,15 +486,19 @@ internal static partial class VkKernels
             }
 
             case "cross_entropy_bwd":
+            case "weighted_cross_entropy_bwd":
             {
+                // Weighted: (softmax − one_hot)·(a·s), the target's p − 1 before the scaling.
                 var b = c.B;
                 var m = c.Reduce("max", c.X);
                 var sum = c.Reduce("add", () => c.Exp(c.X() - m));
                 var inv = c.Rcp(sum);
+                V? factor = op.Name == "weighted_cross_entropy_bwd" ? c.A * c.S() : null;
                 c.Store(() =>
                 {
                     var p = c.Exp(c.X() - m) * inv;
-                    return c.Sel(b.Bitcast(c.Col, K.S32) == c.PosInt(), p - c.Lit(1), p);
+                    var d = c.Sel(b.Bitcast(c.Col, K.S32) == c.PosInt(), p - c.Lit(1), p);
+                    return factor is null ? d : d * factor.Value;
                 });
                 return;
             }
