@@ -614,7 +614,35 @@ internal sealed partial class Kernels
     /// TC when done (C's rows off its storage units — values below a byte, blocks — C in lanes, stored once at the end).</summary>
     public static void MatMul<TA, TB, TC, TIn, TAcc, TL>(byte[] a, byte[] b, byte[] c, int m, int n, int k, Operands o)
         where TA : struct, IAdad<TA, TIn> where TB : struct, IAdad<TB, TIn> where TC : struct, IAdad<TC, TAcc>
-        where TIn : unmanaged where TAcc : unmanaged where TL : struct, ILane<TL, TAcc>
+        where TIn : unmanaged where TAcc : unmanaged where TL : struct, ILane<TL, TAcc> =>
+        MatMulFrom<TA, TC, TIn, TAcc, TL, PackSource<TB, TIn, TAcc>>(a, new PackSource<TB, TIn, TAcc>(b, o.BOff, o.TransB, o.ImageB), c, m, n, k, o);
+
+    /// <summary>Where a product's packed panels of B come from: their strips [ps0, ps1) packed by units first .. last (k
+    /// groups, or with Bᵀ stored strips), each column's kg units at the strip's groups.</summary>
+    public interface IPanelSource<TAcc> where TAcc : unmanaged
+    {
+        void Pack(TAcc[] packed, int n, int k, int strip, int kg, int ps0, int ps1, int first, int last);
+    }
+
+    // B as stored (TB; the convolution's image), packed by PackBody.
+    private readonly struct PackSource<TB, TIn, TAcc>(byte[] b, int bOff, bool transB, ConvArgs? image) : IPanelSource<TAcc>
+        where TB : struct, IAdad<TB, TIn> where TIn : unmanaged where TAcc : unmanaged
+    {
+        public void Pack(TAcc[] packed, int n, int k, int strip, int kg, int ps0, int ps1, int first, int last) =>
+            new PackBody<TB, TIn, TAcc>(b, packed, n, k, strip, kg, ps0, ps1, bOff, transB, image).Run(first, last);
+    }
+
+    private readonly struct PackRun<TAcc, TP>(TP source, TAcc[] packed, int n, int k, int strip, int kg, int ps0, int ps1) : Team.IBody
+        where TAcc : unmanaged where TP : struct, IPanelSource<TAcc>
+    {
+        public void Run(int first, int last) => source.Pack(packed, n, k, strip, kg, ps0, ps1, first, last);
+    }
+
+    /// <summary>C = A·B with B's panels packed from `source` (o.TransB: by strips, else by k groups; o.BOff and o.ImageB the
+    /// source's own), A and C as MatMul's.</summary>
+    public static void MatMulFrom<TA, TC, TIn, TAcc, TL, TP>(byte[] a, TP source, byte[] c, int m, int n, int k, Operands o)
+        where TA : struct, IAdad<TA, TIn> where TC : struct, IAdad<TC, TAcc>
+        where TIn : unmanaged where TAcc : unmanaged where TL : struct, ILane<TL, TAcc> where TP : struct, IPanelSource<TAcc>
     {
         int g = Unsafe.SizeOf<TAcc>() / Unsafe.SizeOf<TIn>(), kg = (k + g - 1) / g;
         int w = Vector<TAcc>.Count, strip = 2 * w, strips = (n + strip - 1) / strip;
@@ -657,7 +685,7 @@ internal sealed partial class Kernels
                 int ps1 = Math.Min(strips, ps0 + panel), cols = Math.Min(n, ps1 * strip) - ps0 * strip;
                 // The packing's tasks: groups of k-rows, or (Bᵀ stored) runs of strips.
                 int units = o.TransB ? ps1 - ps0 : kg;
-                Team.For(units, Math.Max(1, units / (Threads * 2)), (long)k * cols, new PackBody<TB, TIn, TAcc>(b, packed, n, k, strip, kg, ps0, ps1, o.BOff, o.TransB, o.ImageB));
+                Team.For(units, Math.Max(1, units / (Threads * 2)), (long)k * cols, new PackRun<TAcc, TP>(source, packed, n, k, strip, kg, ps0, ps1));
                 t0 = Mark(t0, 1);
                 int tiles = rowTiles * ((ps1 - ps0 + tileStrips - 1) / tileStrips);
                 Team.For(tiles, 1, (long)m * cols * k,

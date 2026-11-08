@@ -16,6 +16,15 @@ public interface IProducts<TBuffer>
     /// gradient through one, then + residual), every term in the float lane and C rounded to the type once.</summary>
     string MatMulEpilogue<TN>(ProductView v, ProductEpilogue e, TBuffer a, TBuffer b, TBuffer c, ProductTerms<TBuffer> t) where TN : struct, IFloatAdad<TN>;
 
+    /// <summary>y (m × N) = the epilogue's y of x (m × K) · Wᵀ (over ScaledWeight.View(m)), W the scaled weight's values made
+    /// in the float lane as the product reads each code (codes TW, any type; scales and zeros stored as TN): no W in memory
+    /// but its codes; y rounded to TN once.</summary>
+    string MatMulScaled<TN, TW>(ScaledWeight w, int m, ProductEpilogue e, TBuffer x, TBuffer codes, TBuffer scales, TBuffer? zeros, TBuffer y, ProductTerms<TBuffer> t)
+        where TN : struct, IFloatAdad<TN> where TW : struct, IAdad<TW>;
+
+    /// <summary>output (N × K, TN) = the scaled weight's values, each made in TN's float lane and rounded to TN once.</summary>
+    string ExpandScaled<TN, TW>(ScaledWeight w, TBuffer codes, TBuffer scales, TBuffer? zeros, TBuffer output) where TN : struct, IFloatAdad<TN> where TW : struct, IAdad<TW>;
+
     /// <summary>dA = dC·Bᵀ (m × k) and dB = Aᵀ·dC (k × n) for C = A·B.</summary>
     string MatMulBackward<TN>(TBuffer a, TBuffer b, TBuffer dc, TBuffer da, TBuffer db, int m, int n, int k) where TN : struct, IAdad<TN>;
 

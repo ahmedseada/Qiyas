@@ -76,22 +76,78 @@ public sealed partial class VulkanOps
         ulong Rent(long bytes) { ulong p = vk.Rent(Math.Max(16, bytes)); rented.Add(p); return p; }
         try
         {
-            ulong sums = Rent(v.ValuesC * lane.Size), low = 0;
+            ulong sums = Rent(v.ValuesC * lane.Size);
             var one = new ProductView(v.M, v.N, v.K, v.TransA, v.TransB);
             for (int i = 0; i < v.Batch; i++)
                 Product(one, lane, a, f, i * v.StrideAOrDefault, b, f, i * v.StrideBOrDefault, sums + (ulong)(i * span * lane.Size));
-            if (terms.Low)
-            {
-                low = Rent(span * lane.Size);
-                Product(new ProductView(v.M, v.N, e.Rank, false, e.TransV), lane, t.U, f, 0, t.V, f, 0, low);
-            }
-
-            if (terms.Aux) ProductStore(f, lane, terms.Input, sums, low, t.Bias, 0, 0, t.Aux, v.ValuesC, 1, v.N, e.ActA, e.Beta);
-            ProductStore(f, lane, terms, sums, low, t.Bias, t.Residual, t.Aux, c, v.ValuesC, 1, v.N, e.ActA, e.Beta);
+            EpilogueStore(f, lane, v, e, terms, t, sums, c, Rent);
         }
         finally { foreach (var p in rented) vk.Return(p); }
 
         return lane.Name;
+    }
+
+    /// <summary>y = the epilogue's y of x · Wᵀ, W the scaled weight's values made in the lane as the product's tiles read each
+    /// code (Kernels.Scaled.cs); returns the lane's name.</summary>
+    public string MatMulScaled<TN, TW>(ScaledWeight w, int m, ProductEpilogue e, ulong x, ulong codes, ulong scales, ulong zeros, ulong y, ProductTerms<ulong> t)
+        where TN : struct, IFloatAdad<TN> where TW : struct, IAdad<TW>
+    {
+        w.Validate();
+        var v = w.View(m);
+        var terms = t.Validate(e, v);
+        Fmt f = Fmt.Of<TN>(), fw = Fmt.Of<TW>();
+        var lane = RowLane(f);
+        if (v.M == 0 || v.N == 0) return lane.Name;
+        var rented = new List<ulong>();
+        ulong Rent(long bytes) { ulong p = vk.Rent(Math.Max(16, bytes)); rented.Add(p); return p; }
+        try
+        {
+            ulong sums = Rent(v.ValuesC * lane.Size);
+            bool z = zeros != 0;
+            var fn = vk.Cached($"matmul_scaled:{f.Name}:{fw.Name}:{lane.Name}:{z}", () => VkKernels.MatMulScaled(vk, f, fw, lane, z));
+            vk.Launch(fn, Groups(v.N, VkKernels.TileN), Groups(v.M, VkKernels.TileM), x, codes, sums, Vulkan.U(v.M), Vulkan.U(v.N), Vulkan.U(v.K),
+                scales, zeros, Vulkan.U(w.BlockRows), Vulkan.U(w.BlockColumns), Vulkan.U(w.ScaleColumns));
+            EpilogueStore(f, lane, v, e, terms, t, sums, y, Rent);
+        }
+        finally { foreach (var p in rented) vk.Return(p); }
+
+        return lane.Name;
+    }
+
+    /// <summary>output = the scaled weight's values as TN (Kernels.Scaled.cs); returns the lane's name.</summary>
+    public string ExpandScaled<TN, TW>(ScaledWeight w, ulong codes, ulong scales, ulong zeros, ulong output) where TN : struct, IFloatAdad<TN> where TW : struct, IAdad<TW>
+    {
+        w.Validate();
+        Fmt f = Fmt.Of<TN>(), fw = Fmt.Of<TW>();
+        var lane = RowLane(f);
+        bool z = zeros != 0;
+        if (w.Values == 0) return lane.Name;
+        if (f.IsBlock)
+        {
+            Encode(f, w.Values, vk.Cached($"block_expand_scaled:{f.Name}:{fw.Name}:{z}", () => VkKernels.BlockExpandScaled(vk, f, fw, z)), output,
+                codes, scales, zeros, Vulkan.U(w.K), Vulkan.U(w.BlockRows), Vulkan.U(w.BlockColumns), Vulkan.U(w.ScaleColumns));
+            return lane.Name;
+        }
+
+        var k = vk.Cached($"expand_scaled:{f.Name}:{fw.Name}:{lane.Name}:{z}", () => VkKernels.ExpandScaled(vk, f, fw, lane, z));
+        vk.Launch(k, Groups(f.Words(w.Values), VkKernels.Threads), 1, codes, scales, zeros, output, Vulkan.U((int)w.Values), Vulkan.U(w.K),
+            Vulkan.U(w.BlockRows), Vulkan.U(w.BlockColumns), Vulkan.U(w.ScaleColumns));
+        return lane.Name;
+    }
+
+    // After a product's sums (lane storage, the view's C contiguous): the low-rank term's into sums of its own, then the
+    // store (aux first where it is written).
+    private void EpilogueStore(Fmt f, Lane lane, ProductView v, ProductEpilogue e, StoreTerms terms, ProductTerms<ulong> t, ulong sums, ulong c, Func<long, ulong> rent)
+    {
+        ulong low = 0;
+        if (terms.Low)
+        {
+            low = rent((long)v.M * v.N * lane.Size);
+            Product(new ProductView(v.M, v.N, e.Rank, false, e.TransV), lane, t.U, f, 0, t.V, f, 0, low);
+        }
+
+        if (terms.Aux) ProductStore(f, lane, terms.Input, sums, low, t.Bias, 0, 0, t.Aux, v.ValuesC, 1, v.N, e.ActA, e.Beta);
+        ProductStore(f, lane, terms, sums, low, t.Bias, t.Residual, t.Aux, c, v.ValuesC, 1, v.N, e.ActA, e.Beta);
     }
 
     /// <summary>y (count values of f) = the store terms' value of the lane sums (Kernels.ProductStore.cs): the bias the

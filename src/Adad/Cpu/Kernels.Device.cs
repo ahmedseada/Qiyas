@@ -129,6 +129,11 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
 
     string IProducts<byte[]>.MatMulEpilogue<TN>(ProductView v, ProductEpilogue e, byte[] a, byte[] b, byte[] c, ProductTerms<byte[]> t) => MatMulEpilogue<TN>(v, e, a, b, c, t);
 
+    string IProducts<byte[]>.MatMulScaled<TN, TW>(ScaledWeight w, int m, ProductEpilogue e, byte[] x, byte[] codes, byte[] scales, byte[]? zeros, byte[] y, ProductTerms<byte[]> t) =>
+        MatMulScaled<TN, TW>(w, m, e, x, codes, scales, zeros, y, t);
+
+    string IProducts<byte[]>.ExpandScaled<TN, TW>(ScaledWeight w, byte[] codes, byte[] scales, byte[]? zeros, byte[] output) => ExpandScaled<TN, TW>(w, codes, scales, zeros, output);
+
     string IProducts<byte[]>.MatMulBackward<TN>(byte[] a, byte[] b, byte[] dc, byte[] da, byte[] db, int m, int n, int k) => MatMulBackward<TN>(a, b, dc, da, db, m, n, k);
 
     string IProducts<byte[]>.MatMulViewBlocks<TN>(ProductView v, byte[] a, byte[] b, byte[] c) => MatMulViewBlocks<TN>(v, a, b, c);

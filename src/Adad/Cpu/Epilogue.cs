@@ -32,18 +32,26 @@ internal sealed partial class Kernels
             for (int i = 0; i < v.Batch; i++)
                 MatMul<TN, TN, TS, TLane, TLane, TL>(a, b, sums, v.M, v.N, v.K,
                     new Operands(AOff: (int)(i * v.StrideAOrDefault), TransA: v.TransA, BOff: (int)(i * v.StrideBOrDefault), TransB: v.TransB, COff: i * span));
-            byte[]? low = null;
-            if (terms.Low)
-            {
-                low = new byte[(long)span * size];
-                MatMul<TN, TN, TS, TLane, TLane, TL>(t.U!, t.V!, low, v.M, v.N, e.Rank, new Operands(TransB: e.TransV));
-            }
-
-            var src = new StoreSources(sums, low, t.Bias, t.Residual, t.Aux, 1, v.N, e.ActA, e.Beta);
-            if (terms.Aux) ProductStore<TN, TLane, TL>(terms.Input, src, t.Aux!, (int)v.ValuesC);
-            ProductStore<TN, TLane, TL>(terms, src, c, (int)v.ValuesC);
+            EpilogueStore<TN, TS, TLane, TL>(v, e, terms, t, sums, c);
             return TL.Name;
         }
+    }
+
+    // After a product's sums (lane storage, the view's C contiguous): the low-rank term's into sums of its own, then the
+    // store (aux first where it is written).
+    private static void EpilogueStore<TN, TS, TLane, TL>(ProductView v, ProductEpilogue e, StoreTerms terms, ProductTerms<byte[]> t, byte[] sums, byte[] c)
+        where TN : struct, IAdad<TN, TLane> where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    {
+        byte[]? low = null;
+        if (terms.Low)
+        {
+            low = new byte[(long)v.M * v.N * System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>()];
+            MatMul<TN, TN, TS, TLane, TLane, TL>(t.U!, t.V!, low, v.M, v.N, e.Rank, new Operands(TransB: e.TransV));
+        }
+
+        var src = new StoreSources(sums, low, t.Bias, t.Residual, t.Aux, 1, v.N, e.ActA, e.Beta);
+        if (terms.Aux) ProductStore<TN, TLane, TL>(terms.Input, src, t.Aux!, (int)v.ValuesC);
+        ProductStore<TN, TLane, TL>(terms, src, c, (int)v.ValuesC);
     }
 
     /// <summary>A store's inputs: the sums (lane storage), the low-rank term's (lane storage, or none), the bias (the type: a

@@ -167,3 +167,48 @@ public readonly record struct ProductTerms<TBuffer>(TBuffer? Bias = default, TBu
         return e.Terms(Given(Bias), Given(Residual), Given(Aux));
     }
 }
+
+/// <summary>A layer's weight stored as codes with scales: N rows of K codes (a row an output), value (r, c) = (code − zero)·
+/// scale, its scale and zero point (zeros absent: 0) at (r / BlockRows)·ScaleColumns + c / BlockColumns: one for the tensor,
+/// one a row, or one a group of a row's columns (GPTQ's and AWQ's groups, a float8 weight's channels). The value is made in
+/// the float lane as a product reads the code: the code taken into the lane, the zero subtracted, the scale multiplied.</summary>
+public sealed record ScaledWeight(int N, int K, int BlockRows, int BlockColumns, int ScaleColumns)
+{
+    public static ScaledWeight PerTensor(int n, int k) => new(n, k, Math.Max(1, n), Math.Max(1, k), 1);
+
+    public static ScaledWeight PerRow(int n, int k) => new(n, k, 1, Math.Max(1, k), 1);
+
+    public static ScaledWeight Grouped(int n, int k, int group) => new(n, k, 1, group, (k + group - 1) / group);
+
+    public long Values => (long)N * K;
+
+    /// <summary>The scales (and zero points) the layout takes.</summary>
+    public long Scales => (long)((N + BlockRows - 1) / BlockRows) * ScaleColumns;
+
+    public int ScaleAt(int r, int c) => r / BlockRows * ScaleColumns + c / BlockColumns;
+
+    /// <summary>The product view the weight takes in y = x · Wᵀ (x m × K).</summary>
+    public ProductView View(int m) => new(m, N, K, false, true);
+
+    public void Validate()
+    {
+        if (N < 0 || K < 0) throw new ArgumentException("scaled weight: negative extents");
+        if (BlockRows < 1 || BlockColumns < 1) throw new ArgumentException("scaled weight: a block of no rows or columns");
+        if ((long)ScaleColumns * BlockColumns < K) throw new ArgumentException($"scaled weight: {ScaleColumns} scales a row of blocks do not cover {K} columns");
+        if (Values > int.MaxValue || Scales > int.MaxValue) throw new ArgumentException("scaled weight: past 2^31 values");
+    }
+
+    /// <summary>The float64 reference of the weight's values (N × K).</summary>
+    public double[] Reference(double[] codes, double[] scales, double[]? zeros)
+    {
+        var w = new double[Values];
+        for (int r = 0; r < N; r++)
+            for (int c = 0; c < K; c++)
+            {
+                int at = ScaleAt(r, c);
+                w[(long)r * K + c] = (codes[(long)r * K + c] - (zeros is null ? 0 : zeros[at])) * scales[at];
+            }
+
+        return w;
+    }
+}

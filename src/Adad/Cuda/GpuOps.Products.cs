@@ -96,14 +96,60 @@ public sealed partial class GpuOps
         var f = Fmt.Of<TN>();
         var lane = RowLane(f);
         if (v.M == 0 || v.N == 0 || v.Batch == 0) return lane.Name;
-        long span = (long)v.M * v.N;
-        ulong sums = gpu.Rent(Math.Max(16, v.ValuesC * lane.Size)), low = 0;
+        ulong sums = gpu.Rent(Math.Max(16, v.ValuesC * lane.Size));
         try
         {
             ProductStored(v, lane, a, f, 0, b, f, 0, sums, null);
+            EpilogueStore(f, lane, v, e, terms, t, sums, c);
+        }
+        finally { gpu.Return(sums); }
+
+        return lane.Name;
+    }
+
+    /// <summary>y = the epilogue's y of x · Wᵀ, W the scaled weight's values made in the lane as the stored GEMM reads each
+    /// code (GemmStored.Scales); returns the lane's name.</summary>
+    public string MatMulScaled<TN, TW>(ScaledWeight w, int m, ProductEpilogue e, ulong x, ulong codes, ulong scales, ulong zeros, ulong y, ProductTerms<ulong> t)
+        where TN : struct, IFloatAdad<TN> where TW : struct, IAdad<TW>
+    {
+        w.Validate();
+        var v = w.View(m);
+        var terms = t.Validate(e, v);
+        var f = Fmt.Of<TN>();
+        var lane = RowLane(f);
+        if (v.M == 0 || v.N == 0) return lane.Name;
+        ulong sums = gpu.Rent(Math.Max(16, v.ValuesC * lane.Size));
+        try
+        {
+            ProductStored(v, lane, x, f, 0, codes, Fmt.Of<TW>(), 0, sums, null, new GemmScale(scales, zeros, f, w.BlockRows, w.BlockColumns, w.ScaleColumns));
+            EpilogueStore(f, lane, v, e, terms, t, sums, y);
+        }
+        finally { gpu.Return(sums); }
+
+        return lane.Name;
+    }
+
+    /// <summary>output = the scaled weight's values as TN (Ptx.ExpandScaled); returns the lane's name.</summary>
+    public string ExpandScaled<TN, TW>(ScaledWeight w, ulong codes, ulong scales, ulong zeros, ulong output) where TN : struct, IFloatAdad<TN> where TW : struct, IAdad<TW>
+    {
+        w.Validate();
+        Fmt f = Fmt.Of<TN>(), fw = Fmt.Of<TW>();
+        var lane = RowLane(f);
+        var fn = gpu.Cached($"expand_scaled:{fw.Name}:{f.Name}:{lane.Name}:{zeros != 0}", (out string e) => Ptx.ExpandScaled(gpu, f, fw, lane, zeros != 0, out e));
+        LaunchEach(fn, f, w.Values, codes, scales, zeros, output, Gpu.U((int)w.Values), Gpu.U(w.K), Gpu.U(w.BlockRows), Gpu.U(w.BlockColumns), Gpu.U(w.ScaleColumns));
+        return lane.Name;
+    }
+
+    // After a product's sums (lane storage, the view's C contiguous): the low-rank term's into sums of its own, then the
+    // store (aux first where it is written).
+    private void EpilogueStore(Fmt f, Lane lane, ProductView v, ProductEpilogue e, StoreTerms terms, ProductTerms<ulong> t, ulong sums, ulong c)
+    {
+        ulong low = 0;
+        try
+        {
             if (terms.Low)
             {
-                low = gpu.Rent(Math.Max(16, span * lane.Size));
+                low = gpu.Rent(Math.Max(16, (long)v.M * v.N * lane.Size));
                 ProductStored(new ProductView(v.M, v.N, e.Rank, false, e.TransV), lane, t.U, f, 0, t.V, f, 0, low, null);
             }
 
@@ -112,11 +158,8 @@ public sealed partial class GpuOps
         }
         finally
         {
-            gpu.Return(sums);
             if (low != 0) gpu.Return(low);
         }
-
-        return lane.Name;
     }
 
     /// <summary>y (count values of f) = the store terms' value of the lane sums (Ptx.ProductStore): the bias the channel

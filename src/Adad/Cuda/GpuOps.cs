@@ -753,8 +753,9 @@ public sealed partial class GpuOps(Gpu gpu)
     /// (a lane's own storage, the type's, a block format's: Ptx.Gemm's stored mode), from value aOff of A and bOff of B; C
     /// at c as fc (StoredC) or, fc null, as the lane's sums. A composition's intermediates (scores, gradients of them) and
     /// the type's tensors meet in one product so, none of the type's widened in memory.</summary>
-    private void ProductStored(ProductView v, Lane lane, ulong a, Fmt fa, long aOff, ulong b, Fmt fb, long bOff, ulong c, Fmt? fc)
+    private void ProductStored(ProductView v, Lane lane, ulong a, Fmt fa, long aOff, ulong b, Fmt fb, long bOff, ulong c, Fmt? fc, GemmScale? scale = null)
     {
+        string scaled = scale?.Key ?? "";
         int micro = v.M >= 128 && v.N >= 128 && !lane.Wide ? 8 : 4, tile = micro * 16;
         if (v.Batch == 1 && ProductSplit(v, lane, tile, c, fc, out int slices, out int sliceBlocks))
         {
@@ -763,11 +764,13 @@ public sealed partial class GpuOps(Gpu gpu)
             ulong parts = gpu.Rent((long)slices * v.M * v.N * lane.Size), joined = fc is null ? c : gpu.Rent((long)v.M * v.N * lane.Size);
             try
             {
-                bool ra = fa.IsBlock && (v.TransA ? v.M : v.K) % micro == 0 && aOff % micro == 0, rb = fb.IsBlock && (v.TransB ? v.K : v.N) % micro == 0 && bOff % micro == 0;
-                var st = new Ptx.GemmStored(fa, fb, null);
-                var fs = gpu.Cached($"gemm_stored:{fa.Name}:{fb.Name}:lane:{lane.Name}:{micro}:{v.TransA}:{v.TransB}:{ra}:{rb}:k", (out string e) => Ptx.Gemm(gpu, lane, micro, out e, false, st, v.TransA, v.TransB, ra, rb, split: true));
+                bool ra = fa.IsBlock && (v.TransA ? v.M : v.K) % micro == 0 && aOff % micro == 0;
+                bool rb = scale is null && fb.IsBlock && (v.TransB ? v.K : v.N) % micro == 0 && bOff % micro == 0;
+                var st = new Ptx.GemmStored(fa, fb, null, scale?.Format, scale is { Zeros: not 0 });
+                var fs = gpu.Cached($"gemm_stored:{fa.Name}:{fb.Name}:lane:{lane.Name}:{micro}:{v.TransA}:{v.TransB}:{ra}:{rb}:k{scaled}", (out string e) => Ptx.Gemm(gpu, lane, micro, out e, false, st, v.TransA, v.TransB, ra, rb, split: true));
                 uint mb = Grid(v.M, tile);
-                Gpu.Launch(fs, Grid(v.N, tile), mb * (uint)slices, Ptx.GemmThreads, 1, 0, a, b, parts, Gpu.U(v.M), Gpu.U(v.N), Gpu.U(v.K), Gpu.U((int)aOff), Gpu.U((int)bOff), mb, Gpu.U(sliceBlocks));
+                ulong[] args = [a, b, parts, Gpu.U(v.M), Gpu.U(v.N), Gpu.U(v.K), Gpu.U((int)aOff), Gpu.U((int)bOff), mb, Gpu.U(sliceBlocks), .. scale?.Args ?? []];
+                Gpu.Launch(fs, Grid(v.N, tile), mb * (uint)slices, Ptx.GemmThreads, 1, 0, args);
                 var join = gpu.Cached($"sum_slices:{lane.Name}", (out string e) => Ptx.SumSlices(gpu, lane, out e));
                 Gpu.Launch(join, Grid((long)v.M * v.N / 4, 256), 1, 256, 1, 0, parts, joined, Gpu.U(v.M * v.N), Gpu.U(slices));
                 if (fc is not null) Back(fc, lane, joined, c, (long)v.M * v.N);
@@ -783,15 +786,25 @@ public sealed partial class GpuOps(Gpu gpu)
 
         // A block format's operand as runs of micro values where they are aligned runs of its stored rows.
         bool runsA = fa.IsBlock && (v.TransA ? v.M : v.K) % micro == 0 && v.StrideAOrDefault % micro == 0 && aOff % micro == 0;
-        bool runsB = fb.IsBlock && (v.TransB ? v.K : v.N) % micro == 0 && v.StrideBOrDefault % micro == 0 && bOff % micro == 0;
-        var stored = new Ptx.GemmStored(fa, fb, fc);
-        var fn = gpu.Cached($"gemm_stored:{fa.Name}:{fb.Name}:{fc?.Name ?? "lane"}:{lane.Name}:{micro}:{v.TransA}:{v.TransB}:{runsA}:{runsB}", (out string e) => Ptx.Gemm(gpu, lane, micro, out e, false, stored, v.TransA, v.TransB, runsA, runsB));
+        bool runsB = scale is null && fb.IsBlock && (v.TransB ? v.K : v.N) % micro == 0 && v.StrideBOrDefault % micro == 0 && bOff % micro == 0;
+        var stored = new Ptx.GemmStored(fa, fb, fc, scale?.Format, scale is { Zeros: not 0 });
+        var fn = gpu.Cached($"gemm_stored:{fa.Name}:{fb.Name}:{fc?.Name ?? "lane"}:{lane.Name}:{micro}:{v.TransA}:{v.TransB}:{runsA}:{runsB}{scaled}", (out string e) => Ptx.Gemm(gpu, lane, micro, out e, false, stored, v.TransA, v.TransB, runsA, runsB));
         for (int i = 0; i < v.Batch; i++)
         {
             long cOff = i * v.StrideCOrDefault;
             ulong ci = c + (ulong)(fc is null ? cOff * lane.Size : cOff * fc.Bits / 8);
-            Gpu.Launch(fn, Grid(v.N, tile), Grid(v.M, tile), Ptx.GemmThreads, 1, 0, a, b, ci, Gpu.U(v.M), Gpu.U(v.N), Gpu.U(v.K), Gpu.U((int)(aOff + i * v.StrideAOrDefault)), Gpu.U((int)(bOff + i * v.StrideBOrDefault)));
+            ulong[] args = [a, b, ci, Gpu.U(v.M), Gpu.U(v.N), Gpu.U(v.K), Gpu.U((int)(aOff + i * v.StrideAOrDefault)), Gpu.U((int)(bOff + i * v.StrideBOrDefault)), .. scale?.Args ?? []];
+            Gpu.Launch(fn, Grid(v.N, tile), Grid(v.M, tile), Ptx.GemmThreads, 1, 0, args);
         }
+    }
+
+    /// <summary>B a scaled weight's codes (Ptx.GemmStored.Scales): its scales and zero points (0: none) stored as Format, at
+    /// the layout's blocks.</summary>
+    private sealed record GemmScale(ulong Scales, ulong Zeros, Fmt Format, int BlockRows, int BlockColumns, int ScaleColumns)
+    {
+        public ulong[] Args => [Scales, Zeros, Gpu.U(BlockRows), Gpu.U(BlockColumns), Gpu.U(ScaleColumns)];
+
+        public string Key => $":x{Format.Name}{(Zeros != 0 ? "z" : "")}";
     }
 
     // Split-k for the stored mode as for the staged kernel (SplitK): too few tiles to fill the device and k long. The

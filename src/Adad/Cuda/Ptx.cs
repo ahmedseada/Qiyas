@@ -1743,8 +1743,10 @@ internal static partial class Ptx
     // ---------------------------------------------------------------- C = A·B in a lane (A m×k, B k×n, row-major lane arrays)
 
     /// <summary>The formats of a product's operands as the stored mode reads them, and C's: null C is lane storage (the
-    /// sums), else a format of whole bytes and not blocks, stored by the kernel.</summary>
-    public sealed record GemmStored(Fmt A, Fmt B, Fmt? C);
+    /// sums), else a format of whole bytes and not blocks, stored by the kernel. Scales: B (transposed, from value 0) is a
+    /// scaled weight's codes, each value (code − zero)·scale made in the lane as it is read (ScaleCode), the scales (and,
+    /// Zeros, the zero points) stored as that format.</summary>
+    public sealed record GemmStored(Fmt A, Fmt B, Fmt? C, Fmt? Scales = null, bool Zeros = false);
 
     public const int GemmThreads = 256;
 
@@ -1769,6 +1771,9 @@ internal static partial class Ptx
         if (split && (stored is null || stored.C is not null)) throw new ArgumentException("split: the stored mode's partial C in lane storage");
         if (runsA && stored?.A.IsBlock != true || runsB && (stored?.B.IsBlock != true || conv)) throw new ArgumentException("runs: a block format's stored operands (B's not gathered)");
         if (stored?.C is { } fc && (fc.IsBlock || fc.Bits < 8)) throw new ArgumentException($"C as {fc.Name}: a format of whole bytes, not blocks, is stored by the kernel");
+        var scales = stored?.Scales;
+        if (scales is not null && (!transB || runsB || conv)) throw new ArgumentException("scaled B: a weight's codes read transposed, a value at a time");
+        if (scales is not null) entry += $"_x{scales.Name}{(stored!.Zeros ? "z" : "")}";
         bool typedC = stored?.C is not null;
         var b = new PtxBuilder();
         string tid = b.R(), bx = b.R(), by = b.R(), tx = b.R(), ty = b.R();
@@ -1780,6 +1785,12 @@ internal static partial class Ptx
         string pa = Param64(b, "p_a"), pb = Param64(b, "p_b"), pc = Param64(b, "p_c"), m = Param32(b, "p_m"), n = Param32(b, "p_n"), k = Param32(b, "p_k");
         string[] g = conv ? [.. new[] { "h", "w", "kh", "kw", "sh", "sw", "ph", "pw", "dh", "dw", "ow" }.Select(name => Param32(b, "p_" + name))] : [];
         string aoff = stored is null ? "" : Param32(b, "p_aoff"), boff = stored is null ? "" : Param32(b, "p_boff");
+        string pbs = "", pbz = "", sbr = "", sbc = "", ssc = "";
+        if (scales is not null)
+        {
+            pbs = Param64(b, "p_bs"); pbz = Param64(b, "p_bz");
+            sbr = Param32(b, "p_br"); sbc = Param32(b, "p_bc"); ssc = Param32(b, "p_sc");
+        }
         string slice = "", sliceKb = "";
         if (split)
         {
@@ -2103,6 +2114,13 @@ internal static partial class Ptx
                 if (transB) b.L($"mad.lo.u32 {idx}, {col}, {k}, {kk};"); else b.L($"mad.lo.u32 {idx}, {kk}, {n}, {col};");
                 b.L($"add.u32 {idx}, {idx}, {boff};");
                 bv0[q] = Decoded(stored.B, pb, idx, pq, boff);
+                if (scales is not null)
+                {
+                    // Bᵀ's row is the weight's row: column col of C, k value kk.
+                    string made = ScaleCode(b, scales, lane, bv0[q], pbs, stored.Zeros ? pbz : null, col, kk, sbr, sbc, ssc, pq);
+                    bv0[q] = lane.NewReg(b);
+                    b.L($"selp.{lane.Op} {bv0[q]}, {made}, {lane.Zero}, {pq};");
+                }
             }
 
             string sOff0 = b.R(), sAddr0 = b.R();
@@ -2242,7 +2260,8 @@ internal static partial class Ptx
 
         b.L("ret;");
         string convParams = conv ? ", .param .u32 p_h, .param .u32 p_w, .param .u32 p_kh, .param .u32 p_kw, .param .u32 p_sh, .param .u32 p_sw, .param .u32 p_ph, .param .u32 p_pw, .param .u32 p_dh, .param .u32 p_dw, .param .u32 p_ow" : "";
-        string storedParams = (stored is null ? "" : ", .param .u32 p_aoff, .param .u32 p_boff") + (split ? ", .param .u32 p_mb, .param .u32 p_kb" : "");
+        string storedParams = (stored is null ? "" : ", .param .u32 p_aoff, .param .u32 p_boff") + (split ? ", .param .u32 p_mb, .param .u32 p_kb" : "")
+            + (scales is null ? "" : ", .param .u64 p_bs, .param .u64 p_bz, .param .u32 p_br, .param .u32 p_bc, .param .u32 p_sc");
         return b.Finish(Header(gpu), entry, ".param .u64 p_a, .param .u64 p_b, .param .u64 p_c, .param .u32 p_m, .param .u32 p_n, .param .u32 p_k" + convParams + storedParams, asBytes + bsBytes);
     }
 
