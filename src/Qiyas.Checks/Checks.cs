@@ -2188,13 +2188,18 @@ internal static partial class Checks
 
                 var expected = Bench.Registry.Values(type, Bench.Registry.Encode(type, reference), N);
                 var got = Bench.Registry.Values(type, output, N);
+                // The formula's own error scale where its terms may cancel (MapOp.Scale), from the inputs' values.
+                var xs = op.Scale is not null && x is not null ? Bench.Registry.Values(type, x, N) : null;
+                var ys = op.Scale is not null && y is not null ? Bench.Registry.Values(type, y, N) : null;
+                var zs = op.Scale is not null && z is not null ? Bench.Registry.Values(type, z, N) : null;
                 for (int i = 0; i < N; i++)
                 {
                     double e, want = expected[i], v = got[i];
                     if (double.IsNaN(want) || double.IsInfinity(want)) { e = (double.IsNaN(v) && double.IsNaN(want)) || v == want ? 0 : double.PositiveInfinity; }
                     else
                     {
-                        double scale = Math.Abs(reference[i]) == 0 ? 1 : Math.Pow(2, Math.Floor(Math.Log2(Math.Abs(reference[i]))));
+                        double mag = op.ErrorScale(reference[i], xs?[i] ?? 0, ys?[i] ?? 0, zs?[i] ?? 0);
+                        double scale = mag == 0 ? 1 : Math.Pow(2, Math.Floor(Math.Log2(mag)));
                         double stepType = scale * Math.Pow(2, -mant), stepLane = scale * Math.Pow(2, -laneMant);
                         double tol = stepType + op.Ulps * stepLane;
                         e = Math.Abs(v - want) <= tol ? 0 : Math.Abs(v - want) / stepType;

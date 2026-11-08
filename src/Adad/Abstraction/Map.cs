@@ -13,8 +13,13 @@ namespace Adad.Abstraction;
 
 /// <summary>What the bench and the checks need to know about a formula.</summary>
 public sealed record MapOp(string Name, int Inputs, bool FloatOnly, Func<double, double, double, double, double, double> Reference,
-    (double Low, double High) XRange, (double Low, double High) YRange, double A, double B, string Note = "", int Ulps = 4)
+    (double Low, double High) XRange, (double Low, double High) YRange, double A, double B, string Note = "", int Ulps = 4,
+    Func<double, double, double, double, double, double>? Scale = null)
 {
+    /// <summary>The magnitude a value's error is measured against: |the result|, or where the formula's terms may cancel
+    /// (Scale given) the larger of it and the terms' magnitude.</summary>
+    public double ErrorScale(double result, double x, double y, double z) => Scale is null ? Math.Abs(result) : Math.Max(Math.Abs(result), Scale(x, y, z, A, B));
+
     /// <summary>Inputs (x, y, z) come from this many stored arrays; the rest are unused.</summary>
     public bool IsBackward => Name.EndsWith("_bwd", StringComparison.Ordinal);
 }
@@ -25,6 +30,29 @@ public static class Ops
 
     // The references in forms free of cancellation: 0.5·(1 + tanh u) = σ(2u); 1 − tanh² = sech²; 1 − σ(x) = σ(−x); 1 + erf = erfc(−·).
     private static double Sigmoid(double x) => 1 / (1 + Math.Exp(-x));
+
+    // The focal loss's parts free of cancellation: BCE = max(x, 0) − x·t + log1p(e^−|x|); 1 − p_t = t·σ(−x) + (1 − t)·σ(x);
+    // σ(x) − t = (1 − t)·σ(x) − t·σ(−x); log1p(u) = log(w)·u / (w − 1) with w = 1 + u (Goldberg), u where w is 1.
+    private const string FocalCond = " (log1p by log(w)·u/(w − 1); (1 − p_t)^γ = exp(γ·log(1 − p_t)): γ·log ulps)";
+    private static double Log1p(double u) { double w = 1 + u; return w == 1 ? u : Math.Log(w) * u / (w - 1); }
+    private static double FocalCe(double x, double t) => Math.Max(x, 0) - x * t + Log1p(Math.Exp(-Math.Abs(x)));
+    private static double FocalQ(double x, double t) => t * Sigmoid(-x) + (1 - t) * Sigmoid(x);
+    private static double FocalAlpha(double t, double a) => a < 0 ? 1 : a * t + (1 - a) * (1 - t);
+    private static double Focal(double x, double t, double a, double g) => FocalAlpha(t, a) * Math.Pow(FocalQ(x, t), g) * FocalCe(x, t);
+
+    private static double FocalGradTerms(double x, double t, double a, double g)
+    {
+        double q = FocalQ(x, t), qg = Math.Pow(q, g), s = Sigmoid(x), sn = Sigmoid(-x);
+        double second = g == 0 || q == 0 ? 0 : g * FocalCe(x, t) * (qg / q) * Math.Abs(2 * t - 1) * s * sn;
+        return Math.Abs(FocalAlpha(t, a)) * (Math.Abs((1 - t) * s - t * sn) * qg + second);
+    }
+
+    private static double FocalGrad(double x, double t, double a, double g)
+    {
+        double q = FocalQ(x, t), qg = Math.Pow(q, g), s = Sigmoid(x), sn = Sigmoid(-x);
+        double second = g == 0 || q == 0 ? 0 : g * FocalCe(x, t) * (qg / q) * (2 * t - 1) * s * sn;
+        return FocalAlpha(t, a) * (((1 - t) * s - t * sn) * qg - second);
+    }
     private static double GeluU(double x) => GeluK * (x + GeluC * x * x * x);
     private static double Gelu(double x) => x * Sigmoid(2 * GeluU(x));
     private static double GeluGrad(double x)
@@ -119,6 +147,11 @@ public static class Ops
         new("gated_tanh_sigmoid_bwd_x", 3, true, (x, y, z, a, b) => Funcs.SechSquaredReference(x) * Sigmoid(y) * z, Any, Any, 0, 0, "d/dx given dz (sech² by σ(2x)·σ(−2x), as tanh_bwd)", Ulps: 16),
         new("gated_tanh_sigmoid_bwd_y", 3, true, (x, y, z, a, b) => Math.Tanh(x) * Sigmoid(y) * Sigmoid(-y) * z, Any, Any, 0, 0, "d/dy given dz"),
         new("add_gelu", 2, true, (x, y, z, a, b) => Gelu(x + y), Any, Any, 0, 0, "gelu(x + y): a bias and its gelu in one pass (a row of biases by MapRowFloat); the sum rounded in the lane first, then gelu's conditioning" + Cond, Ulps: 256),
+        new("sigmoid_focal", 2, true, (x, y, z, a, b) => Focal(x, y, a, b), Any, (0, 1), 0.25, 2,
+            "torchvision's sigmoid focal loss: α_t·(1 − p_t)^γ·BCE(x, y), p = σ(x), y the target in [0, 1], a = α (no weighting where a < 0), b = γ ≥ 0" + FocalCond, Ulps: 256),
+        new("sigmoid_focal_bwd", 3, true, (x, y, z, a, b) => FocalGrad(x, y, a, b) * z, Any, (0, 1), 0.25, 2,
+            "d/dx given dz (the target a constant): α_t·((σ(x) − t)·q^γ − γ·BCE·q^(γ−1)·(2t − 1)·σ(x)σ(−x)), q = 1 − p_t; the two terms share their sign for a target of 0 or 1 and cancel near a soft target's minimum (measured against their magnitude)" + FocalCond,
+            Ulps: 256, Scale: (x, y, z, a, b) => FocalGradTerms(x, y, a, b) * Math.Abs(z)),
         new("clip_factor", 1, true, (x, y, z, a, b) => x > 0 ? Math.Min(1, a / Math.Sqrt(x)) : 1, (0, 4), Any, 1, 0, "min(1, a/√x), 1 where x is 0: the clipping factor of a sum of squares x to the norm a"),
     ];
 

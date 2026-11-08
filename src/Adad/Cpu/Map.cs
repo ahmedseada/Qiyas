@@ -174,6 +174,53 @@ internal static class MapOps
     public struct GatedTanhSigmoidBwdX<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) { var s = TL.Sigmoid(TL.Mul(C<T, TL>(2), x)); var sech2 = TL.Mul(C<T, TL>(4), TL.Mul(s, TL.Sigmoid(TL.Mul(C<T, TL>(-2), x)))); return TL.Mul(TL.Mul(sech2, TL.Sigmoid(y)), z); } }
     public struct GatedTanhSigmoidBwdY<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Mul(TL.Tanh(x), TL.Mul(TL.Sigmoid(y), TL.Sigmoid(TL.Neg(y)))), z); }
     public struct AddGelu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => GeluF<T, TL>(TL.Add(x, y)); }
+    // log1p(u) = log(w)·u / (w − 1), w = 1 + u (Goldberg's), u where w is 1.
+    private static Vector<T> Log1pF<T, TL>(Vector<T> u) where T : unmanaged where TL : struct, IFloatLane<TL, T>
+    {
+        var one = C<T, TL>(1);
+        var w = TL.Add(one, u);
+        var d = TL.Sub(w, one);
+        return TL.Select(TL.Greater(d, Vector<T>.Zero), TL.Div(TL.Mul(TL.Log(w), u), d), u);
+    }
+
+    // The focal loss's parts (Abstraction/Map.cs): BCE, σ(x), σ(−x), 1 − p_t, (1 − p_t)^γ (1 where γ is 0), α_t.
+    private static (Vector<T> Ce, Vector<T> S, Vector<T> Sn, Vector<T> Q, Vector<T> Qg, Vector<T> At) FocalParts<T, TL>(Vector<T> x, Vector<T> t, Vector<T> a, Vector<T> g)
+        where T : unmanaged where TL : struct, IFloatLane<TL, T>
+    {
+        var one = C<T, TL>(1);
+        var ce = TL.Add(TL.Fma(TL.Neg(x), t, TL.Max(x, Vector<T>.Zero)), Log1pF<T, TL>(TL.Exp(TL.Neg(TL.Abs(x)))));
+        var s = TL.Sigmoid(x);
+        var sn = TL.Sigmoid(TL.Neg(x));
+        var u = TL.Sub(one, t);
+        var q = TL.Add(TL.Mul(t, sn), TL.Mul(u, s));
+        var qg = TL.Select(TL.Greater(g, Vector<T>.Zero), PowF<T, TL>(q, g), one);
+        var at = TL.Select(TL.Greater(Vector<T>.Zero, a), one, TL.Add(TL.Mul(a, t), TL.Mul(TL.Sub(one, a), u)));
+        return (ce, s, sn, q, qg, at);
+    }
+
+    public struct SigmoidFocal<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T>
+    {
+        public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b)
+        {
+            var f = FocalParts<T, TL>(x, y, a, b);
+            return TL.Mul(TL.Mul(f.At, f.Qg), f.Ce);
+        }
+    }
+
+    public struct SigmoidFocalBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T>
+    {
+        public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b)
+        {
+            var f = FocalParts<T, TL>(x, y, a, b);
+            var one = C<T, TL>(1);
+            var d = TL.Sub(TL.Mul(TL.Sub(one, y), f.S), TL.Mul(y, f.Sn));
+            var live = TL.Greater(f.Q, Vector<T>.Zero) & TL.Greater(b, Vector<T>.Zero);
+            var second = TL.Mul(TL.Mul(TL.Mul(TL.Mul(b, f.Ce), TL.Div(f.Qg, f.Q)), TL.Sub(TL.Add(y, y), one)), TL.Mul(f.S, f.Sn));
+            second = TL.Select(live, second, Vector<T>.Zero);
+            return TL.Mul(TL.Mul(f.At, TL.Sub(TL.Mul(d, f.Qg), second)), z);
+        }
+    }
+
     public struct ClipFactor<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) { var one = C<T, TL>(1); return TL.Select(TL.Greater(x, Vector<T>.Zero), TL.Min(one, TL.Div(a, TL.Sqrt(x))), one); } }
 
     /// <summary>The formulas every lane has: runs `use` with op's struct; false for any other name.</summary>
@@ -262,6 +309,8 @@ internal static class MapOps
             case "gated_tanh_sigmoid_bwd_y": use.Use<GatedTanhSigmoidBwdY<T, TL>>(); return true;
             case "add_gelu": use.Use<AddGelu<T, TL>>(); return true;
             case "clip_factor": use.Use<ClipFactor<T, TL>>(); return true;
+            case "sigmoid_focal": use.Use<SigmoidFocal<T, TL>>(); return true;
+            case "sigmoid_focal_bwd": use.Use<SigmoidFocalBwd<T, TL>>(); return true;
             default: return false;
         }
     }

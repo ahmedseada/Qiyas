@@ -39,7 +39,7 @@ does best for it, chosen per operation from the data itself. No type is fixed an
   reference of every product is accumulated in double-double, so an exact lane reads 0. The bench refuses to time while
   any gate fails.
 - **The operation surface.** `COVERAGE.md` is the list, one row per operation with the lane rule on each device:
-  element-wise formulas and their backward passes; reductions, broadcasts, transposes, gemv; the row family
+  element-wise formulas and their backward passes (the sigmoid focal loss among them); reductions, broadcasts, transposes, gemv; the row family
   (softmax, log_softmax, the norms and their backward passes, rope, masked softmax, cross-entropy's backward); layout
   and indexing (strided copies of up to six dimensions, one-hot, gathers, scatter-add, im2col/col2im, interpolation
   (half-pixel, align-corners or asymmetric, given scales) and its backward, shift, pad, the pools (ceil mode, counting the

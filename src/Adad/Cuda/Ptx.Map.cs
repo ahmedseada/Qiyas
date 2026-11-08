@@ -559,6 +559,25 @@ internal static partial class Ptx
             case "gated_tanh_sigmoid_bwd_y": return e.Mul(e.Mul(e.Tanh(x), e.Mul(e.Sigmoid(y), e.Sigmoid(e.Neg(y)))), z);
             case "add_gelu": return e.Gelu(e.Add(x, y));
             case "clip_factor": return e.Select(e.Greater(x, e.C(0)), e.Min(e.C(1), e.Div(a, e.Sqrt(x))), e.C(1));
+            case "sigmoid_focal":
+            case "sigmoid_focal_bwd":
+            {
+                // Abstraction/Map.cs's parts: BCE with log1p by Goldberg's form, 1 − p_t, (1 − p_t)^γ (1 where γ is 0), α_t.
+                string one = e.C(1), nil = e.C(0);
+                string u0 = e.Exp(e.Neg(e.Abs(x))), w = e.Add(one, u0), dw = e.Sub(w, one);
+                string lp = e.Select(e.Greater(dw, nil), e.Div(e.Mul(e.Log(w), u0), dw), u0);
+                string ce = e.Add(e.Fma(e.Neg(x), y, e.Max(x, nil)), lp);
+                string s = e.Sigmoid(x), sn = e.Sigmoid(e.Neg(x)), u = e.Sub(one, y);
+                string q = e.Add(e.Mul(y, sn), e.Mul(u, s));
+                string qg = e.Select(e.Greater(pb, nil), e.Pow(q, pb), one);
+                string at = e.Select(e.Greater(nil, a), one, e.Add(e.Mul(a, y), e.Mul(e.Sub(one, a), u)));
+                if (op == "sigmoid_focal") return e.Mul(e.Mul(at, qg), ce);
+                string d = e.Sub(e.Mul(u, s), e.Mul(y, sn));
+                string second = e.Mul(e.Mul(e.Mul(e.Mul(pb, ce), e.Div(qg, q)), e.Sub(e.Add(y, y), one)), e.Mul(s, sn));
+                second = e.Select(e.Greater(q, nil), e.Select(e.Greater(pb, nil), second, nil), nil);
+                return e.Mul(e.Mul(at, e.Sub(e.Mul(d, qg), second)), z);
+            }
+
             default: throw new ArgumentException(op);
         }
     }

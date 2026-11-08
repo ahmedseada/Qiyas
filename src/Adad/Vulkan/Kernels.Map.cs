@@ -342,6 +342,27 @@ internal static partial class VkKernels
             case "gated_tanh_sigmoid_bwd_y": return (Fn.Tanh(b, x) * (e.Sigmoid(y) * e.Sigmoid(-y))) * z;
             case "add_gelu": return e.Gelu(x + y);
             case "clip_factor": return b.Select(x > 0, b.Min(e.C(1), a / b.Sqrt(x)), e.C(1));
+            case "sigmoid_focal":
+            case "sigmoid_focal_bwd":
+            {
+                // Abstraction/Map.cs's parts: BCE with log1p by Goldberg's form, 1 − p_t, (1 − p_t)^γ (1 where γ is 0), α_t.
+                V one = e.C(1), zero = e.C(0);
+                var u0 = e.Exp(-b.Abs(x));
+                var w = one + u0;
+                var dw = w - one;
+                var lp = b.Select(dw > 0, Fn.Log(b, w) * u0 / dw, u0);
+                var ce = b.Fma(-x, y, b.Max(x, zero)) + lp;
+                V s = e.Sigmoid(x), sn = e.Sigmoid(-x), u = one - y;
+                var q = y * sn + u * s;
+                var qg = b.Select(pb > 0, e.Pow(q, pb), one);
+                var at = b.Select(a < 0, one, a * y + (one - a) * u);
+                if (op == "sigmoid_focal") return at * qg * ce;
+                var d = u * s - y * sn;
+                var second = pb * ce * (qg / q) * (y + y - one) * (s * sn);
+                second = b.Select(q > 0, b.Select(pb > 0, second, zero), zero);
+                return at * (d * qg - second) * z;
+            }
+
             default: throw new ArgumentException(op);
         }
     }
