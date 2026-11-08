@@ -581,6 +581,8 @@ internal static partial class Ptx
             case "sin_bwd": return e.Mul(Fn.Cos(b, lane, x), y);
             case "cos_bwd": return e.Neg(e.Mul(Fn.Sin(b, lane, x), y));
             case "tanh_bwd": { string s = e.Sigmoid(e.Mul(e.C(2), x)); return e.Mul(e.Mul(e.C(4), e.Mul(s, e.Sigmoid(e.Mul(e.C(-2), x)))), y); }
+            case "softcap": return e.Mul(a, e.Tanh(e.Div(e.Mul(pb, x), a)));
+            case "softcap_bwd": { string u = e.Div(e.Mul(pb, x), a); string s = e.Sigmoid(e.Mul(e.C(2), u)); return e.Mul(e.Mul(e.Mul(e.C(4), e.Mul(s, e.Sigmoid(e.Mul(e.C(-2), u)))), pb), y); }
             case "sigmoid_bwd": return e.Mul(e.Mul(e.Sigmoid(x), e.Sigmoid(e.Neg(x))), y);
             case "silu_bwd": return e.Mul(e.SiluGrad(x), y);
             case "gelu_bwd": return e.Mul(e.GeluGrad(x), y);

@@ -153,6 +153,8 @@ public static class Ops
         new("sigmoid_focal_bwd", 3, true, (x, y, z, a, b) => FocalGrad(x, y, a, b) * z, Any, (0, 1), 0.25, 2,
             "d/dx given dz (the target a constant): α_t·((σ(x) − t)·q^γ − γ·BCE·q^(γ−1)·(2t − 1)·σ(x)σ(−x)), q = 1 − p_t; the two terms share their sign for a target of 0 or 1 and cancel near a soft target's minimum (measured against their magnitude)" + FocalCond,
             Ulps: 256, Scale: (x, y, z, a, b) => FocalGradTerms(x, y, a, b) * Math.Abs(z)),
+        new("softcap", 1, true, (x, y, z, a, b) => a * Math.Tanh(b * x / a), Any, Any, 2, 1.5, "a·tanh(b·x/a): a score scaled by b and capped at ±a (attention's cap)", Ulps: 8),
+        new("softcap_bwd", 2, true, (x, y, z, a, b) => b * Funcs.SechSquaredReference(b * x / a) * y, Any, Any, 2, 1.5, "d/dx of softcap given dy: b·sech²(b·x/a)·y (sech² by σ(2u)·σ(−2u), as tanh_bwd)", Ulps: 32),
         new("clip_factor", 1, true, (x, y, z, a, b) => x > 0 ? Math.Min(1, a / Math.Sqrt(x)) : 1, (0, 4), Any, 1, 0, "min(1, a/√x), 1 where x is 0: the clipping factor of a sum of squares x to the norm a"),
     ];
 

@@ -747,8 +747,10 @@ internal static partial class Ptx
             }
 
             case "scale_mask_softmax":
+            case "scale_mask_softmax_lse":
             {
                 // z = a·x + mask; causal (b ≠ 0): columns past the row's position excluded; excluded values give 0 (a fully excluded row too).
+                // The log-sum-exp (lse): the row's value m + log Σ e^(z − m), −∞ where no column is kept.
                 string pCausal = c.Gt(c.Bs, c.Lit(0)), negInf = c.Lit(double.NegativeInfinity), posInt = c.PosInt();
                 string Keep(int q, int i) => c.Not(c.And(pCausal, c.GtS(c.Col(q, i), posInt)));
                 string Z(int q, int i) => c.Sel(Keep(q, i), c.Fma(c.X(q, i), c.A, c.X2(q, i)), negInf);
@@ -757,6 +759,7 @@ internal static partial class Ptx
                 string sum = c.Reduce("add", (q, i) => c.Sel(Keep(q, i), c.Exp(c.Sub(Z(q, i), m)), c.Lit(0)));
                 string scale = c.Sel(pAny, c.Rcp(sum), c.Lit(0));
                 c.Store((q, i) => c.Sel(Keep(q, i), c.Mul(c.Exp(c.Sub(Z(q, i), m)), scale), c.Lit(0)));
+                if (op.RowOut) c.StoreRow(c.Sel(pAny, c.Add(m, c.Log(sum)), negInf));
                 return;
             }
 

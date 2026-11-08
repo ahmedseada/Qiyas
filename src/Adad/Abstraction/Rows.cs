@@ -25,7 +25,7 @@ public sealed record RowOp(string Name, bool Second, bool Gamma, bool Beta, bool
 
     /// <summary>The second row is an additive mask: 0 keeps a value, −400 excludes it (exp underflows to 0 in f32; within
     /// every float type's range, 448 being the smallest of the maxima); a pattern over (row, column).</summary>
-    public bool Mask => Name == "scale_mask_softmax";
+    public bool Mask => Name is "scale_mask_softmax" or "scale_mask_softmax_lse";
 
     public static double MaskValue(int row, int col) => (row * 7 + col) % 3 == 0 ? -400 : 0;
 
@@ -90,6 +90,7 @@ public static class RowOps
         new("weight_norm_bwd", true, false, false, true, false, false, 1e-12, 0, WeightNormBwd, "(x, dy, s) → dx = s/n·(dy − x·(Σ dy·x)/n²), n = √(Σ x² + a); y2[row] = (Σ dy·x)/n, the scalar's gradient") { RowOut = true },
         new("rope", false, false, false, false, true, false, 10000, 0, Rope, "pairs (i, i + cols/2) rotated by pos·a^(−2i/cols); an odd row's last value kept", Ulps: 64),
         new("scale_mask_softmax", true, false, false, false, false, false, 0.125, 1, ScaleMaskSoftmax, "softmax(a·x + mask); b ≠ 0: columns past the row's position excluded (causal; the position is the row's index, or the one given: a key span)"),
+        new("scale_mask_softmax_lse", true, false, false, false, false, false, 0.125, 1, ScaleMaskSoftmaxLse, "scale_mask_softmax; y2[row] = the row's log-sum-exp m + log Σ e^(z − m) of its kept values (−∞ when none)") { RowOut = true },
         new("add_rms_norm", true, true, false, false, false, true, Eps, 0, AddRmsNorm, "h = x + x2 (written to y2); y = rms_norm_affine(h)") { SecondRange = (-4, 4), Offset = true },
         new("add_layer_norm", true, true, true, false, false, true, Eps, 0, AddLayerNorm, "h = x + x2 (written to y2); y = layer_norm(h)") { SecondRange = (-4, 4) },
         new("cross_entropy_bwd", false, false, false, false, true, false, 0, 0, CrossEntropyBwd, "softmax(x) − one_hot(the row's position: the target class); the loss is −log_softmax(x) picked at the target (pick_rows)"),
@@ -219,7 +220,15 @@ public static class RowOps
         double sum = 0;
         for (int i = 0; i < n; i++) sum += y[i] = double.IsNegativeInfinity(y[i]) ? 0 : Math.Exp(y[i] - m);
         for (int i = 0; i < n; i++) y[i] = sum > 0 ? y[i] / sum : 0;
+        if (!y2.IsEmpty) y2[0] = sum > 0 ? m + Math.Log(sum) : double.NegativeInfinity;
         return 1 + Math.Abs(a) * MaxAbs(x);
+    }
+
+    private static double ScaleMaskSoftmaxLse(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)
+    {
+        double scale = ScaleMaskSoftmax(x, x2, g, bt, s, pos, row, a, b, y, y2);
+        // The log-sum-exp's value: the sum's rounding (as P's) plus the last rounding at |lse|.
+        return scale + (y2.IsEmpty || double.IsInfinity(y2[0]) ? 0 : Math.Abs(y2[0]));
     }
 
     private static double CrossEntropyBwd(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)

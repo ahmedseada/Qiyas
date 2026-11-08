@@ -54,6 +54,8 @@ public sealed partial class GpuOps : IDevice<ulong, ulong>
 
     string IAttention<ulong>.AttentionDecode<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) => AttentionDecode<TN>(a, q, k, v, o);
 
+    string IAttention<ulong>.AttentionLse<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o, ulong lse) => AttentionLse<TN>(a, q, k, v, o, lse);
+
     string IAttention<ulong>.AttentionBackward<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong dO, ulong dq, ulong dk, ulong dv) => AttentionBackward<TN>(a, q, k, v, dO, dq, dk, dv);
 
     string IOptimizers<ulong>.Optimizer<TN>(OptimizerArgs a, ulong p, ulong g, ulong m, ulong v, int n) => Optimizer<TN>(a, p, g, m, v, n);

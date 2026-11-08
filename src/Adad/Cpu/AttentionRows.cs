@@ -30,6 +30,8 @@ internal sealed partial class Kernels
     /// <summary>O for rows of queries by the fused rows (no scores in memory); returns the lane's name.</summary>
     public static string AttentionRows<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) where TN : struct, IFloatAdad<TN>
     {
+        a = a.Grouped();
+        if (a.Softcap > 0) return AttentionComposed<TN>(a, q, k, v, o);
         var vis = new FusedVisitor(a, q, k, v, o);
         TN.Float(ref vis);
         return vis.Lane;

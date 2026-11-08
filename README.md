@@ -32,7 +32,7 @@ does best for it, chosen per operation from the data itself. No type is fixed an
   every tensor-kernel configuration the device can run with every kind choice (k = 53 and 300, every integer and
   narrow-float type); attention rows by both the composition and the fused rows (causal, spans with starts, head
   dimensions up to 128, rows that see no key), and the backward by both its fused kernels and its composition on the
-  same shapes; ctc's loss and gradient (the float64 reference's gradient checked
+  same shapes; attention's options (grouped heads, multi-query, a window, a cap, the log-sum-exp) by every form; ctc's loss and gradient (the float64 reference's gradient checked
   against its own loss by central differences; short sequences, empty and repeated labels, another blank, a sequence
   no alignment fits); the thread
   team under 20 000 jobs of alternating chunk counts (every chunk within its job, every index once). The float64
@@ -45,7 +45,7 @@ does best for it, chosen per operation from the data itself. No type is fixed an
   (half-pixel, align-corners or asymmetric, given scales) and its backward, shift, pad, the pools (ceil mode, counting the
   pads) and their backward, depthwise convolution); image resampling by Pillow's filters with a per-channel normalization
   (Pillow's 8-bit passes bit for bit, or float passes from any input type); products on views (transposed, batched) and the matmul backward, and the product's epilogue (a bias, an activation keeping its input or the gradient through one, β·C, a residual, a low-rank term; one rounding); products with a weight stored as codes of any type with scales and zero points (for the tensor, a row, groups of a row, blocks), each weight's value made in the lane as the product reads its code, and its expansion; a mixture of experts (the top-k routing of tokens to experts, and the experts' products and gated pairs over the rows grouped by expert, the offsets read where they are on the device); attention
-  (rows by the composition or the fused rows, whichever is measured faster; causal, spans, decode, backward); convolution forward and backward (images, groups, uneven pads, a bias and a fused activation; dx, dw, db); the optimizer steps; LSTM and GRU cells and
+  (rows by the composition or the fused rows, whichever is measured faster; causal, spans, decode, backward; grouped heads and multi-query by every form, a sliding window, a cap on the scores, each query's log-sum-exp); convolution forward and backward (images, groups, uneven pads, a bias and a fused activation; dx, dw, db); the optimizer steps; LSTM and GRU cells and
   steps with their backward passes, LSTM and GRU sequences with theirs (either direction); top-k, pick, sampling, routing, cross-entropy and ctc (loss and
   gradient; frame-major or batch-first, labels packed or padded, zero-infinity); the box overlap losses (IoU, GIoU, DIoU, CIoU)
   and their gradients; and the block formats and bool

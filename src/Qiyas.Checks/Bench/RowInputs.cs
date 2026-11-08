@@ -68,7 +68,7 @@ public sealed class RowCase
         double laneEps = lane == "f64" ? Math.Pow(2, -52) : Math.Pow(2, -23), worst = 0;
         for (int r = 0; r < Rows; r++)
         {
-            double tol = Op.Ulps * laneEps * Scale[r], err = Math.Abs(values[r] - Y2![r]);
+            double tol = Op.Ulps * laneEps * Scale[r], err = values[r] == Y2![r] ? 0 : Math.Abs(values[r] - Y2[r]);
             if (double.IsNaN(err) || err > tol) worst = Math.Max(worst, double.IsNaN(err) ? double.PositiveInfinity : err / tol);
         }
 

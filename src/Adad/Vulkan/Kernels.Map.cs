@@ -340,6 +340,8 @@ internal static partial class VkKernels
             case "sin_bwd": return Fn.Cos(b, x) * y;
             case "cos_bwd": return -(Fn.Sin(b, x) * y);
             case "tanh_bwd": { var s = e.Sigmoid(e.C(2) * x); return (e.C(4) * (s * e.Sigmoid(e.C(-2) * x))) * y; }
+            case "softcap": return a * Fn.Tanh(b, (pb * x) / a);
+            case "softcap_bwd": { var u = (pb * x) / a; var s = e.Sigmoid(e.C(2) * u); return ((e.C(4) * (s * e.Sigmoid(e.C(-2) * u))) * pb) * y; }
             case "sigmoid_bwd": return (e.Sigmoid(x) * e.Sigmoid(-x)) * y;
             case "silu_bwd": return e.SiluGrad(x) * y;
             case "gelu_bwd": return e.GeluGrad(x) * y;

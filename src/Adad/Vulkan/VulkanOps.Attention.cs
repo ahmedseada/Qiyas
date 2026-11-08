@@ -6,7 +6,8 @@
 // dimension), the fused decode kernel, the backward's fused kernels where both fit the device's workgroup memory or its
 // composition. Q, K, V and dO are read where they are stored by every route; the scores and their gradients are lane
 // storage (intermediates), the outputs lane values: the type's own storage for float32 and float64, else lane storage
-// stored as the type once after (a block format's by its encoder).
+// stored as the type once after (a block format's by its encoder). Grouped heads run as KvHeads heads of Group·Lq rows
+// (AttentionArgs.Grouped) by every route; a cap on the scores takes the composition (the map's softcap, softcap_bwd).
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
@@ -85,8 +86,9 @@ public sealed partial class VulkanOps
     public string Attention<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IFloatAdad<TN>
     {
         var f = AttentionFormat<TN>("attention");
-        if (a.D > VkKernels.FusedHeadMax || !RowsFit(RowLane(f), a.D)) return AttentionComposed<TN>(a, q, k, v, o);
-        string key = $"{f.Name}:{a.Heads}x{a.Lq}x{a.Lk}x{a.D}:{a.Causal}:{a.Spans is not null}:{a.SpanStarts is not null}";
+        a = a.Grouped();
+        if (a.D > VkKernels.FusedHeadMax || !RowsFit(RowLane(f), a.D) || a.Softcap > 0) return AttentionComposed<TN>(a, q, k, v, o);
+        string key = $"{f.Name}:{a.Heads}x{a.Lq}x{a.Lk}x{a.D}:{a.Causal}:{a.Spans is not null}:{a.HasStarts}";
         if (!_fusedFaster.TryGetValue(key, out bool fused))
         {
             var (tf, tc) = Measure.Faster(() => AttentionRows<TN>(a, q, k, v, o), () => AttentionComposed<TN>(a, q, k, v, o), vk.Synchronize);
@@ -101,6 +103,8 @@ public sealed partial class VulkanOps
     /// <summary>O for rows of queries by the fused rows (no scores in memory); d ≤ 128. Returns the lane's name.</summary>
     public string AttentionRows<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IFloatAdad<TN>
     {
+        a = a.Grouped();
+        if (a.Softcap > 0) return AttentionComposed<TN>(a, q, k, v, o);
         var f = AttentionFormat<TN>("attention rows");
         var lane = RowLane(f);
         if (a.D > VkKernels.FusedHeadMax) throw new NotSupportedException($"vulkan: attention rows with a head dimension of {a.D} exceed the fused kernel's {VkKernels.FusedHeadMax}");
@@ -125,12 +129,19 @@ public sealed partial class VulkanOps
         }
     }
 
-    /// <summary>O for rows of queries by the composition: per head S = Q·Kᵀ (lane storage), the scaled masked softmax, O =
-    /// P·V, the products reading Q, K, V where they are stored. Returns the lane's name.</summary>
-    public string AttentionComposed<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IFloatAdad<TN>
+    /// <summary>O for rows of queries by the composition: per head S = Q·Kᵀ (lane storage; capped when there is a cap), the
+    /// scaled masked softmax, O = P·V, the products reading Q, K, V where they are stored. Returns the lane's name.</summary>
+    public string AttentionComposed<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IFloatAdad<TN> => Composed<TN>(a, q, k, v, o, 0);
+
+    /// <summary>O and each query's log-sum-exp of its scores (heads × Lq, as the type): the composition, the softmax's row
+    /// values (lane storage) stored as the type after. Returns the lane's name.</summary>
+    public string AttentionLse<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o, ulong lse) where TN : struct, IFloatAdad<TN> => Composed<TN>(a, q, k, v, o, lse);
+
+    private string Composed<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o, ulong lse) where TN : struct, IFloatAdad<TN>
     {
         var f = AttentionFormat<TN>("attention (composed)");
         var lane = RowLane(f);
+        a = a.Grouped();
         if (a.QValues == 0) return lane.Name;
         var lf = VkKernels.LaneFormat(lane);
         var rented = new List<ulong>();
@@ -138,18 +149,23 @@ public sealed partial class VulkanOps
         {
             ulong Rent(long bytes) { ulong p = vk.Rent(bytes); rented.Add(p); return p; }
             ulong s = Rent(Math.Max(1, (long)a.Lq * a.Lk) * lane.Size), lo = Own(f) ? o : Rent(a.QValues * lane.Size);
+            ulong ll = lse == 0 ? 0 : Own(f) ? lse : Rent((long)a.Heads * a.Lq * lane.Size);
             // positions = the last visible key of each query (limit − 1): scale_mask_softmax's causal rule excludes the keys past it.
             ulong last = PerQuery(a, i => a.Limit(i) - 1, rented), mask = SpanMask(a, lane, rented);
-            var softmax = RowOps.Find("scale_mask_softmax");
+            var softmax = RowOps.Find(lse != 0 ? "scale_mask_softmax_lse" : "scale_mask_softmax");
+            bool capped = a.Softcap > 0;
+            int pairs = (int)((long)a.Lq * a.Lk);
             for (int h = 0; h < a.Heads; h++)
             {
                 long qo = (long)h * a.Lq * a.D, ko = (long)h * a.Lk * a.D;
                 Product(new ProductView(a.Lq, a.Lk, a.D, false, true), lane, q, f, qo, k, f, ko, s);
-                Row(lf, softmax, s, mask, 0, 0, 0, last, s, 0, a.Lq, a.Lk, a.Scale, 1);
+                if (capped) LaneMap(lane, "softcap", s, 0, s, pairs, a.Softcap, a.Scale);                  // cap·tanh(scale·S / cap)
+                Row(lf, softmax, s, mask, 0, 0, 0, last, s, ll == 0 ? 0 : ll + (ulong)((long)h * a.Lq * lane.Size), a.Lq, a.Lk, capped ? 1 : a.Scale, 1);
                 Product(new ProductView(a.Lq, a.D, a.Lk, false, false), lane, s, lf, 0, v, f, ko, lo + (ulong)(qo * lane.Size));
             }
 
             if (!Own(f)) Back(f, lane, lo, o, a.QValues);
+            if (ll != 0 && !Own(f)) Back(f, lane, ll, lse, (long)a.Heads * a.Lq);
             return lane.Name;
         }
         finally
@@ -169,10 +185,17 @@ public sealed partial class VulkanOps
             Vulkan.U(aOffset), Vulkan.U(bOffset));
     }
 
-    /// <summary>The additive mask excluding the keys below each query's span start (lane storage), 0 when no span starts.</summary>
+    // A formula of Map over lane values (the lane's own type).
+    private void LaneMap(Lane lane, string op, ulong x, ulong y, ulong output, int n, double a, double b)
+    {
+        var m = Ops.Find(op);
+        if (lane.Wide) Map<Float64>(m, x, y, 0, output, n, a, b); else Map<Float32>(m, x, y, 0, output, n, a, b);
+    }
+
+    /// <summary>The additive mask excluding the keys below each query's start (span starts, a window; lane storage), 0 when none.</summary>
     private ulong SpanMask(AttentionArgs a, Lane lane, List<ulong> rented)
     {
-        if (a.SpanStarts is null) return 0;
+        if (!a.HasStarts) return 0;
         var m = new double[(long)a.Lq * a.Lk];
         for (int i = 0; i < a.Lq; i++) for (int j = 0; j < a.Start(i); j++) m[(long)i * a.Lk + j] = -400;
         var bytes = lane.Wide ? Stored.StoreValues<Float64>(m) : Stored.StoreValues<Float32>(m);
@@ -187,6 +210,8 @@ public sealed partial class VulkanOps
     /// <summary>O for a few queries against a long cache, a workgroup per query, K and V read once; returns the lane's name.</summary>
     public string AttentionDecode<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IFloatAdad<TN>
     {
+        a = a.Grouped();
+        if (a.Softcap > 0) return AttentionComposed<TN>(a, q, k, v, o);
         var f = AttentionFormat<TN>("attention decode");
         var lane = RowLane(f);
         if (a.D > 4 * VkKernels.DecodeThreads) throw new NotSupportedException($"vulkan: attention decode with a head dimension of {a.D} exceeds {4 * VkKernels.DecodeThreads}");
@@ -217,13 +242,14 @@ public sealed partial class VulkanOps
     {
         var f = AttentionFormat<TN>("attention backward");
         var lane = RowLane(f);
+        a = a.Grouped();
         var rented = new List<ulong>();
         try
         {
             ulong Rent(long bytes) { ulong p = vk.Rent(bytes); rented.Add(p); return p; }
             bool own = Own(f);
             ulong ldq = own ? dq : Rent(Math.Max(1, a.QValues) * lane.Size), ldk = own ? dk : Rent(Math.Max(1, a.KValues) * lane.Size), ldv = own ? dv : Rent(Math.Max(1, a.KValues) * lane.Size);
-            if (FusedBackward != false && a.D <= VkKernels.FusedHeadMax && BackwardFits(lane, a.D)) { BackwardFused(f, lane, a, q, k, v, dO, ldq, ldk, ldv, rented); BackwardRoute = "fused"; }
+            if (FusedBackward != false && a.D <= VkKernels.FusedHeadMax && a.Softcap == 0 && BackwardFits(lane, a.D)) { BackwardFused(f, lane, a, q, k, v, dO, ldq, ldk, ldv, rented); BackwardRoute = "fused"; }
             else { BackwardComposed(f, lane, a, q, k, v, dO, ldq, ldk, ldv, rented); BackwardRoute = "composed"; }
             if (!own)
             {
@@ -275,9 +301,11 @@ public sealed partial class VulkanOps
         }
 
         var lf = VkKernels.LaneFormat(lane);
+        bool capped = a.Softcap > 0;
         long sBytes = (long)a.Lq * a.Lk * lane.Size;
-        ulong p = vk.Rent(sBytes), dp = vk.Rent(sBytes);
+        ulong p = vk.Rent(sBytes), dp = vk.Rent(sBytes), raw = capped ? vk.Rent(sBytes) : 0;
         rented.Add(p); rented.Add(dp);
+        if (capped) rented.Add(raw);
         ulong last = PerQuery(a, i => a.Limit(i) - 1, rented), mask = SpanMask(a, lane, rented);
         var softmax = RowOps.Find("scale_mask_softmax");
         var softmaxBwd = RowOps.Find("softmax_bwd");
@@ -287,12 +315,14 @@ public sealed partial class VulkanOps
         {
             long qo = (long)h * a.Lq * a.D, ko = (long)h * a.Lk * a.D;
             ulong dqh = dq + (ulong)(qo * lane.Size), dkh = dk + (ulong)(ko * lane.Size), dvh = dv + (ulong)(ko * lane.Size);
-            Product(new ProductView(a.Lq, a.Lk, a.D, false, true), lane, q, f, qo, k, f, ko, p);
-            Row(lf, softmax, p, mask, 0, 0, 0, last, p, 0, a.Lq, a.Lk, a.Scale, 1);
+            Product(new ProductView(a.Lq, a.Lk, a.D, false, true), lane, q, f, qo, k, f, ko, capped ? raw : p);
+            if (capped) LaneMap(lane, "softcap", raw, 0, p, pairs, a.Softcap, a.Scale);                       // cap·tanh(scale·S / cap)
+            Row(lf, softmax, p, mask, 0, 0, 0, last, p, 0, a.Lq, a.Lk, capped ? 1 : a.Scale, 1);
             Product(new ProductView(a.Lk, a.D, a.Lq, true, false), lane, p, lf, 0, dO, f, qo, dvh);            // dV = Pᵀ·dO
             Product(new ProductView(a.Lq, a.Lk, a.D, false, true), lane, dO, f, qo, v, f, ko, dp);             // dP = dO·Vᵀ
             Row(lf, softmaxBwd, p, dp, 0, 0, 0, 0, dp, 0, a.Lq, a.Lk, 0, 0);                                   // dS = P·(dP − Σ P·dP)
-            if (lane.Wide) Map<Float64>(scale, dp, 0, 0, dp, pairs, a.Scale, 0); else Map<Float32>(scale, dp, 0, 0, dp, pairs, a.Scale, 0);   // · scale
+            if (capped) LaneMap(lane, "softcap_bwd", raw, dp, dp, pairs, a.Softcap, a.Scale);                 // · the cap's slope
+            else if (lane.Wide) Map<Float64>(scale, dp, 0, 0, dp, pairs, a.Scale, 0); else Map<Float32>(scale, dp, 0, 0, dp, pairs, a.Scale, 0);   // · scale
             Product(new ProductView(a.Lq, a.D, a.Lk, false, false), lane, dp, lf, 0, k, f, ko, dqh);           // dQ = dS·K
             Product(new ProductView(a.Lk, a.D, a.Lq, true, false), lane, dp, lf, 0, q, f, qo, dkh);            // dK = dSᵀ·Q
         }

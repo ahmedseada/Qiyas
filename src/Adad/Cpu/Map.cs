@@ -153,6 +153,8 @@ internal static class MapOps
     public struct SinBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Cos(x), y); }
     public struct CosBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Neg(TL.Mul(TL.Sin(x), y)); }
     public struct TanhBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) { var s = TL.Sigmoid(TL.Mul(C<T, TL>(2), x)); return TL.Mul(TL.Mul(C<T, TL>(4), TL.Mul(s, TL.Sigmoid(TL.Mul(C<T, TL>(-2), x)))), y); } }
+    public struct Softcap<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(a, TL.Tanh(TL.Div(TL.Mul(b, x), a))); }
+    public struct SoftcapBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) { var u = TL.Div(TL.Mul(b, x), a); var s = TL.Sigmoid(TL.Mul(C<T, TL>(2), u)); return TL.Mul(TL.Mul(TL.Mul(C<T, TL>(4), TL.Mul(s, TL.Sigmoid(TL.Mul(C<T, TL>(-2), u)))), b), y); } }
     public struct SigmoidBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Mul(TL.Sigmoid(x), TL.Sigmoid(TL.Neg(x))), y); }
     public struct SiluBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(SiluGradF<T, TL>(x), y); }
     public struct GeluBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(GeluGradF<T, TL>(x), y); }
@@ -296,6 +298,8 @@ internal static class MapOps
             case "sin_bwd": use.Use<SinBwd<T, TL>>(); return true;
             case "cos_bwd": use.Use<CosBwd<T, TL>>(); return true;
             case "tanh_bwd": use.Use<TanhBwd<T, TL>>(); return true;
+            case "softcap": use.Use<Softcap<T, TL>>(); return true;
+            case "softcap_bwd": use.Use<SoftcapBwd<T, TL>>(); return true;
             case "sigmoid_bwd": use.Use<SigmoidBwd<T, TL>>(); return true;
             case "silu_bwd": use.Use<SiluBwd<T, TL>>(); return true;
             case "gelu_bwd": use.Use<GeluBwd<T, TL>>(); return true;

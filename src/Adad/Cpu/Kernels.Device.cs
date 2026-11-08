@@ -160,6 +160,8 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
 
     string IAttention<byte[]>.AttentionDecode<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) => AttentionDecode<TN>(a, q, k, v, o);
 
+    string IAttention<byte[]>.AttentionLse<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o, byte[] lse) => AttentionLse<TN>(a, q, k, v, o, lse);
+
     string IAttention<byte[]>.AttentionBackward<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] dO, byte[] dq, byte[] dk, byte[] dv) => AttentionBackward<TN>(a, q, k, v, dO, dq, dk, dv);
 
     // ---------------------------------------------------------------- optimizers, convolution, ctc

@@ -379,13 +379,17 @@ internal static class RowKernels
 
     public struct ScaleMaskSoftmax<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
-        public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
+        public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2) =>
+            Softmax(x, x2, pos, a, b, y);
+
+        // The softmax into y; returns the row's log-sum-exp m + log Σ e^(z − m) over the kept columns (−∞ when none).
+        internal static TLane Softmax(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, int pos, TLane a, TLane b, Span<TLane> y)
         {
             // z = a·x + mask into y over the columns kept (causal: columns past the row's position excluded, never read:
             // their outputs are 0 whatever x and the mask hold there).
             int n = x.Length, w = Vector<TLane>.Count, i = 0;
             int limit = TL.From(0).Equals(b) ? n : Math.Max(0, Math.Min(n, pos + 1)), vec = limit / w * w;
-            if (limit == 0) { y.Fill(TL.Zero); return; }
+            if (limit == 0) { y.Fill(TL.Zero); return TL.NegativeInfinity; }
             var av = new Vector<TLane>(a);
             if (x2.IsEmpty) for (; i < vec; i += w) (new Vector<TLane>(x[i..]) * av).CopyTo(y[i..]);
             else for (; i < vec; i += w) TL.Fma(new Vector<TLane>(x[i..]), av, new Vector<TLane>(x2[i..])).CopyTo(y[i..]);
@@ -394,6 +398,17 @@ internal static class RowKernels
             TLane sum = RowMath<TLane, TL>.ExpSum(y[..limit], m, y[..limit]);
             RowMath<TLane, TL>.Scale(y[..limit], TL.Zero, TL.Div(TL.From(1), sum), y[..limit]);
             if (limit < n) y[limit..].Fill(TL.Zero);
+            return TL.Add(m, RowMath<TLane, TL>.Log(sum));
+        }
+    }
+
+    // The softmax, and y2 (one lane value) = the row's log-sum-exp.
+    public struct ScaleMaskSoftmaxLse<TLane, TL> : IRowKernel<TLane, TL> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    {
+        public static void Row(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> x2, ReadOnlySpan<TLane> g, ReadOnlySpan<TLane> bt, TLane s, int pos, int row, TLane a, TLane b, Span<TLane> y, Span<TLane> y2)
+        {
+            TLane lse = ScaleMaskSoftmax<TLane, TL>.Softmax(x, x2, pos, a, b, y);
+            if (!y2.IsEmpty) y2[0] = lse;
         }
     }
 
@@ -467,6 +482,7 @@ internal sealed partial class Kernels
                 case "weight_norm_bwd": Go<TN, TLane, TL, RowKernels.WeightNormBwd<TLane, TL>>(); break;
                 case "rope": Go<TN, TLane, TL, RowKernels.Rope<TLane, TL>>(); break;
                 case "scale_mask_softmax": Go<TN, TLane, TL, RowKernels.ScaleMaskSoftmax<TLane, TL>>(); break;
+                case "scale_mask_softmax_lse": Go<TN, TLane, TL, RowKernels.ScaleMaskSoftmaxLse<TLane, TL>>(); break;
                 case "add_rms_norm": Go<TN, TLane, TL, RowKernels.AddRmsNorm<TLane, TL>>(); break;
                 case "add_layer_norm": Go<TN, TLane, TL, RowKernels.AddLayerNorm<TLane, TL>>(); break;
                 case "cross_entropy_bwd": Go<TN, TLane, TL, RowKernels.CrossEntropyBwd<TLane, TL>>(); break;

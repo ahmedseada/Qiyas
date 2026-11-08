@@ -14,7 +14,12 @@
 //                     dQ = scale·dS·K, dK = scale·dSᵀ·Q).
 //
 // Causal: query i (of Lq) sees keys j ≤ i + (Lk − Lq): the queries are the last Lq positions of the keys. A span per
-// query (spans[i] = the keys it sees, from 0) replaces the causal rule when given.
+// query (spans[i] = the keys it sees, from 0) replaces the causal rule when given; a window keeps its last keys.
+//
+// Grouped heads (KvHeads below Heads): a group's query heads are adjacent in Q and O, so every form runs the attention of
+// KvHeads heads of Group·Lq rows (AttentionArgs.Grouped), each reading its K and V's head; the backward's sums over a
+// group's rows into dK and dV are the products' own sums (one rounding). A cap on the scores (Softcap) takes the
+// composition: S = cap·tanh(scale·Q·Kᵀ / cap) by the map's softcap, its gradient by softcap_bwd from the products kept.
 
 using System.Buffers;
 using System.Numerics;
@@ -34,7 +39,9 @@ internal sealed partial class Kernels
     /// shape and type (once); returns the lane's name.</summary>
     public static string Attention<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) where TN : struct, IFloatAdad<TN>
     {
-        string key = $"{TN.Name}:{a.Heads}x{a.Lq}x{a.Lk}x{a.D}:{a.Causal}:{a.Spans is not null}:{a.SpanStarts is not null}";
+        a = a.Grouped();
+        if (a.Softcap > 0) return AttentionComposed<TN>(a, q, k, v, o);
+        string key = $"{TN.Name}:{a.Heads}x{a.Lq}x{a.Lk}x{a.D}:{a.Causal}:{a.Spans is not null}:{a.HasStarts}";
         bool fused;
         lock (s_fusedFaster)
         {
@@ -54,25 +61,33 @@ internal sealed partial class Kernels
     /// <summary>O for rows of queries: the composition; returns the lane's name.</summary>
     public static string AttentionComposed<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) where TN : struct, IFloatAdad<TN>
     {
-        var vis = new ComposeVisitor(a, q, k, v, o, null, null, null, null);
+        var vis = new ComposeVisitor(a.Grouped(), q, k, v, o, null, null, null, null, null);
         TN.Float(ref vis);
         return vis.Lane;
     }
 
-    // The composition in TN's float lane, the lane's own type TS holding the intermediates (S, P, dP, dS).
-    private struct ComposeVisitor(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[]? o, byte[]? dO, byte[]? dq, byte[]? dk, byte[]? dv) : IFloatLaneVisitor
+    /// <summary>O and each query's log-sum-exp of its scores (heads × Lq, as TN): the composition; returns the lane's name.</summary>
+    public static string AttentionLse<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o, byte[] lse) where TN : struct, IFloatAdad<TN>
+    {
+        var vis = new ComposeVisitor(a.Grouped(), q, k, v, o, lse, null, null, null, null);
+        TN.Float(ref vis);
+        return vis.Lane;
+    }
+
+    // The composition in TN's float lane, the lane's own type TS holding the intermediates (S, P, dP, dS, the rows' lse).
+    private struct ComposeVisitor(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[]? o, byte[]? lse, byte[]? dO, byte[]? dq, byte[]? dk, byte[]? dv) : IFloatLaneVisitor
     {
         public string Lane = "";
 
         public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
         {
             Lane = TL.Name;
-            var compose = new Compose<TN, TLane, TL>(a, q, k, v, o, dO, dq, dk, dv);
+            var compose = new Compose<TN, TLane, TL>(a, q, k, v, o, lse, dO, dq, dk, dv);
             TL.Own(ref compose);
         }
     }
 
-    private readonly struct Compose<TN, TLane, TL>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[]? o, byte[]? dO, byte[]? dq, byte[]? dk, byte[]? dv) : IOwnVisitor<TLane>
+    private readonly struct Compose<TN, TLane, TL>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[]? o, byte[]? lse, byte[]? dO, byte[]? dq, byte[]? dk, byte[]? dv) : IOwnVisitor<TLane>
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         public void Run<TS>() where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane>
@@ -83,10 +98,17 @@ internal sealed partial class Kernels
             bool lanes = TN.Granularity > 1;
             if (dO is null)
             {
-                if (!lanes) { Forward<TS, TN>(o!); return; }
-                var lo = new byte[a.QValues * size];
-                Forward<TS, TS>(lo);
-                StoreLanes<TN, TLane>(lo, o!, 0, a.QValues);
+                // The rows' log-sum-exp: lane values, stored as the type once.
+                var ll = lse is null ? null : new byte[(long)a.Heads * a.Lq * size];
+                if (!lanes) Forward<TS, TN>(o!, ll);
+                else
+                {
+                    var lo = new byte[a.QValues * size];
+                    Forward<TS, TS>(lo, ll);
+                    StoreLanes<TN, TLane>(lo, o!, 0, a.QValues);
+                }
+
+                if (ll is not null) StoreLanes<TN, TLane>(ll, lse!, 0, (long)a.Heads * a.Lq);
                 return;
             }
 
@@ -100,28 +122,37 @@ internal sealed partial class Kernels
             StoreLanes<TN, TLane>(lv, dv!, 0, a.KValues);
         }
 
-        // O (as TO) = softmax(scale·Q·Kᵀ + mask)·V per head.
-        private void Forward<TS, TO>(byte[] lo) where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TO : struct, IAdad<TO, TLane>
+        // O (as TO) = softmax(scale·Q·Kᵀ + mask)·V per head (the scores capped when there is a cap); the rows' log-sum-exp
+        // into ll (lane storage, heads × Lq) when asked.
+        private void Forward<TS, TO>(byte[] lo, byte[]? ll) where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TO : struct, IAdad<TO, TLane>
         {
-            var s = new byte[(long)a.Lq * a.Lk * Unsafe.SizeOf<TLane>()];
+            int size = Unsafe.SizeOf<TLane>(), pairs = (int)((long)a.Lq * a.Lk);
+            var s = new byte[(long)pairs * size];
+            var row = ll is null ? null : new byte[(long)a.Lq * size];
             var limits = Limits(a);
-            var softmax = RowOps.Find("scale_mask_softmax");
+            var softmax = RowOps.Find(ll is null ? "scale_mask_softmax" : "scale_mask_softmax_lse");
             var mask = SpanMask<TS>(a);
+            bool capped = a.Softcap > 0;
             for (int h = 0; h < a.Heads; h++)
             {
                 int qOff = (int)((long)h * a.Lq * a.D), kOff = (int)((long)h * a.Lk * a.D);
                 MatMul<TN, TN, TS, TLane, TLane, TL>(q, k, s, a.Lq, a.Lk, a.D, new Operands(qOff, false, kOff, true, 0));      // S = Q_h·K_hᵀ
-                RowOp<TS>(softmax, s, mask, null, null, null, limits, s, null, a.Lq, a.Lk, a.Scale, 1);
+                if (capped) MapFloat<TS>("softcap", s, null, null, s, pairs, a.Softcap, a.Scale);                             // cap·tanh(scale·S / cap)
+                RowOp<TS>(softmax, s, mask, null, null, null, limits, s, row, a.Lq, a.Lk, capped ? 1 : a.Scale, 1);
+                if (row is not null) Array.Copy(row, 0, ll!, (long)h * a.Lq * size, row.Length);
                 MatMul<TS, TN, TO, TLane, TLane, TL>(s, v, lo, a.Lq, a.D, a.Lk, new Operands(0, false, kOff, false, qOff));     // O_h = P·V_h
             }
         }
 
-        // dQ, dK, dV (as TO): P recomputed; dV = Pᵀ·dO, dP = dO·Vᵀ, dS = softmax_bwd(P, dP)·scale, dQ = dS·K, dK = dSᵀ·Q.
+        // dQ, dK, dV (as TO): P recomputed; dV = Pᵀ·dO, dP = dO·Vᵀ, dS = softmax_bwd(P, dP)·scale (with a cap: times
+        // softcap_bwd's slope at the products kept), dQ = dS·K, dK = dSᵀ·Q.
         private void Backward<TS, TO>(byte[] gq, byte[] gk, byte[] gv) where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TO : struct, IAdad<TO, TLane>
         {
-            int size = Unsafe.SizeOf<TLane>();
-            var p = new byte[(long)a.Lq * a.Lk * size];
+            int size = Unsafe.SizeOf<TLane>(), pairs = (int)((long)a.Lq * a.Lk);
+            var p = new byte[(long)pairs * size];
             var dp = new byte[p.Length];
+            bool capped = a.Softcap > 0;
+            var raw = capped ? new byte[p.Length] : null;
             var limits = Limits(a);
             var softmax = RowOps.Find("scale_mask_softmax");
             var softmaxBwd = RowOps.Find("softmax_bwd");
@@ -129,12 +160,14 @@ internal sealed partial class Kernels
             for (int h = 0; h < a.Heads; h++)
             {
                 int qOff = (int)((long)h * a.Lq * a.D), kOff = (int)((long)h * a.Lk * a.D);
-                MatMul<TN, TN, TS, TLane, TLane, TL>(q, k, p, a.Lq, a.Lk, a.D, new Operands(qOff, false, kOff, true, 0));
-                RowOp<TS>(softmax, p, mask, null, null, null, limits, p, null, a.Lq, a.Lk, a.Scale, 1);
+                MatMul<TN, TN, TS, TLane, TLane, TL>(q, k, raw ?? p, a.Lq, a.Lk, a.D, new Operands(qOff, false, kOff, true, 0));
+                if (capped) MapFloat<TS>("softcap", raw!, null, null, p, pairs, a.Softcap, a.Scale);
+                RowOp<TS>(softmax, p, mask, null, null, null, limits, p, null, a.Lq, a.Lk, capped ? 1 : a.Scale, 1);
                 MatMul<TS, TN, TO, TLane, TLane, TL>(p, dO!, gv, a.Lk, a.D, a.Lq, new Operands(0, true, qOff, false, kOff));       // dV = Pᵀ·dO
                 MatMul<TN, TN, TS, TLane, TLane, TL>(dO!, v, dp, a.Lq, a.Lk, a.D, new Operands(qOff, false, kOff, true, 0));     // dP = dO·Vᵀ
                 RowOp<TS>(softmaxBwd, p, dp, null, null, null, null, dp, null, a.Lq, a.Lk, 0, 0);                              // dS = P·(dP − Σ P·dP)
-                MapFloat<TS>("scale", dp, null, null, dp, (int)((long)a.Lq * a.Lk), a.Scale, 0);                               // · scale
+                if (capped) MapFloat<TS>("softcap_bwd", raw!, dp, null, dp, pairs, a.Softcap, a.Scale);                       // · the cap's slope
+                else MapFloat<TS>("scale", dp, null, null, dp, pairs, a.Scale, 0);                                             // · scale
                 MatMul<TS, TN, TO, TLane, TLane, TL>(dp, k, gq, a.Lq, a.D, a.Lk, new Operands(0, false, kOff, false, qOff));      // dQ = dS·K
                 MatMul<TS, TN, TO, TLane, TLane, TL>(dp, q, gk, a.Lk, a.D, a.Lq, new Operands(0, true, qOff, false, kOff));       // dK = dSᵀ·Q
             }
@@ -152,7 +185,7 @@ internal sealed partial class Kernels
     /// <summary>The additive mask (Lq × Lk, lane storage) excluding the keys below each query's span start; null when no span starts.</summary>
     private static byte[]? SpanMask<TS>(AttentionArgs a) where TS : struct, IFloatAdad<TS>
     {
-        if (a.SpanStarts is null) return null;
+        if (!a.HasStarts) return null;
         var m = new double[(long)a.Lq * a.Lk];
         for (int i = 0; i < a.Lq; i++) for (int j = 0; j < a.Start(i); j++) m[(long)i * a.Lk + j] = -400;
         return Stored.StoreValues<TS>(m);
@@ -167,8 +200,10 @@ internal sealed partial class Kernels
     /// this shape and type (once, as the forward's rows); returns the lane's name.</summary>
     public static string AttentionBackward<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] dO, byte[] dq, byte[] dk, byte[] dv) where TN : struct, IFloatAdad<TN>
     {
+        a = a.Grouped();
+        if (a.Softcap > 0) return AttentionBackwardComposed<TN>(a, q, k, v, dO, dq, dk, dv);
         if (FusedBackwardCpu is bool forced) return forced ? AttentionBackwardRows<TN>(a, q, k, v, dO, dq, dk, dv) : AttentionBackwardComposed<TN>(a, q, k, v, dO, dq, dk, dv);
-        string key = $"{TN.Name}:{a.Heads}x{a.Lq}x{a.Lk}x{a.D}:{a.Causal}:{a.Spans is not null}:{a.SpanStarts is not null}";
+        string key = $"{TN.Name}:{a.Heads}x{a.Lq}x{a.Lk}x{a.D}:{a.Causal}:{a.Spans is not null}:{a.HasStarts}";
         bool fused;
         lock (s_backFusedFaster)
         {
@@ -186,7 +221,7 @@ internal sealed partial class Kernels
     /// <summary>dQ, dK, dV: the composition; returns the lane's name.</summary>
     public static string AttentionBackwardComposed<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] dO, byte[] dq, byte[] dk, byte[] dv) where TN : struct, IFloatAdad<TN>
     {
-        var vis = new ComposeVisitor(a, q, k, v, null, dO, dq, dk, dv);
+        var vis = new ComposeVisitor(a.Grouped(), q, k, v, null, null, dO, dq, dk, dv);
         TN.Float(ref vis);
         return vis.Lane;
     }
@@ -196,6 +231,8 @@ internal sealed partial class Kernels
     /// <summary>O for a few queries against a long cache, each query on its own: scores, softmax and the context in the lane.</summary>
     public static string AttentionDecode<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) where TN : struct, IFloatAdad<TN>
     {
+        a = a.Grouped();
+        if (a.Softcap > 0) return AttentionComposed<TN>(a, q, k, v, o);
         var vis = new DecodeVisitor(a, q, k, v, o);
         TN.Float(ref vis);
         return vis.Lane;

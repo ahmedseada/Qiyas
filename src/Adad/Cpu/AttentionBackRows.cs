@@ -35,6 +35,8 @@ internal sealed partial class Kernels
     /// <summary>dQ, dK, dV by the fused rows and keys passes; returns the lane's name.</summary>
     public static string AttentionBackwardRows<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] dO, byte[] dq, byte[] dk, byte[] dv) where TN : struct, IFloatAdad<TN>
     {
+        a = a.Grouped();
+        if (a.Softcap > 0) return AttentionBackwardComposed<TN>(a, q, k, v, dO, dq, dk, dv);
         var vis = new BackRowsVisitor(a, q, k, v, dO, dq, dk, dv);
         TN.Float(ref vis);
         return vis.Lane;

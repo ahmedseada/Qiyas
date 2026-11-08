@@ -470,8 +470,10 @@ internal static partial class VkKernels
             }
 
             case "scale_mask_softmax":
+            case "scale_mask_softmax_lse":
             {
                 // z = a·x + mask; causal (b ≠ 0): columns past the row's position excluded; excluded values give 0 (a fully excluded row too).
+                // The log-sum-exp (lse): the row's value m + log Σ e^(z − m), −∞ where no column is kept.
                 var b = c.B;
                 var causal = c.Bs > 0;
                 var negInf = c.Lit(double.NegativeInfinity);
@@ -482,6 +484,7 @@ internal static partial class VkKernels
                 var sum = c.Reduce("add", () => c.Sel(Keep(), c.Exp(Z() - m), c.Lit(0)));
                 var scale = c.Sel(any, c.Rcp(sum), c.Lit(0));
                 c.Store(() => c.Sel(Keep(), c.Exp(Z() - m) * scale, c.Lit(0)));
+                if (op.RowOut) c.StoreRow(c.Sel(any, m + c.Log(sum), negInf));
                 return;
             }
 
