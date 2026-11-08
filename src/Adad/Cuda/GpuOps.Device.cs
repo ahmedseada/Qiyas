@@ -58,7 +58,7 @@ public sealed partial class GpuOps : IDevice<ulong, ulong>
 
     string IOptimizers<ulong>.Optimizer<TN>(OptimizerArgs a, ulong p, ulong g, ulong m, ulong v, int n) => Optimizer<TN>(a, p, g, m, v, n);
 
-    string IConvolution<ulong>.ConvBackward<TN>(ConvArgs a, ulong x, ulong w, ulong dy, ulong dx, ulong dw) => ConvBackward<TN>(a, x, w, dy, dx, dw);
+    string IConvolution<ulong>.ConvBackward<TN>(ConvArgs a, ulong x, ulong w, ulong dy, ulong dx, ulong dw, ulong db) => ConvBackward<TN>(a, x, w, dy, dx, dw, db);
 
     string ICtc<ulong>.Ctc<TN>(CtcArgs a, ulong x, ulong loss, ulong grad) => Ctc<TN>(a, x, loss, grad);
 

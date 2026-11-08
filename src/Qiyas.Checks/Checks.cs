@@ -721,7 +721,7 @@ internal static partial class Checks
                 ok &= Close(type, $"conv {a.Kh}x{a.Kw} s{a.Sh}", where, y, want, (int)a.YValues, a.Rows);
                 if (!Bench.Registry.IsFloat(type)) continue;                 // the backward needs the float lane's storage
                 var dy = Bench.Registry.Make(type, (int)a.YValues, 63, -1, 1);
-                var (wantX, wantW) = a.ReferenceBackward(Bench.Registry.Values(type, x, (int)a.XValues), Bench.Registry.Values(type, w, (int)a.WValues), Bench.Registry.Values(type, dy, (int)a.YValues));
+                var (wantX, wantW, _) = a.ReferenceBackward(Bench.Registry.Values(type, x, (int)a.XValues), Bench.Registry.Values(type, w, (int)a.WValues), Bench.Registry.Values(type, dy, (int)a.YValues));
                 var dx = new byte[x.Length];
                 var dw = new byte[w.Length];
                 Bench.Registry.WithFloat(type, new ConvBackwardRun(ops, a, x, w, dy, dx, dw));
@@ -762,7 +762,7 @@ internal static partial class Checks
                 // equal bit for bit to the composition's (the columns written, then the same kernel).
                 if (ops is not null || !Bench.Registry.IsFloat(type)) continue;
                 var dy = Bench.Registry.Make(type, (int)a.YValues, 66, -1, 1);
-                var (_, wantW) = a.ReferenceBackward(Bench.Registry.Values(type, x, (int)a.XValues), Bench.Registry.Values(type, w, (int)a.WValues), Bench.Registry.Values(type, dy, (int)a.YValues));
+                var (_, wantW, _) = a.ReferenceBackward(Bench.Registry.Values(type, x, (int)a.XValues), Bench.Registry.Values(type, w, (int)a.WValues), Bench.Registry.Values(type, dy, (int)a.YValues));
                 byte[] dxF = new byte[x.Length], dwF = new byte[w.Length], dxC = new byte[x.Length], dwC = new byte[w.Length];
                 Bench.Registry.WithFloat(type, new ConvBackwardModeRun(a, x, w, dy, dxF, dwF, dxC, dwC));
                 string back = $"conv_bwd fused {a.C}x{a.H}x{a.W}>{a.OC} {a.Kh}x{a.Kw} s{a.Sh} d{a.Dh}";
@@ -775,7 +775,8 @@ internal static partial class Checks
             }
         }
 
-        if (ok) Console.WriteLine($"check convolution            {where,-6} every type{(blocks ? "" : " but the block formats")}: forward and the backward pair within the products' rounding; the fused forward equal to the composition through the same kernel{(ops is null ? ", and the backward with dw's columns from the image" : "")}");
+        ok &= ConvGeneral(ops, where, blocks);
+        if (ok) Console.WriteLine($"check convolution            {where,-6} every type{(blocks ? "" : " but the block formats")}: forward and the backward pair within the products' rounding; the fused forward equal to the composition through the same kernel{(ops is null ? ", and the backward with dw's columns from the image" : "")}; every float type over images, groups, uneven pads, a bias and an activation, and their backward (dx, dw, db)");
         return ok;
     }
 
@@ -848,7 +849,7 @@ internal static partial class Checks
             if (ops is null) { Kernels.Conv<TN>(a, x, w, y); return true; }
             ulong dX = ops.Rent(x.Length + 16), dW = ops.Rent(w.Length + 16), dY = ops.Rent(y.Length + 16);
             ops.Upload(x, dX); ops.Upload(w, dW);
-            ops.Conv<TN>(a, dX, dW, dY);
+            ops.Conv<TN>(a, dX, dW, 0, dY);
             ops.Synchronize();
             ops.Download(dY, y);
             ops.Return(dX); ops.Return(dW); ops.Return(dY);
@@ -863,7 +864,7 @@ internal static partial class Checks
             if (ops is null) { Kernels.ConvBackward<TN>(a, x, w, dy, dx, dw); return true; }
             ulong dX = ops.Rent(x.Length + 16), dW = ops.Rent(w.Length + 16), dY = ops.Rent(dy.Length + 16), gx = ops.Rent(dx.Length + 16), gw = ops.Rent(dw.Length + 16);
             ops.Upload(x, dX); ops.Upload(w, dW); ops.Upload(dy, dY);
-            ops.ConvBackward<TN>(a, dX, dW, dY, gx, gw);
+            ops.ConvBackward<TN>(a, dX, dW, dY, gx, gw, 0);
             ops.Synchronize();
             ops.Download(gx, dx); ops.Download(gw, dw);
             ops.Return(dX); ops.Return(dW); ops.Return(dY); ops.Return(gx); ops.Return(gw);

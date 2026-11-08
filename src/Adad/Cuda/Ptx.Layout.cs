@@ -973,12 +973,13 @@ internal static partial class Ptx
         return d;
     }
 
-    // OH or OW of a convolution's output from the twelve parameters (C H W kh kw sh sw ph pw dh dw).
+    // OH or OW of a convolution's output from its parameters (C H W kh kw sh sw ph pw dh dw 0 pb pr).
     private static string OutWidth(PtxBuilder b, string[] p, bool height)
     {
-        string size = height ? p[1] : p[2], k = height ? p[3] : p[4], s = height ? p[5] : p[6], pad = height ? p[7] : p[8], d = height ? p[9] : p[10];
+        // The bottom or right pad at p[12], p[13] (LayoutArgs.KernelP gives them).
+        string size = height ? p[1] : p[2], k = height ? p[3] : p[4], s = height ? p[5] : p[6], pad = height ? p[7] : p[8], d = height ? p[9] : p[10], end = height ? p[12] : p[13];
         string t = b.R(), u = b.R();
-        b.L($"shl.b32 {t}, {pad}, 1;");
+        b.L($"add.u32 {t}, {pad}, {end};");
         b.L($"add.u32 {t}, {t}, {size};");
         b.L($"sub.u32 {u}, {k}, 1;");
         b.L($"mul.lo.u32 {u}, {u}, {d};");

@@ -55,12 +55,21 @@ public interface IAdad<TSelf> where TSelf : struct, IAdad<TSelf>
 
     /// <summary>Runs <paramref name="visitor"/> with the cheapest lane in which sums of products within <paramref name="bounds"/> are exact.</summary>
     static abstract void Sum<TV>(ref TV visitor, in Bounds bounds) where TV : struct, ISumVisitor;
+
+    /// <summary>Runs the visitor with the type's float lane where it has one (IFloatAdad: true), else nothing (false).</summary>
+    static virtual bool TryFloat<TV>(ref TV visitor) where TV : struct, IFloatLaneVisitor => false;
 }
 
 /// <summary>A float number: the lane its row operations (softmax, norms) take.</summary>
 public interface IFloatAdad<TSelf> : IAdad<TSelf> where TSelf : struct, IFloatAdad<TSelf>
 {
     static abstract void Float<TV>(ref TV visitor) where TV : struct, IFloatLaneVisitor;
+
+    static bool IAdad<TSelf>.TryFloat<TV>(ref TV visitor)
+    {
+        TSelf.Float(ref visitor);
+        return true;
+    }
 }
 
 public interface IAdad<TSelf, TLane> : IAdad<TSelf>

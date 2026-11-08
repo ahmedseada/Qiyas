@@ -53,10 +53,11 @@ internal static partial class VkKernels
         }
     }
 
-    /// <summary>A layout operation's output as f, a thread per stored word (values past the count stored as zero).</summary>
-    public static SpvKernel Layout(Vulkan vk, Fmt f, Lane lane, string name)
+    /// <summary>A layout operation's output as f, a thread per stored word (values past the count stored as zero); inFmt: the
+    /// inputs' format where it is not the output's (lane storage, an intermediate's).</summary>
+    public static SpvKernel Layout(Vulkan vk, Fmt f, Lane lane, string name, Fmt? inFmt = null)
     {
-        var b = new Spv($"layout_{name}_{f.Name}_{lane.Name}", Threads, vk.Controls);
+        var b = new Spv($"layout_{name}_{f.Name}_{lane.Name}{(inFmt is null ? "" : "_i" + inFmt.Name)}", Threads, vk.Controls);
         var a = new LayoutIn(b);
         var gid = b.GlobalX;
         var natural = f.Natural;
@@ -72,7 +73,7 @@ internal static partial class VkKernels
                 var v = b.Min(at, last);
                 var r = v / a.Cols;
                 var c = v - r * a.Cols;
-                var value = LayoutValue(b, f, lane, name, a, r, c, v);
+                var value = LayoutValue(b, inFmt ?? f, lane, name, a, r, c, v);
                 var stored = lane.Name == natural.Name ? value : Codec.Convert(b, lane, value, natural);
                 word = Codec.Pack(b, f, b.Select(at < a.Count, stored, b.C(nk, 0)), natural, i, word);
             }
@@ -149,7 +150,8 @@ internal static partial class VkKernels
     internal static (V Src, V Inside) Im2colAt(Spv b, V[] p, V r, V c)
     {
         V kw = p[4], kh = p[3], H = p[1], W = p[2];
-        var OW = PoolSize(p[2], p[4], p[6], p[8], p[10]);
+        // The layout's parameters give the right pad (LayoutArgs.KernelP); the product's (ConvArgs.P's twelve) are symmetric.
+        var OW = p.Length > 13 ? ConvSize(p[2], p[4], p[6], p[8], p[13], p[10]) : PoolSize(p[2], p[4], p[6], p[8], p[10]);
         var ow = c % OW;
         var oh = c / OW;
         var bb = r % kw;
@@ -184,6 +186,9 @@ internal static partial class VkKernels
         up = b.Select(up * s >= size + pad, up, up + 1);
         return b.Select(cm != 0, up, floor);
     }
+
+    // A convolution's output size with its leading and trailing pads (LayoutArgs.ConvOut): (pad + end + size − (k − 1)·d − 1) / s + 1.
+    private static V ConvSize(V size, V k, V s, V pad, V end, V d) => (pad + end + size - (k - 1) * d - 1) / s + 1;
 
     // LayoutArgs.PoolDivisor: window (oh, ow)'s divisor, its `inside` count or, counting the pads (p[12] ≠ 0), its positions up
     // to H + ph, W + pw (signed: a window may start in the leading pad).
@@ -317,8 +322,8 @@ internal static partial class VkKernels
             {
                 // Output (ch, ih, iw = c), r = ch·H + ih: Σ over (a, bb) with (ih + ph − a·dh) = oh·sh, (iw + pw − bb·dw) = ow·sw in range.
                 V H = p[1], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8], dh = p[9], dw = p[10];
-                var OW = PoolSize(p[2], p[4], p[6], p[8], p[10]);
-                var OH = PoolSize(p[1], p[3], p[5], p[7], p[9]);
+                var OW = ConvSize(p[2], p[4], p[6], p[8], p[13], p[10]);
+                var OH = ConvSize(p[1], p[3], p[5], p[7], p[12], p[9]);
                 var ih = r % H;
                 var ch = r / H;
                 var plane = OH * OW;

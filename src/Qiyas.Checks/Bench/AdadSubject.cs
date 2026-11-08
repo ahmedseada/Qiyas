@@ -397,7 +397,7 @@ public sealed class AdadSubject : IBenchSubject
         public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IAdad<TN, float>
         {
             TB dX = s.In(x), dW = s.In(w), dY = s.Out(y);
-            return s.Run(() => s.D.Conv<TN>(a, dX, dW, dY));
+            return s.Run(() => s.D.Conv<TN>(a, dX, dW, default, dY));
         }
     }
 
@@ -408,7 +408,7 @@ public sealed class AdadSubject : IBenchSubject
         public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
         {
             TB dX = s.In(x), dW = s.In(w), dY = s.In(dy), gx = s.Out(dx), gw = s.Out(dw);
-            return s.Run(() => s.D.ConvBackward<TN>(a, dX, dW, dY, gx, gw));
+            return s.Run(() => s.D.ConvBackward<TN>(a, dX, dW, dY, gx, gw, default));
         }
     }
 

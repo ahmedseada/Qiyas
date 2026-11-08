@@ -13,7 +13,11 @@ namespace Adad.Vulkan;
 public sealed partial class VulkanOps
 {
     /// <summary>A layout operation (LayoutArgs.Names) from x (and the index array, and x2) into output, all on the device. Returns the lane's name.</summary>
-    public string Layout<TN>(LayoutArgs k, ulong x, ulong idx, ulong output, ulong x2) where TN : struct, IAdad<TN>
+    public string Layout<TN>(LayoutArgs k, ulong x, ulong idx, ulong output, ulong x2) where TN : struct, IAdad<TN> => Layout<TN>(k, x, idx, output, x2, null);
+
+    /// <summary>inFmt: the inputs' format where it is not the output's (a composition's lane storage, or the type's read into
+    /// lane storage), the lane its natural one.</summary>
+    internal string Layout<TN>(LayoutArgs k, ulong x, ulong idx, ulong output, ulong x2, Fmt? inFmt) where TN : struct, IAdad<TN>
     {
         k = k.ForKernels();
         var f = Fmt.Of<TN>();
@@ -21,7 +25,8 @@ public sealed partial class VulkanOps
         // A six-dimensional view takes its own kernel (the four-dimensional one keeps its three divisions a value).
         string kn = k.Name == "strided" && k.P.Length == 13 ? "strided6" : k.Name;
         Lane lane;
-        if (LayoutArgs.Sums(k.Name))
+        if (inFmt is not null) lane = inFmt.Natural;
+        else if (LayoutArgs.Sums(k.Name))
         {
             var (lo, hi) = Range<TN>(x, k.InputCount);
             var (lo2, hi2) = x2 != 0 && k.Name == "depthwise_conv" ? Range<TN>(x2, k.P[0] * k.P[3] * k.P[4]) : (1, 1);
@@ -53,10 +58,10 @@ public sealed partial class VulkanOps
             }
 
             if (k.Count > 0 && f.IsBlock)
-                Encode(f, k.Count, vk.Cached($"block_layout:{kn}:{f.Name}:{lane.Name}", () => VkKernels.BlockLayout(vk, f, lane, kn)), output, VkKernels.LayoutSlots(x, x2, idx, aux, output, k.Count, cols, k.P));
+                Encode(f, k.Count, vk.Cached($"block_layout:{kn}:{f.Name}:{lane.Name}:{inFmt?.Name}", () => VkKernels.BlockLayout(vk, f, lane, kn, inFmt)), output, VkKernels.LayoutSlots(x, x2, idx, aux, output, k.Count, cols, k.P));
             else if (k.Count > 0)
             {
-                var fn = vk.Cached($"layout:{kn}:{f.Name}:{lane.Name}", () => VkKernels.Layout(vk, f, lane, kn));
+                var fn = vk.Cached($"layout:{kn}:{f.Name}:{lane.Name}:{inFmt?.Name}", () => VkKernels.Layout(vk, f, lane, kn, inFmt));
                 vk.Launch(fn, Groups(f.Words(k.Count), VkKernels.Threads), 1, VkKernels.LayoutSlots(x, x2, idx, aux, output, k.Count, cols, k.P));
             }
         }

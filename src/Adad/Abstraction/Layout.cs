@@ -148,6 +148,7 @@ public sealed class LayoutArgs
     {
         "strided" => StridedKernel(p),
         "interpolate_nearest" or "interpolate_bilinear" or "interpolate_nearest_bwd" or "interpolate_bilinear_bwd" => InterpolateKernel(name, p),
+        "im2col" or "col2im" => ConvKernel(p),
         // The pools take positions 9 and 10 (depthwise_conv's dilations) only so ceil and the pad count keep one order: 1.
         "maxpool" or "avgpool" or "maxpool_bwd" or "avgpool_bwd" when p.Length > 9 && (p[9] != 1 || p[10] != 1)
             => throw new ArgumentException($"{name}: the pools' dilations (P[9], P[10]) are 1"),
@@ -252,11 +253,18 @@ public sealed class LayoutArgs
     /// <summary>An adaptive window along one axis: [⌊i·n/o⌋, ⌈(i + 1)·n/o⌉).</summary>
     public static (int From, int To) Adaptive(int i, int n, int o) => (i * n / o, ((i + 1) * n + o - 1) / o);
 
+    /// <summary>A convolution's (im2col's) output size from C H W kh kw sh sw ph pw dh dw [0 pb pr]: the bottom and right pads
+    /// (ONNX's four pads; ph and pw where not given) only add windows, never move them: (H + ph + pb − dh·(kh − 1) − 1) / sh + 1.</summary>
     public static (int OH, int OW) ConvOut(int[] p)
     {
         int H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8], dh = p[9], dw = p[10];
-        return ((H + 2 * ph - dh * (kh - 1) - 1) / sh + 1, (W + 2 * pw - dw * (kw - 1) - 1) / sw + 1);
+        int pb = p.Length > 13 ? p[12] : ph, pr = p.Length > 13 ? p[13] : pw;
+        return ((H + ph + pb - dh * (kh - 1) - 1) / sh + 1, (W + pw + pr - dw * (kw - 1) - 1) / sw + 1);
     }
+
+    // im2col's and col2im's parameters as the kernels take them: fourteen, the bottom and right pads given.
+    private static int[] ConvKernel(int[] p) =>
+        p.Length > 13 ? p : [.. p.Take(11), 0, p[7], p[8]];
 
     /// <summary>The float64 reference of the operation on the input's values (x2: the second input's).</summary>
     public static double[] Reference(string name, double[] x, int[]? index, int[] p, int count, double[]? x2 = null)

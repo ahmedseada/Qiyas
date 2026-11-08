@@ -364,15 +364,15 @@ internal static partial class VkKernels
         });
 
     /// <summary>A layout operation's output (LayoutValue of the output index). The layout's slots (LayoutSlots: 0 .. 13).</summary>
-    public static SpvKernel BlockLayout(Vulkan vk, Fmt f, Lane lane, string name) =>
-        BlockEncoder(vk, f, $"layout_{name}_{lane.Name}", b =>
+    public static SpvKernel BlockLayout(Vulkan vk, Fmt f, Lane lane, string name, Fmt? inFmt = null) =>
+        BlockEncoder(vk, f, $"layout_{name}_{lane.Name}{(inFmt is null ? "" : "_i" + inFmt.Name)}", b =>
         {
             var a = new LayoutIn(b);
             return (at, _) =>
             {
                 var r = at / a.Cols;
                 var c = at - r * a.Cols;
-                var value = LayoutValue(b, f, lane, name, a, r, c, at);
+                var value = LayoutValue(b, inFmt ?? f, lane, name, a, r, c, at);
                 return value.Kind == K.F32 ? value : b.Convert(value, K.F32);
             };
         });

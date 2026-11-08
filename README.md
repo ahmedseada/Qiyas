@@ -45,7 +45,7 @@ does best for it, chosen per operation from the data itself. No type is fixed an
   (half-pixel, align-corners or asymmetric, given scales) and its backward, shift, pad, the pools (ceil mode, counting the
   pads) and their backward, depthwise convolution); image resampling by Pillow's filters with a per-channel normalization
   (Pillow's 8-bit passes bit for bit, or float passes from any input type); products on views (transposed, batched) and the matmul backward; attention
-  (rows by the composition or the fused rows, whichever is measured faster; causal, spans, decode, backward); convolution forward and backward; the optimizer steps; LSTM and GRU cells and
+  (rows by the composition or the fused rows, whichever is measured faster; causal, spans, decode, backward); convolution forward and backward (images, groups, uneven pads, a bias and a fused activation; dx, dw, db); the optimizer steps; LSTM and GRU cells and
   steps with their backward passes, LSTM and GRU sequences with theirs; top-k, pick, sampling, routing, cross-entropy and ctc (loss and
   gradient); and the block formats and bool
   through all of it. What is still open is listed in COVERAGE.md's "State" and marked **todo** in its rows.

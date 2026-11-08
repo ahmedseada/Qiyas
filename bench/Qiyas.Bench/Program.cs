@@ -594,7 +594,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         {
             if (!Registry.IsFloat(type)) return;
             var dy = Registry.Make(type, (int)a.YValues, 63, -1, 1);
-            var (wantX, _) = a.ReferenceBackward(Registry.Values(type, x, (int)a.XValues), Registry.Values(type, w, (int)a.WValues), Registry.Values(type, dy, (int)a.YValues));
+            var (wantX, _, _) = a.ReferenceBackward(Registry.Values(type, x, (int)a.XValues), Registry.Values(type, w, (int)a.WValues), Registry.Values(type, dy, (int)a.YValues));
             var dw = new byte[w.Length];
             Measure(device, name, type, shape, wantX, (s, dx) => s.Conv(device, type, a, x, w, dy, dx, dw), x.Length);
             return;
