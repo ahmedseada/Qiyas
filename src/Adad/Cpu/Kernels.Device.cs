@@ -134,6 +134,8 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
 
     string IProducts<byte[]>.ExpandScaled<TN, TW>(ScaledWeight w, byte[] codes, byte[] scales, byte[]? zeros, byte[] output) => ExpandScaled<TN, TW>(w, codes, scales, zeros, output);
 
+    string IProducts<byte[]>.Quantize<TN, TW>(ScaledWeight w, byte[] values, byte[] codes, byte[] scales, byte[]? zeros) => Quantize<TN, TW>(w, values, codes, scales, zeros);
+
     // ---------------------------------------------------------------- experts
 
     string IExperts<byte[], int[]>.RouteTopK<TN>(byte[] p, int tokens, int experts, int k, bool normalize, byte[] weights, int[] offsets, int[] tokenOfRow, int[] slotRow) =>

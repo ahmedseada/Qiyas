@@ -135,6 +135,42 @@ public sealed partial class VulkanOps
         return lane.Name;
     }
 
+    /// <summary>The scaled weight's codes, scales and zero points from its values (IProducts.Quantize; Kernels.Scaled.cs):
+    /// the scales and zero points lane values, stored as TN before the next pass reads them. Returns the lane's name.</summary>
+    public string Quantize<TN, TW>(ScaledWeight w, ulong values, ulong codes, ulong scales, ulong zeros) where TN : struct, IFloatAdad<TN> where TW : struct, IAdad<TW>
+    {
+        w.Validate();
+        Fmt f = Fmt.Of<TN>(), fw = Fmt.Of<TW>();
+        ScaledWeight.ValidateCodes(fw, zeros != 0);
+        var lane = RowLane(f);
+        if (w.Values == 0) return lane.Name;
+        bool z = zeros != 0, own = Own(f);
+        ulong min = Slot(lane, TW.Min), max = Slot(lane, TW.Max);
+        var rented = new List<ulong>();
+        ulong Rent(long bytes) { ulong p = vk.Rent(Math.Max(16, bytes)); rented.Add(p); return p; }
+        try
+        {
+            ulong sl = own ? scales : Rent(w.Scales * lane.Size), lows = z ? Rent(w.Scales * lane.Size) : 0;
+            var range = vk.Cached($"quantize_range:{f.Name}:{lane.Name}:{z}", () => VkKernels.QuantizeRange(vk, f, lane, z));
+            vk.Launch(range, (uint)w.Scales, 1, values, sl, lows, Vulkan.U(w.N), Vulkan.U(w.K), Vulkan.U(w.BlockRows), Vulkan.U(w.BlockColumns), Vulkan.U(w.ScaleColumns), min, max);
+            if (!own) Back(f, lane, sl, scales, w.Scales);
+            if (z)
+            {
+                ulong zl = own ? zeros : Rent(w.Scales * lane.Size);
+                var zfn = vk.Cached($"quantize_zeros:{f.Name}:{lane.Name}", () => VkKernels.QuantizeZeros(vk, f, lane));
+                vk.Launch(zfn, Groups(w.Scales, VkKernels.Threads), 1, scales, lows, zl, Vulkan.U((int)w.Scales), min, max);
+                if (!own) Back(f, lane, zl, zeros, w.Scales);
+            }
+
+            var cfn = vk.Cached($"quantize_codes:{f.Name}:{fw.Name}:{lane.Name}:{z}", () => VkKernels.QuantizeCodes(vk, f, fw, lane, z));
+            vk.Launch(cfn, Groups(fw.Words(w.Values), VkKernels.Threads), 1, values, scales, zeros, codes, Vulkan.U((int)w.Values), Vulkan.U(w.K),
+                Vulkan.U(w.BlockRows), Vulkan.U(w.BlockColumns), Vulkan.U(w.ScaleColumns), min, max);
+        }
+        finally { foreach (var p in rented) vk.Return(p); }
+
+        return lane.Name;
+    }
+
     // After a product's sums (lane storage, the view's C contiguous): the low-rank term's into sums of its own, then the
     // store (aux first where it is written).
     private void EpilogueStore(Fmt f, Lane lane, ProductView v, ProductEpilogue e, StoreTerms terms, ProductTerms<ulong> t, ulong sums, ulong c, Func<long, ulong> rent)

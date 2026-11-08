@@ -375,6 +375,7 @@ internal static class Codec
         string d = to.NewReg(b);
         if (from.IsFloat && to.IsFloat) b.L(to.Wide ? $"cvt.f64.f32 {d}, {v};" : $"cvt.rn.f32.f64 {d}, {v};");
         else if (!from.IsFloat && to.IsFloat) b.L($"cvt.rn.{to.Op}.{from.Op} {d}, {v};");
+        else if (from.IsFloat && !to.IsFloat) b.L($"cvt.rni.{to.Op}.{from.Op} {d}, {v};");          // to the nearest (ties to even), held to the lane's range
         else if (!from.IsFloat && !to.IsFloat)
         {
             if (from.Size == to.Size) b.L($"mov.{to.Reg} {d}, {v};");

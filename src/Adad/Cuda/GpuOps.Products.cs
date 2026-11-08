@@ -140,6 +140,43 @@ public sealed partial class GpuOps
         return lane.Name;
     }
 
+    /// <summary>The scaled weight's codes, scales and zero points from its values (IProducts.Quantize; Ptx.QuantizeRange,
+    /// QuantizeZeros, QuantizeCodes): the scales and zero points lane values, stored as TN before the next pass reads them.
+    /// Returns the lane's name.</summary>
+    public string Quantize<TN, TW>(ScaledWeight w, ulong values, ulong codes, ulong scales, ulong zeros) where TN : struct, IFloatAdad<TN> where TW : struct, IAdad<TW>
+    {
+        w.Validate();
+        Fmt f = Fmt.Of<TN>(), fw = Fmt.Of<TW>();
+        ScaledWeight.ValidateCodes(fw, zeros != 0);
+        var lane = RowLane(f);
+        if (w.Values == 0) return lane.Name;
+        bool z = zeros != 0, own = f.Is("float32") || f.Is("float64");
+        ulong Min() => lane.Wide ? Gpu.D(TW.Min) : Gpu.F((float)TW.Min);
+        ulong Max() => lane.Wide ? Gpu.D(TW.Max) : Gpu.F((float)TW.Max);
+        var rented = new List<ulong>();
+        ulong Rent(long bytes) { ulong p = gpu.Rent(Math.Max(16, bytes)); rented.Add(p); return p; }
+        try
+        {
+            ulong sl = own ? scales : Rent(w.Scales * lane.Size), lows = z ? Rent(w.Scales * lane.Size) : 0;
+            var range = gpu.Cached($"quantize_range:{f.Name}:{lane.Name}:{z}", (out string e) => Ptx.QuantizeRange(gpu, f, lane, z, out e));
+            Gpu.Launch(range, (uint)w.Scales, 1, 256, 1, 0, values, sl, lows, Gpu.U(w.N), Gpu.U(w.K), Gpu.U(w.BlockRows), Gpu.U(w.BlockColumns), Gpu.U(w.ScaleColumns), Min(), Max());
+            FromLane(f, sl, scales, w.Scales);
+            if (z)
+            {
+                ulong zl = own ? zeros : Rent(w.Scales * lane.Size);
+                var zfn = gpu.Cached($"quantize_zeros:{f.Name}:{lane.Name}", (out string e) => Ptx.QuantizeZeros(gpu, f, lane, out e));
+                Gpu.Launch(zfn, Grid(w.Scales, 256), 1, 256, 1, 0, scales, lows, zl, Gpu.U((int)w.Scales), Min(), Max());
+                FromLane(f, zl, zeros, w.Scales);
+            }
+
+            var cfn = gpu.Cached($"quantize_codes:{f.Name}:{fw.Name}:{lane.Name}:{z}", (out string e) => Ptx.QuantizeCodes(gpu, f, fw, lane, z, out e));
+            LaunchEach(cfn, fw, w.Values, values, scales, zeros, codes, Gpu.U((int)w.Values), Gpu.U(w.K), Gpu.U(w.BlockRows), Gpu.U(w.BlockColumns), Gpu.U(w.ScaleColumns), Min(), Max());
+        }
+        finally { foreach (var p in rented) gpu.Return(p); }
+
+        return lane.Name;
+    }
+
     // After a product's sums (lane storage, the view's C contiguous): the low-rank term's into sums of its own, then the
     // store (aux first where it is written).
     private void EpilogueStore(Fmt f, Lane lane, ProductView v, ProductEpilogue e, StoreTerms terms, ProductTerms<ulong> t, ulong sums, ulong c)

@@ -5,10 +5,15 @@
 // the product's packing reads the codes (ScaledSource: each output's row of codes read once into TW's element-wise lane,
 // taken into the float lane, the zero subtracted and the scale multiplied there, laid into the packed strips): no W in
 // memory but its codes and the packed panel the product holds of any operand; the sums in the lane, then the epilogue's
-// store (Epilogue.cs). ExpandScaled makes the same values a tile at a time and stores them as TN.
+// store (Epilogue.cs). ExpandScaled makes the same values a tile at a time and stores them as TN. Quantize is its inverse:
+// each block's range and scale in the lane (stored as TN, read back), the zero points from the stored scales, then each
+// code made in the lane and rounded to TW once (Convert's rule: an f64 lane's value to a narrow float rounded to odd at
+// float32 first).
 
 using System.Buffers;
+using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Adad.Abstraction;
 
 namespace Adad.Cpu;
@@ -30,6 +35,128 @@ internal sealed partial class Kernels
     {
         w.Validate();
         return Mixed<TN, ExpandCall<TW>>(new ExpandCall<TW>(w, codes, scales, zeros, output));
+    }
+
+    /// <summary>The scaled weight's codes, scales and zero points from its values (IProducts.Quantize); returns the lane's name.</summary>
+    public static string Quantize<TN, TW>(ScaledWeight w, byte[] values, byte[] codes, byte[] scales, byte[]? zeros) where TN : struct, IFloatAdad<TN> where TW : struct, IAdad<TW>
+    {
+        w.Validate();
+        ScaledWeight.ValidateCodes(Fmt.Of<TW>(), zeros is not null);
+        return Mixed<TN, QuantizeCall<TW>>(new QuantizeCall<TW>(w, values, codes, scales, zeros));
+    }
+
+    private readonly struct QuantizeCall<TW>(ScaledWeight w, byte[] values, byte[] codes, byte[] scales, byte[]? zeros) : IMixed where TW : struct, IAdad<TW>
+    {
+        public string Run<TN, TS, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+        {
+            if (w.Values == 0) return TL.Name;
+            TLane min = TL.From(TW.Min), max = TL.From(TW.Max);
+            // Each block's range and scale, the scales stored as TN once and read back as stored.
+            var s = new TLane[w.Scales];
+            var lows = new TLane[w.Scales];
+            Team.For((int)w.Scales, 1, w.Values * 2, new QuantizeRangeBody<TN, TLane, TL>(w, values, zeros is not null, min, max, s, lows));
+            TN.Store(s, scales, 0);
+            TN.Load(scales, 0, s);
+            TLane[]? z = null;
+            if (zeros is not null)
+            {
+                // The zero points from the stored scales: round(min − lo / scale) held to TW's range (0 where the scale is 0).
+                z = new TLane[w.Scales];
+                for (int i = 0; i < z.Length; i++)
+                    z[i] = Widths.Compare(s[i], TL.Zero) > 0 ? Held<TLane, TL>(TL.Round(new Vector<TLane>(TL.Sub(min, TL.Div(lows[i], s[i]))))[0], min, max) : TL.Zero;
+                TN.Store(z, zeros, 0);
+                TN.Load(zeros, 0, z);
+            }
+
+            var codesVisitor = new QuantizeVisitor<TN, TS, TLane, TL>(w, values, s, z, min, max, codes);
+            TW.Elementwise(ref codesVisitor);
+            return TL.Name;
+        }
+    }
+
+    // v held to [min, max].
+    private static TLane Held<TLane, TL>(TLane v, TLane min, TLane max) where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane> =>
+        Widths.Compare(v, min) < 0 ? min : Widths.Compare(v, max) > 0 ? max : v;
+
+    // Each block's range with 0, lo = min(x, 0) and hi = max(x, 0), over its rows' runs read into the lane; its scale
+    // max(hi, −lo) / max, or (hi − lo) / (max − min) with zero points.
+    private readonly struct QuantizeRangeBody<TN, TLane, TL>(ScaledWeight w, byte[] values, bool zeros, TLane min, TLane max, TLane[] scales, TLane[] lows) : Team.IBody
+        where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    {
+        public void Run(int first, int last)
+        {
+            var row = ArrayPool<TLane>.Shared.Rent(Math.Max(1, Math.Min(w.K, w.BlockColumns)));
+            try
+            {
+                for (int si = first; si < last; si++)
+                {
+                    var (r0, r1, c0, c1) = w.Block(si);
+                    int len = c1 - c0, lanes = Vector<TLane>.Count;
+                    Vector<TLane> vlo = Vector<TLane>.Zero, vhi = Vector<TLane>.Zero;
+                    TLane lo = TL.Zero, hi = TL.Zero;
+                    for (int r = r0; r < r1 && len > 0; r++)
+                    {
+                        TN.Load(values, (int)((long)r * w.K + c0), row.AsSpan(0, len));
+                        int c = 0;
+                        for (; c + lanes <= len; c += lanes) { var v = new Vector<TLane>(row.AsSpan(c)); vlo = Vector.Min(vlo, v); vhi = Vector.Max(vhi, v); }
+                        for (; c < len; c++) { if (Widths.Compare(row[c], lo) < 0) lo = row[c]; if (Widths.Compare(row[c], hi) > 0) hi = row[c]; }
+                    }
+
+                    for (int l = 0; l < lanes; l++) { if (Widths.Compare(vlo[l], lo) < 0) lo = vlo[l]; if (Widths.Compare(vhi[l], hi) > 0) hi = vhi[l]; }
+                    lows[si] = lo;
+                    scales[si] = zeros ? TL.Div(TL.Sub(hi, lo), TL.Sub(max, min)) : TL.Div(TL.Max(hi, TL.Sub(TL.Zero, lo)), max);
+                }
+            }
+            finally { ArrayPool<TLane>.Shared.Return(row); }
+        }
+    }
+
+    private readonly struct QuantizeVisitor<TN, TS, TLane, TL>(ScaledWeight w, byte[] values, TLane[] scales, TLane[]? zeros, TLane min, TLane max, byte[] codes) : ILaneVisitor
+        where TN : struct, IAdad<TN, TLane> where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    {
+        public void Run<TW, TLW, TLWL>() where TW : struct, IAdad<TW, TLW> where TLW : unmanaged where TLWL : struct, ILane<TLWL, TLW>
+        {
+            int n = (int)w.Values, size = Math.Max(Tile, (n / (Threads * 4) + Tile - 1) / Tile * Tile);
+            bool toOdd = Fmt.ConvertPlan(Fmt.Of<TS>(), Fmt.Of<TW>()).ToOdd;
+            Team.For(n, size, (long)n * 4, new QuantizeBody<TN, TW, TLW, TLane, TL>(w, values, scales, zeros, min, max, codes, toOdd));
+        }
+    }
+
+    // Aligned tiles of the codes (a stored word of TW written by one task): x / scale (+ the zero point) in the lane, held
+    // to TW's range, rounded to TW once.
+    private readonly struct QuantizeBody<TN, TW, TLW, TLane, TL>(ScaledWeight w, byte[] values, TLane[] scales, TLane[]? zeros, TLane min, TLane max, byte[] codes, bool toOdd) : Team.IBody
+        where TN : struct, IAdad<TN, TLane> where TW : struct, IAdad<TW, TLW> where TLW : unmanaged where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    {
+        public void Run(int first, int last)
+        {
+            Span<TLane> v = stackalloc TLane[Tile];
+            Span<TLW> raw = stackalloc TLW[Tile];
+            bool integer = !TW.IsFloat;
+            for (int at = first; at < last; at += Tile)
+            {
+                int len = Math.Min(Tile, last - at);
+                TN.Load(values, at, v[..len]);
+                for (int i = 0; i < len; i++)
+                {
+                    int r = (at + i) / w.K, c = (at + i) % w.K, si = w.ScaleAt(r, c);
+                    TLane s = scales[si], q = Widths.Compare(s, TL.Zero) > 0 ? TL.Div(v[i], s) : TL.Zero;
+                    if (integer) q = TL.Round(new Vector<TLane>(q))[0];
+                    if (zeros is not null) q = TL.Add(q, zeros[si]);
+                    v[i] = Held<TLane, TL>(q, min, max);
+                }
+
+                if (toOdd)
+                {
+                    // TW a float narrower than float32 from the f64 lane: its lane float32, the value rounded to odd there first.
+                    var f = MemoryMarshal.Cast<TLW, float>(raw);
+                    var d = MemoryMarshal.Cast<TLane, double>(v);
+                    for (int i = 0; i < len; i++) f[i] = ToOdd(d[i]);
+                }
+                else if (typeof(TLW) == typeof(float) || typeof(TLW) == typeof(double)) Widths.Load<TLane, TLW>(v[..len], raw[..len]);
+                else Widths.Store<TLane, TLW>(v[..len], raw[..len]);
+                TW.Store(raw[..len], codes, at);
+            }
+        }
     }
 
     // The scales as lane values, and the zero points negated (exact), each read once from TN.

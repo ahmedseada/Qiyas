@@ -25,6 +25,14 @@ public interface IProducts<TBuffer>
     /// <summary>output (N × K, TN) = the scaled weight's values, each made in TN's float lane and rounded to TN once.</summary>
     string ExpandScaled<TN, TW>(ScaledWeight w, TBuffer codes, TBuffer scales, TBuffer? zeros, TBuffer output) where TN : struct, IFloatAdad<TN> where TW : struct, IAdad<TW>;
 
+    /// <summary>The scaled weight's codes (TW), scales and zero points (TN) from its values (N × K, TN), ExpandScaled's inverse:
+    /// each block's range [lo, hi] = [min(x, 0), max(x, 0)] in TN's float lane, its scale max(hi, −lo) / TW.Max, or with zero
+    /// points (an integer TW) (hi − lo) / (TW.Max − TW.Min), stored as TN; the zero point round(TW.Min − lo / scale) from the
+    /// stored scale, held to TW's range, stored as TN; each code x / scale (+ the zero point) by the stored scale and zero
+    /// point, rounded to TW once (an integer's nearest, ties to even) and held to TW's range. A block of zeros: scale 0, its
+    /// codes the zero point (0). TW not a block format.</summary>
+    string Quantize<TN, TW>(ScaledWeight w, TBuffer values, TBuffer codes, TBuffer scales, TBuffer? zeros) where TN : struct, IFloatAdad<TN> where TW : struct, IAdad<TW>;
+
     /// <summary>dA = dC·Bᵀ (m × k) and dB = Aᵀ·dC (k × n) for C = A·B.</summary>
     string MatMulBackward<TN>(TBuffer a, TBuffer b, TBuffer dc, TBuffer da, TBuffer db, int m, int n, int k) where TN : struct, IAdad<TN>;
 

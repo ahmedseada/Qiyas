@@ -198,6 +198,39 @@ public sealed record ScaledWeight(int N, int K, int BlockRows, int BlockColumns,
         if (Values > int.MaxValue || Scales > int.MaxValue) throw new ArgumentException("scaled weight: past 2^31 values");
     }
 
+    /// <summary>The block (rows [R0, R1), columns [C0, C1)) scale si covers.</summary>
+    public (int R0, int R1, int C0, int C1) Block(int si)
+    {
+        int r0 = si / ScaleColumns * BlockRows, c0 = si % ScaleColumns * BlockColumns;
+        return (r0, Math.Min(N, r0 + BlockRows), c0, Math.Max(c0, Math.Min(K, c0 + BlockColumns)));
+    }
+
+    /// <summary>Whether codes of fw (zero points or not) can be made by Quantize: not a block format; zero points for an integer type only.</summary>
+    public static void ValidateCodes(Fmt fw, bool zeros)
+    {
+        if (fw.IsBlock) throw new ArgumentException($"quantize: codes of the block format {fw.Name}");
+        if (zeros && fw.IsFloat) throw new ArgumentException($"quantize: zero points for the float codes of {fw.Name}");
+    }
+
+    /// <summary>The float64 reference of each block's range (IProducts.Quantize's rule): lo = min(x, 0) and hi = max(x, 0)
+    /// over the block's values, and its scale from them, max(hi, −lo) / max, or with zero points (hi − lo) / (max − min).</summary>
+    public (double[] Scales, double[] Lows) QuantizeReference(double[] x, double min, double max, bool zeros)
+    {
+        var scales = new double[Scales];
+        var lows = new double[Scales];
+        for (int si = 0; si < Scales; si++)
+        {
+            var (r0, r1, c0, c1) = Block(si);
+            double lo = 0, hi = 0;
+            for (int r = r0; r < r1; r++)
+                for (int c = c0; c < c1; c++) { double v = x[(long)r * K + c]; lo = Math.Min(lo, v); hi = Math.Max(hi, v); }
+            lows[si] = lo;
+            scales[si] = zeros ? (hi - lo) / (max - min) : Math.Max(hi, -lo) / max;
+        }
+
+        return (scales, lows);
+    }
+
     /// <summary>The float64 reference of the weight's values (N × K).</summary>
     public double[] Reference(double[] codes, double[] scales, double[]? zeros)
     {
