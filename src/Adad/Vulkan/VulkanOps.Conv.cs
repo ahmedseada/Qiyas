@@ -12,7 +12,7 @@
 // composition would encode the columns as blocks (each window's values quantized again).
 // Images, groups, the bottom and right pads, a bias and an activation (the float types) take the general path (Conv.cs),
 // CUDA's: the columns of every image's channels into lane storage, a product an image and group into the lane's sums, then
-// y = act(sums + bias[f]) stored once (Kernels.ConvStore.cs); its backward: dcols = w_gᵀ·dy_g, dx = col2im(dcols); dy and
+// y = act(sums + bias[f]) stored once (Kernels.ProductStore.cs); its backward: dcols = w_gᵀ·dy_g, dx = col2im(dcols); dy and
 // the columns side by side over the images in the lane, dw_g = dy_g·cols_gᵀ, db = dy's rows times ones, stored once.
 using Adad.Abstraction;
 
@@ -47,15 +47,7 @@ public sealed partial class VulkanOps
                 for (int g = 0; g < a.Groups; g++)
                     Product(new ProductView(a.OCg, a.Cols, a.Rows, false, false), lane, w, f, (long)g * a.OCg * a.Rows, cols, lf, (long)(n * a.Groups + g) * a.Rows * a.Cols,
                         sums + (ulong)(((long)n * a.OC + g * a.OCg) * a.Cols * lane.Size));
-            bool b = bias != 0;
-            if (f.IsBlock)
-                Encode(f, a.YValues, vk.Cached($"block_conv_store:{f.Name}:{a.Act}:{b}", () => VkKernels.BlockConvStore(vk, f, a.Act, b)), y,
-                    sums, bias, Vulkan.U(a.Cols), Vulkan.U(a.OC), Vulkan.F((float)a.ActA));
-            else
-            {
-                var k = vk.Cached($"conv_store:{f.Name}:{lane.Name}:{a.Act}:{b}", () => VkKernels.ConvStore(vk, f, lane, a.Act, b));
-                vk.Launch(k, Groups(f.Words(a.YValues), VkKernels.Threads), 1, sums, bias, y, Vulkan.U((int)a.YValues), Vulkan.U(a.Cols), Vulkan.U(a.OC), Slot(lane, a.ActA));
-            }
+            ProductStore(f, lane, new StoreTerms(false, bias != 0, false, a.Act, null, false), sums, 0, bias, 0, 0, y, a.YValues, a.Cols, a.OC, a.ActA, 0);
         }
         finally { foreach (var p in rented) vk.Return(p); }
 

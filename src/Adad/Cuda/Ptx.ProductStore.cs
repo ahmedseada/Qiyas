@@ -1,37 +1,47 @@
 // Copyright (c) 2026 Ahmed Seada
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
-// The general convolution's store on CUDA (GpuOps.Conv.cs): y = act(sums + bias[f]) a thread per stored word (a warp, or a
-// CTA, per block of a block format), the sums lane values, the bias read where it is stored, the activation the
-// element-wise formula's (Ptx.Map.cs) in the lane, each value rounded to the type once.
+// A product's store on CUDA (Products.cs ProductEpilogue; GpuOps.Products.cs, and the general convolution's, GpuOps.Conv.cs):
+// y = the store terms' value of the lane sums, a thread per stored word (a warp, or a CTA, per block of a block format):
+// the sums and the low-rank term's (lane values), the bias, β·y (y's value read by the thread, warp or CTA that writes its
+// word or block, before it does), the activation or the gradient through one (the element-wise formula's, Ptx.Map.cs) and
+// the residual, every operand read where it is stored and every term in the lane, each value rounded to the type once.
 using Adad.Abstraction;
 
 namespace Adad.Cuda;
 
 internal static partial class Ptx
 {
-    /// <summary>Params: sums (lane storage), bias (f), y, n, cols (an output channel's positions), oc, the activation's
-    /// parameter (a lane value).</summary>
-    public static string ConvStore(Gpu gpu, Fmt f, Lane lane, string? act, bool bias, out string entry)
+    /// <summary>Params: sums (lane storage), the low-rank term's sums (lane storage), bias (an output channel's, the channel
+    /// (at / cols) mod oc), residual, the activation's inputs (aux), y, n, cols, oc, the activation's parameter and β (lane
+    /// values). A term the store does not take has its pointer unread.</summary>
+    public static string ProductStore(Gpu gpu, Fmt f, Lane lane, StoreTerms t, out string entry)
     {
-        entry = $"conv_store_{f.Name}_{lane.Name}_{act ?? "none"}{(bias ? "_b" : "")}";
+        entry = $"product_store_{f.Name}_{lane.Name}_{t.Key}";
         var b = new PtxBuilder();
-        string ps = Param64(b, "p_s"), pb = Param64(b, "p_b"), py = Param64(b, "p_y");
+        string ps = Param64(b, "p_s"), pl = Param64(b, "p_l"), pb = Param64(b, "p_b"), pr = Param64(b, "p_r"), px = Param64(b, "p_x"), py = Param64(b, "p_y");
         string n = Param32(b, "p_n"), cols = Param32(b, "p_cols"), oc = Param32(b, "p_oc");
-        string pa = lane.NewReg(b);
+        string pa = lane.NewReg(b), beta = lane.NewReg(b);
         b.L($"ld.param.{lane.Mem} {pa}, [p_a];");
+        b.L($"ld.param.{lane.Mem} {beta}, [p_beta];");
+        var e = new Emit(b, lane);
         string Value(string at)
         {
             string v = LoadLane(b, lane, ps, at);
-            if (bias) v = LaneOp(b, lane, "add", v, Codec.UnpackAt(b, f, pb, Within(b, at, cols, oc), lane));
-            return act is null ? v : Formula(b, lane, act, v, v, v, pa, pa);
+            if (t.Low) v = e.Add(v, LoadLane(b, lane, pl, at));
+            if (t.Bias) v = e.Add(v, Codec.UnpackAt(b, f, pb, Within(b, at, cols, oc), lane));
+            if (t.Beta) v = e.Fma(beta, Codec.UnpackAt(b, f, py, at, lane), v);
+            if (t.Grad is not null) v = Formula(b, lane, t.Grad, Codec.UnpackAt(b, f, px, at, lane), v, v, pa, pa);
+            else if (t.Act is not null) v = Formula(b, lane, t.Act, v, v, v, pa, pa);
+            if (t.Residual) v = e.Add(v, Codec.UnpackAt(b, f, pr, at, lane));
+            return v;
         }
 
         StoreEach(b, f, lane, py, n, Value);
         b.Label("DONE");
         b.L("ret;");
         return b.Finish(Header(gpu), entry,
-            $".param .u64 p_s, .param .u64 p_b, .param .u64 p_y, .param .u32 p_n, .param .u32 p_cols, .param .u32 p_oc, .param .{lane.Mem} p_a", EachShared(f));
+            $".param .u64 p_s, .param .u64 p_l, .param .u64 p_b, .param .u64 p_r, .param .u64 p_x, .param .u64 p_y, .param .u32 p_n, .param .u32 p_cols, .param .u32 p_oc, .param .{lane.Mem} p_a, .param .{lane.Mem} p_beta", EachShared(f));
     }
 
     /// <summary>The n values of f at py from value(at) (a lane register; at a .u32 register below n), each rounded to the type

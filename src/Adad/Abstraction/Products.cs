@@ -72,3 +72,98 @@ public sealed record ProductView(int M, int N, int K, bool TransA, bool TransB, 
         return c;
     }
 }
+
+/// <summary>What a product's store does with each of its sums s = op(A)·op(B) (the float lane's, every term below added in
+/// it) before y is rounded to the type once: s + U·op(V) (the low-rank term, a LoRA adapter's: U m × Rank, V Rank × n, or
+/// n × Rank with TransV; one batch), + bias[col] (n values), + β·y (y's value before, read where it is stored; β 0: y is
+/// not read); then y = act(s), and aux = s (the activation's input stored as the type) where an aux buffer is given; or,
+/// with Grad, y = grad(aux, s) (the gradient through the activation whose inputs aux holds, s the incoming gradient:
+/// gelu_bwd: a gelu's backward through the product before it); then y + residual (y's layout). The batches' C contiguous
+/// (StrideC m·n).</summary>
+public sealed record ProductEpilogue
+{
+    /// <summary>y's value before, times β, added to the sums (0: y not read).</summary>
+    public double Beta { get; init; }
+
+    /// <summary>A one-input formula (Map.cs) applied to the sums, with ActA its parameter; null none.</summary>
+    public string? Act { get; init; }
+
+    public double ActA { get; init; }
+
+    /// <summary>A two-input backward formula grad(x, dy) (Map.cs: gelu_bwd, silu_bwd, …) taken as grad(aux, s); null none.</summary>
+    public string? Grad { get; init; }
+
+    /// <summary>The low-rank term's rank (0: none).</summary>
+    public int Rank { get; init; }
+
+    /// <summary>V stored n × Rank (Vᵀ) rather than Rank × n.</summary>
+    public bool TransV { get; init; }
+
+    /// <summary>The terms the store takes for the buffers given (low: the low-rank term's sums).</summary>
+    public StoreTerms Terms(bool bias, bool residual, bool aux) => new(Rank > 0, bias, Beta != 0, Act, Grad, residual) { Aux = aux && Act is not null };
+
+    public void Validate(ProductView v, bool bias, bool residual, bool aux, bool u, bool lowV)
+    {
+        if (v.Batch > 1 && v.StrideCOrDefault != (long)v.M * v.N) throw new ArgumentException("matmul epilogue: the batches' C must be contiguous (StrideC m·n)");
+        if (v.ValuesC > int.MaxValue) throw new ArgumentException("matmul epilogue: C past 2^31 values");
+        if (Act is not null && Grad is not null) throw new ArgumentException("matmul epilogue: an activation or a gradient, not both");
+        if (Act is not null && Ops.Find(Act).Inputs != 1) throw new ArgumentException($"matmul epilogue: the activation {Act} is not a one-input formula");
+        if (Grad is not null && Ops.Find(Grad).Inputs != 2) throw new ArgumentException($"matmul epilogue: the gradient {Grad} is not a two-input formula");
+        if (Grad is not null && !aux) throw new ArgumentException("matmul epilogue: a gradient reads the activation's inputs (aux)");
+        if (Rank < 0) throw new ArgumentException("matmul epilogue: a negative rank");
+        if (Rank > 0 && (!u || !lowV)) throw new ArgumentException("matmul epilogue: the low-rank term takes U and V");
+        if (Rank > 0 && v.Batch != 1) throw new ArgumentException("matmul epilogue: the low-rank term over one batch");
+        if (Rank == 0 && (u || lowV)) throw new ArgumentException("matmul epilogue: U and V given at rank 0");
+    }
+
+    /// <summary>The float64 reference: y and the sums s it was made from (y0 y's values before; bias n values; residual and
+    /// aux y's layout; u m × Rank; lowV Rank × n, or n × Rank with TransV).</summary>
+    public (double[] Y, double[] S) Reference(ProductView v, double[] a, double[] b, double[] y0, double[]? bias, double[]? residual, double[]? aux, double[]? u, double[]? lowV)
+    {
+        var s = v.Reference(a, b);
+        double[]? low = null;
+        if (Rank > 0)
+        {
+            var vt = new double[Rank * v.N];
+            for (int r = 0; r < Rank; r++) for (int j = 0; j < v.N; j++) vt[r * v.N + j] = TransV ? lowV![j * Rank + r] : lowV![r * v.N + j];
+            low = ProductView.Reference(u!, vt, v.M, v.N, Rank);
+        }
+
+        var act = Act is null ? null : Ops.Find(Act);
+        var grad = Grad is null ? null : Ops.Find(Grad);
+        var y = new double[s.Length];
+        for (int i = 0; i < s.Length; i++)
+        {
+            double t = s[i] + (low is null ? 0 : low[i]) + (bias is null ? 0 : bias[i % v.N]) + (Beta == 0 ? 0 : Beta * y0[i]);
+            s[i] = t;
+            double o = act is not null ? act.Reference(t, 0, 0, ActA, 0) : grad is not null ? grad.Reference(aux![i], t, 0, ActA, 0) : t;
+            y[i] = o + (residual is null ? 0 : residual[i]);
+        }
+
+        return (y, s);
+    }
+}
+
+/// <summary>The terms a product's store adds to its lane sums and what it applies (ProductEpilogue.Terms; the convolution's
+/// store takes the bias and the activation): a store kernel's variant. Aux: the pass that writes aux = s before y.</summary>
+public readonly record struct StoreTerms(bool Low, bool Bias, bool Beta, string? Act, string? Grad, bool Residual)
+{
+    public bool Aux { get; init; }
+
+    /// <summary>The pass that stores the activation's input (s, no activation and no residual) into aux.</summary>
+    public StoreTerms Input => this with { Act = null, Grad = null, Residual = false, Aux = false };
+
+    public string Key => $"{(Low ? "l" : "")}{(Bias ? "b" : "")}{(Beta ? "c" : "")}_{(Grad is null ? Act ?? "none" : "d" + Grad)}{(Residual ? "_r" : "")}";
+}
+
+/// <summary>A product epilogue's operands (ProductEpilogue), each absent (null; 0 on a device) where its term is not taken.</summary>
+public readonly record struct ProductTerms<TBuffer>(TBuffer? Bias = default, TBuffer? Residual = default, TBuffer? Aux = default, TBuffer? U = default, TBuffer? V = default)
+{
+    public static bool Given(TBuffer? x) => !EqualityComparer<TBuffer?>.Default.Equals(x, default);
+
+    public StoreTerms Validate(ProductEpilogue e, ProductView v)
+    {
+        e.Validate(v, Given(Bias), Given(Residual), Given(Aux), Given(U), Given(V));
+        return e.Terms(Given(Bias), Given(Residual), Given(Aux));
+    }
+}

@@ -12,6 +12,10 @@ public interface IProducts<TBuffer>
     /// <summary>C = op(A)·op(B) over the view's batches.</summary>
     string MatMulView<TN>(ProductView v, TBuffer a, TBuffer b, TBuffer c) where TN : struct, IAdad<TN>;
 
+    /// <summary>C = the epilogue's y of op(A)·op(B) (ProductEpilogue: + U·op(V) + bias + β·C, then the activation or a
+    /// gradient through one, then + residual), every term in the float lane and C rounded to the type once.</summary>
+    string MatMulEpilogue<TN>(ProductView v, ProductEpilogue e, TBuffer a, TBuffer b, TBuffer c, ProductTerms<TBuffer> t) where TN : struct, IFloatAdad<TN>;
+
     /// <summary>dA = dC·Bᵀ (m × k) and dB = Aᵀ·dC (k × n) for C = A·B.</summary>
     string MatMulBackward<TN>(TBuffer a, TBuffer b, TBuffer dc, TBuffer da, TBuffer db, int m, int n, int k) where TN : struct, IAdad<TN>;
 

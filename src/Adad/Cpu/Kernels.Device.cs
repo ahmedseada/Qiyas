@@ -127,6 +127,8 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
 
     string IProducts<byte[]>.MatMulView<TN>(ProductView v, byte[] a, byte[] b, byte[] c) => MatMulView<TN>(v, a, b, c);
 
+    string IProducts<byte[]>.MatMulEpilogue<TN>(ProductView v, ProductEpilogue e, byte[] a, byte[] b, byte[] c, ProductTerms<byte[]> t) => MatMulEpilogue<TN>(v, e, a, b, c, t);
+
     string IProducts<byte[]>.MatMulBackward<TN>(byte[] a, byte[] b, byte[] dc, byte[] da, byte[] db, int m, int n, int k) => MatMulBackward<TN>(a, b, dc, da, db, m, n, k);
 
     string IProducts<byte[]>.MatMulViewBlocks<TN>(ProductView v, byte[] a, byte[] b, byte[] c) => MatMulViewBlocks<TN>(v, a, b, c);

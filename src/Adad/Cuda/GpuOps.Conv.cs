@@ -13,7 +13,7 @@
 // dw's product gathered from the image by the product kernel (transposed), dx's columns an f32 intermediate.
 // Images, groups, the bottom and right pads, a bias and an activation (the float types) take the general path (Conv.cs):
 // the columns of every image's channels into lane storage (im2col reading the image where it is stored), a stored-mode
-// product a group over the images into the lane's sums, then Ptx.ConvStore: y = act(sums + bias[f]) stored once. Its
+// product a group over the images into the lane's sums, then Ptx.ProductStore: y = act(sums + bias[f]) stored once. Its
 // backward: dcols = w_gᵀ·dy_g, dx = col2im(dcols); dy and the columns side by side over the images in the lane (exact
 // moves), dw_g = dy_g·cols_gᵀ, db = dy's rows times ones; dw and db stored as the type once.
 using Adad.Abstraction;
@@ -51,9 +51,7 @@ public sealed partial class GpuOps
             for (int g = 0; g < a.Groups; g++)
                 ProductStored(new ProductView(a.OCg, a.Cols, a.Rows, false, false, a.N, 0, (long)a.Groups * a.Rows * a.Cols, (long)a.OC * a.Cols), lane,
                     w, f, (long)g * a.OCg * a.Rows, cols, lf, (long)g * a.Rows * a.Cols, sums + (ulong)((long)g * a.OCg * a.Cols * lane.Size), null);
-            var store = gpu.Cached($"conv_store:{f.Name}:{lane.Name}:{a.Act}:{bias != 0}", (out string e) => Ptx.ConvStore(gpu, f, lane, a.Act, bias != 0, out e));
-            ulong[] args = [sums, bias, y, Gpu.U((int)a.YValues), Gpu.U(a.Cols), Gpu.U(a.OC), lane.Wide ? Gpu.D(a.ActA) : Gpu.F((float)a.ActA)];
-            LaunchEach(store, f, a.YValues, args);
+            ProductStore(f, lane, new StoreTerms(false, bias != 0, false, a.Act, null, false), sums, 0, bias, 0, 0, y, a.YValues, a.Cols, a.OC, a.ActA, 0);
         }
         finally { foreach (var p in rented) gpu.Return(p); }
 

@@ -17,7 +17,7 @@
 //
 // Images, groups, the bottom and right pads, a bias and an activation (ConvArgs; the float types) take the general path:
 // the columns of every image's channels into the float lane's storage (exact), each image's and group's product with the
-// group's weights into the lane's sums, then y = act(sums + bias[f]) stored as the type once (ConvStore). Its backward:
+// group's weights into the lane's sums, then y = act(sums + bias[f]) stored as the type once (Epilogue.cs ProductStore). Its backward:
 // dcols = w_gᵀ·dy_g in the lane, dx = col2im(dcols); dy and the columns laid side by side over the images (exact moves into
 // the lane), dw_g = dy_g · cols_gᵀ in one product a group, stored once; db the lane's sums of dy's rows.
 
@@ -103,7 +103,7 @@ internal sealed partial class Kernels
                 for (int g = 0; g < G; g++)
                     MatMul<TN, TS, TS, TLane, TLane, TL>(w, cols, sums, a.OCg, a.Cols, a.Rows,
                         new Operands(AOff: g * a.OCg * a.Rows, BOff: (n * G + g) * a.Rows * a.Cols, COff: (n * a.OC + g * a.OCg) * a.Cols));
-            ConvStore<TN, TLane, TL>(a, sums, bias, y);
+            ProductStore<TN, TLane, TL>(new StoreTerms(false, bias is not null, false, a.Act, null, false), new StoreSources(sums, null, bias, null, null, a.Cols, a.OC, a.ActA, 0), y, (int)a.YValues);
             return TL.Name;
         }
     }
@@ -138,52 +138,6 @@ internal sealed partial class Kernels
             }
 
             return TL.Name;
-        }
-    }
-
-    // y = act(sums + bias[f]) over the outputs (sums: lane storage, f the output's channel), in aligned tiles of the index (a
-    // stored word or block written by one task), the activation the formula's (Map.cs) in the lane, stored as the type once.
-    private static void ConvStore<TN, TLane, TL>(ConvArgs a, byte[] sums, byte[]? bias, byte[] y) where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
-    {
-        var bl = bias is null ? null : new TLane[a.OC];
-        if (bias is not null) TN.Load(bias, 0, bl);
-        var use = new ConvStoreUse<TN, TLane, TL>(a, sums, bl, y);
-        string op = a.Act ?? "copy";
-        if (!MapOps.FloatOp<TLane, TL, ConvStoreUse<TN, TLane, TL>>(op, ref use) && !MapOps.AnyOp<TLane, TL, ConvStoreUse<TN, TLane, TL>>(op, ref use)) throw new ArgumentException($"conv: no activation {op}");
-    }
-
-    private readonly struct ConvStoreUse<TN, TLane, TL>(ConvArgs a, byte[] sums, TLane[]? bias, byte[] y) : IOpUse<TLane, TL>
-        where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
-    {
-        public void Use<TOp>() where TOp : struct, IMapOp<TLane, TL>
-        {
-            int n = (int)a.YValues, size = Math.Max(Tile, (n / (Threads * 4) + Tile - 1) / Tile * Tile);
-            Team.For(n, size, (long)n * 4, new ConvStoreBody<TN, TLane, TL, TOp>(a, sums, bias, y));
-        }
-    }
-
-    private readonly struct ConvStoreBody<TN, TLane, TL, TOp>(ConvArgs a, byte[] sums, TLane[]? bias, byte[] y) : Team.IBody
-        where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane> where TOp : struct, IMapOp<TLane, TL>
-    {
-        public void Run(int first, int last)
-        {
-            var s = MemoryMarshal.Cast<byte, TLane>(sums.AsSpan());
-            int lanes = Vector<TLane>.Count, P = a.Cols;
-            Span<TLane> v = stackalloc TLane[Tile + lanes];
-            var va = new Vector<TLane>(TL.From(a.ActA));
-            for (int at = first; at < last; at += Tile)
-            {
-                int len = Math.Min(Tile, last - at);
-                for (int i = 0; i < len; i++) v[i] = bias is null ? s[at + i] : TL.Add(s[at + i], bias[(at + i) / P % a.OC]);
-                for (int i = len; i < (len + lanes - 1) / lanes * lanes; i++) v[i] = TL.Zero;
-                for (int i = 0; i < len; i += lanes)
-                {
-                    var vi = new Vector<TLane>(v.Slice(i, lanes));
-                    TOp.Apply(vi, vi, vi, va, Vector<TLane>.Zero).CopyTo(v.Slice(i, lanes));
-                }
-
-                TN.Store(v[..len], y, at);
-            }
         }
     }
 

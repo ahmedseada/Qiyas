@@ -87,6 +87,47 @@ public sealed partial class GpuOps
         return lane;
     }
 
+    /// <summary>C = the epilogue's y of op(A)·op(B) (ProductEpilogue): every batch's product into the float lane's sums
+    /// (the operands read where they are stored), the low-rank term's into sums of its own, then the store
+    /// (Ptx.ProductStore; aux first where it is written); returns the lane's name.</summary>
+    public string MatMulEpilogue<TN>(ProductView v, ProductEpilogue e, ulong a, ulong b, ulong c, ProductTerms<ulong> t) where TN : struct, IFloatAdad<TN>
+    {
+        var terms = t.Validate(e, v);
+        var f = Fmt.Of<TN>();
+        var lane = RowLane(f);
+        if (v.M == 0 || v.N == 0 || v.Batch == 0) return lane.Name;
+        long span = (long)v.M * v.N;
+        ulong sums = gpu.Rent(Math.Max(16, v.ValuesC * lane.Size)), low = 0;
+        try
+        {
+            ProductStored(v, lane, a, f, 0, b, f, 0, sums, null);
+            if (terms.Low)
+            {
+                low = gpu.Rent(Math.Max(16, span * lane.Size));
+                ProductStored(new ProductView(v.M, v.N, e.Rank, false, e.TransV), lane, t.U, f, 0, t.V, f, 0, low, null);
+            }
+
+            if (terms.Aux) ProductStore(f, lane, terms.Input, sums, low, t.Bias, 0, 0, t.Aux, v.ValuesC, 1, v.N, e.ActA, e.Beta);
+            ProductStore(f, lane, terms, sums, low, t.Bias, t.Residual, t.Aux, c, v.ValuesC, 1, v.N, e.ActA, e.Beta);
+        }
+        finally
+        {
+            gpu.Return(sums);
+            if (low != 0) gpu.Return(low);
+        }
+
+        return lane.Name;
+    }
+
+    /// <summary>y (count values of f) = the store terms' value of the lane sums (Ptx.ProductStore): the bias the channel
+    /// (at / cols) mod oc's, an absent term's pointer 0.</summary>
+    private void ProductStore(Fmt f, Lane lane, StoreTerms t, ulong sums, ulong low, ulong bias, ulong residual, ulong aux, ulong y, long count, int cols, int oc, double actA, double beta)
+    {
+        var fn = gpu.Cached($"product_store:{f.Name}:{lane.Name}:{t.Key}", (out string e) => Ptx.ProductStore(gpu, f, lane, t, out e));
+        LaunchEach(fn, f, count, sums, low, bias, residual, aux, y, Gpu.U((int)count), Gpu.U(cols), Gpu.U(oc),
+            lane.Wide ? Gpu.D(actA) : Gpu.F((float)actA), lane.Wide ? Gpu.D(beta) : Gpu.F((float)beta));
+    }
+
     /// <summary>dA = dC·Bᵀ and dB = Aᵀ·dC for C = A·B (A m × k, B k × n, dC m × n); returns dA's lane.</summary>
     public string MatMulBackward<TN>(ulong a, ulong b, ulong dc, ulong da, ulong db, int m, int n, int k) where TN : struct, IAdad<TN>
     {

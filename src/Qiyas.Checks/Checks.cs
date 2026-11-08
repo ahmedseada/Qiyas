@@ -1311,6 +1311,7 @@ internal static partial class Checks
         else if (ops is not null) ok &= ProductsWith(ops, where, 37, 29, 1100, " [long k]", blocks);
 
         if (cuda is not null) ok &= Epilogues(cuda);
+        ok &= ProductEpilogues(ops, where, blocks);
         if (cuda is not null) ok &= TensorConfigs(cuda);
         ok &= BlockProducts(ops, where);
         if (ok && cuda is null && ops is not null) Console.WriteLine($"check products               {where,-6} every type{(blocks ? "" : " but the block formats")} at 37 x 29 x 53, transposed, batched, and the backward pair; at 128 x 256 x 128 and 37 x 29 x 1100: within the product's rounding");

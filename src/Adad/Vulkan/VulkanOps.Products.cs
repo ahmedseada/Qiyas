@@ -62,6 +62,53 @@ public sealed partial class VulkanOps
         vk.Launch(back, Groups(f.Words(count), VkKernels.Threads), 1, lanes, c, Vulkan.U(count), Vulkan.U(period), Vulkan.U(span));
     }
 
+    /// <summary>C = the epilogue's y of op(A)·op(B) (ProductEpilogue): each batch's product into the float lane's sums (the
+    /// operands read where they are stored), the low-rank term's into sums of its own, then the store
+    /// (Kernels.ProductStore.cs; aux first where it is written); returns the lane's name.</summary>
+    public string MatMulEpilogue<TN>(ProductView v, ProductEpilogue e, ulong a, ulong b, ulong c, ProductTerms<ulong> t) where TN : struct, IFloatAdad<TN>
+    {
+        var terms = t.Validate(e, v);
+        var f = Fmt.Of<TN>();
+        var lane = RowLane(f);
+        if (v.M == 0 || v.N == 0 || v.Batch == 0) return lane.Name;
+        long span = (long)v.M * v.N;
+        var rented = new List<ulong>();
+        ulong Rent(long bytes) { ulong p = vk.Rent(Math.Max(16, bytes)); rented.Add(p); return p; }
+        try
+        {
+            ulong sums = Rent(v.ValuesC * lane.Size), low = 0;
+            var one = new ProductView(v.M, v.N, v.K, v.TransA, v.TransB);
+            for (int i = 0; i < v.Batch; i++)
+                Product(one, lane, a, f, i * v.StrideAOrDefault, b, f, i * v.StrideBOrDefault, sums + (ulong)(i * span * lane.Size));
+            if (terms.Low)
+            {
+                low = Rent(span * lane.Size);
+                Product(new ProductView(v.M, v.N, e.Rank, false, e.TransV), lane, t.U, f, 0, t.V, f, 0, low);
+            }
+
+            if (terms.Aux) ProductStore(f, lane, terms.Input, sums, low, t.Bias, 0, 0, t.Aux, v.ValuesC, 1, v.N, e.ActA, e.Beta);
+            ProductStore(f, lane, terms, sums, low, t.Bias, t.Residual, t.Aux, c, v.ValuesC, 1, v.N, e.ActA, e.Beta);
+        }
+        finally { foreach (var p in rented) vk.Return(p); }
+
+        return lane.Name;
+    }
+
+    /// <summary>y (count values of f) = the store terms' value of the lane sums (Kernels.ProductStore.cs): the bias the
+    /// channel (at / cols) mod oc's, an absent term's pointer 0.</summary>
+    private void ProductStore(Fmt f, Lane lane, StoreTerms t, ulong sums, ulong low, ulong bias, ulong residual, ulong aux, ulong y, long count, int cols, int oc, double actA, double beta)
+    {
+        if (f.IsBlock)
+        {
+            Encode(f, count, vk.Cached($"block_product_store:{f.Name}:{t.Key}", () => VkKernels.BlockProductStore(vk, f, t)), y,
+                sums, low, bias, residual, aux, y, Vulkan.U(cols), Vulkan.U(oc), Vulkan.F((float)actA), Vulkan.F((float)beta));
+            return;
+        }
+
+        var k = vk.Cached($"product_store:{f.Name}:{lane.Name}:{t.Key}", () => VkKernels.ProductStore(vk, f, lane, t));
+        vk.Launch(k, Groups(f.Words(count), VkKernels.Threads), 1, sums, low, bias, residual, aux, y, Vulkan.U((int)count), Vulkan.U(cols), Vulkan.U(oc), Slot(lane, actA), Slot(lane, beta));
+    }
+
     /// <summary>dA = dC·Bᵀ and dB = Aᵀ·dC for C = A·B (A m × k, B k × n, dC m × n); returns dA's lane.</summary>
     public string MatMulBackward<TN>(ulong a, ulong b, ulong dc, ulong da, ulong db, int m, int n, int k) where TN : struct, IAdad<TN>
     {
