@@ -2,15 +2,16 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // ctc: the connectionist temporal classification loss and its gradient, for a batch of B sequences of T frames over C
-// classes (one of them the blank). The input is logits (T × B × C, frame-major as the usual layout); log_softmax is taken
-// inside. Sequence b sees its first InputLengths[b] frames and its LabelLengths[b] labels (Labels flat, sequences one
-// after another, none the blank). The extended labels l' put a blank before, between and after them (S = 2L + 1
+// classes (one of them the blank). The input is logits (T × B × C, frame-major as the usual layout, or B × T × C with
+// BatchFirst); log_softmax is taken inside. Sequence b sees its first InputLengths[b] frames and its LabelLengths[b]
+// labels (Labels flat, sequences one after another or from LabelOffsets, none the blank). The extended labels l' put a blank before, between and after them (S = 2L + 1
 // states); in log space α_t(s) and β_t(s), both including frame t's emission y_t(l'_s):
 //   α_0(0) = log y_0(blank), α_0(1) = log y_0(l_1); α_t(s) = lse(α_{t−1}(s), α_{t−1}(s−1), α_{t−1}(s−2) when l'_s is not
 //   the blank and differs from l'_{s−2}) + log y_t(l'_s); β the same backwards from the last frame's last two states.
 //   loss_b = −log P, log P = lse(α_{T_b−1}(S−1), α_{T_b−1}(S−2)).
 //   d loss / d logit_t(c) = y_t(c) − Σ_{s: l'_s = c} exp(α_t(s) + β_t(s) − log y_t(l'_s) − log P); 0 past T_b.
-// A sequence no alignment fits (too few frames for its labels and their repeats) has loss +∞ and a gradient of 0.
+// A sequence no alignment fits (too few frames for its labels and their repeats) has loss +∞ (0 with ZeroInfinity) and a
+// gradient of 0.
 // The lane is the float lane (f32; f64 for float64): a sequence's task loads its rows into lanes (in place for float32
 // and float64) and stores its loss and gradient as the type (a block format's: the lane's values, encoded once — a
 // sequence's rows do not start on blocks).
@@ -94,7 +95,7 @@ internal sealed partial class Kernels
             // (own), its outputs stored as the type, or written as lanes (lanesOut).
             bool own = TS.Direct, ownOut = own || lanesOut;
             var X = own ? null : pool0().Rent(tb * C);
-            if (!own) for (int t = 0; t < tb; t++) TS.Load(x, (int)(((long)t * B + b) * C), X.AsSpan(t * C, C));
+            if (!own) for (int t = 0; t < tb; t++) TS.Load(x, (int)(a.Row(t, b) * C), X.AsSpan(t * C, C));
             var negInf = TL.NegativeInfinity;
             var pool = ArrayPool<TLane>.Shared;
             var lse = pool.Rent(tb);
@@ -120,7 +121,7 @@ internal sealed partial class Kernels
                 // Each frame's log-sum-exp over the classes, and the states' emissions.
                 for (int t = 0; t < tb; t++)
                 {
-                    Span<TLane> row = own ? MemoryMarshal.Cast<byte, TLane>(x.AsSpan()).Slice((int)(((long)t * B + b) * C), C) : X.AsSpan(t * C, C);
+                    Span<TLane> row = own ? MemoryMarshal.Cast<byte, TLane>(x.AsSpan()).Slice((int)(a.Row(t, b) * C), C) : X.AsSpan(t * C, C);
                     var mv = new Vector<TLane>(negInf);
                     int c = 0;
                     for (; c + w <= C; c += w) mv = TL.Max(mv, new Vector<TLane>(row.Slice(c, w)));
@@ -158,7 +159,7 @@ internal sealed partial class Kernels
 
                 var last = alpha.AsSpan((tb - 1) * stride + w, S);
                 var logP = Lse(new Vector<TLane>(last[S - 1]), new Vector<TLane>(S >= 2 ? last[S - 2] : negInf), new Vector<TLane>(negInf))[0];
-                Span<TLane> one = [TL.Sub(TL.Zero, logP)];
+                Span<TLane> one = [a.ZeroInfinity && IsNegInf(logP) ? TL.Zero : TL.Sub(TL.Zero, logP)];
                 if (ownOut) MemoryMarshal.Cast<byte, TLane>(loss.AsSpan())[b] = one[0]; else TS.Store(one, loss, b);
                 if (grad is null) return;
 
@@ -167,7 +168,7 @@ internal sealed partial class Kernels
                 g.AsSpan(0, C).Clear();
                 for (int t = none ? 0 : tb; t < a.T; t++)
                 {
-                    int at0 = (int)(((long)t * B + b) * C);
+                    int at0 = (int)(a.Row(t, b) * C);
                     if (ownOut) MemoryMarshal.Cast<byte, TLane>(grad.AsSpan()).Slice(at0, C).Clear(); else TS.Store(g.AsSpan(0, C), grad, at0);
                 }
 
@@ -205,9 +206,9 @@ internal sealed partial class Kernels
                         TL.Exp(e).CopyTo(gamma.AsSpan(s, w));
                     }
 
-                    Span<TLane> row = own ? MemoryMarshal.Cast<byte, TLane>(x.AsSpan()).Slice((int)(((long)t * B + b) * C), C) : X.AsSpan(t * C, C);
+                    Span<TLane> row = own ? MemoryMarshal.Cast<byte, TLane>(x.AsSpan()).Slice((int)(a.Row(t, b) * C), C) : X.AsSpan(t * C, C);
                     var vl = new Vector<TLane>(lse[t]);
-                    int at1 = (int)(((long)t * B + b) * C), c = 0;
+                    int at1 = (int)(a.Row(t, b) * C), c = 0;
                     Span<TLane> gs = ownOut ? MemoryMarshal.Cast<byte, TLane>(grad.AsSpan()).Slice(at1, C) : g.AsSpan(0, C);
                     for (; c + w <= C; c += w) TL.Exp(TL.Sub(new Vector<TLane>(row.Slice(c, w)), vl)).CopyTo(gs.Slice(c, w));
                     for (; c < C; c++) gs[c] = TL.Exp(TL.Sub(row[c], lse[t]));

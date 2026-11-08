@@ -46,10 +46,12 @@ public sealed partial class GpuOps
             Gpu.Upload<int>(host, dc);
             bool backward = grad != 0;
             var rowsFn = gpu.Cached($"ctc_rows:{lane.Name}:{backward}:{fx?.Name}:{fo?.Name}", (out string e) => Ptx.CtcRows(gpu, lane, backward, out e, fx, fo));
-            Gpu.Launch(rowsFn, Grid((long)a.T * a.B, Ptx.CtcThreads / 32), 1, Ptx.CtcThreads, 1, 0, x, lse, di, lgrad, Gpu.U(a.T), Gpu.U(a.B), Gpu.U(a.C));
+            var (ts, bs) = a.RowStrides;
+            Gpu.Launch(rowsFn, Grid((long)a.T * a.B, Ptx.CtcThreads / 32), 1, Ptx.CtcThreads, 1, 0, x, lse, di, lgrad, Gpu.U(a.T), Gpu.U(a.B), Gpu.U(a.C), Gpu.U(ts), Gpu.U(bs));
             bool one = cap <= Ptx.CtcThreads && CtcOneState != false;
             var fn = gpu.Cached($"ctc:{lane.Name}:{backward}:{cap}{(one ? ":1" : "")}:{fx?.Name}:{fo?.Name}", (out string e) => Ptx.Ctc(gpu, lane, cap, backward, one, out e, fx, fo));
-            Gpu.Launch(fn, (uint)a.B, 1, Ptx.CtcThreads, 1, 0, x, lse, alpha, dc, df, di, ds, lloss, lgrad, Gpu.U(a.T), Gpu.U(a.B), Gpu.U(a.C), Gpu.U(smax));
+            Gpu.Launch(fn, (uint)a.B, 1, Ptx.CtcThreads, 1, 0, x, lse, alpha, dc, df, di, ds, lloss, lgrad, Gpu.U(a.T), Gpu.U(a.B), Gpu.U(a.C), Gpu.U(smax),
+                Gpu.U(ts), Gpu.U(bs), Gpu.U(a.ZeroInfinity ? 1 : 0));
             if (viaLane)
             {
                 FromLane<TN>(lloss, loss, a.B);

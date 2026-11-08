@@ -1144,6 +1144,11 @@ internal static partial class Checks
         // Longer sequences: 81 and 51 states (the device's one-state kernel over three warps), each label class many times.
         int[] long1 = Enumerable.Range(0, 40).Select(i => 1 + (i * 7 + i / 3) % 5).ToArray(), long2 = Enumerable.Range(0, 25).Select(i => 1 + (i * 3 + i / 4) % 5).ToArray();
         cases.Add((new(60, 2, 6, 0, [60, 52], [40, 25], [.. long1, .. long2]), false));
+        // The options: batch-first logits; labels padded to B × 5 (offsets, the padding a blank never read); a sequence no
+        // alignment fits counting 0.
+        cases.Add((new(11, 4, 7, 0, [11, 9, 11, 7], [3, 4, 0, 3], [1, 2, 3, 2, 2, 4, 5, 3, 1, 3]) { BatchFirst = true }, false));
+        cases.Add((new(13, 3, 5, 4, [13, 6, 12], [5, 3, 1], [0, 1, 2, 3, 0, 1, 1, 1, 4, 4, 2, 4, 4, 4, 4]) { LabelOffsets = [0, 5, 10], BatchFirst = true }, false));
+        cases.Add((new(5, 2, 4, 0, [5, 2], [2, 2], [1, 2, 3, 3]) { ZeroInfinity = true }, false));
         // The reference's gradient against its own loss by central differences (the formula, independently of any kernel).
         foreach (var (a, impossible) in cases)
         {
@@ -1153,7 +1158,7 @@ internal static partial class Checks
             double worst = 0;
             for (long i = 0; i < a.Values; i++)
             {
-                int bb = (int)(i / a.C % a.B);
+                int bb = a.BatchFirst ? (int)(i / a.C / a.T) : (int)(i / a.C % a.B);
                 const double h = 1e-5;
                 double keep = x[i];
                 x[i] = keep + h; double up = a.Reference(x).Loss[bb];
@@ -1179,7 +1184,7 @@ internal static partial class Checks
                 var (wantLoss, wantGrad) = a.Reference(Bench.Registry.Values(type, x, (int)a.Values));
                 double logP = wantLoss.Where(double.IsFinite).Max(Math.Abs);
                 int terms = a.T * (int)Math.Ceiling(logP + 1);
-                string name = $"ctc T{a.T} B{a.B} C{a.C}{(impossible ? " no alignment" : "")}{(one == false ? " (general kernel)" : "")}";
+                string name = $"ctc T{a.T} B{a.B} C{a.C}{(impossible ? " no alignment" : "")}{(a.ZeroInfinity ? " zero infinity" : "")}{(a.BatchFirst ? " batch-first" : "")}{(a.LabelOffsets is null ? "" : " padded labels")}{(one == false ? " (general kernel)" : "")}";
                 int scored = impossible ? 1 : a.B;                            // the impossible case: its first sequence scored, the second checked for +∞
                 var loss = new byte[Bench.Registry.Bytes(type, a.B)];
                 Bench.Registry.WithFloat(type, new CtcRun(ops, a, x, loss, null));
@@ -1207,7 +1212,7 @@ internal static partial class Checks
                         for (int bb = 0; bb < a.B; bb++)
                         {
                             double sum = 0;
-                            for (int c = 0; c < a.C; c++) sum += g[((long)t * a.B + bb) * a.C + c];
+                            for (int c = 0; c < a.C; c++) sum += g[a.Row(t, bb) * a.C + c];
                             worst = Math.Max(worst, Math.Abs(sum));
                         }
                     }
@@ -1218,7 +1223,7 @@ internal static partial class Checks
         }
 
         if (cuda is not null) cuda.CtcOneState = null;
-        if (ok) Console.WriteLine($"check ctc                    {where,-6} every float type{(blocks ? "" : " but the block formats")}: loss and gradient (the reference's gradient by central differences), short and 81-state sequences, empty and repeated labels, another blank, no alignment, within the recursion's rounding");
+        if (ok) Console.WriteLine($"check ctc                    {where,-6} every float type{(blocks ? "" : " but the block formats")}: loss and gradient (the reference's gradient by central differences), short and 81-state sequences, empty and repeated labels, another blank, no alignment (+∞, or 0 with zero-infinity), batch-first logits, padded labels by offsets, within the recursion's rounding");
         return ok;
     }
 

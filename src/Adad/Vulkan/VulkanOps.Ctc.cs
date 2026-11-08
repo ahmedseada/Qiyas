@@ -39,9 +39,11 @@ public sealed partial class VulkanOps
             ulong dc = Rent(host.Length * 4L), df = dc + (ulong)(cls.Length * 4L), di = df + (ulong)(flags.Length * 4L), ds = di + (ulong)(a.B * 4L);
             vk.Upload<int>(host, dc);
             var rows = vk.Cached($"ctc_rows:{f.Name}:{backward}", () => VkKernels.CtcRows(vk, f, lane, backward));
-            vk.Launch(rows, (uint)((long)a.T * a.B), 1, x, lse, di, lgrad, Vulkan.U(a.T), Vulkan.U(a.B), Vulkan.U(a.C));
+            var (ts, bs) = a.RowStrides;
+            vk.Launch(rows, (uint)((long)a.T * a.B), 1, x, lse, di, lgrad, Vulkan.U(a.T), Vulkan.U(a.B), Vulkan.U(a.C), Vulkan.U(ts), Vulkan.U(bs));
             var fn = vk.Cached($"ctc:{f.Name}:{backward}:{cap}", () => VkKernels.Ctc(vk, f, lane, cap, backward));
-            vk.Launch(fn, (uint)a.B, 1, x, lse, alpha, dc, df, di, ds, lloss, lgrad, Vulkan.U(a.T), Vulkan.U(a.B), Vulkan.U(a.C), Vulkan.U(smax));
+            vk.Launch(fn, (uint)a.B, 1, x, lse, alpha, dc, df, di, ds, lloss, lgrad, Vulkan.U(a.T), Vulkan.U(a.B), Vulkan.U(a.C), Vulkan.U(smax),
+                Vulkan.U(ts), Vulkan.U(bs), Vulkan.U(a.ZeroInfinity ? 1 : 0));
             if (!own)
             {
                 Back(f, lane, lloss, loss, a.B);
