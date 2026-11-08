@@ -169,7 +169,7 @@ public sealed partial class GpuOps
         ulong gx = gpu.Rent(bytes), gh = gpu.Rent(bytes), dgx = gpu.Rent(bytes), dgh = gpu.Rent(bytes), dhCell = gpu.Rent(hBytes), dhGates = gpu.Rent(hBytes);
         try
         {
-            var hArgs = new CellArgs("gru", a.B, a.H, a.H);
+            var hArgs = a with { D = a.H };
             CellGates<TN>(a, x, w, 0, 0, bias, gx);
             CellGates<TN>(hArgs, h, u, 0, 0, biasH, gh);
             string lane = GruCellBackward<TN>(a, gx, gh, h, dhOut, dgx, dgh, dhCell);
@@ -220,9 +220,10 @@ public sealed partial class GpuOps
             string lane = "";
             for (int t = 0; t < T; t++)
             {
-                ulong gt = gates == 0 ? g : gates + (ulong)(t * gStep), ht = hOut + (ulong)(t * hStep), ct = cOut + (ulong)(t * hStep);
+                int step = a.Step(t, T);
+                ulong gt = gates == 0 ? g : gates + (ulong)(step * gStep), ht = hOut + (ulong)(step * hStep), ct = cOut + (ulong)(step * hStep);
                 MatMulView<TN>(new ProductView(a.B, GH, a.H, false, true), hPrev, u, gh);                  // h · Uᵀ
-                Map<TN>(add, gx + (ulong)(t * gStep), gh, 0, gt, a.B * GH, 0, 0);
+                Map<TN>(add, gx + (ulong)(step * gStep), gh, 0, gt, a.B * GH, 0, 0);
                 lane = LstmCell<TN>(a, gt, cPrev, ht, ct);
                 hPrev = ht; cPrev = ct;
             }
@@ -251,10 +252,11 @@ public sealed partial class GpuOps
             string lane = "";
             for (int t = 0; t < T; t++)
             {
-                ulong ght = ghAll == 0 ? gh : ghAll + (ulong)(t * gStep), ht = hOut + (ulong)(t * hStep);
+                int step = a.Step(t, T);
+                ulong ght = ghAll == 0 ? gh : ghAll + (ulong)(step * gStep), ht = hOut + (ulong)(step * hStep);
                 MatMulView<TN>(new ProductView(a.B, GH, a.H, false, true), hPrev, u, ght);                 // h · Uᵀ
                 MapRow<TN>(add, ght, biasH, ght, a.B, GH);
-                lane = GruCell<TN>(a, gx + (ulong)(t * gStep), ght, hPrev, ht);
+                lane = GruCell<TN>(a, gx + (ulong)(step * gStep), ght, hPrev, ht);
                 hPrev = ht;
             }
 
@@ -290,12 +292,13 @@ public sealed partial class GpuOps
         }
     }
 
-    // Each step's input state, T·B × H: h0, then h of steps 0 … T − 2.
-    private ulong Shifted(ulong h0, ulong hs, long hStep, int T)
+    // Each step's input state, T·B × H: h0 at the first step taken, the others' the states of the steps before them (CellArgs.Shift).
+    private ulong Shifted(CellArgs a, ulong h0, ulong hs, long hStep, int T)
     {
         ulong prev = gpu.Rent(hStep * T + 4);
-        Gpu.Copy(h0, prev, hStep);
-        if (T > 1) Gpu.Copy(hs, prev + (ulong)hStep, hStep * (T - 1));
+        var (first, others, input) = a.Shift(T);
+        Gpu.Copy(h0, prev + (ulong)(first * hStep), hStep);
+        if (T > 1) Gpu.Copy(hs + (ulong)(input * hStep), prev + (ulong)(others * hStep), hStep * (T - 1));
         return prev;
     }
 
@@ -339,14 +342,15 @@ public sealed partial class GpuOps
             string lane = "";
             for (int t = T - 1; t >= 0; t--)
             {
-                Map<TN>(add, dhOut + (ulong)(t * hStep), dhNext, 0, dht, (int)((long)a.B * a.H), 0, 0);
-                ulong dg = dgAll + (ulong)(t * gStep), dhp = dhb[t & 1], dcp = dcb[t & 1];
-                lane = LstmCellBackward<TN>(a, gates + (ulong)(t * gStep), t == 0 ? c0 : cs + (ulong)((t - 1) * hStep), dht, dcNext, dg, dcp);
+                int step = a.Step(t, T);
+                Map<TN>(add, dhOut + (ulong)(step * hStep), dhNext, 0, dht, (int)((long)a.B * a.H), 0, 0);
+                ulong dg = dgAll + (ulong)(step * gStep), dhp = dhb[t & 1], dcp = dcb[t & 1];
+                lane = LstmCellBackward<TN>(a, gates + (ulong)(step * gStep), t == 0 ? c0 : cs + (ulong)(a.Step(t - 1, T) * hStep), dht, dcNext, dg, dcp);
                 MatMulView<TN>(new ProductView(a.B, a.H, GW, false, false), dg, u, dhp);                // dg · U
                 dhNext = dhp; dcNext = dcp;
             }
 
-            ulong prev = Shifted(h0, hs, hStep, T);
+            ulong prev = Shifted(a, h0, hs, hStep, T);
             rented.Add(prev);
             SequenceWeights<TN>(a, T * a.B, dgAll, x, prev, w, dx, dw, du, db);
             Gpu.Copy(dhNext, dh0, hStep); Gpu.Copy(dcNext, dc0, hStep);
@@ -388,18 +392,19 @@ public sealed partial class GpuOps
             string lane = "";
             for (int t = T - 1; t >= 0; t--)
             {
-                Map<TN>(add, dhOut + (ulong)(t * hStep), dhNext, 0, dht, (int)((long)a.B * a.H), 0, 0);
-                ulong dgx = dgxAll + (ulong)(t * gStep), dgh = dghAll + (ulong)(t * gStep), dhp = dhb[t & 1];
-                lane = GruCellBackward<TN>(a, gx + (ulong)(t * gStep), ghAll + (ulong)(t * gStep), t == 0 ? h0 : hs + (ulong)((t - 1) * hStep), dht, dgx, dgh, dhCell);
+                int step = a.Step(t, T);
+                Map<TN>(add, dhOut + (ulong)(step * hStep), dhNext, 0, dht, (int)((long)a.B * a.H), 0, 0);
+                ulong dgx = dgxAll + (ulong)(step * gStep), dgh = dghAll + (ulong)(step * gStep), dhp = dhb[t & 1];
+                lane = GruCellBackward<TN>(a, gx + (ulong)(step * gStep), ghAll + (ulong)(step * gStep), t == 0 ? h0 : hs + (ulong)(a.Step(t - 1, T) * hStep), dht, dgx, dgh, dhCell);
                 MatMulView<TN>(new ProductView(a.B, a.H, GW, false, false), dgh, u, dhp);               // dgh · U
                 Map<TN>(add, dhp, dhCell, 0, dhp, (int)((long)a.B * a.H), 0, 0);
                 dhNext = dhp;
             }
 
-            ulong prev = Shifted(h0, hs, hStep, T);
+            ulong prev = Shifted(a, h0, hs, hStep, T);
             rented.Add(prev);
             SequenceWeights<TN>(a, T * a.B, dgxAll, x, 0, w, dx, dw, 0, db);
-            SequenceWeights<TN>(new CellArgs("gru", a.B, a.H, a.H), T * a.B, dghAll, prev, 0, u, 0, du, 0, dbh);
+            SequenceWeights<TN>(a with { D = a.H }, T * a.B, dghAll, prev, 0, u, 0, du, 0, dbh);
             Gpu.Copy(dhNext, dh0, hStep);
             return lane;
         }
@@ -420,7 +425,7 @@ public sealed partial class GpuOps
         try
         {
             CellGates<TN>(a, x, w, 0, 0, bias, gx);
-            CellGates<TN>(new CellArgs("gru", a.B, a.H, a.H), h, u, 0, 0, biasH, gh);
+            CellGates<TN>(a with { D = a.H }, h, u, 0, 0, biasH, gh);
             return GruCell<TN>(a, gx, gh, h, hOut);
         }
         finally

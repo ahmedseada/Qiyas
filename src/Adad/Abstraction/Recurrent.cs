@@ -13,6 +13,18 @@ namespace Adad.Abstraction;
 /// <summary>B rows, input size D, hidden size H; the kind ("lstm" or "gru").</summary>
 public sealed record CellArgs(string Kind, int B, int D, int H)
 {
+    /// <summary>A sequence taken from its last step to its first (a bidirectional layer's second direction): each step's
+    /// state still written at the step's own position, h0 (and c0) the state before step T − 1, dh0 (dc0) its gradient, and
+    /// dcLast the gradient of the state after step 0.</summary>
+    public bool Reverse { get; init; }
+
+    /// <summary>The step a sequence of T takes i-th.</summary>
+    public int Step(int i, int T) => Reverse ? T - 1 - i : i;
+
+    /// <summary>Each step's input state: First reads h0; the other T − 1 steps from Others on read the states from Input on
+    /// (forward: step 0, then steps 1 … T − 1 reading steps 0 … T − 2; reversed: step T − 1, then 0 … T − 2 reading 1 … T − 1).</summary>
+    public (int First, int Others, int Input) Shift(int T) => Reverse ? (T - 1, 0, 1) : (0, 1, 0);
+
     public int Gates => Kind == "lstm" ? 4 : 3;
     public long GateValues => (long)B * Gates * H;
 

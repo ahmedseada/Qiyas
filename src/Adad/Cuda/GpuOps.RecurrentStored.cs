@@ -127,8 +127,8 @@ public sealed partial class GpuOps
         ColumnSums(f, dg, rows, GH, db);
     }
 
-    // dU (an output of the type) = dgᵀ · each step's input state: h0 for step 0's rows, the f32 states hs of steps
-    // 0 … T − 2 for the rest.
+    // dU (an output of the type) = dgᵀ · each step's input state: h0 for the first step taken's rows, the f32 states hs of
+    // the steps before them for the others' (CellArgs.Shift).
     private void ShiftedWeights(Fmt f, CellArgs a, int T, ulong dg, Buf h0, ulong hs, ulong du)
     {
         int GH = a.Gates * a.H;
@@ -136,10 +136,12 @@ public sealed partial class GpuOps
         ulong acc = gpu.Rent(values * 4), rest = T > 1 ? gpu.Rent(values * 4) : 0;
         try
         {
-            Prod(new ProductView(GH, a.H, a.B, true, false), Lanes32(dg), h0, acc);
+            var (first, others, input) = a.Shift(T);
+            long gRows = (long)a.B * GH * 4, hRows = (long)a.B * a.H * 4;
+            Prod(new ProductView(GH, a.H, a.B, true, false), Lanes32(dg + (ulong)(first * gRows)), h0, acc);
             if (T > 1)
             {
-                Prod(new ProductView(GH, a.H, (T - 1) * a.B, true, false), Lanes32(dg + (ulong)((long)a.B * GH * 4)), Lanes32(hs), rest);
+                Prod(new ProductView(GH, a.H, (T - 1) * a.B, true, false), Lanes32(dg + (ulong)(others * gRows)), Lanes32(hs + (ulong)(input * hRows)), rest);
                 Map<Float32>(Ops.Find("add"), acc, rest, 0, acc, (int)values, 0, 0);
             }
 
@@ -198,7 +200,7 @@ public sealed partial class GpuOps
             long bh = (long)a.B * a.H;
             ulong gx = RentLanes(rented, a.GateValues), gh = RentLanes(rented, a.GateValues), lh = StateOut(f, hOut, bh, rented);
             GatesMixed(a, new(x, f), new(w, f), default, default, new(bias, f), gx);
-            GatesMixed(new CellArgs("gru", a.B, a.H, a.H), new(h, f), new(u, f), default, default, new(biasH, f), gh);
+            GatesMixed(a with { D = a.H }, new(h, f), new(u, f), default, default, new(biasH, f), gh);
             CellMixed(a, false, Lanes32(gx), Lanes32(gh), new(h, f), default, default, lh, 0, 0, StoredC(f) ? f : null);
             StateDone(f, lh, hOut, bh);
             return MixedName(f);
@@ -212,7 +214,7 @@ public sealed partial class GpuOps
         try
         {
             long bh = (long)a.B * a.H;
-            var hArgs = new CellArgs("gru", a.B, a.H, a.H);
+            var hArgs = a with { D = a.H };
             ulong gx = RentLanes(rented, a.GateValues), gh = RentLanes(rented, a.GateValues), dgx = RentLanes(rented, a.GateValues), dgh = RentLanes(rented, a.GateValues);
             ulong dhCell = RentLanes(rented, bh), dhGates = RentLanes(rented, bh);
             GatesMixed(a, new(x, f), new(w, f), default, default, new(bias, f), gx);
@@ -262,18 +264,19 @@ public sealed partial class GpuOps
         Buf hPrev = new(h0, f), cPrev = new(c0, f);
         for (int t = 0; t < T; t++)
         {
-            ulong gt = gates == 0 ? g : gates + (ulong)(t * gStep);
+            int step = a.Step(t, T);
+            ulong gt = gates == 0 ? g : gates + (ulong)(step * gStep);
             Prod(new ProductView(a.B, GH, a.H, false, true), hPrev, new(u, f), gh);                          // h · Uᵀ
-            Map<Float32>(add, gx + (ulong)(t * gStep), gh, 0, gt, a.B * GH, 0, 0);
+            Map<Float32>(add, gx + (ulong)(step * gStep), gh, 0, gt, a.B * GH, 0, 0);
             if (typedOut)
             {
                 ulong ht = hb[t & 1], ct = cb[t & 1];
-                CellMixed(a, false, Lanes32(gt), default, cPrev, default, default, hs + (ulong)(t * typedStep), cs + (ulong)(t * typedStep), 0, f, ht, ct);
+                CellMixed(a, false, Lanes32(gt), default, cPrev, default, default, hs + (ulong)(step * typedStep), cs + (ulong)(step * typedStep), 0, f, ht, ct);
                 hPrev = Lanes32(ht); cPrev = Lanes32(ct);
             }
             else
             {
-                ulong ht = hs + (ulong)(t * hStep), ct = cs + (ulong)(t * hStep);
+                ulong ht = hs + (ulong)(step * hStep), ct = cs + (ulong)(step * hStep);
                 CellMixed(a, false, Lanes32(gt), default, cPrev, default, default, ht, ct, 0);
                 hPrev = Lanes32(ht); cPrev = Lanes32(ct);
             }
@@ -293,12 +296,13 @@ public sealed partial class GpuOps
         Buf hPrev = new(h0, f);
         for (int t = 0; t < T; t++)
         {
-            ulong ght = ghAll == 0 ? gh : ghAll + (ulong)(t * gStep);
+            int step = a.Step(t, T);
+            ulong ght = ghAll == 0 ? gh : ghAll + (ulong)(step * gStep);
             Prod(new ProductView(a.B, GH, a.H, false, true), hPrev, new(u, f), ght);                         // h · Uᵀ
             AddMixed(Lanes32(ght), new(biasH, f), ght, (long)a.B * GH, GH);
-            ulong ht = typedOut ? hb[t & 1] : hs + (ulong)(t * hStep);
-            if (typedOut) CellMixed(a, false, Lanes32(gx + (ulong)(t * gStep)), Lanes32(ght), hPrev, default, default, hs + (ulong)(t * typedStep), 0, 0, f, ht);
-            else CellMixed(a, false, Lanes32(gx + (ulong)(t * gStep)), Lanes32(ght), hPrev, default, default, ht, 0, 0);
+            ulong ht = typedOut ? hb[t & 1] : hs + (ulong)(step * hStep);
+            if (typedOut) CellMixed(a, false, Lanes32(gx + (ulong)(step * gStep)), Lanes32(ght), hPrev, default, default, hs + (ulong)(step * typedStep), 0, 0, f, ht);
+            else CellMixed(a, false, Lanes32(gx + (ulong)(step * gStep)), Lanes32(ght), hPrev, default, default, ht, 0, 0);
             hPrev = Lanes32(ht);
         }
 
@@ -351,9 +355,10 @@ public sealed partial class GpuOps
             Buf dhNext = Lanes32(zero), dcNext = new(dcLast, f);
             for (int t = T - 1; t >= 0; t--)
             {
-                AddMixed(new(dhOut, f, t * bh), dhNext, dht, bh);
-                ulong dg = dgAll + (ulong)(t * gStep), dhp = dhb[t & 1], dcp = dcb[t & 1];
-                CellMixed(a, true, Lanes32(gates + (ulong)(t * gStep)), default, t == 0 ? new(c0, f) : Lanes32(cs + (ulong)((t - 1) * hStep)), Lanes32(dht), dcNext, dg, dcp, 0);
+                int step = a.Step(t, T);
+                AddMixed(new(dhOut, f, step * bh), dhNext, dht, bh);
+                ulong dg = dgAll + (ulong)(step * gStep), dhp = dhb[t & 1], dcp = dcb[t & 1];
+                CellMixed(a, true, Lanes32(gates + (ulong)(step * gStep)), default, t == 0 ? new(c0, f) : Lanes32(cs + (ulong)(a.Step(t - 1, T) * hStep)), Lanes32(dht), dcNext, dg, dcp, 0);
                 Prod(new ProductView(a.B, a.H, GW, false, false), Lanes32(dg), new(u, f), dhp);                  // dg · U
                 dhNext = Lanes32(dhp); dcNext = Lanes32(dcp);
             }
@@ -386,9 +391,10 @@ public sealed partial class GpuOps
             var add = Ops.Find("add");
             for (int t = T - 1; t >= 0; t--)
             {
-                AddMixed(new(dhOut, f, t * bh), dhNext, dht, bh);
-                ulong dgx = dgxAll + (ulong)(t * gStep), dgh = dghAll + (ulong)(t * gStep), dhp = dhb[t & 1];
-                CellMixed(a, true, Lanes32(gx + (ulong)(t * gStep)), Lanes32(ghAll + (ulong)(t * gStep)), t == 0 ? new(h0, f) : Lanes32(hs + (ulong)((t - 1) * hStep)), Lanes32(dht), default, dgx, dgh, dhCell);
+                int step = a.Step(t, T);
+                AddMixed(new(dhOut, f, step * bh), dhNext, dht, bh);
+                ulong dgx = dgxAll + (ulong)(step * gStep), dgh = dghAll + (ulong)(step * gStep), dhp = dhb[t & 1];
+                CellMixed(a, true, Lanes32(gx + (ulong)(step * gStep)), Lanes32(ghAll + (ulong)(step * gStep)), t == 0 ? new(h0, f) : Lanes32(hs + (ulong)(a.Step(t - 1, T) * hStep)), Lanes32(dht), default, dgx, dgh, dhCell);
                 Prod(new ProductView(a.B, a.H, GW, false, false), Lanes32(dgh), new(u, f), dhp);                 // dgh · U
                 Map<Float32>(add, dhp, dhCell, 0, dhp, (int)bh, 0, 0);
                 dhNext = Lanes32(dhp);
@@ -398,7 +404,7 @@ public sealed partial class GpuOps
             ProdOut(new ProductView(rows, a.D, GW, false, false), Lanes32(dgxAll), new(w, f), dx, f);
             ProdOut(new ProductView(GW, a.D, rows, true, false), Lanes32(dgxAll), new(x, f), dw, f);
             ColumnSums(f, dgxAll, rows, GW, db);
-            ShiftedWeights(f, new CellArgs("gru", a.B, a.H, a.H), T, dghAll, new(h0, f), hs, du);
+            ShiftedWeights(f, a with { D = a.H }, T, dghAll, new(h0, f), hs, du);
             ColumnSums(f, dghAll, rows, GW, dbh);
             Narrowed(f, dhNext.P, dh0, bh);
             return MixedName(f);

@@ -588,41 +588,48 @@ internal static partial class Checks
             }
         }
 
-        // Sequences: 3 steps of 5 × 7 → 11, forward (h, c every step) and backward (dx, dh0, dc0, dW, dU, db), for the plain float types.
+        // Sequences: 3 steps of 5 × 7 → 11, forward (h, c every step) and backward (dx, dh0, dc0, dW, dU, db), for the plain float
+        // types, in both directions (reversed: the forward reference over the steps reversed, its per-step outputs reversed back).
         foreach (var type in Bench.Registry.Names)
+        foreach (bool reverse in new[] { false, true })
         {
             if (!Bench.Registry.IsFloat(type) || Bench.Registry.IsBlock(type)) continue;
-            var a = new CellArgs("lstm", 5, 7, 11);
+            var a = new CellArgs("lstm", 5, 7, 11) { Reverse = reverse };
+            string dir = reverse ? " reversed" : "";
             const int T = 3;
             int GH = a.Gates * a.H;
             double scale = 1 / Math.Sqrt(a.D + a.H);
             var x = Bench.Registry.Make(type, T * a.B * a.D, 81, -1, 1); var h0 = Bench.Registry.Make(type, a.B * a.H, 82, -1, 1); var c0 = Bench.Registry.Make(type, a.B * a.H, 83, -1, 1);
             var w = Bench.Registry.Make(type, GH * a.D, 84, -scale, scale); var u = Bench.Registry.Make(type, GH * a.H, 85, -scale, scale); var b = Bench.Registry.Make(type, GH, 86, -0.1, 0.1);
             double[] V(byte[] s, int n) => Bench.Registry.Values(type, s, n);
-            var (wantH, wantC) = Bench.RecurrentCase.LstmSequenceReference(a, T, V(x, T * a.B * a.D), V(h0, a.B * a.H), V(c0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH));
+            var (wantH, wantC) = Bench.RecurrentCase.LstmSequenceReference(a, T, Flip(V(x, T * a.B * a.D), T, reverse), V(h0, a.B * a.H), V(c0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH));
+            (wantH, wantC) = (Flip(wantH, T, reverse), Flip(wantC, T, reverse));
             var hOut = new byte[Bench.Registry.Bytes(type, T * a.B * a.H)]; var cOut = new byte[hOut.Length];
             var subject = new Bench.AdadSubject();
             using (var run = subject.LstmSequence(dev, type, a, T, x, h0, c0, w, u, b, hOut, cOut, null, null, null, null, null, null)!) { run.Run(); run.Collect(); }
-            ok &= Close(type, "lstm_seq h", where, hOut, wantH, T * a.B * a.H, T * (a.D + a.H));
-            ok &= Close(type, "lstm_seq c", where, cOut, wantC, T * a.B * a.H, T * (a.D + a.H));
+            ok &= Close(type, "lstm_seq h" + dir, where, hOut, wantH, T * a.B * a.H, T * (a.D + a.H));
+            ok &= Close(type, "lstm_seq c" + dir, where, cOut, wantC, T * a.B * a.H, T * (a.D + a.H));
             var dhOut = Bench.Registry.Make(type, T * a.B * a.H, 88, -1, 1); var dcLast = Bench.Registry.Make(type, a.B * a.H, 89, -1, 1);
-            var (wdx, wdh0, wdc0, wdw, wdu, wdb) = Bench.RecurrentCase.LstmSequenceBackwardReference(a, T, V(x, T * a.B * a.D), V(h0, a.B * a.H), V(c0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH), V(dhOut, T * a.B * a.H), V(dcLast, a.B * a.H));
+            var (wdx, wdh0, wdc0, wdw, wdu, wdb) = Bench.RecurrentCase.LstmSequenceBackwardReference(a, T, Flip(V(x, T * a.B * a.D), T, reverse), V(h0, a.B * a.H), V(c0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH),
+                Flip(V(dhOut, T * a.B * a.H), T, reverse), V(dcLast, a.B * a.H));
+            wdx = Flip(wdx, T, reverse);
             var dx = new byte[x.Length]; var dh0 = new byte[h0.Length]; var dc0 = new byte[c0.Length]; var dw = new byte[w.Length]; var du = new byte[u.Length]; var db = new byte[b.Length];
             using (var run = subject.LstmSequence(dev, type, a, T, x, h0, c0, w, u, b, dhOut, dcLast, dx, dh0, dc0, dw, du, db)!) { run.Run(); run.Collect(); }
             int terms = 8 * T * (a.D + a.H + GH + a.B);
-            ok &= Close(type, "lstm_seq_bwd dx", where, dx, wdx, T * a.B * a.D, terms);
-            ok &= Close(type, "lstm_seq_bwd dh0", where, dh0, wdh0, a.B * a.H, terms);
-            ok &= Close(type, "lstm_seq_bwd dc0", where, dc0, wdc0, a.B * a.H, terms);
-            ok &= Close(type, "lstm_seq_bwd dw", where, dw, wdw, GH * a.D, terms);
-            ok &= Close(type, "lstm_seq_bwd du", where, du, wdu, GH * a.H, terms);
-            ok &= Close(type, "lstm_seq_bwd db", where, db, wdb, GH, terms);
+            ok &= Close(type, "lstm_seq_bwd dx" + dir, where, dx, wdx, T * a.B * a.D, terms);
+            ok &= Close(type, "lstm_seq_bwd dh0" + dir, where, dh0, wdh0, a.B * a.H, terms);
+            ok &= Close(type, "lstm_seq_bwd dc0" + dir, where, dc0, wdc0, a.B * a.H, terms);
+            ok &= Close(type, "lstm_seq_bwd dw" + dir, where, dw, wdw, GH * a.D, terms);
+            ok &= Close(type, "lstm_seq_bwd du" + dir, where, du, wdu, GH * a.H, terms);
+            ok &= Close(type, "lstm_seq_bwd db" + dir, where, db, wdb, GH, terms);
         }
 
-        // GRU sequences: 3 steps of 5 × 7 → 11 (h every step), every float type, the block formats through lane storage.
+        // GRU sequences: 3 steps of 5 × 7 → 11 (h every step), every float type, the block formats through lane storage; both directions.
         foreach (var type in Bench.Registry.Names)
+        foreach (bool reverse in new[] { false, true })
         {
             if (!Bench.Registry.IsFloat(type) || (!blocks && Bench.Registry.IsBlock(type))) continue;
-            var a = new CellArgs("gru", 5, 7, 11);
+            var a = new CellArgs("gru", 5, 7, 11) { Reverse = reverse };
             const int T = 3;
             int GH = a.Gates * a.H;
             double scale = 1 / Math.Sqrt(a.D + a.H);
@@ -630,10 +637,10 @@ internal static partial class Checks
             var w = Bench.Registry.Make(type, GH * a.D, 94, -scale, scale); var u = Bench.Registry.Make(type, GH * a.H, 95, -scale, scale);
             var b = Bench.Registry.Make(type, GH, 96, -0.1, 0.1); var bh = Bench.Registry.Make(type, GH, 97, -0.1, 0.1);
             double[] V(byte[] s, int n) => Bench.Registry.Values(type, s, n);
-            var wantH = Bench.RecurrentCase.GruSequenceReference(a, T, V(x, T * a.B * a.D), V(h0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH), V(bh, GH));
+            var wantH = Flip(Bench.RecurrentCase.GruSequenceReference(a, T, Flip(V(x, T * a.B * a.D), T, reverse), V(h0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH), V(bh, GH)), T, reverse);
             var hOut = new byte[Bench.Registry.Bytes(type, T * a.B * a.H)];
             using (var run = new Bench.AdadSubject().GruSequence(dev, type, a, T, x, h0, w, u, b, bh, hOut)!) { run.Run(); run.Collect(); }
-            ok &= Close(type, "gru_seq h", where, hOut, wantH, T * a.B * a.H, T * (a.D + a.H));
+            ok &= Close(type, "gru_seq h" + (reverse ? " reversed" : ""), where, hOut, wantH, T * a.B * a.H, T * (a.D + a.H));
         }
 
         // The GRU sequence backward's reference against central differences of the forward reference (the formula, independently
@@ -669,11 +676,14 @@ internal static partial class Checks
             if (worst > 1e-7) { Console.WriteLine($"check gru_seq_bwd reference: the gradient differs from the loss's differences by {worst:R}"); ok = false; }
         }
 
-        // GRU sequence backward: 3 steps of 5 × 7 → 11 (dx, dh0, dW, dU, db, dbh), every float type, the block formats through lane storage.
+        // GRU sequence backward: 3 steps of 5 × 7 → 11 (dx, dh0, dW, dU, db, dbh), every float type, the block formats through lane
+        // storage; both directions.
         foreach (var type in Bench.Registry.Names)
+        foreach (bool reverse in new[] { false, true })
         {
             if (!Bench.Registry.IsFloat(type) || (!blocks && Bench.Registry.IsBlock(type))) continue;
-            var a = new CellArgs("gru", 5, 7, 11);
+            var a = new CellArgs("gru", 5, 7, 11) { Reverse = reverse };
+            string dir = reverse ? " reversed" : "";
             const int T = 3;
             int GH = a.Gates * a.H;
             double scale = 1 / Math.Sqrt(a.D + a.H);
@@ -682,19 +692,21 @@ internal static partial class Checks
             var b = Bench.Registry.Make(type, GH, 96, -0.1, 0.1); var bh = Bench.Registry.Make(type, GH, 97, -0.1, 0.1);
             var dhOut = Bench.Registry.Make(type, T * a.B * a.H, 98, -1, 1);
             double[] V(byte[] s, int n) => Bench.Registry.Values(type, s, n);
-            var (wdx, wdh0, wdw, wdu, wdb, wdbh) = Bench.RecurrentCase.GruSequenceBackwardReference(a, T, V(x, T * a.B * a.D), V(h0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH), V(bh, GH), V(dhOut, T * a.B * a.H));
+            var (wdx, wdh0, wdw, wdu, wdb, wdbh) = Bench.RecurrentCase.GruSequenceBackwardReference(a, T, Flip(V(x, T * a.B * a.D), T, reverse), V(h0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH), V(bh, GH),
+                Flip(V(dhOut, T * a.B * a.H), T, reverse));
+            wdx = Flip(wdx, T, reverse);
             var dx = new byte[x.Length]; var dh0 = new byte[h0.Length]; var dw = new byte[w.Length]; var du = new byte[u.Length]; var db = new byte[b.Length]; var dbh = new byte[bh.Length];
             using (var run = new Bench.AdadSubject().GruSequenceBackward(dev, type, a, T, x, h0, w, u, b, bh, dhOut, dx, dh0, dw, du, db, dbh)!) { run.Run(); run.Collect(); }
             int terms = 8 * T * (a.D + a.H + GH + a.B);
-            ok &= Close(type, "gru_seq_bwd dx", where, dx, wdx, T * a.B * a.D, terms);
-            ok &= Close(type, "gru_seq_bwd dh0", where, dh0, wdh0, a.B * a.H, terms);
-            ok &= Close(type, "gru_seq_bwd dw", where, dw, wdw, GH * a.D, terms);
-            ok &= Close(type, "gru_seq_bwd du", where, du, wdu, GH * a.H, terms);
-            ok &= Close(type, "gru_seq_bwd db", where, db, wdb, GH, terms);
-            ok &= Close(type, "gru_seq_bwd dbh", where, dbh, wdbh, GH, terms);
+            ok &= Close(type, "gru_seq_bwd dx" + dir, where, dx, wdx, T * a.B * a.D, terms);
+            ok &= Close(type, "gru_seq_bwd dh0" + dir, where, dh0, wdh0, a.B * a.H, terms);
+            ok &= Close(type, "gru_seq_bwd dw" + dir, where, dw, wdw, GH * a.D, terms);
+            ok &= Close(type, "gru_seq_bwd du" + dir, where, du, wdu, GH * a.H, terms);
+            ok &= Close(type, "gru_seq_bwd db" + dir, where, db, wdb, GH, terms);
+            ok &= Close(type, "gru_seq_bwd dbh" + dir, where, dbh, wdbh, GH, terms);
         }
 
-        if (ok) Console.WriteLine($"check recurrent              {where,-6} every float type{(blocks ? "" : " but the block formats")}: LSTM and GRU steps, forward and backward, LSTM sequences and their backward, GRU sequences and their backward ({(blocks ? "block formats too; " : "")}the backward's reference by central differences), within the products' rounding");
+        if (ok) Console.WriteLine($"check recurrent              {where,-6} every float type{(blocks ? "" : " but the block formats")}: LSTM and GRU steps, forward and backward, LSTM sequences and their backward, GRU sequences and their backward, each in both directions ({(blocks ? "block formats too; " : "")}the backward's reference by central differences), within the products' rounding");
         return ok;
     }
 
@@ -1982,6 +1994,16 @@ internal static partial class Checks
 
         if (ok) Console.WriteLine($"check reductions, broadcasts, transposes, gemv {where,-6} every type{(blocks ? "" : " but the block formats")} at 37 × 1001: as the references");
         return ok;
+    }
+
+    // A sequence's values (T steps of the same count each) with the steps in the other order when reverse.
+    private static double[] Flip(double[] v, int T, bool reverse)
+    {
+        if (!reverse) return v;
+        int n = v.Length / T;
+        var r = new double[v.Length];
+        for (int t = 0; t < T; t++) Array.Copy(v, t * n, r, (T - 1 - t) * n, n);
+        return r;
     }
 
     // Stored output against a float64 reference rounded as the type rounds: integers exact, floats within one step of the type plus lane ulps.

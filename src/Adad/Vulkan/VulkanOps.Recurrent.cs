@@ -284,7 +284,7 @@ public sealed partial class VulkanOps
             long bh = (long)a.B * a.H;
             ulong gx = RentLanes(lane, rented, a.GateValues), gh = RentLanes(lane, rented, a.GateValues), lh = StateOut(f, lane, hOut, bh, rented);
             GatesMixed(lane, a, new(x, f), new(w, f), default, default, new(bias, f), gx);
-            GatesMixed(lane, new CellArgs("gru", a.B, a.H, a.H), new(h, f), new(u, f), default, default, new(biasH, f), gh);
+            GatesMixed(lane, a with { D = a.H }, new(h, f), new(u, f), default, default, new(biasH, f), gh);
             CellMixed(lane, a, false, Lanes(lane, gx), Lanes(lane, gh), new(h, f), default, default, lh, 0, 0);
             StateDone(f, lane, lh, hOut, bh);
             return lane.Name;
@@ -302,7 +302,7 @@ public sealed partial class VulkanOps
         try
         {
             long bh = (long)a.B * a.H;
-            var hArgs = new CellArgs("gru", a.B, a.H, a.H);
+            var hArgs = a with { D = a.H };
             ulong gx = RentLanes(lane, rented, a.GateValues), gh = RentLanes(lane, rented, a.GateValues), dgx = RentLanes(lane, rented, a.GateValues), dgh = RentLanes(lane, rented, a.GateValues);
             ulong dhCell = RentLanes(lane, rented, bh), dhGates = RentLanes(lane, rented, bh), ldh = StateOut(f, lane, dh, bh, rented);
             GatesMixed(lane, a, new(x, f), new(w, f), default, default, new(bias, f), gx);
@@ -342,9 +342,10 @@ public sealed partial class VulkanOps
         Buf hPrev = new(h0, f), cPrev = new(c0, f);
         for (int t = 0; t < T; t++)
         {
-            ulong gt = gates == 0 ? g : gates + (ulong)(t * gStep), ht = hs + (ulong)(t * hStep), ct = cs + (ulong)(t * hStep);
+            int step = a.Step(t, T);
+            ulong gt = gates == 0 ? g : gates + (ulong)(step * gStep), ht = hs + (ulong)(step * hStep), ct = cs + (ulong)(step * hStep);
             Prod(lane, new ProductView(a.B, GH, a.H, false, true), hPrev, new(u, f), gh);                    // h · Uᵀ
-            LaneAdd(lane, gx + (ulong)(t * gStep), gh, gt, (long)a.B * GH);
+            LaneAdd(lane, gx + (ulong)(step * gStep), gh, gt, (long)a.B * GH);
             CellMixed(lane, a, false, Lanes(lane, gt), default, cPrev, default, default, ht, ct, 0);
             hPrev = Lanes(lane, ht); cPrev = Lanes(lane, ct);
         }
@@ -360,18 +361,19 @@ public sealed partial class VulkanOps
         Buf hPrev = new(h0, f);
         for (int t = 0; t < T; t++)
         {
-            ulong ght = ghAll == 0 ? gh : ghAll + (ulong)(t * gStep), ht = hs + (ulong)(t * hStep);
+            int step = a.Step(t, T);
+            ulong ght = ghAll == 0 ? gh : ghAll + (ulong)(step * gStep), ht = hs + (ulong)(step * hStep);
             Prod(lane, new ProductView(a.B, GH, a.H, false, true), hPrev, new(u, f), ght);                   // h · Uᵀ
             AddMixed(lane, Lanes(lane, ght), new(biasH, f), ght, (long)a.B * GH, GH);
-            CellMixed(lane, a, false, Lanes(lane, gx + (ulong)(t * gStep)), Lanes(lane, ght), hPrev, default, default, ht, 0, 0);
+            CellMixed(lane, a, false, Lanes(lane, gx + (ulong)(step * gStep)), Lanes(lane, ght), hPrev, default, default, ht, 0, 0);
             hPrev = Lanes(lane, ht);
         }
 
         return gx;
     }
 
-    // dU (an output of the type) = dgᵀ · each step's input state: h0 for step 0's rows, the lane states hs of steps
-    // 0 … T − 2 for the rest.
+    // dU (an output of the type) = dgᵀ · each step's input state: h0 for the first step taken's rows, the lane states hs of
+    // the steps before them for the others' (CellArgs.Shift).
     private void ShiftedWeights(Fmt f, Lane lane, CellArgs a, int T, ulong dg, Buf h0, ulong hs, ulong du)
     {
         int GH = a.Gates * a.H;
@@ -379,10 +381,12 @@ public sealed partial class VulkanOps
         ulong acc = vk.Rent(Math.Max(1, values) * lane.Size), rest = T > 1 ? vk.Rent(Math.Max(1, values) * lane.Size) : 0;
         try
         {
-            Prod(lane, new ProductView(GH, a.H, a.B, true, false), Lanes(lane, dg), h0, acc);
+            var (first, others, input) = a.Shift(T);
+            long gRows = (long)a.B * GH * lane.Size, hRows = (long)a.B * a.H * lane.Size;
+            Prod(lane, new ProductView(GH, a.H, a.B, true, false), Lanes(lane, dg + (ulong)(first * gRows)), h0, acc);
             if (T > 1)
             {
-                Prod(lane, new ProductView(GH, a.H, (T - 1) * a.B, true, false), Lanes(lane, dg + (ulong)((long)a.B * GH * lane.Size)), Lanes(lane, hs), rest);
+                Prod(lane, new ProductView(GH, a.H, (T - 1) * a.B, true, false), Lanes(lane, dg + (ulong)(others * gRows)), Lanes(lane, hs + (ulong)(input * hRows)), rest);
                 LaneAdd(lane, acc, rest, acc, values);
             }
 
@@ -451,9 +455,10 @@ public sealed partial class VulkanOps
             Buf dhNext = Lanes(lane, zero), dcNext = new(dcLast, f);
             for (int t = T - 1; t >= 0; t--)
             {
-                AddMixed(lane, new(dhOut, f, t * bh), dhNext, dht, bh);
-                ulong dg = dgAll + (ulong)(t * gStep), dhp = dhb[t & 1], dcp = dcb[t & 1];
-                CellMixed(lane, a, true, Lanes(lane, gates + (ulong)(t * gStep)), default, t == 0 ? new(c0, f) : Lanes(lane, cs + (ulong)((t - 1) * hStep)), Lanes(lane, dht), dcNext, dg, dcp, 0);
+                int step = a.Step(t, T);
+                AddMixed(lane, new(dhOut, f, step * bh), dhNext, dht, bh);
+                ulong dg = dgAll + (ulong)(step * gStep), dhp = dhb[t & 1], dcp = dcb[t & 1];
+                CellMixed(lane, a, true, Lanes(lane, gates + (ulong)(step * gStep)), default, t == 0 ? new(c0, f) : Lanes(lane, cs + (ulong)(a.Step(t - 1, T) * hStep)), Lanes(lane, dht), dcNext, dg, dcp, 0);
                 Prod(lane, new ProductView(a.B, a.H, GW, false, false), Lanes(lane, dg), new(u, f), dhp);         // dg · U
                 dhNext = Lanes(lane, dhp); dcNext = Lanes(lane, dcp);
             }
@@ -491,9 +496,10 @@ public sealed partial class VulkanOps
             Buf dhNext = Lanes(lane, zero);
             for (int t = T - 1; t >= 0; t--)
             {
-                AddMixed(lane, new(dhOut, f, t * bh), dhNext, dht, bh);
-                ulong dgx = dgxAll + (ulong)(t * gStep), dgh = dghAll + (ulong)(t * gStep), dhp = dhb[t & 1];
-                CellMixed(lane, a, true, Lanes(lane, gx + (ulong)(t * gStep)), Lanes(lane, ghAll + (ulong)(t * gStep)), t == 0 ? new(h0, f) : Lanes(lane, hs + (ulong)((t - 1) * hStep)), Lanes(lane, dht), default, dgx, dgh, dhCell);
+                int step = a.Step(t, T);
+                AddMixed(lane, new(dhOut, f, step * bh), dhNext, dht, bh);
+                ulong dgx = dgxAll + (ulong)(step * gStep), dgh = dghAll + (ulong)(step * gStep), dhp = dhb[t & 1];
+                CellMixed(lane, a, true, Lanes(lane, gx + (ulong)(step * gStep)), Lanes(lane, ghAll + (ulong)(step * gStep)), t == 0 ? new(h0, f) : Lanes(lane, hs + (ulong)(a.Step(t - 1, T) * hStep)), Lanes(lane, dht), default, dgx, dgh, dhCell);
                 Prod(lane, new ProductView(a.B, a.H, GW, false, false), Lanes(lane, dgh), new(u, f), dhp);        // dgh · U
                 LaneAdd(lane, dhp, dhCell, dhp, bh);
                 dhNext = Lanes(lane, dhp);
@@ -503,7 +509,7 @@ public sealed partial class VulkanOps
             ProdOut(f, lane, new ProductView(rows, a.D, GW, false, false), Lanes(lane, dgxAll), new(w, f), dx);
             ProdOut(f, lane, new ProductView(GW, a.D, rows, true, false), Lanes(lane, dgxAll), new(x, f), dw);
             ColumnSums(f, lane, dgxAll, rows, GW, db);
-            ShiftedWeights(f, lane, new CellArgs("gru", a.B, a.H, a.H), T, dghAll, new(h0, f), hs, du);
+            ShiftedWeights(f, lane, a with { D = a.H }, T, dghAll, new(h0, f), hs, du);
             ColumnSums(f, lane, dghAll, rows, GW, dbh);
             Narrowed(f, lane, dhNext.P, dh0, bh);
             return lane.Name;

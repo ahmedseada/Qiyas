@@ -129,17 +129,18 @@ internal sealed partial class Kernels
             CopyLanes<TN>(sum, db, cols);
         }
 
-        // dU (the type's) = Σ_t dg_tᵀ · the step's input state: h0 for step 0's rows (as the type), the states hs (TS) of
-        // steps 0 … T − 2 for the rest.
+        // dU (the type's) = Σ_t dg_tᵀ · the step's input state: h0 (as the type) for the first step taken's rows, the states
+        // hs (TS) of the steps before them for the others' (CellArgs.Shift).
         private static void ShiftedWeights(CellArgs a, int T, Arg dgAll, byte[] h0, Arg hs, byte[] du)
         {
-            int GH = a.Gates * a.H, bg = a.B * GH;
+            int GH = a.Gates * a.H, bg = a.B * GH, bh = a.B * a.H;
             long values = (long)GH * a.H;
             if (T == 1) { Product(dgAll, true, new Arg(h0), false, new Arg(du), GH, a.H, a.B); return; }
+            var (first, others, input) = a.Shift(T);
             var d0 = Lanes(values);
             var d1 = Lanes(values);
-            Product(dgAll, true, new Arg(h0), false, d0, GH, a.H, a.B);
-            Product(dgAll.Plus(bg), true, hs, false, d1, GH, a.H, (T - 1) * a.B);
+            Product(dgAll.Plus(first * bg), true, new Arg(h0), false, d0, GH, a.H, a.B);
+            Product(dgAll.Plus(others * bg), true, hs.Plus(input * bh), false, d1, GH, a.H, (T - 1) * a.B);
             Add(d0, d1, new Arg(du), (int)values);
         }
 
@@ -173,7 +174,7 @@ internal sealed partial class Kernels
         public static string GruStep(CellArgs a, byte[] x, byte[] h, byte[] w, byte[] u, byte[] bias, byte[] biasH, byte[] hOut)
         {
             long bh = (long)a.B * a.H;
-            var hArgs = new CellArgs("gru", a.B, a.H, a.H);
+            var hArgs = a with { D = a.H };
             var gx = Lanes(a.GateValues);
             var gh = Lanes(a.GateValues);
             Gates(a, new(x), new(w), default, default, new(bias), gx, a.B);
@@ -189,7 +190,7 @@ internal sealed partial class Kernels
         {
             int GH = a.Gates * a.H;
             long bh = (long)a.B * a.H;
-            var hArgs = new CellArgs("gru", a.B, a.H, a.H);
+            var hArgs = a with { D = a.H };
             var gx = Lanes(a.GateValues);
             var gh = Lanes(a.GateValues);
             Gates(a, new(x), new(w), default, default, new(bias), gx, a.B);
@@ -233,10 +234,11 @@ internal sealed partial class Kernels
             Arg hPrev = new(h0), cPrev = new(c0);
             for (int t = 0; t < T; t++)
             {
-                var gt = gates is null ? g : new Arg(gates, t * bg, true);
+                int step = a.Step(t, T);
+                var gt = gates is null ? g : new Arg(gates, step * bg, true);
                 Product(hPrev, false, new(u), true, gh, a.B, GH, a.H);                          // h · Uᵀ
-                Add(gx.Plus(t * bg), gh, gt, bg);
-                Arg ht = hs.Plus(t * bh), ct = cs.Plus(t * bh);
+                Add(gx.Plus(step * bg), gh, gt, bg);
+                Arg ht = hs.Plus(step * bh), ct = cs.Plus(step * bh);
                 if (hs.Lanes) { Cell(a, gt, default, cPrev, ht, ct); hPrev = ht; cPrev = ct; }
                 else { Cell(a, gt, default, cPrev, ht, ct, hm[t & 1], cm[t & 1]); hPrev = hm[t & 1]; cPrev = cm[t & 1]; }
             }
@@ -253,12 +255,13 @@ internal sealed partial class Kernels
             Arg hPrev = new(h0);
             for (int t = 0; t < T; t++)
             {
-                var gh = ghAll is null ? ghStep : new Arg(ghAll, t * bg, true);
+                int step = a.Step(t, T);
+                var gh = ghAll is null ? ghStep : new Arg(ghAll, step * bg, true);
                 Product(hPrev, false, new(u), true, gh, a.B, GH, a.H);                          // h · Uᵀ
                 Add(gh, new(biasH), gh, bg, GH);
-                var ht = hs.Plus(t * bh);
-                if (hs.Lanes) { Cell(a, gx.Plus(t * bg), gh, hPrev, ht, default); hPrev = ht; }
-                else { Cell(a, gx.Plus(t * bg), gh, hPrev, ht, default, hm[t & 1]); hPrev = hm[t & 1]; }
+                var ht = hs.Plus(step * bh);
+                if (hs.Lanes) { Cell(a, gx.Plus(step * bg), gh, hPrev, ht, default); hPrev = ht; }
+                else { Cell(a, gx.Plus(step * bg), gh, hPrev, ht, default, hm[t & 1]); hPrev = hm[t & 1]; }
             }
 
             return gx;
@@ -298,9 +301,10 @@ internal sealed partial class Kernels
             Arg dhNext = default, dcNext = new(dcLast);
             for (int t = T - 1; t >= 0; t--)
             {
-                Add(new Arg(dhOut, t * bh), dhNext, dht, bh);                                  // the loss's gradient plus the next step's
-                var dg = dgAll.Plus(t * bg);
-                CellBack(a, gates.Plus(t * bg), default, t == 0 ? new Arg(c0) : cs.Plus((t - 1) * bh), dht, dcNext, dg, dcb[t & 1], default);
+                int step = a.Step(t, T);
+                Add(new Arg(dhOut, step * bh), dhNext, dht, bh);                                  // the loss's gradient plus the next step's
+                var dg = dgAll.Plus(step * bg);
+                CellBack(a, gates.Plus(step * bg), default, t == 0 ? new Arg(c0) : cs.Plus(a.Step(t - 1, T) * bh), dht, dcNext, dg, dcb[t & 1], default);
                 Product(dg, false, new(u), false, dhb[t & 1], a.B, a.H, GH);                   // dg · U
                 dhNext = dhb[t & 1]; dcNext = dcb[t & 1];
             }
@@ -332,9 +336,10 @@ internal sealed partial class Kernels
             Arg dhNext = default;
             for (int t = T - 1; t >= 0; t--)
             {
-                Add(new Arg(dhOut, t * bh), dhNext, dht, bh);                                  // the loss's gradient plus the next step's
-                var dgh = dghAll.Plus(t * bg);
-                CellBack(a, gx.Plus(t * bg), ghAll.Plus(t * bg), t == 0 ? new Arg(h0) : hs.Plus((t - 1) * bh), dht, default, dgxAll.Plus(t * bg), dgh, dhCell);
+                int step = a.Step(t, T);
+                Add(new Arg(dhOut, step * bh), dhNext, dht, bh);                                  // the loss's gradient plus the next step's
+                var dgh = dghAll.Plus(step * bg);
+                CellBack(a, gx.Plus(step * bg), ghAll.Plus(step * bg), t == 0 ? new Arg(h0) : hs.Plus(a.Step(t - 1, T) * bh), dht, default, dgxAll.Plus(step * bg), dgh, dhCell);
                 var dhp = dhb[t & 1];
                 Product(dgh, false, new(u), false, dhp, a.B, a.H, GH);                         // dgh · U
                 Add(dhp, dhCell, dhp, bh);
@@ -342,7 +347,7 @@ internal sealed partial class Kernels
             }
 
             int rows = T * a.B;
-            var hArgs = new CellArgs("gru", a.B, a.H, a.H);
+            var hArgs = a with { D = a.H };
             Product(dgxAll, false, new(w), false, new Arg(dx), rows, a.D, GH);                 // dx = dgx · W
             Product(dgxAll, true, new(x), false, new Arg(dw), GH, a.D, rows);                  // dW = dgxᵀ · x
             ColumnSums(dgxAll, rows, GH, db);

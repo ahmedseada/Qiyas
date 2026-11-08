@@ -351,7 +351,7 @@ internal sealed partial class Kernels
         var gx = new byte[BytesOf<TN>(a.GateValues)];
         var gh = new byte[gx.Length];
         CellGates<TN>(a, x, w, null, null, bias, gx);
-        var hArgs = new CellArgs("gru", a.B, a.H, a.H);
+        var hArgs = a with { D = a.H };
         CellGates<TN>(hArgs, h, u, null, null, biasH, gh);
         var dgx = new byte[gx.Length];
         var dgh = new byte[gx.Length];
@@ -397,14 +397,15 @@ internal sealed partial class Kernels
         string lane = "";
         for (int t = 0; t < T; t++)
         {
-            Buffer.BlockCopy(gx, t * gBytes, g, 0, gBytes);
+            int step = a.Step(t, T);
+            Buffer.BlockCopy(gx, step * gBytes, g, 0, gBytes);
             MatMulView<TN>(new ProductView(a.B, GH, a.H, false, true), hPrev, u, gh);                // h · Uᵀ
             Map<TN>("add", g, gh, null, g, a.B * GH, 0, 0);
-            if (gates is not null) Buffer.BlockCopy(g, 0, gates, t * gBytes, gBytes);
+            if (gates is not null) Buffer.BlockCopy(g, 0, gates, step * gBytes, gBytes);
             var ht = hb[t & 1]; var ct = cb[t & 1];
             lane = LstmCell<TN>(a, g, cPrev, ht, ct);
-            Buffer.BlockCopy(ht, 0, hOut, t * hBytes, hBytes);
-            Buffer.BlockCopy(ct, 0, cOut, t * hBytes, hBytes);
+            Buffer.BlockCopy(ht, 0, hOut, step * hBytes, hBytes);
+            Buffer.BlockCopy(ct, 0, cOut, step * hBytes, hBytes);
             hPrev = ht; cPrev = ct;
         }
 
@@ -423,13 +424,14 @@ internal sealed partial class Kernels
         string lane = "";
         for (int t = 0; t < T; t++)
         {
-            Buffer.BlockCopy(gx, t * gBytes, gxt, 0, gBytes);
+            int step = a.Step(t, T);
+            Buffer.BlockCopy(gx, step * gBytes, gxt, 0, gBytes);
             MatMulView<TN>(new ProductView(a.B, GH, a.H, false, true), hPrev, u, gh);                // h · Uᵀ
             MapRow<TN>("add", gh, biasH, gh, a.B, GH);
-            if (ghAll is not null) Buffer.BlockCopy(gh, 0, ghAll, t * gBytes, gBytes);
+            if (ghAll is not null) Buffer.BlockCopy(gh, 0, ghAll, step * gBytes, gBytes);
             var ht = hb[t & 1];
             lane = GruCell<TN>(a, gxt, gh, hPrev, ht);
-            Buffer.BlockCopy(ht, 0, hOut, t * hBytes, hBytes);
+            Buffer.BlockCopy(ht, 0, hOut, step * hBytes, hBytes);
             hPrev = ht;
         }
 
@@ -469,12 +471,13 @@ internal sealed partial class Kernels
         }
     }
 
-    // Each step's input state: h0, then h of steps 0 … T − 2 (T·B × H).
-    private static byte[] Shifted(byte[] h0, byte[] hs, int hBytes, int T)
+    // Each step's input state (T·B × H): h0 at the first step taken, the others' the states of the steps before them (CellArgs.Shift).
+    private static byte[] Shifted(CellArgs a, byte[] h0, byte[] hs, int hBytes, int T)
     {
         var prev = Scratch.Get(Scratch.Prev, (long)T * hBytes);
-        Buffer.BlockCopy(h0, 0, prev, 0, hBytes);
-        Buffer.BlockCopy(hs, 0, prev, hBytes, (T - 1) * hBytes);
+        var (first, others, input) = a.Shift(T);
+        Buffer.BlockCopy(h0, 0, prev, first * hBytes, hBytes);
+        Buffer.BlockCopy(hs, input * hBytes, prev, others * hBytes, (T - 1) * hBytes);
         return prev;
     }
 
@@ -506,19 +509,20 @@ internal sealed partial class Kernels
         string lane = "";
         for (int t = T - 1; t >= 0; t--)
         {
-            Buffer.BlockCopy(dhOut, t * hBytes, dht, 0, hBytes);
+            int step = a.Step(t, T);
+            Buffer.BlockCopy(dhOut, step * hBytes, dht, 0, hBytes);
             Map<TN>("add", dht, dhNext, null, dht, (int)bh, 0, 0);                        // the loss's gradient plus the next step's
-            Buffer.BlockCopy(gates, t * gBytes, g, 0, gBytes);
-            if (t > 0) Buffer.BlockCopy(cs, (t - 1) * hBytes, cPrev, 0, hBytes);
+            Buffer.BlockCopy(gates, step * gBytes, g, 0, gBytes);
+            if (t > 0) Buffer.BlockCopy(cs, a.Step(t - 1, T) * hBytes, cPrev, 0, hBytes);
             var dcp = dcb[t & 1];
             lane = LstmCellBackward<TN>(a, g, t == 0 ? c0 : cPrev, dht, dcNext, dg, dcp);
-            Buffer.BlockCopy(dg, 0, dgAll, t * gBytes, gBytes);
+            Buffer.BlockCopy(dg, 0, dgAll, step * gBytes, gBytes);
             var dhp = dhb[t & 1];
             MatMulView<TN>(new ProductView(a.B, a.H, GW, false, false), dg, u, dhp);         // dg · U
             dhNext = dhp; dcNext = dcp;
         }
 
-        SequenceWeights<TN>(a, T, dgAll, x, Shifted(h0, hs, hBytes, T), w, dx, dw, du, db);
+        SequenceWeights<TN>(a, T, dgAll, x, Shifted(a, h0, hs, hBytes, T), w, dx, dw, du, db);
         dhNext.CopyTo(dh0, 0); dcNext.CopyTo(dc0, 0);
         return lane;
     }
@@ -545,23 +549,24 @@ internal sealed partial class Kernels
         string lane = "";
         for (int t = T - 1; t >= 0; t--)
         {
-            Buffer.BlockCopy(dhOut, t * hBytes, dht, 0, hBytes);
+            int step = a.Step(t, T);
+            Buffer.BlockCopy(dhOut, step * hBytes, dht, 0, hBytes);
             Map<TN>("add", dht, dhNext, null, dht, (int)bh, 0, 0);                        // the loss's gradient plus the next step's
-            Buffer.BlockCopy(gx, t * gBytes, gxt, 0, gBytes);
-            Buffer.BlockCopy(ghAll, t * gBytes, ght, 0, gBytes);
-            if (t > 0) Buffer.BlockCopy(hs, (t - 1) * hBytes, hPrev, 0, hBytes);
+            Buffer.BlockCopy(gx, step * gBytes, gxt, 0, gBytes);
+            Buffer.BlockCopy(ghAll, step * gBytes, ght, 0, gBytes);
+            if (t > 0) Buffer.BlockCopy(hs, a.Step(t - 1, T) * hBytes, hPrev, 0, hBytes);
             lane = GruCellBackward<TN>(a, gxt, ght, t == 0 ? h0 : hPrev, dht, dgx, dgh, dhCell);
-            Buffer.BlockCopy(dgx, 0, dgxAll, t * gBytes, gBytes);
-            Buffer.BlockCopy(dgh, 0, dghAll, t * gBytes, gBytes);
+            Buffer.BlockCopy(dgx, 0, dgxAll, step * gBytes, gBytes);
+            Buffer.BlockCopy(dgh, 0, dghAll, step * gBytes, gBytes);
             var dhp = dhb[t & 1];
             MatMulView<TN>(new ProductView(a.B, a.H, GW, false, false), dgh, u, dhp);        // dgh · U
             Map<TN>("add", dhp, dhCell, null, dhp, (int)bh, 0, 0);
             dhNext = dhp;
         }
 
-        var hArgs = new CellArgs("gru", a.B, a.H, a.H);
+        var hArgs = a with { D = a.H };
         SequenceWeights<TN>(a, T, dgxAll, x, null, w, dx, dw, null, db);
-        SequenceWeights<TN>(hArgs, T, dghAll, Shifted(h0, hs, hBytes, T), null, u, null, du, null, dbh);
+        SequenceWeights<TN>(hArgs, T, dghAll, Shifted(a, h0, hs, hBytes, T), null, u, null, du, null, dbh);
         dhNext.CopyTo(dh0, 0);
         return lane;
     }
@@ -574,7 +579,7 @@ internal sealed partial class Kernels
         var gx = new byte[BytesOf<TN>(a.GateValues)];
         var gh = new byte[gx.Length];
         CellGates<TN>(a, x, w, null, null, bias, gx);
-        CellGates<TN>(new CellArgs("gru", a.B, a.H, a.H), h, u, null, null, biasH, gh);
+        CellGates<TN>(a with { D = a.H }, h, u, null, null, biasH, gh);
         return GruCell<TN>(a, gx, gh, h, hOut);
     }
 }
