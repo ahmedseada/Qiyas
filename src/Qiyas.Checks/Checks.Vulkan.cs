@@ -23,6 +23,7 @@ internal static partial class Checks
         ok &= Products(ops, "vulkan");
         ok &= Optimizers(ops, "vulkan");
         ok &= Routings(ops, "vulkan");
+        ok &= ExpertsCheck(ops, "vulkan");
         ok &= Ctcs(ops, "vulkan");
         ok &= Attentions(ops, "vulkan");
         ok &= Convs(ops, "vulkan");

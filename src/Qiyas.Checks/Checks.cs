@@ -138,6 +138,7 @@ internal static partial class Checks
         ok &= Convs(null);
         ok &= Recurrents(null);
         ok &= Routings(null);
+        ok &= ExpertsCheck(null);
         ok &= Ctcs(null);
         ok &= BlockFormats(null);
         ok &= Arenas(null);
@@ -2352,6 +2353,7 @@ internal static partial class Checks
         ok &= Convs(ops);
         ok &= Recurrents(ops);
         ok &= Routings(ops);
+        ok &= ExpertsCheck(ops, "cuda");
         ok &= Ctcs(ops);
         ok &= BlockFormats(ops);
         ok &= Arenas(ops);

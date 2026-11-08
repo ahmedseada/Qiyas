@@ -1762,8 +1762,13 @@ internal static partial class Ptx
     /// operand's tile loaded as runs of micro values consecutive where it is stored (A's along k, or along m transposed;
     /// B's along n, or along k transposed), each decoded with one read of its block's scales (Codec.UnpackRun).
     /// split (the stored mode, C lane storage; split-k): grid y = the m tiles × the slices; slice z = ctaid.y / p_mb takes
-    /// the k-blocks [z·p_kb, (z + 1)·p_kb) and stores its partial C at p_c + z·m·n lanes (SumSlices joins them in order).</summary>
-    public static string Gemm(Gpu gpu, Lane lane, int micro, out string entry, bool conv = false, GemmStored? stored = null, bool transA = false, bool transB = false, bool runsA = false, bool runsB = false, bool split = false)
+    /// the k-blocks [z·p_kb, (z + 1)·p_kb) and stores its partial C at p_c + z·m·n lanes (SumSlices joins them in order).
+    /// grouped (the stored mode, C lane storage; a mixture's experts, Experts.cs): A's rows grouped by expert at p_off
+    /// (experts + 1 offsets) and B expert e's at e·k·n values; the grid's y the experts' tiles listed expert by expert
+    /// (p_tiles: experts + 1 prefix counts of ⌈rows / tile⌉, ExpertTiles) and past them, a CTA past the last returning; a
+    /// tile's rows those of its expert from offsets[e], bounded by offsets[e + 1].</summary>
+    public static string Gemm(Gpu gpu, Lane lane, int micro, out string entry, bool conv = false, GemmStored? stored = null, bool transA = false, bool transB = false, bool runsA = false, bool runsB = false, bool split = false,
+        bool grouped = false)
     {
         int tile = micro * 16, bk = 16, e = lane.Size;
         entry = conv ? $"gemmconv{(transB ? "t" : "")}{tile}_{lane.Name}" : $"gemm{tile}_{lane.Name}";
@@ -1774,6 +1779,8 @@ internal static partial class Ptx
         var scales = stored?.Scales;
         if (scales is not null && (!transB || runsB || conv)) throw new ArgumentException("scaled B: a weight's codes read transposed, a value at a time");
         if (scales is not null) entry += $"_x{scales.Name}{(stored!.Zeros ? "z" : "")}";
+        if (grouped && (stored is null || stored.C is not null || split || transA || conv || scales is not null)) throw new ArgumentException("grouped: the stored mode into lane sums, A as stored rows");
+        if (grouped) entry += "_g";
         bool typedC = stored?.C is not null;
         var b = new PtxBuilder();
         string tid = b.R(), bx = b.R(), by = b.R(), tx = b.R(), ty = b.R();
@@ -1806,6 +1813,35 @@ internal static partial class Ptx
             b.L($"mul.lo.u64 {cOff}, {cOff}, {e};");
             b.L($"add.u64 {pc}, {pc}, {cOff};");
         }
+        string groupFirst = "";
+        if (grouped)
+        {
+            // This CTA's expert: the first whose tiles end past by (tiles[e + 1] > by); past every expert's, return.
+            string po = Param64(b, "p_off"), pt = Param64(b, "p_tiles"), nE = Param32(b, "p_experts");
+            string ex = b.R(), ts = b.R(), at = b.RD(), pIn = b.P(), kn = b.R();
+            groupFirst = b.R();
+            b.L($"mov.u32 {ex}, 0;");
+            b.Label("GFIND");
+            b.L($"mul.wide.u32 {at}, {ex}, 4;");
+            b.L($"add.u64 {at}, {pt}, {at};");
+            b.L($"ld.global.u32 {ts}, [{at}+4];");
+            b.L($"setp.gt.u32 {pIn}, {ts}, {by};");
+            b.L($"@{pIn} bra GFOUND;");
+            b.L($"add.u32 {ex}, {ex}, 1;");
+            b.L($"setp.lt.u32 {pIn}, {ex}, {nE};");
+            b.L($"@{pIn} bra GFIND;");
+            b.L("ret;");
+            b.Label("GFOUND");
+            b.L($"ld.global.u32 {ts}, [{at}];");
+            b.L($"sub.u32 {by}, {by}, {ts};");                                  // the tile within the expert's rows
+            b.L($"mul.wide.u32 {at}, {ex}, 4;");
+            b.L($"add.u64 {at}, {po}, {at};");
+            b.L($"ld.global.u32 {groupFirst}, [{at}];");
+            b.L($"ld.global.u32 {m}, [{at}+4];");                                // the rows end at the next expert's first
+            b.L($"mul.lo.u32 {kn}, {k}, {n};");
+            b.L($"mad.lo.u32 {boff}, {ex}, {kn}, {boff};");                       // expert ex's weights
+        }
+
         // A stored value of the tile, or 0 where p is false (the index then the array's first value: every load in range).
         string Decoded(Fmt fmt, string ptr, string index, string p, string first)
         {
@@ -1850,7 +1886,8 @@ internal static partial class Ptx
         }
 
         string row0 = b.R(), col0 = b.R();
-        b.L($"mul.lo.u32 {row0}, {by}, {tile};");
+        if (grouped) b.L($"mad.lo.u32 {row0}, {by}, {tile}, {groupFirst};");
+        else b.L($"mul.lo.u32 {row0}, {by}, {tile};");
         b.L($"mul.lo.u32 {col0}, {bx}, {tile};");
         int asBytes = bk * tile * e, bsBytes = bk * tile * e;
         string smem = b.R(), asBase = b.R(), bsBase = b.R();
@@ -2261,7 +2298,8 @@ internal static partial class Ptx
         b.L("ret;");
         string convParams = conv ? ", .param .u32 p_h, .param .u32 p_w, .param .u32 p_kh, .param .u32 p_kw, .param .u32 p_sh, .param .u32 p_sw, .param .u32 p_ph, .param .u32 p_pw, .param .u32 p_dh, .param .u32 p_dw, .param .u32 p_ow" : "";
         string storedParams = (stored is null ? "" : ", .param .u32 p_aoff, .param .u32 p_boff") + (split ? ", .param .u32 p_mb, .param .u32 p_kb" : "")
-            + (scales is null ? "" : ", .param .u64 p_bs, .param .u64 p_bz, .param .u32 p_br, .param .u32 p_bc, .param .u32 p_sc");
+            + (scales is null ? "" : ", .param .u64 p_bs, .param .u64 p_bz, .param .u32 p_br, .param .u32 p_bc, .param .u32 p_sc")
+            + (grouped ? ", .param .u64 p_off, .param .u64 p_tiles, .param .u32 p_experts" : "");
         return b.Finish(Header(gpu), entry, ".param .u64 p_a, .param .u64 p_b, .param .u64 p_c, .param .u32 p_m, .param .u32 p_n, .param .u32 p_k" + convParams + storedParams, asBytes + bsBytes);
     }
 

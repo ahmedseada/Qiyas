@@ -134,6 +134,16 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
 
     string IProducts<byte[]>.ExpandScaled<TN, TW>(ScaledWeight w, byte[] codes, byte[] scales, byte[]? zeros, byte[] output) => ExpandScaled<TN, TW>(w, codes, scales, zeros, output);
 
+    // ---------------------------------------------------------------- experts
+
+    string IExperts<byte[], int[]>.RouteTopK<TN>(byte[] p, int tokens, int experts, int k, bool normalize, byte[] weights, int[] offsets, int[] tokenOfRow, int[] slotRow) =>
+        RouteTopK<TN>(p, tokens, experts, k, normalize, weights, offsets, tokenOfRow, slotRow);
+
+    string IExperts<byte[], int[]>.ExpertMatMul<TN>(ExpertView v, byte[] x, int[] offsets, byte[] weights, byte[]? bias, byte[] y) => ExpertMatMul<TN>(v, x, offsets, weights, bias, y);
+
+    string IExperts<byte[], int[]>.ExpertGatedPair<TN>(ExpertView v, string gate, byte[] x, int[] offsets, byte[] gateWeights, byte[]? gateBias, byte[] upWeights, byte[]? upBias, byte[] hidden) =>
+        ExpertGatedPair<TN>(v, gate, x, offsets, gateWeights, gateBias, upWeights, upBias, hidden);
+
     string IProducts<byte[]>.MatMulBackward<TN>(byte[] a, byte[] b, byte[] dc, byte[] da, byte[] db, int m, int n, int k) => MatMulBackward<TN>(a, b, dc, da, db, m, n, k);
 
     string IProducts<byte[]>.MatMulViewBlocks<TN>(ProductView v, byte[] a, byte[] b, byte[] c) => MatMulViewBlocks<TN>(v, a, b, c);

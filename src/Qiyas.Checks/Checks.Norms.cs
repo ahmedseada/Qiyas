@@ -171,6 +171,7 @@ internal static partial class Checks
     {
         private readonly List<(ulong Ptr, byte[]? Host)> _buffers = [];
         private readonly List<ulong> _indices = [];
+        private readonly List<(ulong Ptr, int[] Host)> _indicesBack = [];
 
         public ulong In(byte[]? a) => Put(a, false);
 
@@ -182,6 +183,14 @@ internal static partial class Checks
             ulong d = ops.RentIndices(a.Length);
             ops.UploadIndices(a, d);
             _indices.Add(d);
+            return d;
+        }
+
+        /// <summary>Indices uploaded, and downloaded back (an output).</summary>
+        public ulong IndicesOut(int[] a)
+        {
+            ulong d = Indices(a);
+            _indicesBack.Add((d, a));
             return d;
         }
 
@@ -198,6 +207,7 @@ internal static partial class Checks
         {
             ops.Synchronize();
             foreach (var (p, h) in _buffers) if (h is not null) ops.Download(p, h);
+            foreach (var (p, h) in _indicesBack) ops.DownloadIndices(p, h);
         }
 
         public void Dispose()
