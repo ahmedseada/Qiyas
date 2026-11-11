@@ -255,13 +255,23 @@ internal static partial class VkKernels
         return b.Build();
     }
 
+    /// <summary>The decode kernel over caches at a position the device holds (ICache.AttentionCached): K and V stored as Fc,
+    /// each row's scale (the queries' type, at head·lk + row) multiplied into its values as they are read, the scores capped.</summary>
+    internal sealed record DecodeCache(Fmt Fc, bool KScales, bool VScales, bool Capped)
+    {
+        public string Key => $"{Fc.Name}{(KScales ? "_k" : "")}{(VScales ? "_v" : "")}{(Capped ? "_cap" : "")}";
+    }
+
     /// <summary>The decode kernel. Arguments: q, k, v, o (lane values), limits, starts, lq, lk, d, scale (a lane slot);
-    /// workgroups heads · lq.</summary>
-    public static SpvKernel AttentionDecode(Vulkan vk, Fmt f, Lane lane, int dims)
+    /// workgroups heads · lq. Over caches: lq is the rows a head of K and V serves (a group's query heads × lq0 queries),
+    /// limits the position (an s32 at the device): row r's query i = r mod lq0 sees keys [max(0, limit − window) when a
+    /// window, limit), limit = p + i + 1 held to [0, lk]; then the K and V row scales, lq0, the window, the cap (a lane slot).</summary>
+    public static SpvKernel AttentionDecode(Vulkan vk, Fmt f, Lane lane, int dims, DecodeCache? cache = null)
     {
         var k = Kinds.Of(lane);
         int nd = (dims + DecodeThreads - 1) / DecodeThreads, cap = nd * DecodeThreads;
-        var b = new Spv($"attention_decode_{f.Name}_{lane.Name}_d{cap}", DecodeThreads, vk.Controls);
+        var fk = cache?.Fc ?? f;                                                 // K and V's stored format
+        var b = new Spv($"attention_decode_{f.Name}_{lane.Name}_d{cap}{(cache is null ? "" : "_at_" + cache.Key)}", DecodeThreads, vk.Controls);
         var q = b.Arg(0);
         var kp = b.Arg(1);
         var vp = b.Arg(2);
@@ -276,8 +286,24 @@ internal static partial class VkKernels
         var hq = b.GroupX;
         var h = hq / lq;
         var i = hq - h * lq;
-        var limit = b.Min(b.Load(K.U32, b.At(lim, i, 4)), lk);
-        var start = b.Load(K.U32, b.At(starts, i, 4));
+        V limit, start;
+        V? kScales = null, vScales = null, capAt = null;
+        if (cache is null)
+        {
+            limit = b.Min(b.Load(K.U32, b.At(lim, i, 4)), lk);
+            start = b.Load(K.U32, b.At(starts, i, 4));
+        }
+        else
+        {
+            kScales = b.Arg(10);
+            vScales = b.Arg(11);
+            V lq0 = b.Arg(12, K.U32), window = b.Arg(13, K.U32);
+            capAt = b.Arg(14, k);
+            var seen = b.Min(b.Max(b.Load(K.S32, lim) + b.Convert(i % lq0, K.S32) + 1.0, b.S(0)), b.Convert(lk, K.S32));
+            limit = b.Convert(seen, K.U32);
+            start = b.Select(window == 0.0, b.U(0), b.Convert(b.Max(seen - b.Convert(window, K.S32), b.S(0)), K.U32));
+        }
+
         var qOff = hq * d;
         var kHead = h * lk * d;
         var zero = b.C(k, 0);
@@ -286,6 +312,7 @@ internal static partial class VkKernels
         var red1 = b.Shared(k, DecodeThreads);
         var red2 = b.Shared(k, DecodeThreads);
         var ps = b.Shared(k, DecodeThreads);
+        Arr? pv = cache is { VScales: true } ? b.Shared(k, DecodeThreads) : null;      // the chunk's V row scales
         b.For(tid, b.U(cap), b.U(DecodeThreads), t => sq[t] = b.Select(t < d, Codec.UnpackAt(b, f, q, qOff + b.Select(t < d, t, b.U(0)), lane), zero));
         b.Barrier();
         var m = b.Local(negInf);
@@ -298,15 +325,25 @@ internal static partial class VkKernels
             var key = c0 + tid;
             var valid = key < limit;
             var row = kHead + b.Select(valid, key, b.U(0)) * d;
+            var keyRow = h * lk + b.Select(valid, key, b.U(0));
             var dot = b.Local(zero);
-            b.For(b.U(0), d, t => dot.V = b.Fma(sq[t], Codec.UnpackAt(b, f, kp, row + t, lane), dot.V));
-            var sj = b.Select(valid, dot.V * scale, negInf);
+            if (cache is { KScales: true })
+            {
+                var rowScale = Codec.UnpackAt(b, f, kScales!.Value, keyRow, lane);                 // the row's values: code·scale
+                b.For(b.U(0), d, t => dot.V = b.Fma(sq[t], Codec.UnpackAt(b, fk, kp, row + t, lane) * rowScale, dot.V));
+            }
+            else b.For(b.U(0), d, t => dot.V = b.Fma(sq[t], Codec.UnpackAt(b, fk, kp, row + t, lane), dot.V));
+
+            // The score: scaled, or the map's softcap (cap·tanh(scale·s / cap)).
+            var score = cache is { Capped: true } ? capAt!.Value * Fn.Tanh(b, (scale * dot.V) / capAt!.Value) : dot.V * scale;
+            var sj = b.Select(valid, score, negInf);
             var cmax = GroupReduce(b, red1, tid, sj, b.Max, DecodeThreads);
             var mNew = b.Max(m.V, cmax);
             var mUse = b.Select(mNew == double.NegativeInfinity, zero, mNew);
             var alpha = Fn.Exp(b, m.V - mUse);
             var p = b.Select(valid, Fn.Exp(b, sj - mUse), zero);
             ps[tid] = p;
+            if (pv is { } vRows) vRows[tid] = Codec.UnpackAt(b, f, vScales!.Value, keyRow, lane);
             var csum = GroupReduce(b, red2, tid, p, static (x, y) => x + y, DecodeThreads);
             l.V = b.Fma(l.V, alpha, csum);
             m.V = mNew;
@@ -319,7 +356,8 @@ internal static partial class VkKernels
                 var col = b.Select(inside, dim, b.U(0));
                 var a = acc[j];
                 a.V = a.V * alpha;
-                b.For(b.U(0), count, cc => a.V = b.Fma(ps[cc], Codec.UnpackAt(b, f, vp, kHead + (c0 + cc) * d + col, lane), a.V));
+                if (pv is { } rowScales) b.For(b.U(0), count, cc => a.V = b.Fma(ps[cc], Codec.UnpackAt(b, fk, vp, kHead + (c0 + cc) * d + col, lane) * rowScales[cc], a.V));
+                else b.For(b.U(0), count, cc => a.V = b.Fma(ps[cc], Codec.UnpackAt(b, fk, vp, kHead + (c0 + cc) * d + col, lane), a.V));
             }
 
             b.Barrier();

@@ -166,6 +166,18 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
 
     string IAttention<byte[]>.AttentionBackward<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] dO, byte[] dq, byte[] dk, byte[] dv) => AttentionBackward<TN>(a, q, k, v, dO, dq, dk, dv);
 
+    // ---------------------------------------------------------------- caches
+
+    string ICache<byte[], int[]>.CacheWrite<TN, TC>(CacheView c, int steps, int[] position, byte[] source, byte[] cache, byte[]? scales) =>
+        CacheWrite<TN, TC>(c, steps, position, source, cache, scales);
+
+    string ICache<byte[], int[]>.AttentionCached<TN, TC>(AttentionArgs a, int[] position, byte[] q, byte[] k, byte[]? kScales, byte[] v, byte[]? vScales, byte[] o) =>
+        AttentionCached<TN, TC>(a, position, q, k, kScales, v, vScales, o);
+
+    string ICache<byte[], int[]>.DecoderMask<TN>(int rows, int capacity, int window, int[] position, byte[] mask) => DecoderMask<TN>(rows, capacity, window, position, mask);
+
+    void ICache<byte[], int[]>.PositionAdvance(int[] position, int steps) => PositionAdvance(position, steps);
+
     // ---------------------------------------------------------------- optimizers, convolution, ctc
 
     string IOptimizers<byte[]>.Optimizer<TN>(OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) => Optimizer<TN>(a, p, g, m, v, n);

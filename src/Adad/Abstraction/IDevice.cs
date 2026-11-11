@@ -10,7 +10,7 @@ namespace Adad.Abstraction;
 
 public interface IDevice<TBuffer, TIndex> : IMemory<TBuffer, TIndex>, IElementwise<TBuffer>, IReductions<TBuffer>, IRows<TBuffer, TIndex>,
     ILayouts<TBuffer, TIndex>, IProducts<TBuffer>, IAttention<TBuffer>, IOptimizers<TBuffer>, IConvolution<TBuffer>, IRecurrent<TBuffer>,
-    IRouting<TBuffer, TIndex>, ICtc<TBuffer>, IBoxes<TBuffer>, IExperts<TBuffer, TIndex>
+    IRouting<TBuffer, TIndex>, ICtc<TBuffer>, IBoxes<TBuffer>, IExperts<TBuffer, TIndex>, ICache<TBuffer, TIndex>
 {
     /// <summary>What the kernels were chosen by on this device (measured, or as the hardware reports it).</summary>
     string Report();

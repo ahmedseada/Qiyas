@@ -135,6 +135,7 @@ internal static partial class Checks
         ok &= Products(null);
         ok &= Attentions(null);
         ok &= AttentionOptions(null);
+        ok &= CacheCheck(null);
         ok &= Optimizers(null);
         ok &= Convs(null);
         ok &= Recurrents(null);
@@ -2352,6 +2353,7 @@ internal static partial class Checks
         ok &= Products(ops);
         ok &= Attentions(ops);
         ok &= AttentionOptions(ops, "cuda");
+        ok &= CacheCheck(ops, "cuda");
         ok &= Optimizers(ops);
         ok &= Convs(ops);
         ok &= Recurrents(ops);
