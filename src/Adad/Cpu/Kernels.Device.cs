@@ -181,6 +181,12 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
 
     void ICache<byte[], int[]>.PositionAdvance(int[] position, int steps) => PositionAdvance(position, steps);
 
+    // ---------------------------------------------------------------- decoding
+
+    void IDecoding<byte[], int[]>.HistoryPush(int[] ids, int[] history, int[] length, int rows, int capacity) => HistoryPush(ids, history, length, rows, capacity);
+
+    string IDecoding<byte[], int[]>.Penalize<TN>(PenaltyArgs a, byte[] x, int[] history, int[] length, byte[] output) => Penalize<TN>(a, x, history, length, output);
+
     // ---------------------------------------------------------------- optimizers, convolution, ctc
 
     string IOptimizers<byte[]>.Optimizer<TN>(OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) => Optimizer<TN>(a, p, g, m, v, n);

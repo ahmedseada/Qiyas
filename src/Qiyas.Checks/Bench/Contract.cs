@@ -129,6 +129,10 @@ public interface IBenchSubject
     /// <summary>top-k of each row of x (rows × cols): values (rows × k, as the type) and indices (s32), largest first.</summary>
     IBenchRun? TopK(Device device, string type, byte[] x, int rows, int cols, int k, byte[] values, int[] indices) => null;
 
+    /// <summary>The rows' scores with the tokens of each row's window penalized (IDecoding.Penalize): the rings (a.Rows ×
+    /// a.Capacity) at the length, output a.Rows × a.Cols as the type.</summary>
+    IBenchRun? Penalize(Device device, string type, PenaltyArgs a, byte[] x, int[] history, int length, byte[] output) => null;
+
     /// <summary>top-k of each row as log-probabilities (IRouting.LogSoftmaxTopK): values (rows × k, as the type) and indices.</summary>
     IBenchRun? LogSoftmaxTopK(Device device, string type, byte[] x, int rows, int cols, int k, byte[] values, int[] indices) => null;
 

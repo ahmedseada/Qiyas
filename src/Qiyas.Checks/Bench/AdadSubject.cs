@@ -609,6 +609,21 @@ public sealed class AdadSubject : IBenchSubject
         }
     }
 
+    public IBenchRun? Penalize(Device device, string type, PenaltyArgs a, byte[] x, int[] history, int length, byte[] output) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new PenalizeVisitor(device, a, x, history, length, output)) : null;
+
+    private sealed class PenalizeVisitor(Device device, PenaltyArgs a, byte[] x, int[] history, int length, byte[] output) : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, PenalizeVisitor>(device, this);
+
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        {
+            TB dx = s.In(x, s.Slack), dy = s.Out(output, s.Slack);
+            TI dh = s.Index(history), dl = s.Index([length]);
+            return s.Run(() => s.D.Penalize<TN>(a, dx, dh, dl, dy));
+        }
+    }
+
     public IBenchRun? Pick(Device device, string type, byte[] x, int rows, int cols, int[] index, byte[] output) =>
         Registry.With(type, new PickVisitor(device, x, rows, cols, index, output));
 

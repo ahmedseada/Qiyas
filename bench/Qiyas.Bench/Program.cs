@@ -141,6 +141,7 @@ internal sealed class Options
     public static readonly string[] Group9 = ["topk_rows", "log_softmax_topk", "pick_rows", "sample_rows", "route", "route_wide", "cross_entropy", "ctc", "ctc_bwd"];
     public static readonly string[] Group10 = ["cache_write", "cache_write_scaled", "quantize_rows", "attention_cached", "attention_cached_scaled", "decoder_mask"];
     public static readonly string[] Group11 = ["rope_table", "rope_heads", "cache_write_rope", "attention_steps"];
+    public static readonly string[] Group12 = ["penalize"];
     public List<string>? Subjects;
     public string? Baseline;
 
@@ -166,7 +167,7 @@ internal sealed class Options
                 case "--types": o.Types = Next(); break;
                 case "--ops":
                     o.Ops = Next();
-                    if (o.Ops.Contains("all")) o.Ops = [.. Core, .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name), .. Group2, .. Group3, .. Group4, .. Group4b, .. Group5, .. Group6, .. Group7, .. Group8, .. Group9, .. Group10, .. Group11];
+                    if (o.Ops.Contains("all")) o.Ops = [.. Core, .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name), .. Group2, .. Group3, .. Group4, .. Group4b, .. Group5, .. Group6, .. Group7, .. Group8, .. Group9, .. Group10, .. Group11, .. Group12];
                     if (o.Ops.Contains("map")) o.Ops = [.. o.Ops.Where(n => n != "map"), .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name)];
                     if (o.Ops.Contains("reduce")) o.Ops = [.. o.Ops.Where(n => n != "reduce"), .. Group2];
                     if (o.Ops.Contains("rows")) o.Ops = [.. o.Ops.Where(n => n != "rows"), .. Group3];
@@ -179,6 +180,7 @@ internal sealed class Options
                     if (o.Ops.Contains("routing")) o.Ops = [.. o.Ops.Where(n => n != "routing"), .. Group9];
                     if (o.Ops.Contains("cache")) o.Ops = [.. o.Ops.Where(n => n != "cache"), .. Group10];
                     if (o.Ops.Contains("heads")) o.Ops = [.. o.Ops.Where(n => n != "heads"), .. Group11];
+                    if (o.Ops.Contains("decoding")) o.Ops = [.. o.Ops.Where(n => n != "decoding"), .. Group12];
                     break;
                 case "--baseline": o.Baseline = args[++i]; break;
                 case "--shapes": o.Shapes = args[++i]; if (o.Shapes is not ("regular" or "odd")) throw new ArgumentException($"--shapes takes regular or odd, not {o.Shapes}"); break;
@@ -333,6 +335,11 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         foreach (var name in Options.Group11)
         {
             if (options.Ops.Contains(name)) HeadsRow(device, type, name);
+        }
+
+        foreach (var name in Options.Group12)
+        {
+            if (options.Ops.Contains(name)) DecodingRow(device, type, name);
         }
 
         if (!Registry.IsFloat(type)) return;
@@ -687,6 +694,25 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         var want = a.Reference(qv, kv, vv);
         if (name.StartsWith("attention_fused", StringComparison.Ordinal)) { Measure(device, name, type, shape, want, (s, o) => s.AttentionFused(device, type, a, q, k, v, o), q.Length); return; }
         Measure(device, name, type, shape, want, (s, o) => s.Attention(device, type, a, q, k, v, o, name == "attention_decode"), q.Length);
+    }
+
+    // A decoder's steps (float types).
+    private void DecodingRow(Device device, string type, string name)
+    {
+        if (!Registry.IsFloat(type)) return;
+        if (name == "penalize")
+        {
+            // As many scores as a map row (512 rows of 32768: map's 16M values), each row's window the last 64 tokens of a ring
+            // of 256 that has wrapped, a token in four repeated.
+            int rows = Prime(512), cols = Prime(32768), capacity = 256, length = 1000;
+            var a = new PenaltyArgs(rows, cols, capacity, 64, 1.1, 0.25, 0.125);
+            var x = Registry.Make(type, rows * cols, 95, -4, 4);
+            var random = new Random(96);
+            var history = new int[rows * capacity];
+            for (int i = 0; i < history.Length; i++) history[i] = i % 4 == 3 ? history[i - 1] : random.Next(cols);
+            var want = a.Reference(Registry.Values(type, x, rows * cols), history, length);
+            Measure(device, name, type, $"{rows}x{cols} last 64 of {capacity}", want, (s, y) => s.Penalize(device, type, a, x, history, length, y), (int)Registry.Bytes(type, rows * cols));
+        }
     }
 
     // Key and value caches (float types). The write: 16 heads of 512 rows of d = 128 at row 1000 of a cache of 2048 rows, as
