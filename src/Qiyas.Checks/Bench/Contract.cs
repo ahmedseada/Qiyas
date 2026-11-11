@@ -95,6 +95,20 @@ public interface IBenchSubject
     /// <summary>dQ, dK, dV from dO.</summary>
     IBenchRun? AttentionBackward(Device device, string type, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] dO, byte[] dq, byte[] dk, byte[] dv) => null;
 
+    /// <summary>The source's rows (c.Heads × steps × c.D of the type) into the cache (of cacheType) at the position
+    /// (ICache.CacheWrite); with scales (of the type) given: the rows' codes and their scales.</summary>
+    IBenchRun? CacheWrite(Device device, string type, string cacheType, CacheView c, int steps, int position, byte[] source, byte[] cache, byte[]? scales) => null;
+
+    /// <summary>O for the queries at the position against caches of cacheType (ICache.AttentionCached), their row scales (of
+    /// the type) when given.</summary>
+    IBenchRun? AttentionCached(Device device, string type, string cacheType, AttentionArgs a, int position, byte[] q, byte[] k, byte[]? kScales, byte[] v, byte[]? vScales, byte[] o) => null;
+
+    /// <summary>The mask of rows decoder steps over capacity positions at the position (ICache.DecoderMask), as the type.</summary>
+    IBenchRun? DecoderMask(Device device, string type, int rows, int capacity, int window, int position, byte[] mask) => null;
+
+    /// <summary>The codes (of codesType) and scales (of the type) of a scaled weight's values (IProducts.Quantize, no zero points).</summary>
+    IBenchRun? Quantize(Device device, string type, string codesType, ScaledWeight w, byte[] values, byte[] codes, byte[] scales) => null;
+
     /// <summary>An optimizer step (OptimizerArgs.Names) over n values: p (updated in place) and g as the type, the moments m, v as
     /// the subject's lane storage (float32 or float64 bytes; v null for one moment), updated in place.</summary>
     IBenchRun? Optimizer(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) => null;

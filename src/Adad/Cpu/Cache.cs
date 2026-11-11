@@ -230,7 +230,7 @@ internal sealed partial class Kernels
             try
             {
                 TLane scale = TL.From(a.Scale);
-                bool capped = a.Softcap > 0;
+                bool capped = a.Softcap > 0, own = typeof(TLW) == typeof(TLane);          // the cache's lane is the float lane: its rows loaded into it
                 Vector<TLane> capV = new(TL.From(a.Softcap)), scaleV = new(scale);
                 Span<TLane> tail = stackalloc TLane[w];
                 var row = kr.AsSpan(0, d);
@@ -246,8 +246,13 @@ internal sealed partial class Kernels
                     if (kScales is not null && n > 0) TN.Load(kScales, rowBase, rs.AsSpan(0, n));
                     for (int j = start; j < limit; j++)
                     {
-                        TW.Load(k, (int)(kBase + (long)j * d), codes);
-                        Widths.Load<TLW, TLane>(codes, row);
+                        if (own) TW.Load(k, (int)(kBase + (long)j * d), MemoryMarshal.Cast<TLane, TLW>(row));
+                        else
+                        {
+                            TW.Load(k, (int)(kBase + (long)j * d), codes);
+                            Widths.Load<TLW, TLane>(codes, row);
+                        }
+
                         if (kScales is not null) RowMath<TLane, TL>.Scale(row, TL.Zero, rs[j - start], row);
                         s[j] = RowMath<TLane, TL>.Dot(qr.AsSpan(0, d), row);
                     }
@@ -275,8 +280,13 @@ internal sealed partial class Kernels
                     acc.AsSpan(0, d).Clear();
                     for (int j = start; j < limit; j++)
                     {
-                        TW.Load(v, (int)(kBase + (long)j * d), codes);
-                        Widths.Load<TLW, TLane>(codes, row);
+                        if (own) TW.Load(v, (int)(kBase + (long)j * d), MemoryMarshal.Cast<TLane, TLW>(row));
+                        else
+                        {
+                            TW.Load(v, (int)(kBase + (long)j * d), codes);
+                            Widths.Load<TLW, TLane>(codes, row);
+                        }
+
                         if (vScales is not null) RowMath<TLane, TL>.Scale(row, TL.Zero, rs[j - start], row);
                         var pj = new Vector<TLane>(s[j]);
                         int t = 0;

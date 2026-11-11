@@ -139,6 +139,14 @@ public static class Registry
         }
     }
 
+    /// <summary>The type's lowest value (a float type's: its largest finite, negated).</summary>
+    public static double Lowest(string name) => With(name, new LowestVisitor());
+
+    private sealed class LowestVisitor : ITypeVisitor<double>
+    {
+        public double Visit<TN>() where TN : struct, IAdad<TN, float> => TN.Min;
+    }
+
     /// <summary>The type's smallest step (its subnormals'): float64 2^−1074, float32 2^−149, float16 2^−24, bfloat16 2^−133, float8 e4m3 2^−9, e5m2 2^−16.</summary>
     public static double MinStep(string name) => name switch
     {

@@ -59,6 +59,16 @@ public sealed class AdadSubject : IBenchSubject
 
         public TB? OutOrNone(byte[]? data, int pad = 0) => data is null ? default : Out(data, pad);
 
+        /// <summary>Uploaded, and read back on Collect: an output the operation writes a part of (the rest as the host gave it).</summary>
+        public TB InOut(byte[] data, int pad = 0)
+        {
+            var b = In(data, pad);
+            Collect(b, data);
+            return b;
+        }
+
+        public TB? InOutOrNone(byte[]? data, int pad = 0) => data is null ? default : InOut(data, pad);
+
         /// <summary>The buffer read back into data on Collect.</summary>
         public void Collect(TB buffer, byte[] data) => _collect.Add(() => device.Download(buffer, data));
 
@@ -362,6 +372,109 @@ public sealed class AdadSubject : IBenchSubject
             TB dOut = s.Out(o);
             return s.Run(() => decode ? s.D.AttentionDecode<TN>(a, dQ, dK, dV, dOut) : fused ? s.D.AttentionRows<TN>(a, dQ, dK, dV, dOut) : s.D.Attention<TN>(a, dQ, dK, dV, dOut));
         }
+    }
+
+    // ---------------------------------------------------------------- caches (two types: the values', and the cache's by name)
+
+    public IBenchRun? CacheWrite(Device device, string type, string cacheType, CacheView c, int steps, int position, byte[] source, byte[] cache, byte[]? scales) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new CacheWriteVisitor(device, cacheType, c, steps, position, source, cache, scales)) : null;
+
+    private sealed class CacheWriteVisitor(Device device, string cacheType, CacheView c, int steps, int position, byte[] source, byte[] cache, byte[]? scales) : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, CacheWriteVisitor>(device, this);
+
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => Registry.With(cacheType, new Typed<TN, TB, TI>(this, s));
+
+        private sealed class Typed<TN, TB, TI>(CacheWriteVisitor r, Staged<TB, TI> s) : ITypeVisitor<IBenchRun> where TN : struct, IFloatAdad<TN>
+        {
+            public IBenchRun Visit<TC>() where TC : struct, IAdad<TC, float>
+            {
+                int pad = s.Slack;
+                TB src = s.In(r.Source, pad), dst = s.InOut(r.Cache, pad);
+                TB? sc = s.InOutOrNone(r.Scales, pad);
+                TI at = s.Index([r.Position]);
+                return s.Run(() => s.D.CacheWrite<TN, TC>(r.C, r.Steps, at, src, dst, sc));
+            }
+        }
+
+        public CacheView C => c;
+        public int Steps => steps;
+        public int Position => position;
+        public byte[] Source => source;
+        public byte[] Cache => cache;
+        public byte[]? Scales => scales;
+    }
+
+    public IBenchRun? AttentionCached(Device device, string type, string cacheType, AttentionArgs a, int position, byte[] q, byte[] k, byte[]? kScales, byte[] v, byte[]? vScales, byte[] o) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new AttentionCachedVisitor(device, cacheType, a, position, q, k, kScales, v, vScales, o)) : null;
+
+    private sealed class AttentionCachedVisitor(Device device, string cacheType, AttentionArgs a, int position, byte[] q, byte[] k, byte[]? kScales, byte[] v, byte[]? vScales, byte[] o)
+        : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, AttentionCachedVisitor>(device, this);
+
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => Registry.With(cacheType, new Typed<TN, TB, TI>(this, s));
+
+        private sealed class Typed<TN, TB, TI>(AttentionCachedVisitor r, Staged<TB, TI> s) : ITypeVisitor<IBenchRun> where TN : struct, IFloatAdad<TN>
+        {
+            public IBenchRun Visit<TC>() where TC : struct, IAdad<TC, float>
+            {
+                int pad = s.Slack;
+                TB dq = s.In(r.Q, pad), dk = s.In(r.K, pad), dv = s.In(r.V, pad), dout = s.Out(r.O, pad);
+                TB? ks = s.InOrNone(r.KScales, pad), vs = s.InOrNone(r.VScales, pad);
+                TI at = s.Index([r.Position]);
+                return s.Run(() => s.D.AttentionCached<TN, TC>(r.A, at, dq, dk, ks, dv, vs, dout));
+            }
+        }
+
+        public AttentionArgs A => a;
+        public int Position => position;
+        public byte[] Q => q;
+        public byte[] K => k;
+        public byte[]? KScales => kScales;
+        public byte[] V => v;
+        public byte[]? VScales => vScales;
+        public byte[] O => o;
+    }
+
+    public IBenchRun? DecoderMask(Device device, string type, int rows, int capacity, int window, int position, byte[] mask) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new DecoderMaskVisitor(device, rows, capacity, window, position, mask)) : null;
+
+    private sealed class DecoderMaskVisitor(Device device, int rows, int capacity, int window, int position, byte[] mask) : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, DecoderMaskVisitor>(device, this);
+
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        {
+            TB dm = s.Out(mask, s.Slack);
+            TI at = s.Index([position]);
+            return s.Run(() => s.D.DecoderMask<TN>(rows, capacity, window, at, dm));
+        }
+    }
+
+    public IBenchRun? Quantize(Device device, string type, string codesType, ScaledWeight w, byte[] values, byte[] codes, byte[] scales) =>
+        Registry.IsFloat(type) && !Registry.IsBlock(type) ? Registry.WithFloat(type, new QuantizeVisitor(device, codesType, w, values, codes, scales)) : null;
+
+    private sealed class QuantizeVisitor(Device device, string codesType, ScaledWeight w, byte[] values, byte[] codes, byte[] scales) : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, QuantizeVisitor>(device, this);
+
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => Registry.With(codesType, new Typed<TN, TB, TI>(this, s));
+
+        private sealed class Typed<TN, TB, TI>(QuantizeVisitor r, Staged<TB, TI> s) : ITypeVisitor<IBenchRun> where TN : struct, IFloatAdad<TN>
+        {
+            public IBenchRun Visit<TW>() where TW : struct, IAdad<TW, float>
+            {
+                int pad = s.Slack;
+                TB x = s.In(r.Values, pad), dc = s.Out(r.Codes, pad), ds = s.Out(r.Scales, pad);
+                return s.Run(() => s.D.Quantize<TN, TW>(r.W, x, dc, ds, default));
+            }
+        }
+
+        public ScaledWeight W => w;
+        public byte[] Values => values;
+        public byte[] Codes => codes;
+        public byte[] Scales => scales;
     }
 
     public IBenchRun? Optimizer(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) =>

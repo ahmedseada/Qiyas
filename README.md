@@ -53,7 +53,7 @@ does best for it, chosen per operation from the data itself. No type is fixed an
 
 ## The bench
 
-`Qiyas.Bench.dll [cpu|cuda|cuda,cpu] [--subjects a,b] [--types ...] [--ops add,matmul,softmax,rms_norm,map|reduce|rows|layout|products|attention|optimizers|conv|recurrent|routing|all] [--baseline name] [--shapes regular|odd] [--report] [--repeat N]`
+`Qiyas.Bench.dll [cpu|cuda|cuda,cpu] [--subjects a,b] [--types ...] [--ops add,matmul,softmax,rms_norm,map|reduce|rows|layout|products|attention|optimizers|conv|recurrent|routing|cache|all] [--baseline name] [--shapes regular|odd] [--report] [--repeat N]`
 
 `--subjects` picks the columns (`adad`, `number`, and what you add), `--types` the stored types (the seventeen plain
 ones, `bool`, `q8_0`, `q4_0`, `q4_k`, `q6_k`), `--ops` the rows, `--baseline` a named earlier results file to
@@ -89,7 +89,13 @@ pools and the depthwise convolution are layout operations (`layout:maxpool`, `la
 `layout:adaptive_maxpool`, `layout:adaptive_avgpool`, `layout:depthwise_conv`); `recurrent` adds `lstm_step`, `gru_step`
 and their `_bwd` (a batch of 1024, input 1024, hidden 1024), `lstm_seq`, `lstm_seq_bwd`, `gru_seq` and `gru_seq_bwd` (16 steps of 256 × 512 → 512); `routing` adds `topk_rows`, `pick_rows`, `sample_rows`
 (4096 rows of 32768), `route` (1M indices into 64 buckets), `route_wide` (1M into 65 536), `cross_entropy` (the loss per row: the subject's fused loss where it has one, else log_softmax, pick, neg), and
-`ctc`, `ctc_bwd` (256 frames of 32 sequences over 1024 classes, 64 labels each; the loss scored, then the gradient).
+`ctc`, `ctc_bwd` (256 frames of 32 sequences over 1024 classes, 64 labels each; the loss scored, then the gradient);
+`cache` adds the key and value caches' rows (float types): `cache_write` (16 heads of 512 rows of d = 128 into a cache of
+2048 rows at row 1000, as the type itself — a block format's as float32 — the cache scored), `cache_write_scaled` (the same
+rows as int8 codes with a scale a row, the scales scored) beside `quantize_rows` (the same rows through Quantize, a scale a
+row: the write's nearest equivalent), `attention_cached` and `attention_cached_scaled` (`attention_decode`'s shape, 32
+heads and one query at the last of 4096 rows, over a cache of the type and over int8 codes with row scales) and
+`decoder_mask` (512 steps over 4096 positions). `--shapes odd` keeps a row of the cache whole 32-bit words (d = 124).
 `COVERAGE.md` lists every operation with its lane rule on each device. The block formats and bool run through every
 family: a block format's lane is float32, read a value at a time anywhere (both devices decode by index) and written a
 block at a time (the CPU re-encodes the blocks a store touches, tasks never sharing a block; the device computes

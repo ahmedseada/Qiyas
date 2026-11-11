@@ -139,6 +139,7 @@ internal sealed class Options
     public static readonly string[] Group6 = ["conv", "conv_bwd"];
     public static readonly string[] Group8 = ["lstm_step", "gru_step", "lstm_step_bwd", "gru_step_bwd", "lstm_seq", "lstm_seq_bwd", "gru_seq", "gru_seq_bwd"];
     public static readonly string[] Group9 = ["topk_rows", "pick_rows", "sample_rows", "route", "route_wide", "cross_entropy", "ctc", "ctc_bwd"];
+    public static readonly string[] Group10 = ["cache_write", "cache_write_scaled", "quantize_rows", "attention_cached", "attention_cached_scaled", "decoder_mask"];
     public List<string>? Subjects;
     public string? Baseline;
 
@@ -164,7 +165,7 @@ internal sealed class Options
                 case "--types": o.Types = Next(); break;
                 case "--ops":
                     o.Ops = Next();
-                    if (o.Ops.Contains("all")) o.Ops = [.. Core, .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name), .. Group2, .. Group3, .. Group4, .. Group4b, .. Group5, .. Group6, .. Group7, .. Group8, .. Group9];
+                    if (o.Ops.Contains("all")) o.Ops = [.. Core, .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name), .. Group2, .. Group3, .. Group4, .. Group4b, .. Group5, .. Group6, .. Group7, .. Group8, .. Group9, .. Group10];
                     if (o.Ops.Contains("map")) o.Ops = [.. o.Ops.Where(n => n != "map"), .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name)];
                     if (o.Ops.Contains("reduce")) o.Ops = [.. o.Ops.Where(n => n != "reduce"), .. Group2];
                     if (o.Ops.Contains("rows")) o.Ops = [.. o.Ops.Where(n => n != "rows"), .. Group3];
@@ -175,6 +176,7 @@ internal sealed class Options
                     if (o.Ops.Contains("conv")) o.Ops = [.. o.Ops.Where(n => n != "conv"), .. Group6];
                     if (o.Ops.Contains("recurrent")) o.Ops = [.. o.Ops.Where(n => n != "recurrent"), .. Group8];
                     if (o.Ops.Contains("routing")) o.Ops = [.. o.Ops.Where(n => n != "routing"), .. Group9];
+                    if (o.Ops.Contains("cache")) o.Ops = [.. o.Ops.Where(n => n != "cache"), .. Group10];
                     break;
                 case "--baseline": o.Baseline = args[++i]; break;
                 case "--shapes": o.Shapes = args[++i]; if (o.Shapes is not ("regular" or "odd")) throw new ArgumentException($"--shapes takes regular or odd, not {o.Shapes}"); break;
@@ -319,6 +321,11 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         foreach (var name in Options.Group9)
         {
             if (options.Ops.Contains(name)) RoutingRow(device, type, name);
+        }
+
+        foreach (var name in Options.Group10)
+        {
+            if (options.Ops.Contains(name)) CacheRow(device, type, name);
         }
 
         if (!Registry.IsFloat(type)) return;
@@ -665,6 +672,78 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         Measure(device, name, type, shape, want, (s, o) => s.Attention(device, type, a, q, k, v, o, name == "attention_decode"), q.Length);
     }
 
+    // Key and value caches (float types). The write: 16 heads of 512 rows of d = 128 at row 1000 of a cache of 2048 rows, as
+    // the type itself (a block format's: as float32) — the cache scored — and as int8 codes with a scale a row — the scales
+    // scored; quantize_rows is the same rows through Quantize (a scale a row), the write's nearest equivalent. Attention:
+    // attention_decode's shape (32 heads, one query over 4096 keys) with the position at the cache's last row, over a cache
+    // of the type and over int8 codes with row scales. The mask: 512 steps over 4096 positions. Odd shapes keep a row of
+    // the cache whole 32-bit words (d a multiple of 4).
+    private void CacheRow(Device device, string type, string name)
+    {
+        if (!Registry.IsFloat(type)) return;
+        int d = Odd ? 4 * Prime(32) : 128;
+        string own = Registry.IsBlock(type) ? "float32" : type;
+        if (name == "decoder_mask")
+        {
+            int rows = Prime(512), cap = Prime(4096), at = 1000;
+            double lowest = Registry.Lowest(type);
+            var want = new double[rows * cap];
+            for (int i = 0; i < want.Length; i++) want[i] = CacheView.Sees(at, i / cap, i % cap, 0) ? 0 : lowest;
+            Measure(device, name, type, $"{rows}x{cap}", want, (s, mask) => s.DecoderMask(device, type, rows, cap, 0, at, mask), (int)Registry.Bytes(type, want.Length));
+            return;
+        }
+
+        if (name is "cache_write" or "cache_write_scaled" or "quantize_rows")
+        {
+            int heads = 16, steps = Prime(512), cap = Prime(2048), at = 1000, n = heads * steps * d;
+            var view = new CacheView(heads, cap, d);
+            var source = Registry.Make(type, n, 91, -1, 1);
+            var x = Registry.Values(type, source, n);
+            string shape = $"{heads}h {steps}x{d} at {at}/{cap}";
+            if (name == "cache_write")
+            {
+                var want = new double[view.Values];
+                for (int h = 0; h < heads; h++) Array.Copy(x, (long)h * steps * d, want, ((long)h * cap + at) * d, (long)steps * d);
+                Measure(device, name, type, shape, want, (s, cache) => s.CacheWrite(device, type, own, view, steps, at, source, cache, null), (int)Registry.Bytes(own, view.Values), own);
+                return;
+            }
+
+            if (name == "quantize_rows")
+            {
+                var w = ScaledWeight.PerRow(heads * steps, d);
+                var codes = new byte[Registry.Bytes("int8", w.Values)];
+                var (wantScales, _) = w.QuantizeReference(x, -128, 127, false);
+                Measure(device, name, type, $"{heads * steps}x{d} int8", wantScales, (s, scales) => s.Quantize(device, type, "int8", w, source, codes, scales), (int)Registry.Bytes(type, w.Scales));
+                return;
+            }
+
+            var (rowScales, rowsAt) = view.WriteRows(x, steps, at, 127);
+            var wantAll = new double[view.Rows];
+            for (int i = 0; i < rowsAt.Length; i++) if (rowsAt[i] >= 0) wantAll[rowsAt[i]] = rowScales[i];
+            var codesOut = new byte[Registry.Bytes("int8", view.Values)];
+            Measure(device, name, type, shape + " int8", wantAll, (s, scales) => s.CacheWrite(device, type, "int8", view, steps, at, source, codesOut, scales), (int)Registry.Bytes(type, view.Rows));
+            return;
+        }
+
+        bool scaled = name == "attention_cached_scaled";
+        string cacheType = scaled ? "int8" : own;
+        var a = new AttentionArgs(32, 1, Prime(4096), d, 1 / Math.Sqrt(128), true);
+        int keys = (int)a.KValues, rowsK = a.KvHeadCount * a.Lk, position = a.Lk - 1;
+        var q = Registry.Make(type, (int)a.QValues, 41, -1, 1);
+        var k = Registry.Make(cacheType, keys, 42, -1, 1);
+        var v = Registry.Make(cacheType, keys, 43, -1, 1);
+        byte[]? ks = scaled ? Registry.Make(type, rowsK, 44, 0.25, 0.5) : null, vs = scaled ? Registry.Make(type, rowsK, 45, 0.25, 0.5) : null;
+        double[] kv = Registry.Values(cacheType, k, keys), vv = Registry.Values(cacheType, v, keys);
+        if (scaled)
+        {
+            double[] sk = Registry.Values(type, ks!, rowsK), sv = Registry.Values(type, vs!, rowsK);
+            for (int i = 0; i < keys; i++) { kv[i] *= sk[i / d]; vv[i] *= sv[i / d]; }
+        }
+
+        var wantO = CacheRule.AtPosition(a, position).Reference(Registry.Values(type, q, (int)a.QValues), kv, vv);
+        Measure(device, name, type, $"{a.Heads}h {a.Lq}x{a.Lk} d{a.D}{(scaled ? " int8" : "")}", wantO, (s, o) => s.AttentionCached(device, type, cacheType, a, position, q, k, ks, v, vs, o), q.Length);
+    }
+
     // Products on views at the core product's size: transposed operands, 16 batches of a quarter size, the backward pair (dA and dB; dA scored).
     private void ProductRow(Device device, string type, string name)
     {
@@ -772,7 +851,8 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         Measure(device, "map:" + op.Name, type, $"{MapCount}", reference, (s, o) => s.Map(device, op, type, x, y, z, o, MapCount, op.A, op.B), (int)Registry.Bytes(type, MapCount));
     }
 
-    private void Measure(Device device, string op, string type, string shape, double[] reference, Func<IBenchSubject, byte[], IBenchRun?> prepare, int outputBytes)
+    // scored: the type the output is stored as where it is not the row's (a cache of another type).
+    private void Measure(Device device, string op, string type, string shape, double[] reference, Func<IBenchSubject, byte[], IBenchRun?> prepare, int outputBytes, string? scored = null)
     {
         var cells = new List<Cell?>();
         foreach (var subject in subjects)
@@ -782,7 +862,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             if (run is null) { cells.Add(null); continue; }
             if (TimeOrRefused(device, subject, run) is not { } ms) { cells.Add(null); continue; }
             run.Collect();
-            cells.Add(new Cell(subject.Name, run.Lane, ms, Err(type, output, reference)));
+            cells.Add(new Cell(subject.Name, run.Lane, ms, Err(scored ?? type, output, reference)));
         }
 
         var row = new Row(device, op, type, shape, cells);
