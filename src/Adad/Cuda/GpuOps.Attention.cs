@@ -267,7 +267,8 @@ public sealed partial class GpuOps
             ulong lo = f.IsBlock ? gpu.Rent(a.QValues * 4) : o;
             if (f.IsBlock) rented.Add(lo);
             ulong limits = Limits(a, rented), starts = Starts(a, rented);
-            var fn = gpu.Cached($"attention_decode:{f.Name}:{dCap}", (out string e) => Ptx.AttentionDecode(gpu, f, lane, dCap, out e, f.IsBlock ? Fmt.Of<Float32>() : null));
+            bool runs = f.IsBlock && a.D % 8 == 0;                              // a block format's keys in runs of 8 values
+            var fn = gpu.Cached($"attention_decode:{f.Name}:{dCap}{(runs ? ":runs" : "")}", (out string e) => Ptx.AttentionDecode(gpu, f, lane, dCap, out e, f.IsBlock ? Fmt.Of<Float32>() : null, null, runs));
             Gpu.Launch(fn, (uint)(a.Heads * a.Lq), 1, Ptx.DecodeThreads, 1, 0, q, k, v, lo, limits, starts, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), lane.Wide ? Gpu.D(a.Scale) : Gpu.F((float)a.Scale));
             if (!f.IsBlock) return lane.Name;
             Back(f, lane, lo, o, a.QValues);

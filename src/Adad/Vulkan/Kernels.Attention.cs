@@ -266,12 +266,14 @@ internal static partial class VkKernels
     /// workgroups heads · lq. Over caches: lq is the rows a head of K and V serves (a group's query heads × lq0 queries),
     /// limits the position (an s32 at the device): row r's query i = r mod lq0 sees keys [max(0, limit − window) when a
     /// window, limit), limit = p + i + 1 held to [0, lk]; then the K and V row scales, lq0, the window, the cap (a lane slot).</summary>
-    public static SpvKernel AttentionDecode(Vulkan vk, Fmt f, Lane lane, int dims, DecodeCache? cache = null)
+    /// runs (K and V a block format, d a multiple of 8): a key's row read in runs of 8 values (Codec.UnpackRun), each
+    /// value's arithmetic and the sum's order as without.
+    public static SpvKernel AttentionDecode(Vulkan vk, Fmt f, Lane lane, int dims, DecodeCache? cache = null, bool runs = false)
     {
         var k = Kinds.Of(lane);
         int nd = (dims + DecodeThreads - 1) / DecodeThreads, cap = nd * DecodeThreads;
         var fk = cache?.Fc ?? f;                                                 // K and V's stored format
-        var b = new Spv($"attention_decode_{f.Name}_{lane.Name}_d{cap}{(cache is null ? "" : "_at_" + cache.Key)}", DecodeThreads, vk.Controls);
+        var b = new Spv($"attention_decode_{f.Name}_{lane.Name}_d{cap}{(cache is null ? "" : "_at_" + cache.Key)}{(runs ? "_runs" : "")}", DecodeThreads, vk.Controls);
         var q = b.Arg(0);
         var kp = b.Arg(1);
         var vp = b.Arg(2);
@@ -331,6 +333,14 @@ internal static partial class VkKernels
             {
                 var rowScale = Codec.UnpackAt(b, f, kScales!.Value, keyRow, lane);                 // the row's values: code·scale
                 b.For(b.U(0), d, t => dot.V = b.Fma(sq[t], Codec.UnpackAt(b, fk, kp, row + t, lane) * rowScale, dot.V));
+            }
+            else if (runs)
+            {
+                b.For(b.U(0), d, b.U(8), t =>
+                {
+                    var keys = Codec.UnpackRun(b, fk, kp, row + t, 8, lane);
+                    for (int r = 0; r < 8; r++) dot.V = b.Fma(sq[t + r], keys[r], dot.V);
+                });
             }
             else b.For(b.U(0), d, t => dot.V = b.Fma(sq[t], Codec.UnpackAt(b, fk, kp, row + t, lane), dot.V));
 

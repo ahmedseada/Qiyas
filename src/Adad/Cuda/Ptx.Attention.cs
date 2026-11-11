@@ -28,9 +28,11 @@ internal static partial class Ptx
     /// lq is the rows a head of K and V serves (a group's query heads × p_lq0 queries), p_lim the position (an s32 at the
     /// device): row r's query i = r mod p_lq0 sees keys [max(0, limit − p_win) when a window, limit), limit = p + i + 1 held
     /// to [0, lk]; p_ks and p_vs the row scales; p_cap the cap.</summary>
-    public static string AttentionDecode(Gpu gpu, Fmt f, Lane lane, int dCap, out string entry, Fmt? outFmt = null, DecodeCache? cache = null)
+    /// runs (K and V a block format, d a multiple of 8): a key's row read in runs of 8 values (Codec.UnpackRun: the block's
+    /// and the sub-block's scales read once a run), each value's arithmetic and the sum's order as without.
+    public static string AttentionDecode(Gpu gpu, Fmt f, Lane lane, int dCap, out string entry, Fmt? outFmt = null, DecodeCache? cache = null, bool runs = false)
     {
-        entry = $"attention_decode_{f.Name}_{lane.Name}_d{dCap}{(outFmt is null ? "" : "_o" + outFmt.Name)}{(cache is null ? "" : "_at_" + cache.Key)}";
+        entry = $"attention_decode_{f.Name}_{lane.Name}_d{dCap}{(outFmt is null ? "" : "_o" + outFmt.Name)}{(cache is null ? "" : "_at_" + cache.Key)}{(runs ? "_runs" : "")}";
         var fk = cache?.Fc ?? f;                                                 // K and V's stored format
         var b = new PtxBuilder();
         string tid = b.R(), bid = b.R();
@@ -133,12 +135,18 @@ internal static partial class Ptx
             b.L($"setp.ge.u32 {pEnd}, {tt}, {d};");
             b.L($"@{pEnd} bra DOT_END;");
             b.L($"add.u32 {idx}, {rowBase}, {tt};");
-            string kv = Codec.UnpackAt(b, fk, k, idx, lane);
-            if (cache is { KScales: true }) kv = LaneOp(b, lane, "mul", kv, kScale);          // the row's value: code·scale
+            int run = runs ? 8 : 1;
+            string[] keys = runs ? Codec.UnpackRun(b, fk, k, idx, run, lane) : [Codec.UnpackAt(b, fk, k, idx, lane)];
             b.L($"mad.lo.u32 {addr}, {tt}, {lane.Size}, {sq};");
-            b.L($"ld.shared.{lane.Mem} {qv}, [{addr}];");
-            b.L(lane.Fma(s, qv, kv, s));
-            b.L($"add.u32 {tt}, {tt}, 1;");
+            for (int r = 0; r < run; r++)
+            {
+                string kv = keys[r];
+                if (cache is { KScales: true }) kv = LaneOp(b, lane, "mul", kv, kScale);      // the row's value: code·scale
+                b.L($"ld.shared.{lane.Mem} {qv}, [{addr}+{r * lane.Size}];");
+                b.L(lane.Fma(s, qv, kv, s));
+            }
+
+            b.L($"add.u32 {tt}, {tt}, {run};");
             b.L("bra DOT;");
             b.Label("DOT_END");
         }

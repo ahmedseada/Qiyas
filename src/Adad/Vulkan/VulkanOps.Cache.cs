@@ -155,7 +155,8 @@ public sealed partial class VulkanOps
         ulong lo = Own(f) ? o : vk.Rent(a.QValues * lane.Size);
         try
         {
-            var fn = vk.Cached($"attention_cached:{f.Name}:{dims}:{over.Key}", () => VkKernels.AttentionDecode(vk, f, lane, dims, over));
+            bool runs = fc.IsBlock && a.D % 8 == 0 && kScales == 0;             // a block format cache's keys in runs of 8 values
+            var fn = vk.Cached($"attention_cached:{f.Name}:{dims}:{over.Key}{(runs ? ":runs" : "")}", () => VkKernels.AttentionDecode(vk, f, lane, dims, over, runs));
             vk.Launch(fn, (uint)(a.KvHeadCount * rows), 1, q, k, v, lo, position, 0, Vulkan.U(rows), Vulkan.U(a.Lk), Vulkan.U(a.D), Slot(lane, a.Scale),
                 kScales, vScales, Vulkan.U(a.Lq), Vulkan.U(a.Window), Slot(lane, a.Softcap));
             if (!Own(f)) Back(f, lane, lo, o, a.QValues);

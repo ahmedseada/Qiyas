@@ -114,7 +114,8 @@ public sealed partial class GpuOps
         ulong lo = f.IsBlock ? gpu.Rent(a.QValues * 4) : o;
         try
         {
-            var fn = gpu.Cached($"attention_cached:{f.Name}:{dCap}:{over.Key}", (out string e) => Ptx.AttentionDecode(gpu, f, lane, dCap, out e, f.IsBlock ? Fmt.Of<Float32>() : null, over));
+            bool runs = fc.IsBlock && a.D % 8 == 0;                             // a block format cache's keys in runs of 8 values
+            var fn = gpu.Cached($"attention_cached:{f.Name}:{dCap}:{over.Key}{(runs ? ":runs" : "")}", (out string e) => Ptx.AttentionDecode(gpu, f, lane, dCap, out e, f.IsBlock ? Fmt.Of<Float32>() : null, over, runs));
             Gpu.Launch(fn, (uint)(a.KvHeadCount * rows), 1, Ptx.DecodeThreads, 1, 0, q, k, v, lo, position, 0, Gpu.U(rows), Gpu.U(a.Lk), Gpu.U(a.D), LaneValue(lane, a.Scale),
                 kScales, vScales, Gpu.U(a.Lq), Gpu.U(a.Window), LaneValue(lane, a.Softcap));
             if (!f.IsBlock) return lane.Name;
