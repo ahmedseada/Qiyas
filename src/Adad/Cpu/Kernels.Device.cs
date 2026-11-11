@@ -19,13 +19,58 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
 
     byte[] IMemory<byte[], int[]>.Rent(long bytes) => new byte[bytes];
 
+    // A long buffer is zeroed across the team (the runtime's own zeroing of a new array is one core's).
+    byte[] IMemory<byte[], int[]>.RentZeroed(long bytes)
+    {
+        if (bytes < 4 * MemoryPart) return new byte[bytes];
+        var buffer = GC.AllocateUninitializedArray<byte>((int)bytes);
+        MoveBytes(null, 0, buffer, 0, bytes);
+        return buffer;
+    }
+
+    void IMemory<byte[], int[]>.Clear(byte[] buffer, long offset, long bytes) => MoveBytes(null, 0, buffer, offset, bytes);
+
+    void IMemory<byte[], int[]>.Upload(ReadOnlySpan<byte> source, byte[] destination, long offset) => source.CopyTo(destination.AsSpan((int)offset));
+
+    void IMemory<byte[], int[]>.Download(byte[] source, long offset, Span<byte> destination) => source.AsSpan((int)offset, destination.Length).CopyTo(destination);
+
+    void IMemory<byte[], int[]>.Copy(byte[] source, long sourceOffset, byte[] destination, long destinationOffset, long bytes) =>
+        MoveBytes(source, sourceOffset, destination, destinationOffset, bytes);
+
+    // A range's bytes copied (source null: cleared). A long range in parts across the team: memory moves at the cores'
+    // pace, not one core's; a short one where it is called.
+    private const int MemoryPart = 1 << 18;
+
+    private static void MoveBytes(byte[]? source, long sourceOffset, byte[] destination, long destinationOffset, long bytes)
+    {
+        if (bytes <= 0) return;
+        if (bytes < 4 * MemoryPart)
+        {
+            if (source is null) destination.AsSpan((int)destinationOffset, (int)bytes).Clear();
+            else source.AsSpan((int)sourceOffset, (int)bytes).CopyTo(destination.AsSpan((int)destinationOffset));
+            return;
+        }
+
+        Team.For((int)((bytes + MemoryPart - 1) / MemoryPart), 1, bytes, new MoveBody(source, (int)sourceOffset, destination, (int)destinationOffset, (int)bytes));
+    }
+
+    private readonly struct MoveBody(byte[]? source, int sourceOffset, byte[] destination, int destinationOffset, int bytes) : Team.IBody
+    {
+        public void Run(int first, int last)
+        {
+            int at = first * MemoryPart, count = Math.Min(bytes, last * MemoryPart) - at;
+            if (source is null) destination.AsSpan(destinationOffset + at, count).Clear();
+            else source.AsSpan(sourceOffset + at, count).CopyTo(destination.AsSpan(destinationOffset + at));
+        }
+    }
+
     void IMemory<byte[], int[]>.Return(byte[] buffer) { }
 
     void IMemory<byte[], int[]>.Upload(ReadOnlySpan<byte> source, byte[] destination) => source.CopyTo(destination);
 
     void IMemory<byte[], int[]>.Download(byte[] source, Span<byte> destination) => source.AsSpan(0, destination.Length).CopyTo(destination);
 
-    void IMemory<byte[], int[]>.Copy(byte[] source, byte[] destination, long bytes) => Array.Copy(source, destination, bytes);
+    void IMemory<byte[], int[]>.Copy(byte[] source, byte[] destination, long bytes) => MoveBytes(source, 0, destination, 0, bytes);
 
     int[] IMemory<byte[], int[]>.RentIndices(int count) => new int[count];
 

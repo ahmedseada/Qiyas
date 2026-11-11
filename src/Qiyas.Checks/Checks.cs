@@ -146,6 +146,7 @@ internal static partial class Checks
         ok &= Ctcs(null);
         ok &= BlockFormats(null);
         ok &= Arenas(null);
+        ok &= MemoryCheck(CpuDevice.Device, "cpu");
         ok &= WeightsInPlace();
         ok &= TeamJobs();
         return ok;
@@ -2393,6 +2394,7 @@ internal static partial class Checks
         ok &= Ctcs(ops);
         ok &= BlockFormats(ops);
         ok &= Arenas(ops);
+        ok &= MemoryCheck<ulong, ulong>(ops, "cuda");
         ok &= WholeSums(ops);
         return ok;
     }

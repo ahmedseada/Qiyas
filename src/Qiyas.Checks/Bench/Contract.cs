@@ -142,6 +142,11 @@ public interface IBenchSubject
     /// pick's probability (rows, as the type).</summary>
     IBenchRun? SampleFiltered(Device device, string type, SamplingArgs a, byte[] x, int step, int[] picks, byte[] probability) => null;
 
+    /// <summary>A memory operation by a range (IMemory) over the bytes from <paramref name="offset"/> to as many before the
+    /// end: "copy" (the source's range into the output's), "clear" (the output's range zeroed), "rent_zeroed" (a zeroed
+    /// buffer of the source's length rented and returned; the output is not written).</summary>
+    IBenchRun? Memory(Device device, string op, byte[] source, byte[] output, int offset) => null;
+
     /// <summary>top-k of each row as log-probabilities (IRouting.LogSoftmaxTopK): values (rows × k, as the type) and indices.</summary>
     IBenchRun? LogSoftmaxTopK(Device device, string type, byte[] x, int rows, int cols, int k, byte[] values, int[] indices) => null;
 

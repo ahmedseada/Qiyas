@@ -143,6 +143,7 @@ internal sealed class Options
     public static readonly string[] Group10 = ["cache_write", "cache_write_scaled", "quantize_rows", "attention_cached", "attention_cached_scaled", "decoder_mask"];
     public static readonly string[] Group11 = ["rope_table", "rope_heads", "cache_write_rope", "attention_steps"];
     public static readonly string[] Group12 = ["penalize", "sample_filtered", "sample_plain"];
+    public static readonly string[] Group13 = ["memory:copy", "memory:clear", "memory:rent_zeroed"];
     public List<string>? Subjects;
     public string? Baseline;
 
@@ -168,7 +169,7 @@ internal sealed class Options
                 case "--types": o.Types = Next(); break;
                 case "--ops":
                     o.Ops = Next();
-                    if (o.Ops.Contains("all")) o.Ops = [.. Core, .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name), .. Group2, .. Group3, .. Group4, .. Group4b, .. Group5, .. Group6, .. Group7, .. Group7b, .. Group8, .. Group9, .. Group10, .. Group11, .. Group12];
+                    if (o.Ops.Contains("all")) o.Ops = [.. Core, .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name), .. Group2, .. Group3, .. Group4, .. Group4b, .. Group5, .. Group6, .. Group7, .. Group7b, .. Group8, .. Group9, .. Group10, .. Group11, .. Group12, .. Group13];
                     if (o.Ops.Contains("map")) o.Ops = [.. o.Ops.Where(n => n != "map"), .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name)];
                     if (o.Ops.Contains("reduce")) o.Ops = [.. o.Ops.Where(n => n != "reduce"), .. Group2];
                     if (o.Ops.Contains("rows")) o.Ops = [.. o.Ops.Where(n => n != "rows"), .. Group3];
@@ -182,6 +183,7 @@ internal sealed class Options
                     if (o.Ops.Contains("cache")) o.Ops = [.. o.Ops.Where(n => n != "cache"), .. Group10];
                     if (o.Ops.Contains("heads")) o.Ops = [.. o.Ops.Where(n => n != "heads"), .. Group11];
                     if (o.Ops.Contains("decoding")) o.Ops = [.. o.Ops.Where(n => n != "decoding"), .. Group12];
+                    if (o.Ops.Contains("memory")) o.Ops = [.. o.Ops.Where(n => n != "memory"), .. Group13];
                     break;
                 case "--baseline": o.Baseline = args[++i]; break;
                 case "--shapes": o.Shapes = args[++i]; if (o.Shapes is not ("regular" or "odd")) throw new ArgumentException($"--shapes takes regular or odd, not {o.Shapes}"); break;
@@ -343,6 +345,11 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         foreach (var name in Options.Group12)
         {
             if (options.Ops.Contains(name)) DecodingRow(device, type, name);
+        }
+
+        foreach (var name in Options.Group13)
+        {
+            if (options.Ops.Contains(name)) MemoryRow(device, type, name);
         }
 
         if (!Registry.IsFloat(type)) return;
@@ -727,6 +734,26 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         var want = a.Reference(qv, kv, vv);
         if (name.StartsWith("attention_fused", StringComparison.Ordinal)) { Measure(device, name, type, shape, want, (s, o) => s.AttentionFused(device, type, a, q, k, v, o), q.Length); return; }
         Measure(device, name, type, shape, want, (s, o) => s.Attention(device, type, a, q, k, v, o, name == "attention_decode"), q.Length);
+    }
+
+    // A device's memory by a range (uint8's row: bytes have no type): a map row's 16M bytes but the first and last three,
+    // a range that neither starts nor ends on a word — copied from one buffer into another, cleared, and a zeroed buffer of
+    // the 16M bytes rented and returned. map:copy over uint8 is the copy's nearest equivalent (a kernel over the values).
+    private void MemoryRow(Device device, string type, string name)
+    {
+        if (type != "uint8") return;
+        int n = MapCount, offset = 3;
+        string op = name[7..];
+        var source = Registry.Make(type, n, 61, 0, 255);
+        var values = Registry.Values(type, source, n);
+        var want = new double[n];
+        if (op == "copy") Array.Copy(values, offset, want, offset, n - 2 * offset);
+        else if (op == "clear") { values.CopyTo(want, 0); Array.Clear(want, offset, n - 2 * offset); }
+        Measure(device, name, type, $"{n} bytes", want, (s, o) =>
+        {
+            if (op == "clear") source.CopyTo(o, 0); else Array.Clear(o);
+            return s.Memory(device, op, source, o, offset);
+        }, n);
     }
 
     // A decoder's steps (float types).

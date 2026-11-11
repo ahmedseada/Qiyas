@@ -684,6 +684,22 @@ public sealed class AdadSubject : IBenchSubject
         }
     }
 
+    public IBenchRun? Memory(Device device, string op, byte[] source, byte[] output, int offset) =>
+        device == Device.Cpu ? MemoryRun(new Staged<byte[], int[]>(CpuDevice.Device, 0), op, source, output, offset)
+            : MemoryRun(new Staged<ulong, ulong>(Devices.Of(device), 4), op, source, output, offset);
+
+    private static IBenchRun MemoryRun<TB, TI>(Staged<TB, TI> s, string op, byte[] source, byte[] output, int offset)
+    {
+        int n = source.Length, bytes = n - 2 * offset;
+        TB src = s.In(source, s.Slack), dst = s.InOut(output, s.Slack);
+        return op switch
+        {
+            "copy" => s.Run(() => { s.D.Copy(src, offset, dst, offset, bytes); return "bytes"; }),
+            "clear" => s.Run(() => { s.D.Clear(dst, offset, bytes); return "bytes"; }),
+            _ => s.Run(() => { s.D.Return(s.D.RentZeroed(n)); return "bytes"; }, "; rent, zero, return"),
+        };
+    }
+
     public IBenchRun? SampleFiltered(Device device, string type, SamplingArgs a, byte[] x, int step, int[] picks, byte[] probability) =>
         Registry.IsFloat(type) ? Registry.WithFloat(type, new SampleFilteredVisitor(device, a, x, step, picks, probability)) : null;
 

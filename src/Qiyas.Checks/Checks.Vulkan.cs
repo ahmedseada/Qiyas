@@ -33,6 +33,7 @@ internal static partial class Checks
         ok &= Convs(ops, "vulkan");
         ok &= Recurrents(ops, "vulkan");
         ok &= BlockFormats(ops);
+        ok &= MemoryCheck<ulong, ulong>(ops, "vulkan");
         return ok;
     }
 

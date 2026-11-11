@@ -14,6 +14,22 @@ public sealed partial class GpuOps : IDevice<ulong, ulong>
 
     ulong IMemory<ulong, ulong>.Rent(long bytes) => gpu.Rent(bytes);
 
+    ulong IMemory<ulong, ulong>.RentZeroed(long bytes)
+    {
+        ulong buffer = gpu.Rent(bytes);
+        if (bytes > 0) Gpu.Clear(buffer, bytes);
+        return buffer;
+    }
+
+    // A range of a buffer is its address past the buffer's: the driver's own fill and copies take it as it is.
+    void IMemory<ulong, ulong>.Clear(ulong buffer, long offset, long bytes) { if (bytes > 0) Gpu.Clear(buffer + (ulong)offset, bytes); }
+
+    void IMemory<ulong, ulong>.Upload(ReadOnlySpan<byte> source, ulong destination, long offset) { if (source.Length > 0) Gpu.Upload(source, destination + (ulong)offset); }
+
+    void IMemory<ulong, ulong>.Download(ulong source, long offset, Span<byte> destination) { if (destination.Length > 0) Gpu.Download(source + (ulong)offset, destination); }
+
+    void IMemory<ulong, ulong>.Copy(ulong source, long sourceOffset, ulong destination, long destinationOffset, long bytes) { if (bytes > 0) Gpu.Copy(source + (ulong)sourceOffset, destination + (ulong)destinationOffset, bytes); }
+
     void IMemory<ulong, ulong>.Return(ulong buffer) => gpu.Return(buffer);
 
     void IMemory<ulong, ulong>.Upload(ReadOnlySpan<byte> source, ulong destination) => Gpu.Upload(source, destination);
