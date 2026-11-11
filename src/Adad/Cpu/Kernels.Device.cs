@@ -187,6 +187,8 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
 
     string IDecoding<byte[], int[]>.Penalize<TN>(PenaltyArgs a, byte[] x, int[] history, int[] length, byte[] output) => Penalize<TN>(a, x, history, length, output);
 
+    string IDecoding<byte[], int[]>.SampleFiltered<TN>(SamplingArgs a, byte[] x, int[] step, int[] picks, byte[]? probability) => SampleFiltered<TN>(a, x, step, picks, probability);
+
     // ---------------------------------------------------------------- optimizers, convolution, ctc
 
     string IOptimizers<byte[]>.Optimizer<TN>(OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) => Optimizer<TN>(a, p, g, m, v, n);

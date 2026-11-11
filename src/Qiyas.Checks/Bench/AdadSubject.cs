@@ -624,6 +624,21 @@ public sealed class AdadSubject : IBenchSubject
         }
     }
 
+    public IBenchRun? SampleFiltered(Device device, string type, SamplingArgs a, byte[] x, int step, int[] picks, byte[] probability) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new SampleFilteredVisitor(device, a, x, step, picks, probability)) : null;
+
+    private sealed class SampleFilteredVisitor(Device device, SamplingArgs a, byte[] x, int step, int[] picks, byte[] probability) : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, SampleFilteredVisitor>(device, this);
+
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        {
+            TB dx = s.In(x, s.Slack), dp = s.Out(probability, s.Slack);
+            TI ds = s.Index([step]), di = s.IndexOut(picks);
+            return s.Run(() => s.D.SampleFiltered<TN>(a, dx, ds, di, dp));
+        }
+    }
+
     public IBenchRun? Pick(Device device, string type, byte[] x, int rows, int cols, int[] index, byte[] output) =>
         Registry.With(type, new PickVisitor(device, x, rows, cols, index, output));
 

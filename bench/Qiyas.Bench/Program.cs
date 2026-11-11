@@ -141,7 +141,7 @@ internal sealed class Options
     public static readonly string[] Group9 = ["topk_rows", "log_softmax_topk", "pick_rows", "sample_rows", "route", "route_wide", "cross_entropy", "ctc", "ctc_bwd"];
     public static readonly string[] Group10 = ["cache_write", "cache_write_scaled", "quantize_rows", "attention_cached", "attention_cached_scaled", "decoder_mask"];
     public static readonly string[] Group11 = ["rope_table", "rope_heads", "cache_write_rope", "attention_steps"];
-    public static readonly string[] Group12 = ["penalize"];
+    public static readonly string[] Group12 = ["penalize", "sample_filtered", "sample_plain"];
     public List<string>? Subjects;
     public string? Baseline;
 
@@ -712,6 +712,19 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             for (int i = 0; i < history.Length; i++) history[i] = i % 4 == 3 ? history[i - 1] : random.Next(cols);
             var want = a.Reference(Registry.Values(type, x, rows * cols), history, length);
             Measure(device, name, type, $"{rows}x{cols} last 64 of {capacity}", want, (s, y) => s.Penalize(device, type, a, x, history, length, y), (int)Registry.Bytes(type, rows * cols));
+            return;
+        }
+
+        // The draw (sample_rows's shape, 4096 rows of 32768 scores): every column kept (sample_plain: the weights and the
+        // draw alone, sample_rows's nearest equivalent with cross_entropy's pass before it), and held to the top 40, the
+        // nucleus of 0.95 and min-p 0.02 at a temperature of 0.8 (sample_filtered); the picks scored as sample_rows's.
+        {
+            int rows = Prime(4096), cols = Prime(32768), step = 3;
+            var a = name == "sample_plain" ? new SamplingArgs(rows, cols, 1, 0, 0, 0, 17) : new SamplingArgs(rows, cols, 0.8, 40, 0.95, 0.02, 17);
+            var x = Registry.Make(type, rows * cols, 95, -4, 4);
+            var (want, _) = a.Reference(Registry.Values(type, x, rows * cols), step);
+            var probability = new byte[Registry.Bytes(type, rows)];
+            MeasureIndices(device, name, type, $"{rows}x{cols}", want, (s, picks) => s.SampleFiltered(device, type, a, x, step, picks, probability));
         }
     }
 

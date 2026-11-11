@@ -133,6 +133,10 @@ public interface IBenchSubject
     /// a.Capacity) at the length, output a.Rows × a.Cols as the type.</summary>
     IBenchRun? Penalize(Device device, string type, PenaltyArgs a, byte[] x, int[] history, int length, byte[] output) => null;
 
+    /// <summary>A column of each row drawn from its kept weights (IDecoding.SampleFiltered) at a step: picks (s32) and each
+    /// pick's probability (rows, as the type).</summary>
+    IBenchRun? SampleFiltered(Device device, string type, SamplingArgs a, byte[] x, int step, int[] picks, byte[] probability) => null;
+
     /// <summary>top-k of each row as log-probabilities (IRouting.LogSoftmaxTopK): values (rows × k, as the type) and indices.</summary>
     IBenchRun? LogSoftmaxTopK(Device device, string type, byte[] x, int rows, int cols, int k, byte[] values, int[] indices) => null;
 

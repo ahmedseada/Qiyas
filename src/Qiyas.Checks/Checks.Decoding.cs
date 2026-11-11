@@ -8,6 +8,7 @@
 //                      threads; and k past the row (the values there −∞ as the type stores it, a block format's lowest,
 //                      the indices −1).
 //   history, penalize  the ring and the penalties of its window (Checks.Penalties.cs).
+//   sample             the draw from the kept columns (Checks.Sampling.cs).
 namespace Qiyas;
 
 internal static partial class Checks
@@ -22,9 +23,10 @@ internal static partial class Checks
             if (!Bench.Registry.IsFloat(type) || (!blocks && Bench.Registry.IsBlock(type))) continue;
             ok &= LogSoftmaxTopKs(ops, where, type);
             ok &= Penalties(ops, where, type);
+            ok &= Samplings(ops, where, type);
         }
 
-        if (ok) Console.WriteLine($"check decoding               {where,-6} every float type{(blocks ? "" : " but the block formats")}: the top-k of each row as log-probabilities (TopK's indices exactly, the values within the lane's rounding of the row's log-sum-exp, k past the row); each row's ring of tokens pushed and advanced on the device, and the penalties of its window (repeat, presence, frequency: the last tokens, a wrapped ring, tokens outside the row, rows a stride apart) within the lane's rounding, every other score x's own");
+        if (ok) Console.WriteLine($"check decoding               {where,-6} every float type{(blocks ? "" : " but the block formats")}: the top-k of each row as log-probabilities (TopK's indices exactly, the values within the lane's rounding of the row's log-sum-exp, k past the row); each row's ring of tokens pushed and advanced on the device, and the penalties of its window (repeat, presence, frequency: the last tokens, a wrapped ring, tokens outside the row, rows a stride apart) within the lane's rounding, every other score x's own; a column of each row drawn from its scores at a temperature, held to top-k, the nucleus and min-p (rows of +inf, with a NaN and of -inf; the seed's draw at the device's step), each within the lane's rounding of the float64 rule");
         return ok;
     }
 

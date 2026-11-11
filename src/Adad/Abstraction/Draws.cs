@@ -36,4 +36,7 @@ public static class Draws
 
     /// <summary>Draw i as a uniform value in [0, 1): its top 24 bits over 2^24 (exact in float32).</summary>
     public static double Uniform(uint key, uint i) => (Bits(key, i) >> 8) * (1.0 / 16777216);
+
+    /// <summary>A sampler's uniform value in [0, 1) at (step, row): draw `row` under the key's draw `step`.</summary>
+    public static double Uniform(uint key, uint step, uint row) => Uniform(Bits(key, step), row);
 }
