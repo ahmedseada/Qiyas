@@ -90,58 +90,99 @@ internal static partial class Ptx
         return b.Finish(Header(gpu), entry, $".param .u64 p_x, .param .u64 p_s, .param .u64 p_pos, .param .u32 p_steps, .param .u32 p_cap, .param .u32 p_d, .param .{lane.Op} p_max", ReduceBytes);
     }
 
-    /// <summary>A block format's row scales at their rows: each block of the scales (f, n = heads·cap values) that holds a
-    /// written row re-encoded, a warp a block, from the new scales (lane values at px[head·steps + step]) and its other
-    /// values as they are stored; a block the write does not touch is left as it is. Params: x, scales, pos, n, cap, steps.</summary>
-    public static string CacheScalesBlocks(Gpu gpu, Fmt f, Lane lane, out string entry)
+    /// <summary>Rows of a block format written where rows share blocks (a block-format type's row scales, unit 1; a block
+    /// format cache's rows of `unit` values not whole blocks): each block of the destination (fb, n values: heads·cap rows
+    /// of unit values) that holds a written value re-encoded, a warp a block, from the written rows' values (fx at
+    /// px[(head·steps + step)·unit + column], read as float32) and its other values as they are stored; a block the write
+    /// does not touch is left as it is. Params: x, destination, pos, n, cap, steps, unit.</summary>
+    public static string CacheBlocks(Gpu gpu, Fmt fb, Fmt fx, out string entry)
     {
-        entry = $"cache_scales_blocks_{f.Name}_{lane.Name}";
+        entry = $"cache_blocks_{fb.Name}_from_{fx.Name}";
         var b = new PtxBuilder();
         string px = Param64(b, "p_x"), ps = Param64(b, "p_s"), pos = Param64(b, "p_pos");
-        string n = Param32(b, "p_n"), cap = Param32(b, "p_cap"), steps = Param32(b, "p_steps");
-        var w = BlockWarp(b, f, n);
+        string n = Param32(b, "p_n"), cap = Param32(b, "p_cap"), steps = Param32(b, "p_steps"), unit = Param32(b, "p_unit");
+        var w = BlockWarp(b, fb, n);
         var (p, w0, w1, any) = WrittenRows(b, pos, steps, cap);
         b.L($"@!{any} bra DONE;");
-        // The first written index at or past the block's first value a (the written rows of every head: x mod cap in
-        // [w0, w1)): the block is touched when it is below the block's end.
-        string a = b.R(), end = b.R(), r = b.R(), x0 = b.R(), t = b.R(), below = b.P(), inside = b.P(), untouched = b.P();
-        b.L($"mul.lo.u32 {a}, {w.Blk}, {f.BlockValues};");
-        b.L($"add.u32 {end}, {a}, {f.BlockValues};");
+        // The written values of every head: x mod (cap·unit) in [w0·unit, w1·unit). The first one at or past the block's
+        // first value a: the block is touched when it is below the block's end.
+        string a = b.R(), end = b.R(), r = b.R(), x0 = b.R(), t = b.R(), period = b.R(), lo = b.R(), hi = b.R(), below = b.P(), inside = b.P(), untouched = b.P();
+        b.L($"mul.lo.u32 {period}, {cap}, {unit};");
+        b.L($"mul.lo.u32 {lo}, {w0}, {unit};");
+        b.L($"mul.lo.u32 {hi}, {w1}, {unit};");
+        b.L($"mul.lo.u32 {a}, {w.Blk}, {fb.BlockValues};");
+        b.L($"add.u32 {end}, {a}, {fb.BlockValues};");
         b.L($"min.u32 {end}, {end}, {n};");
-        b.L($"rem.u32 {r}, {a}, {cap};");
-        b.L($"setp.lt.u32 {below}, {r}, {w0};");
-        b.L($"setp.lt.u32 {inside}, {r}, {w1};");
-        b.L($"sub.u32 {t}, {cap}, {r};");
-        b.L($"add.u32 {t}, {t}, {w0};");
-        b.L($"add.u32 {t}, {t}, {a};");                                    // the next head's first written row
+        b.L($"rem.u32 {r}, {a}, {period};");
+        b.L($"setp.lt.u32 {below}, {r}, {lo};");
+        b.L($"setp.lt.u32 {inside}, {r}, {hi};");
+        b.L($"sub.u32 {t}, {period}, {r};");
+        b.L($"add.u32 {t}, {t}, {lo};");
+        b.L($"add.u32 {t}, {t}, {a};");                                    // the next head's first written value
         b.L($"selp.u32 {x0}, {a}, {t}, {inside};");
-        b.L($"sub.u32 {t}, {w0}, {r};");
+        b.L($"sub.u32 {t}, {lo}, {r};");
         b.L($"add.u32 {t}, {t}, {a};");
         b.L($"selp.u32 {x0}, {t}, {x0}, {below};");
         b.L($"setp.ge.u32 {untouched}, {x0}, {end};");
         b.L($"@{untouched} bra DONE;");
-        EncodeBlock(b, f, ps, w, n, at =>
+        EncodeBlock(b, fb, ps, w, n, at =>
         {
-            string h = b.R(), rr = b.R(), idx = b.R(), ge = b.P(), lt = b.P(), addr = b.RD(), fresh = lane.NewReg(b), v = b.F();
-            b.L($"div.u32 {h}, {at}, {cap};");
-            b.L($"rem.u32 {rr}, {at}, {cap};");
+            string rowAt = b.R(), col = b.R(), h = b.R(), rr = b.R(), idx = b.R(), ge = b.P(), lt = b.P(), v = b.F();
+            b.L($"div.u32 {rowAt}, {at}, {unit};");
+            b.L($"mul.lo.u32 {col}, {rowAt}, {unit};");
+            b.L($"sub.u32 {col}, {at}, {col};");
+            b.L($"div.u32 {h}, {rowAt}, {cap};");
+            b.L($"mul.lo.u32 {rr}, {h}, {cap};");
+            b.L($"sub.u32 {rr}, {rowAt}, {rr};");
             b.L($"setp.ge.u32 {ge}, {rr}, {w0};");
             b.L($"setp.lt.u32 {lt}, {rr}, {w1};");
             b.L($"and.pred {ge}, {ge}, {lt};");
             b.L($"sub.u32 {idx}, {rr}, {p};");                             // the step (p may be below 0: modular)
             b.L($"mad.lo.u32 {idx}, {h}, {steps}, {idx};");
+            b.L($"mad.lo.u32 {idx}, {idx}, {unit}, {col};");
             b.L($"selp.u32 {idx}, {idx}, 0, {ge};");
-            b.L($"mul.wide.u32 {addr}, {idx}, {lane.Size};");
-            b.L($"add.u64 {addr}, {px}, {addr};");
-            b.L($"ld.global.{lane.Mem} {fresh}, [{addr}];");
-            string fresh32 = lane.Wide ? Codec.Convert(b, lane, fresh, Lane.F32, f) : fresh;
-            string old = Codec.UnpackAt(b, f, ps, at, Lane.F32);
-            b.L($"selp.f32 {v}, {fresh32}, {old}, {ge};");
+            string fresh = Codec.UnpackAt(b, fx, px, idx, Lane.F32), old = Codec.UnpackAt(b, fb, ps, at, Lane.F32);
+            b.L($"selp.f32 {v}, {fresh}, {old}, {ge};");
             return v;
         });
         b.Label("DONE");
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_s, .param .u64 p_pos, .param .u32 p_n, .param .u32 p_cap, .param .u32 p_steps");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_s, .param .u64 p_pos, .param .u32 p_n, .param .u32 p_cap, .param .u32 p_steps, .param .u32 p_unit");
+    }
+
+    /// <summary>Rows of whole blocks into a block format cache at the device's position, a warp a block of the written rows
+    /// (n = heads·steps·d source values of fx, read as float32; bpr blocks a row): source block row·bpr + j is the cache's
+    /// block (head·cap + p + step)·bpr + j, encoded whole; a row past the capacity not written. Params: x, cache, pos, n,
+    /// steps, cap, bpr.</summary>
+    public static string CacheRowsBlocks(Gpu gpu, Fmt fb, Fmt fx, out string entry)
+    {
+        entry = $"cache_rows_blocks_{fb.Name}_from_{fx.Name}";
+        var b = new PtxBuilder();
+        string px = Param64(b, "p_x"), pc = Param64(b, "p_c"), pos = Param64(b, "p_pos");
+        string n = Param32(b, "p_n"), steps = Param32(b, "p_steps"), cap = Param32(b, "p_cap"), bpr = Param32(b, "p_bpr");
+        var w = BlockWarp(b, fb, n);
+        string row = b.R(), j = b.R(), h = b.R(), t = b.R(), p = b.R(), at = b.R(), dest = b.R(), past = b.P(), off = b.RD(), outp = b.RD();
+        b.L($"div.u32 {row}, {w.Blk}, {bpr};");
+        b.L($"mul.lo.u32 {j}, {row}, {bpr};");
+        b.L($"sub.u32 {j}, {w.Blk}, {j};");
+        b.L($"div.u32 {h}, {row}, {steps};");
+        b.L($"mul.lo.u32 {t}, {h}, {steps};");
+        b.L($"sub.u32 {t}, {row}, {t};");
+        b.L($"ld.global.s32 {p}, [{pos}];");
+        b.L($"add.s32 {at}, {p}, {t};");
+        b.L($"setp.ge.u32 {past}, {at}, {cap};");                         // below 0 too (unsigned)
+        b.L($"@{past} bra DONE;");
+        b.L($"mad.lo.u32 {dest}, {h}, {cap}, {at};");
+        b.L($"mad.lo.u32 {dest}, {dest}, {bpr}, {j};");
+        // The encoder addresses its block from the base: the base moved by the cache's block less the source's.
+        b.L($"sub.s32 {dest}, {dest}, {w.Blk};");
+        b.L($"cvt.s64.s32 {off}, {dest};");
+        b.L($"mul.lo.s64 {off}, {off}, {fb.BlockBytes};");
+        b.L($"add.s64 {outp}, {pc}, {off};");
+        EncodeBlock(b, fb, outp, w, n, idx => Codec.UnpackAt(b, fx, px, idx, Lane.F32));
+        b.Label("DONE");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_c, .param .u64 p_pos, .param .u32 p_n, .param .u32 p_steps, .param .u32 p_cap, .param .u32 p_bpr");
     }
 
     /// <summary>The source's rows into the cache at the device's position, a thread a stored word of fc (a row: wpr words):

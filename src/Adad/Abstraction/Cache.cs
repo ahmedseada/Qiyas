@@ -9,7 +9,10 @@ namespace Adad.Abstraction;
 
 /// <summary>A key or value cache: Heads × Capacity rows of D values stored as the cache's type, filled from row 0 up to the
 /// position the device holds. A scaled cache's rows are codes, each with a scale (stored as the values' type, at
-/// head·Capacity + row): value = code·scale. A row is whole 32-bit words of the cache's type (D·bits a multiple of 32).</summary>
+/// head·Capacity + row): value = code·scale. A row of a plain type is whole 32-bit words (D·bits a multiple of 32). A
+/// block format's rows are its blocks' values (no row scales: its values are scaled by their blocks): whole blocks where D
+/// is a multiple of the format's block, written a block at a time; else rows share blocks, and a write re-encodes each
+/// block it touches with the block's other values kept (the type's partial store: lossy, as the type is).</summary>
 public sealed record CacheView(int Heads, int Capacity, int D)
 {
     public long Values => (long)Heads * Capacity * D;
@@ -17,13 +20,20 @@ public sealed record CacheView(int Heads, int Capacity, int D)
     /// <summary>The rows (and a scaled cache's scales).</summary>
     public long Rows => (long)Heads * Capacity;
 
-    public void Validate(Fmt fc)
+    public void Validate(Fmt fc, bool scaled = false)
     {
         if (Heads < 0 || Capacity < 0 || D < 0) throw new ArgumentException($"cache: {Heads} heads of {Capacity} rows of {D}");
-        if (fc.IsBlock) throw new ArgumentException($"cache: rows of the block format {fc.Name}");
-        if ((long)D * fc.Bits % 32 != 0) throw new ArgumentException($"cache: a row of {D} values of {fc.Name} is not whole 32-bit words");
+        if (fc.IsBlock)
+        {
+            if (scaled) throw new ArgumentException($"cache: codes of the block format {fc.Name} with row scales (a block format's values are scaled by their blocks)");
+        }
+        else if ((long)D * fc.Bits % 32 != 0) throw new ArgumentException($"cache: a row of {D} values of {fc.Name} is not whole 32-bit words");
+
         if (Values > int.MaxValue) throw new ArgumentException("cache: past 2^31 values");
     }
+
+    /// <summary>Whether a row of the cache is whole blocks of the block format fc (a write then touches no other row's block).</summary>
+    public bool WholeBlocks(Fmt fc) => fc.IsBlock && D % fc.BlockValues == 0;
 
     /// <summary>A write of a layer's projection rows (ICache.CacheWriteRope): a.Rows = Heads·a.Steps rows of D values, a step
     /// at a time, the cache's heads the batches' heads (Heads a whole multiple of a.Heads).</summary>

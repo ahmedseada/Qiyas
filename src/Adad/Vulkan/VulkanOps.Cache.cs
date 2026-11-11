@@ -21,7 +21,7 @@ public sealed partial class VulkanOps
     {
         var fc = Fmt.Of<TC>();
         string via = from is null ? "" : ":" + from.Name;
-        c.Validate(fc);
+        c.Validate(fc, scales != 0);
         if (steps < 0 || (long)c.Heads * steps * c.D > int.MaxValue) throw new ArgumentException($"cache: a write of {steps} rows a head");
         var lane = RowLane(f);
         if (c.Heads == 0 || steps == 0 || c.D == 0 || c.Capacity == 0) return lane.Name;
@@ -42,12 +42,13 @@ public sealed partial class VulkanOps
                     long blocks = (n + f.BlockValues - 1) / f.BlockValues;
                     staging = vk.Rent(blocks * VkKernels.BlockSlotWords(f) * 4L);
                     var slots = new ulong[Spv.MaxSlots];
-                    slots[0] = sl; slots[1] = scales; slots[2] = position; slots[3] = Vulkan.U(c.Capacity); slots[4] = Vulkan.U(steps);
+                    slots[0] = sl; slots[1] = scales; slots[2] = position; slots[3] = Vulkan.U(c.Capacity); slots[4] = Vulkan.U(steps); slots[5] = Vulkan.U(1);
                     slots[VkKernels.StagingSlot] = staging;
                     slots[VkKernels.CountSlot] = (ulong)n;
-                    vk.Launch(vk.Cached($"cache_scales_encode:{f.Name}:{lane.Name}", () => VkKernels.CacheScalesEncoder(vk, f, lane)), Groups(blocks, VkKernels.Threads), 1, slots);
-                    vk.Launch(vk.Cached($"cache_scales_compact:{f.Name}", () => VkKernels.CacheScalesCompact(vk, f)), Groups(f.Words(n), VkKernels.Threads), 1,
-                        staging, scales, Vulkan.U(blocks), position, Vulkan.U(n), Vulkan.U(c.Capacity), Vulkan.U(steps));
+                    var lf = LaneFormat(lane);
+                    vk.Launch(vk.Cached($"cache_blocks_encode:{f.Name}:{lf.Name}", () => VkKernels.CacheBlocksEncoder(vk, f, lf)), Groups(blocks, VkKernels.Threads), 1, slots);
+                    vk.Launch(vk.Cached($"cache_blocks_compact:{f.Name}", () => VkKernels.CacheBlocksCompact(vk, f)), Groups(f.Words(n), VkKernels.Threads), 1,
+                        staging, scales, Vulkan.U(blocks), position, Vulkan.U(n), Vulkan.U(c.Capacity), Vulkan.U(steps), Vulkan.U(1));
                 }
                 else if (!direct)
                 {
@@ -62,9 +63,58 @@ public sealed partial class VulkanOps
             }
         }
 
+        if (fc.IsBlock)
+        {
+            BlockRows(fc, from ?? f, c, steps, rows, position, source, cache);
+            return lane.Name;
+        }
+
         var fn = vk.Cached($"cache_write:{f.Name}:{fc.Name}:{lane.Name}:{scaled}{via}", () => VkKernels.CacheWrite(vk, f, fc, lane, scaled, from));
         vk.Launch(fn, Groups((long)rows * wpr, VkKernels.Threads), 1, source, cache, scales, position, Vulkan.U(rows), Vulkan.U(steps), Vulkan.U(c.Capacity), Vulkan.U(c.D), Vulkan.U(wpr), min, max);
         return lane.Name;
+    }
+
+    // A block format cache's write. A row of whole blocks: the written rows' blocks encoded into staging in the source's
+    // order, then written into the cache's words the rows cover (invocations for the rows' words alone). Rows that share
+    // blocks: the cache's blocks encoded from the written rows' values and the others as stored, and the touched blocks
+    // alone compacted (every block of the cache launched, each deciding from the position).
+    private void BlockRows(Fmt fc, Fmt fx, CacheView c, int steps, int rows, ulong position, ulong source, ulong cache)
+    {
+        ulong staging = 0;
+        try
+        {
+            if (c.WholeBlocks(fc))
+            {
+                int bpr = c.D / fc.BlockValues, rowBytes = bpr * fc.BlockBytes;
+                long blocks = (long)rows * bpr, bytes = c.Rows * rowBytes;
+                if (bytes > uint.MaxValue) throw new NotSupportedException($"vulkan: a cache of {bytes} bytes of {fc.Name} past 2^32");
+                staging = vk.Rent(blocks * VkKernels.BlockSlotWords(fc) * 4L);
+                var slots = new ulong[Spv.MaxSlots];
+                slots[0] = source;
+                slots[VkKernels.StagingSlot] = staging;
+                slots[VkKernels.CountSlot] = (ulong)((long)rows * c.D);
+                vk.Launch(vk.Cached($"block_convert:{fx.Name}:{fc.Name}", () => VkKernels.BlockConvert(vk, fx, fc)), Groups(blocks, VkKernels.Threads), 1, slots);
+                long wph = ((long)steps * rowBytes + 3) / 4 + 1;
+                vk.Launch(vk.Cached($"cache_rows_compact:{fc.Name}", () => VkKernels.CacheRowsCompact(vk, fc)), Groups(c.Heads * wph, VkKernels.Threads), 1,
+                    staging, cache, position, Vulkan.U(c.Heads), Vulkan.U(steps), Vulkan.U(c.Capacity), Vulkan.U(rowBytes), Vulkan.U(wph));
+            }
+            else
+            {
+                long n = c.Values, blocks = (n + fc.BlockValues - 1) / fc.BlockValues;
+                staging = vk.Rent(blocks * VkKernels.BlockSlotWords(fc) * 4L);
+                var slots = new ulong[Spv.MaxSlots];
+                slots[0] = source; slots[1] = cache; slots[2] = position; slots[3] = Vulkan.U(c.Capacity); slots[4] = Vulkan.U(steps); slots[5] = Vulkan.U(c.D);
+                slots[VkKernels.StagingSlot] = staging;
+                slots[VkKernels.CountSlot] = (ulong)n;
+                vk.Launch(vk.Cached($"cache_blocks_encode:{fc.Name}:{fx.Name}", () => VkKernels.CacheBlocksEncoder(vk, fc, fx)), Groups(blocks, VkKernels.Threads), 1, slots);
+                vk.Launch(vk.Cached($"cache_blocks_compact:{fc.Name}", () => VkKernels.CacheBlocksCompact(vk, fc)), Groups(fc.Words(n), VkKernels.Threads), 1,
+                    staging, cache, Vulkan.U(blocks), position, Vulkan.U(n), Vulkan.U(c.Capacity), Vulkan.U(steps), Vulkan.U(c.D));
+            }
+        }
+        finally
+        {
+            if (staging != 0) vk.Return(staging);
+        }
     }
 
     /// <summary>A layer's projection rows, normalized and rotated in the lane, into the cache at the position
@@ -74,7 +124,7 @@ public sealed partial class VulkanOps
         where TN : struct, IFloatAdad<TN> where TC : struct, IAdad<TC>
     {
         var f = Fmt.Of<TN>();
-        c.Validate(Fmt.Of<TC>());
+        c.Validate(Fmt.Of<TC>(), scales != 0);
         c.ValidateRope(a);
         var lane = RowLane(f);
         long n = (long)a.Rows * a.Cols;
@@ -96,7 +146,7 @@ public sealed partial class VulkanOps
             return AttentionLayout.Queries<ulong, ulong, TN>(this, a, q, o, (d, h, qh, oh) => d.AttentionCached<TN, TC>(h, position, qh, k, kScales, v, vScales, oh));
         CacheRule.Validate(a);
         Fmt f = Fmt.Of<TN>(), fc = Fmt.Of<TC>();
-        new CacheView(a.KvHeadCount, a.Lk, a.D).Validate(fc);
+        new CacheView(a.KvHeadCount, a.Lk, a.D).Validate(fc, kScales != 0 || vScales != 0);
         var lane = RowLane(f);
         if (a.D > 4 * VkKernels.DecodeThreads) throw new NotSupportedException($"vulkan: attention over a cache with a head dimension of {a.D} exceeds {4 * VkKernels.DecodeThreads}");
         if (a.QValues == 0) return lane.Name;

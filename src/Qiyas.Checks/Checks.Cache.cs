@@ -2,8 +2,10 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // Key and value caches (Cache.cs, ICache) on every device, every float type of the values (the block formats among them):
-//   the write       caches of the type itself, of float16 and int8 by Convert's rule, and scaled caches of int8, int4 and
-//                   float8 e4m3: several rows at a position, a write that runs past the capacity and one that starts before
+//   the write       caches of the type itself, of float16 and int8 by Convert's rule, scaled caches of int8, int4 and
+//                   float8 e4m3, and caches of each block format (Q8_0, Q4_0, Q4_K, Q6_K) with rows of whole blocks and with
+//                   rows that share blocks (each value within its block's rounding of the source's or, kept, of what was
+//                   stored; every block the write does not touch as it was): several rows at a position, a write that runs past the capacity and one that starts before
 //                   row 0 (the rows outside the capacity not written), a row of zeros among the rows. Each unscaled value
 //                   the type's own rounding of the source's; each row scale within the type's rounding of the float64
 //                   reference's (a block format's: its block's, the block's other scales re-rounded with it); each code the
@@ -26,7 +28,9 @@ internal static partial class Checks
             if (!Bench.Registry.IsFloat(type) || (!blocks && Bench.Registry.IsBlock(type))) continue;
             foreach (var (cacheType, scaled) in CacheCases(type))
             {
-                ok &= CacheWrites(ops, where, type, cacheType, scaled);
+                ok &= CacheWrites(ops, where, type, cacheType, scaled, 24);
+                // A block format's rows of whole blocks too (24 values a row share them).
+                if (Bench.Registry.IsBlock(cacheType)) ok &= CacheWrites(ops, where, type, cacheType, scaled, cacheType is "q8_0" or "q4_0" ? 64 : 256);
                 ok &= CacheAttentions(ops, where, type, cacheType, scaled);
             }
 
@@ -34,7 +38,7 @@ internal static partial class Checks
         }
 
         ok &= PositionAdvances(ops, where);
-        if (ok) Console.WriteLine($"check caches                 {where,-6} every float type{(blocks ? "" : " but the block formats")}: rows written at the device's position (the type itself, float16 and int8 by one rounding; int8, int4 and float8 by row scales), attention over the rows filled (grouped heads, a window, a cap), the decoder's mask and the position advanced");
+        if (ok) Console.WriteLine($"check caches                 {where,-6} every float type{(blocks ? "" : " but the block formats")}: rows written at the device's position (the type itself, float16 and int8 by one rounding; int8, int4 and float8 by row scales; Q8_0, Q4_0, Q4_K and Q6_K by whole blocks and by shared ones), attention over the rows filled (grouped heads, a window, a cap), the decoder's mask and the position advanced");
         return ok;
     }
 
@@ -48,17 +52,19 @@ internal static partial class Checks
         yield return ("int8", true);
         yield return ("int4", true);
         yield return ("float8_e4m3", true);
+        foreach (string block in new[] { "q8_0", "q4_0", "q4_k", "q6_k" }) yield return (block, false);
     }
 
-    private static bool CacheWrites(IDevice<ulong, ulong>? ops, string where, string type, string cacheType, bool scaled)
+    private static bool CacheWrites(IDevice<ulong, ulong>? ops, string where, string type, string cacheType, bool scaled, int d)
     {
-        const int heads = 2, cap = 21, d = 24;
+        const int heads = 2, cap = 21;
         var view = new CacheView(heads, cap, d);
-        string what = $"cache_write {cacheType}{(scaled ? " scaled" : "")}";
+        string what = $"cache_write {cacheType}{(scaled ? " scaled" : "")} d {d}";
+        int cacheBlock = cacheType switch { "q8_0" or "q4_0" => 32, "q4_k" or "q6_k" => 256, _ => 0 };
         var (min, max) = Bench.Registry.With(cacheType, new CodeRange());
         bool floatCodes = Bench.Registry.IsFloat(cacheType), blockScales = Bench.Registry.IsBlock(type);
         double laneEps = type == "float64" ? Math.Pow(2, -52) : Math.Pow(2, -23);
-        int rowBytes = (int)Bench.Registry.Bytes(cacheType, d), scaleCount = heads * cap;
+        int rowBytes = cacheBlock > 0 ? 0 : (int)Bench.Registry.Bytes(cacheType, d), scaleCount = heads * cap;
         int blockValues = type switch { "q8_0" or "q4_0" => 32, "q4_k" or "q6_k" => 256, _ => 1 };
         int scaleUnitBytes = (int)Bench.Registry.Bytes(type, blockValues);
         // The buffers before the first write: codes in range, scales of the magnitude a write stores.
@@ -94,6 +100,29 @@ internal static partial class Checks
                     if (!touched && !scales.AsSpan(u * scaleUnitBytes, scaleUnitBytes).SequenceEqual(scalesBefore.AsSpan(u * scaleUnitBytes, scaleUnitBytes)))
                         wrong = $"scale{(blockScales ? "s of block" : "")} {u}, outside the write, changed";
                 }
+            }
+
+            if (cacheBlock > 0)
+            {
+                // A block format cache: every value within its block's rounding of the source's (a written row) or of what was
+                // stored (a row whose block a written row shares); every block with no written value as it was.
+                int all = heads * cap * d, blockBytes = (int)Bench.Registry.Bytes(cacheType, cacheBlock);
+                var want = Bench.Registry.Values(cacheType, cacheBefore, all);
+                for (int h = 0; h < heads; h++)
+                    for (int row = Math.Max(p, 0); row < Math.Min(p + steps, cap); row++) Array.Copy(x, (h * steps + row - p) * d, want, (h * cap + row) * d, d);
+                double bad = Excess(cacheType, at, cache, want, i => Math.Abs(want[i]), 2);
+                if (bad > 0) { Console.WriteLine($"check {at,-40} {where,-6} {type,-12} DIFFERS by {bad:0.##}"); return false; }
+                for (int u = 0; u * cacheBlock < all; u++)
+                {
+                    bool touched = false;
+                    for (int i = u * cacheBlock; i < Math.Min(all, (u + 1) * cacheBlock); i += 1) touched |= Written(i / d % cap);
+                    int bytes = Math.Min(blockBytes, cache.Length - u * blockBytes);
+                    if (touched || cache.AsSpan(u * blockBytes, bytes).SequenceEqual(cacheBefore.AsSpan(u * blockBytes, bytes))) continue;
+                    Console.WriteLine($"check {at,-40} {where,-6} {type,-12} block {u}, outside the write, changed");
+                    return false;
+                }
+
+                continue;
             }
 
             bool Tie(double q) => Math.Abs(Math.Abs(q - Math.Floor(q)) - 0.5) < 64 * laneEps * Math.Max(1, Math.Abs(q));

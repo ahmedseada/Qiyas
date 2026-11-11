@@ -680,8 +680,8 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
     }
 
     // Key and value caches (float types). The write: 16 heads of 512 rows of d = 128 at row 1000 of a cache of 2048 rows, as
-    // the type itself (a block format's: as float32) — the cache scored — and as int8 codes with a scale a row — the scales
-    // scored; quantize_rows is the same rows through Quantize (a scale a row), the write's nearest equivalent. Attention:
+    // the type itself (a block format's rows whole blocks for Q8_0 and Q4_0, shared blocks for Q4_K and Q6_K) — the cache
+    // scored — and as int8 codes with a scale a row — the scales scored; quantize_rows is the same rows through Quantize (a scale a row), the write's nearest equivalent. Attention:
     // attention_decode's shape (32 heads, one query over 4096 keys) with the position at the cache's last row, over a cache
     // of the type and over int8 codes with row scales. The mask: 512 steps over 4096 positions. Odd shapes keep a row of
     // the cache whole 32-bit words (d a multiple of 4).
@@ -689,7 +689,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
     {
         if (!Registry.IsFloat(type)) return;
         int d = Odd ? 4 * Prime(32) : 128;
-        string own = Registry.IsBlock(type) ? "float32" : type;
+        string own = type;
         if (name == "decoder_mask")
         {
             int rows = Prime(512), cap = Prime(4096), at = 1000;

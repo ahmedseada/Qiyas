@@ -11,7 +11,8 @@ public interface ICache<TBuffer, TIndex>
     /// <summary>Rows [p, p + steps) of each head (p = position[0]; rows past Capacity not written) = the source's rows (Heads
     /// × steps × D, TN), each value rounded to TC once; scaled (scales given): each row's scale max |x| / TC.Max in TN's float
     /// lane, stored as TN at head·Capacity + row, each code x / scale by the stored scale (an integer TC's nearest, ties to
-    /// even), held to TC's range, rounded to TC once.</summary>
+    /// even), held to TC's range, rounded to TC once. A block format TC (no scales): each block the rows touch encoded once
+    /// from the rows' values as float32 and, where rows share it, its other values as stored.</summary>
     string CacheWrite<TN, TC>(CacheView c, int steps, TIndex position, TBuffer source, TBuffer cache, TBuffer? scales) where TN : struct, IFloatAdad<TN> where TC : struct, IAdad<TC>;
 
     /// <summary>CacheWrite of a layer's projection rows x (a.Rows = Heads·a.Steps rows of D values of TN, a step at a time: row

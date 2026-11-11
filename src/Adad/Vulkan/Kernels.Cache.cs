@@ -40,6 +40,17 @@ internal static partial class VkKernels
         return (written, b.Select(written, at / cap * steps + (r - w.P), b.U(0)));
     }
 
+    // Value `at` of rows of `unit` values: whether the write fills it, and its source's index ((head·steps + step)·unit +
+    // column; 0 when not).
+    private static (V Written, V Index) WrittenAt(Spv b, V at, V cap, V steps, V unit, (V P, V W0, V W1, V Any) w)
+    {
+        var row = at / unit;
+        var head = row / cap;
+        var r = row - head * cap;
+        var written = w.Any & (r >= w.W0) & (r < w.W1);
+        return (written, b.Select(written, (head * steps + (r - w.P)) * unit + (at - row * unit), b.U(0)));
+    }
+
     /// <summary>Each source row's scale max |x| / max in the lane, a workgroup a row (row = head·steps + step). direct: a lane
     /// value at head·cap + p + step of ps (a row past the capacity not written; the type's storage is the lane's); else at
     /// ps[row]. Slots: x (f), ps, pos, steps, cap, d, max (lane).</summary>
@@ -97,34 +108,36 @@ internal static partial class VkKernels
         return b.Build();
     }
 
-    /// <summary>A block format's row scales into blocks (f32): the new scales (lane values at x[head·steps + step]) where the
-    /// write fills the value, else the value as it is stored. Slots: x, scales, pos, cap, steps.</summary>
-    public static SpvKernel CacheScalesEncoder(Vulkan vk, Fmt f, Lane lane) =>
-        BlockEncoder(vk, f, $"cache_scales_{lane.Name}", b =>
+    /// <summary>Rows of a block format written where rows share blocks (a block-format type's row scales, unit 1; a block
+    /// format cache's rows of `unit` values not whole blocks) into blocks (f32): the written rows' values (fx at
+    /// x[(head·steps + step)·unit + column]) where the write fills the value, else the value as it is stored. Slots: x,
+    /// destination, pos, cap, steps, unit.</summary>
+    public static SpvKernel CacheBlocksEncoder(Vulkan vk, Fmt fb, Fmt fx) =>
+        BlockEncoder(vk, fb, $"cache_blocks_from_{fx.Name}", b =>
         {
-            var k = Kinds.Of(lane);
             V px = b.Arg(0), ps = b.Arg(1), pos = b.Arg(2);
-            V cap = b.Arg(3, K.U32), steps = b.Arg(4, K.U32);
+            V cap = b.Arg(3, K.U32), steps = b.Arg(4, K.U32), unit = b.Arg(5, K.U32);
             var w = WrittenRows(b, pos, steps, cap);
             return (at, _) =>
             {
-                var (written, index) = WrittenAt(b, at, cap, steps, w);
-                var fresh = b.Load(k, b.At(px, index, lane.Size));
-                return b.Select(written, lane.Wide ? b.Convert(fresh, K.F32) : fresh, Codec.UnpackAt(b, f, ps, at, Lane.F32));
+                var (written, index) = WrittenAt(b, at, cap, steps, unit, w);
+                return b.Select(written, Codec.UnpackAt(b, fx, px, index, Lane.F32), Codec.UnpackAt(b, fb, ps, at, Lane.F32));
             };
         });
 
-    /// <summary>The encoder's staging slots into the scales' words (BlockCompact), the blocks that hold a written row only: a
-    /// block the write does not touch keeps its bytes. Slots: staging, scales, blocks, pos, n, cap, steps.</summary>
-    public static SpvKernel CacheScalesCompact(Vulkan vk, Fmt f)
+    /// <summary>The encoder's staging slots into the destination's words (BlockCompact), the blocks that hold a written value
+    /// only: a block the write does not touch keeps its bytes. Slots: staging, destination, blocks, pos, n, cap, steps, unit.</summary>
+    public static SpvKernel CacheBlocksCompact(Vulkan vk, Fmt f)
     {
-        var b = new Spv($"cache_scales_compact_{f.Name}", Threads, vk.Controls);
+        var b = new Spv($"cache_blocks_compact_{f.Name}", Threads, vk.Controls);
         V staging = b.Arg(0), output = b.Arg(1), blocks = b.Arg(2, K.U32), pos = b.Arg(3);
-        V n = b.Arg(4, K.U32), cap = b.Arg(5, K.U32), steps = b.Arg(6, K.U32);
+        V n = b.Arg(4, K.U32), cap = b.Arg(5, K.U32), steps = b.Arg(6, K.U32), unit = b.Arg(7, K.U32);
         var gid = b.GlobalX;
         var bytes = b.Convert(blocks, K.U64) * (double)f.BlockBytes;
         var words = b.Convert((bytes + 3.0) >> 2, K.U32);
-        var w = WrittenRows(b, pos, steps, cap);
+        var rows = WrittenRows(b, pos, steps, cap);
+        var w = (rows.P, rows.W0 * unit, rows.W1 * unit, rows.Any);                // the written values of a head: [W0·unit, W1·unit) of cap·unit
+        var period = cap * unit;
         b.If(gid < words, () =>
         {
             var address = b.At(output, gid, 4);
@@ -137,7 +150,7 @@ internal static partial class VkKernels
                 var blk = b.Select(inside, p / (double)f.BlockBytes, b.U(0));
                 var off = p - blk * (double)f.BlockBytes;
                 var first = blk * (double)f.BlockValues;
-                var take = inside & Touched(b, first, b.Min(first + (double)f.BlockValues, n), cap, w);
+                var take = inside & Touched(b, first, b.Min(first + (double)f.BlockValues, n), period, w);
                 var src = b.Load(K.U32, b.At(staging, b.Select(inside, blk * (double)BlockSlotWords(f) + (off >> 2), b.U(0)), 4));
                 var fresh = src.Shr((off & 3UL) << 3) & 0xFFUL;
                 var kept = (old >> (8 * j)) & 0xFFUL;
@@ -145,6 +158,55 @@ internal static partial class VkKernels
             }
 
             b.Store(address, word);
+        });
+        return b.Build();
+    }
+
+    /// <summary>Rows of whole blocks into a block format cache at the device's position: the written rows' blocks, encoded
+    /// into the staging slots in the source's order (the block encoder over the source), into the cache's words — head h's
+    /// run of rows [W0, W1) is bytes [(h·cap + W0)·rowBytes, (h·cap + W1)·rowBytes); invocation (h, w) owns the w-th word
+    /// of the run unless the head before reaches it, and writes each of its bytes that a written row holds (from the row's
+    /// block in the staging), the others as they are. Slots: staging, cache, pos, heads, steps, cap, rowBytes, wph (the
+    /// invocations a head: the most words a run spans).</summary>
+    public static SpvKernel CacheRowsCompact(Vulkan vk, Fmt f)
+    {
+        var b = new Spv($"cache_rows_compact_{f.Name}", Threads, vk.Controls);
+        V staging = b.Arg(0), cache = b.Arg(1), pos = b.Arg(2);
+        V heads = b.Arg(3, K.U32), steps = b.Arg(4, K.U32), cap = b.Arg(5, K.U32), rowBytes = b.Arg(6, K.U32), wph = b.Arg(7, K.U32);
+        var gid = b.GlobalX;
+        var h = gid / wph;
+        var w = WrittenRows(b, pos, steps, cap);
+        b.If(w.Any & (h < heads), () =>
+        {
+            var firstWord = (h * cap + w.W0) * rowBytes >> 2;
+            var lastWord = ((h * cap + w.W1) * rowBytes - 1) >> 2;
+            var word = firstWord + (gid - h * wph);
+            // The head before reaches at most its own run's last word.
+            var before = b.Select(h > 0, ((b.Max(h, b.U(1)) - 1) * cap + w.W1) * rowBytes - 1 >> 2, b.U(0));
+            b.If((word <= lastWord) & ((h == 0) | (word > before)), () =>
+            {
+                var address = b.At(cache, word, 4);
+                var old = b.Load(K.U32, address);
+                var value = b.U(0);
+                for (int j = 0; j < 4; j++)
+                {
+                    var at = word * 4.0 + j;
+                    var row = at / rowBytes;
+                    var off = at - row * rowBytes;
+                    var head = row / cap;
+                    var r = row - head * cap;
+                    var written = (head < heads) & (r >= w.W0) & (r < w.W1);
+                    // The row's block in the staging: (head·steps + step) blocks-a-row in, then the block within the row.
+                    var blk = b.Select(written, (head * steps + (r - w.P)) * (rowBytes / (double)f.BlockBytes) + off / (double)f.BlockBytes, b.U(0));
+                    var within = off % (double)f.BlockBytes;
+                    var src = b.Load(K.U32, b.At(staging, blk * (double)BlockSlotWords(f) + (within >> 2), 4));
+                    var fresh = src.Shr((within & 3UL) << 3) & 0xFFUL;
+                    var kept = (old >> (8 * j)) & 0xFFUL;
+                    value = value | (b.Select(written, fresh, kept) << (8 * j));
+                }
+
+                b.Store(address, value);
+            });
         });
         return b.Build();
     }

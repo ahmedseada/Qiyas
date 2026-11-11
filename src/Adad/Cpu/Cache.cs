@@ -30,7 +30,7 @@ internal sealed partial class Kernels
     public static string CacheWrite<TN, TC>(CacheView c, int steps, int[] position, byte[] source, byte[] cache, byte[]? scales)
         where TN : struct, IFloatAdad<TN> where TC : struct, IAdad<TC>
     {
-        c.Validate(Fmt.Of<TC>());
+        c.Validate(Fmt.Of<TC>(), scales is not null);
         if (steps < 0 || (long)c.Heads * steps * c.D > int.MaxValue) throw new ArgumentException($"cache: a write of {steps} rows a head");
         return Mixed<TN, CacheWriteCall<TC>>(new CacheWriteCall<TC>(c, steps, position[0], source, cache, scales, false));
     }
@@ -136,6 +136,28 @@ internal sealed partial class Kernels
         public void Run<TW, TLW, TLWL>() where TW : struct, IAdad<TW, TLW> where TLW : unmanaged where TLWL : struct, ILane<TLWL, TLW>
         {
             int rows = c.Heads * steps;
+            if (Fmt.Of<TW>().IsBlock)
+            {
+                // A block format: a task a block the rows touch (BlockRows), each block encoded once.
+                var (w0, w1) = c.Written(position, steps);
+                if (w1 <= w0) return;
+                int g = TW.Granularity, run = (w1 - w0) * c.D, done = -1, total = 0;
+                int[] first = new int[c.Heads + 1], block = new int[c.Heads];
+                for (int h = 0; h < c.Heads; h++)
+                {
+                    // Head h's blocks: from its run's first, past the last one a head before took, to its run's last.
+                    int at = (h * c.Capacity + w0) * c.D, last = (at + run - 1) / g;
+                    block[h] = Math.Max(at / g, done + 1);
+                    first[h] = total;
+                    total += Math.Max(0, last - block[h] + 1);
+                    done = Math.Max(done, last);
+                }
+
+                first[c.Heads] = total;
+                Team.For(total, Math.Max(1, total / (Threads * 4)), (long)total * g * 4, new CacheBlocksBody<TN, TW, TLW, TLane, TL>(c, steps, position, w0, w1, source, lanes, cache, first, block));
+                return;
+            }
+
             bool toOdd = Fmt.ConvertPlan(Fmt.Of<TS>(), Fmt.Of<TW>()).ToOdd;
             Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)rows * c.D * 4, new CacheWriteBody<TN, TW, TLW, TLane, TL>(c, steps, position, source, lanes, cache, rowScales, toOdd));
         }
@@ -195,13 +217,59 @@ internal sealed partial class Kernels
         }
     }
 
+    // A cache of a block format: blocks [first, last) of the flat list of the blocks the write touches (head h's from
+    // block[h], first[h] before them), each one task's. A block's values: the written rows' from the source (the lane's
+    // values rounded to float32, as the format encodes from), the others as they are stored (decoded: the type's partial
+    // store), the block encoded once. A row of whole blocks keeps nothing: its blocks are written whole.
+    private readonly struct CacheBlocksBody<TN, TW, TLW, TLane, TL>(CacheView c, int steps, int position, int w0, int w1, byte[] source, bool lanes, byte[] cache, int[] first, int[] block) : Team.IBody
+        where TN : struct, IAdad<TN, TLane> where TW : struct, IAdad<TW, TLW> where TLW : unmanaged where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    {
+        public void Run(int from, int to)
+        {
+            int g = TW.Granularity, d = c.D, cap = c.Capacity, total = (int)c.Values;
+            Span<TLW> values = stackalloc TLW[g];
+            Span<TLane> row = stackalloc TLane[g];
+            int h = 0;
+            for (int i = from; i < to; i++)
+            {
+                while (i >= first[h + 1]) h++;
+                int a = (block[h] + i - first[h]) * g, e = Math.Min(a + g, total);
+                var block0 = values[..(e - a)];
+                bool kept = false;
+                for (int x = a; x < e; x += Math.Min(e - x, d - x % d))
+                {
+                    int r = x / d % cap;
+                    kept |= r < w0 || r >= w1;
+                }
+
+                if (kept) TW.Load(cache, a, block0);
+                for (int x = a; x < e;)
+                {
+                    int rowAt = x / d, col = x % d, n = Math.Min(e - x, d - col), r = rowAt % cap;
+                    if (r >= w0 && r < w1)
+                    {
+                        int at = (rowAt / cap * steps + (r - position)) * d + col;
+                        var run = row[..n];
+                        if (lanes) MemoryMarshal.Cast<byte, TLane>(source.AsSpan()).Slice(at, n).CopyTo(run);
+                        else TN.Load(source, at, run);
+                        Widths.Load<TLane, TLW>(run, block0.Slice(x - a, n));
+                    }
+
+                    x += n;
+                }
+
+                TW.Store(block0, cache, a);
+            }
+        }
+    }
+
     /// <summary>A layer's projection rows, normalized and rotated in the lane, into the cache at the position
     /// (ICache.CacheWriteRope): the rows a head at a time in the lane's own storage (IRows.Rope's values, not rounded), then
     /// CacheWrite from them. Returns the lane's name.</summary>
     public static string CacheWriteRope<TN, TC>(CacheView c, RopeArgs a, int[] position, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] cache, byte[]? scales)
         where TN : struct, IFloatAdad<TN> where TC : struct, IAdad<TC>
     {
-        c.Validate(Fmt.Of<TC>());
+        c.Validate(Fmt.Of<TC>(), scales is not null);
         c.ValidateRope(a);
         return Mixed<TN, CacheRopeCall<TC>>(new CacheRopeCall<TC>(c, a with { HeadsFirst = true }, position, x, gain, cos, sin, positions, cache, scales));
     }
@@ -230,7 +298,7 @@ internal sealed partial class Kernels
         if (a.StepsFirst)
             return StepsFirstQueries<TN>(a, q, o, (h, qh, oh) => AttentionCached<TN, TC>(h, position, qh, k, kScales, v, vScales, oh));
         CacheRule.Validate(a);
-        new CacheView(a.KvHeadCount, a.Lk, a.D).Validate(Fmt.Of<TC>());
+        new CacheView(a.KvHeadCount, a.Lk, a.D).Validate(Fmt.Of<TC>(), kScales is not null || vScales is not null);
         return Mixed<TN, CachedCall<TC>>(new CachedCall<TC>(CacheRule.AtPosition(a, position[0]), q, k, kScales, v, vScales, o));
     }
 

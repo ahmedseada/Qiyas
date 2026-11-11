@@ -23,7 +23,7 @@ public sealed partial class GpuOps
     {
         var fc = Fmt.Of<TC>();
         string via = from is null ? "" : ":" + from.Name;
-        c.Validate(fc);
+        c.Validate(fc, scales != 0);
         if (steps < 0 || (long)c.Heads * steps * c.D > int.MaxValue) throw new ArgumentException($"cache: a write of {steps} rows a head");
         var lane = RowLane(f);
         if (c.Heads == 0 || steps == 0 || c.D == 0 || c.Capacity == 0) return lane.Name;
@@ -40,14 +40,34 @@ public sealed partial class GpuOps
                 Gpu.Launch(sfn, (uint)rows, 1, 256, 1, 0, source, sl, position, Gpu.U(steps), Gpu.U(c.Capacity), Gpu.U(c.D), max);
                 if (!direct)
                 {
-                    var bfn = gpu.Cached($"cache_scales_blocks:{f.Name}:{lane.Name}", (out string e) => Ptx.CacheScalesBlocks(gpu, f, lane, out e));
-                    Gpu.Launch(bfn, BlockGrid(f, c.Rows), 1, 256, 1, 0, sl, scales, position, Gpu.U((int)c.Rows), Gpu.U(c.Capacity), Gpu.U(steps));
+                    var bfn = gpu.Cached($"cache_blocks:{f.Name}:{lane.Name}", (out string e) => Ptx.CacheBlocks(gpu, f, LaneFormat(lane), out e));
+                    Gpu.Launch(bfn, BlockGrid(f, c.Rows), 1, 256, 1, 0, sl, scales, position, Gpu.U((int)c.Rows), Gpu.U(c.Capacity), Gpu.U(steps), Gpu.U(1));
                 }
             }
             finally
             {
                 if (!direct) gpu.Return(sl);
             }
+        }
+
+        if (fc.IsBlock)
+        {
+            // A block format cache: a row of whole blocks written a block at a time (the written rows' blocks alone); rows
+            // that share blocks by re-encoding the blocks the write touches, their other values kept (every block of the
+            // cache launched, each deciding from the position).
+            var fx = from ?? f;
+            if (c.WholeBlocks(fc))
+            {
+                var rfn = gpu.Cached($"cache_rows_blocks:{fc.Name}:{fx.Name}", (out string e) => Ptx.CacheRowsBlocks(gpu, fc, fx, out e));
+                Gpu.Launch(rfn, BlockGrid(fc, (long)rows * c.D), 1, 256, 1, 0, source, cache, position, Gpu.U(rows * c.D), Gpu.U(steps), Gpu.U(c.Capacity), Gpu.U(c.D / fc.BlockValues));
+            }
+            else
+            {
+                var bfn = gpu.Cached($"cache_blocks:{fc.Name}:{fx.Name}", (out string e) => Ptx.CacheBlocks(gpu, fc, fx, out e));
+                Gpu.Launch(bfn, BlockGrid(fc, c.Values), 1, 256, 1, 0, source, cache, position, Gpu.U((int)c.Values), Gpu.U(c.Capacity), Gpu.U(steps), Gpu.U(c.D));
+            }
+
+            return lane.Name;
         }
 
         var fn = gpu.Cached($"cache_write:{f.Name}:{fc.Name}:{lane.Name}:{scaled}{via}", (out string e) => Ptx.CacheWrite(gpu, f, fc, lane, scaled, out e, from));
@@ -62,7 +82,7 @@ public sealed partial class GpuOps
         where TN : struct, IFloatAdad<TN> where TC : struct, IAdad<TC>
     {
         var f = Fmt.Of<TN>();
-        c.Validate(Fmt.Of<TC>());
+        c.Validate(Fmt.Of<TC>(), scales != 0);
         c.ValidateRope(a);
         var lane = RowLane(f);
         long n = (long)a.Rows * a.Cols;
@@ -84,7 +104,7 @@ public sealed partial class GpuOps
             return AttentionLayout.Queries<ulong, ulong, TN>(this, a, q, o, (d, h, qh, oh) => d.AttentionCached<TN, TC>(h, position, qh, k, kScales, v, vScales, oh));
         CacheRule.Validate(a);
         Fmt f = Fmt.Of<TN>(), fc = Fmt.Of<TC>();
-        new CacheView(a.KvHeadCount, a.Lk, a.D).Validate(fc);
+        new CacheView(a.KvHeadCount, a.Lk, a.D).Validate(fc, kScales != 0 || vScales != 0);
         var lane = RowLane(f);
         if (a.D > 4 * Ptx.DecodeThreads) throw new NotSupportedException($"attention_cached: a head dimension of {a.D} exceeds {4 * Ptx.DecodeThreads}");
         if (a.QValues == 0) return lane.Name;
