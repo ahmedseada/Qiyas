@@ -2,7 +2,8 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // The device-neutral part of Optimizers: its arguments, catalogue and references. The devices implement it in their
-// folders: Cpu/Optimizers.cs; Cuda/GpuOps.Optimizers.cs with its kernels in Cuda/Ptx.Optimizers.cs.
+// folders: Cpu/Optimizers.cs; Cuda/GpuOps.Optimizers.cs with its kernels in Cuda/Ptx.Optimizers.cs;
+// Vulkan/VulkanOps.Optimizers.cs with its kernels in Vulkan/Kernels.Optimizers.cs.
 
 using System.Buffers;
 using System.Numerics;
@@ -15,28 +16,67 @@ namespace Adad.Abstraction;
 /// eps, the weight decay, the step count (for Adam's bias correction).</summary>
 public sealed record OptimizerArgs(string Name, double Lr, double B1, double B2, double Eps, double Wd, int Step)
 {
-    public static readonly string[] Names = ["sgd_momentum", "adam", "adamw"];
+    public static readonly string[] Names = ["sgd", "sgd_momentum", "adam", "adamw"];
 
-    public int Moments => Name == "sgd_momentum" ? 1 : 2;
+    /// <summary>The moments a step keeps: none (sgd), m (sgd_momentum), m and v (adam, adamw).</summary>
+    public int Moments => Name switch { "sgd" => 0, "sgd_momentum" => 1, _ => 2 };
 
-    /// <summary>The float64 reference: p, m, v updated in place.</summary>
-    public void Reference(double[] p, double[] g, double[] m, double[]? v)
+    /// <summary>The norm the gradients of a step across several tensors are clipped to (IOptimizers.OptimizerMany; 0: no
+    /// clipping): each gradient is multiplied, as the step reads it, by min(1, MaxNorm / the norm of all the tensors'
+    /// gradients together).</summary>
+    public double MaxNorm { get; init; }
+
+    public void Validate()
+    {
+        if (Array.IndexOf(Names, Name) < 0) throw new ArgumentException($"optimizer: no step named {Name}");
+        if (!(MaxNorm >= 0) || double.IsInfinity(MaxNorm)) throw new ArgumentException($"optimizer: a gradient norm of {MaxNorm} to clip to");
+    }
+
+    /// <summary>The float64 reference: p, m, v updated in place (m is not read by sgd, v by one moment), each gradient
+    /// times <paramref name="scale"/> as it is read.</summary>
+    public void Reference(double[] p, double[] g, double[]? m, double[]? v, double scale = 1)
     {
         double c1 = 1 - Math.Pow(B1, Step), c2 = 1 - Math.Pow(B2, Step);
         for (int i = 0; i < p.Length; i++)
         {
+            double gi = scale == 1 ? g[i] : g[i] * scale;
+            if (Name == "sgd")
+            {
+                p[i] -= Lr * (gi + Wd * p[i]);
+                continue;
+            }
+
             if (Name == "sgd_momentum")
             {
-                m[i] = B1 * m[i] + g[i] + Wd * p[i];
+                m![i] = B1 * m[i] + gi + Wd * p[i];
                 p[i] -= Lr * m[i];
                 continue;
             }
 
-            m[i] = B1 * m[i] + (1 - B1) * g[i];
-            v![i] = B2 * v[i] + (1 - B2) * g[i] * g[i];
+            m![i] = B1 * m[i] + (1 - B1) * gi;
+            v![i] = B2 * v[i] + (1 - B2) * gi * gi;
             double update = Lr * (m[i] / c1) / (Math.Sqrt(v[i] / c2) + Eps);
             p[i] -= update;
             if (Name == "adamw") p[i] -= Lr * Wd * p[i];
         }
     }
+
+    /// <summary>The clipping factor of a sum of squares: min(1, MaxNorm / its root), 1 where it is 0 or there is no clipping
+    /// (the map's clip_factor).</summary>
+    public double Factor(double sumSquares) => MaxNorm > 0 && sumSquares > 0 ? Math.Min(1, MaxNorm / Math.Sqrt(sumSquares)) : 1;
+
+    /// <summary>The float64 reference of a step across several tensors (IOptimizers.OptimizerMany): the sum of the squares
+    /// of all their gradients, then each tensor's step with its gradients times the factor. Returns the sum.</summary>
+    public double ReferenceMany(double[][] p, double[][] g, double[]?[] m, double[]?[] v)
+    {
+        double sum = 0;
+        foreach (var t in g) foreach (double x in t) sum += x * x;
+        double scale = Factor(sum);
+        for (int t = 0; t < p.Length; t++) Reference(p[t], g[t], m[t], v[t], scale);
+        return sum;
+    }
 }
+
+/// <summary>One tensor of a step across several: its N parameters and gradients (as the type) and its moments (lane
+/// storage; not read where the step keeps none).</summary>
+public readonly record struct OptimizerTensor<TBuffer>(TBuffer P, TBuffer G, TBuffer? M, TBuffer? V, int N);

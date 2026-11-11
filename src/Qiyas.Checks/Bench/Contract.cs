@@ -123,6 +123,11 @@ public interface IBenchSubject
     /// the subject's lane storage (float32 or float64 bytes; v null for one moment), updated in place.</summary>
     IBenchRun? Optimizer(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) => null;
 
+    /// <summary>An optimizer step across several tensors under one clipping (IOptimizers.OptimizerMany, a.MaxNorm): the
+    /// tensors are the consecutive runs of counts[t] values of p (updated in place) and g (as the type) and of m, v (the
+    /// subject's lane storage; null as the step keeps none), each run starting on a whole stored word or block.</summary>
+    IBenchRun? OptimizerMany(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[]? m, byte[]? v, int[] counts) => null;
+
     /// <summary>y = conv(x, w) for one image (ConvArgs); backward: dx and dw from dy when dx is given (y is then dy).</summary>
     IBenchRun? Conv(Device device, string type, ConvArgs a, byte[] x, byte[] w, byte[] y, byte[]? dx, byte[]? dw) => null;
 

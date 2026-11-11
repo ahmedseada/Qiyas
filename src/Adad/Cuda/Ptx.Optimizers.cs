@@ -2,16 +2,17 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // The device's optimizer steps (Optimizers.cs): a thread per word of the parameters (its Per values), the gradients'
-// word alongside, the moments as lane values at the value's index; the parameters packed back into their word.
+// word alongside, the moments as lane values at the value's index; the parameters packed back into their word. Scaled:
+// every gradient times the lane value at p_gs as it is read (a clipping factor made on the device: GpuOps.Optimizers.cs).
 using Adad.Abstraction;
 
 namespace Adad.Cuda;
 
 internal static partial class Ptx
 {
-    public static string Optimizer(Gpu gpu, Fmt f, Lane lane, string name, out string entry)
+    public static string Optimizer(Gpu gpu, Fmt f, Lane lane, string name, out string entry, bool scaled = false)
     {
-        entry = $"optimizer_{name}_{f.Name}_{lane.Name}";
+        entry = $"optimizer_{name}_{f.Name}_{lane.Name}{(scaled ? "_gs" : "")}";
         var b = new PtxBuilder();
         string tid = b.R(), bid = b.R(), word = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
@@ -19,6 +20,7 @@ internal static partial class Ptx
         b.L($"mad.lo.u32 {word}, {bid}, 256, {tid};");
         string pp = Param64(b, "p_p"), pg = Param64(b, "p_g"), pm = Param64(b, "p_m"), pv = Param64(b, "p_v"), n = Param32(b, "p_n");
         var k = StepScalars.Load(b, lane);
+        string? gs = scaled ? GradientScale(b, lane) : null;
         string words = b.R(), pw = b.P();
         if (f.WordBits == 64) b.L($"mov.u32 {words}, {n};");
         else { b.L($"add.u32 {words}, {n}, {f.Per - 1};"); b.L($"div.u32 {words}, {words}, {f.Per};"); }
@@ -32,7 +34,7 @@ internal static partial class Ptx
         b.L($"ld.global.{wt} {wordG}, [{addrG}];");
         string outWord = f.WordBits == 64 ? b.RD() : b.R();
         if (f.WordBits == 32) b.L($"mov.b32 {outWord}, 0;");
-        bool sgd = name == "sgd_momentum";
+        bool plain = name == "sgd", sgd = plain || name == "sgd_momentum";
         var natural = f.Natural;
         for (int i = 0; i < f.Per; i++)
         {
@@ -42,11 +44,16 @@ internal static partial class Ptx
             b.L($"@!{pIn} bra SKIP{i};");
             string p = Codec.Convert(b, natural, Codec.Unpack(b, f, wordP, i, natural), lane, f);
             string g = Codec.Convert(b, natural, Codec.Unpack(b, f, wordG, i, natural), lane, f);
+            if (gs is not null) g = LaneOp(b, lane, "mul", g, gs);
             b.L($"mul.wide.u32 {mAddr}, {idx}, {lane.Size};");
             string mPtr = b.RD();
-            b.L($"add.u64 {mPtr}, {pm}, {mAddr};");
-            b.L($"ld.global.{lane.Mem} {mv}, [{mPtr}];");
-                string vPtr = sgd ? "" : b.RD(), vv = sgd ? "" : lane.NewReg(b);
+            if (!plain)
+            {
+                b.L($"add.u64 {mPtr}, {pm}, {mAddr};");
+                b.L($"ld.global.{lane.Mem} {mv}, [{mPtr}];");
+            }
+
+            string vPtr = sgd ? "" : b.RD(), vv = sgd ? "" : lane.NewReg(b);
             if (!sgd)
             {
                 b.L($"add.u64 {vPtr}, {pv}, {mAddr};");
@@ -55,7 +62,7 @@ internal static partial class Ptx
 
             string pNew = Step(b, lane, name, p, g, mv, vv, k);
             if (!sgd) b.L($"st.global.{lane.Mem} [{vPtr}], {vv};");
-            b.L($"st.global.{lane.Mem} [{mPtr}], {mv};");
+            if (!plain) b.L($"st.global.{lane.Mem} [{mPtr}], {mv};");
             string stored = lane == natural ? pNew : Codec.Convert(b, lane, pNew, natural, f);
             Codec.Pack(b, f, stored, natural, i, outWord);
             b.Label($"SKIP{i}");
@@ -71,22 +78,28 @@ internal static partial class Ptx
     /// in f32 registers from p and g decoded where they are stored, m and v stored (only for values below n: a lane past
     /// the end evaluates the last value again), the block re-encoded in place (its values all read before the warp's
     /// first shuffle, so before any of its bytes is written).</summary>
-    public static string OptimizerBlocks(Gpu gpu, Fmt f, string name, out string entry)
+    public static string OptimizerBlocks(Gpu gpu, Fmt f, string name, out string entry, bool scaled = false)
     {
-        entry = $"optimizer_{name}_{f.Name}_blocks";
+        entry = $"optimizer_{name}_{f.Name}_blocks{(scaled ? "_gs" : "")}";
         var lane = Lane.F32;
         var b = new PtxBuilder();
         string pp = Param64(b, "p_p"), pg = Param64(b, "p_g"), pm = Param64(b, "p_m"), pv = Param64(b, "p_v"), n = Param32(b, "p_n");
         var k = StepScalars.Load(b, lane);
-        bool sgd = name == "sgd_momentum";
+        string? gs = scaled ? GradientScale(b, lane) : null;
+        bool plain = name == "sgd", sgd = plain || name == "sgd_momentum";
         var w = BlockWarp(b, f, n);
         EncodeBlock(b, f, pp, w, n, (at, pIn) =>
         {
             string p = Codec.UnpackAt(b, f, pp, at, lane), g = Codec.UnpackAt(b, f, pg, at, lane);
+            if (gs is not null) g = LaneOp(b, lane, "mul", g, gs);
             string off = b.RD(), mPtr = b.RD(), mv = lane.NewReg(b);
             b.L($"mul.wide.u32 {off}, {at}, {lane.Size};");
-            b.L($"add.u64 {mPtr}, {pm}, {off};");
-            b.L($"ld.global.{lane.Mem} {mv}, [{mPtr}];");
+            if (!plain)
+            {
+                b.L($"add.u64 {mPtr}, {pm}, {off};");
+                b.L($"ld.global.{lane.Mem} {mv}, [{mPtr}];");
+            }
+
             string vPtr = sgd ? "" : b.RD(), vv = sgd ? "" : lane.NewReg(b);
             if (!sgd)
             {
@@ -96,7 +109,7 @@ internal static partial class Ptx
 
             string pNew = Step(b, lane, name, p, g, mv, vv, k);
             if (!sgd) b.L($"@{pIn} st.global.{lane.Mem} [{vPtr}], {vv};");
-            b.L($"@{pIn} st.global.{lane.Mem} [{mPtr}], {mv};");
+            if (!plain) b.L($"@{pIn} st.global.{lane.Mem} [{mPtr}], {mv};");
             return pNew;
         });
         b.Label("DONE");
@@ -107,7 +120,15 @@ internal static partial class Ptx
     private static string OptimizerParams(Lane lane)
     {
         string pa = lane.Wide ? "f64" : "f32";
-        return $".param .u64 p_p, .param .u64 p_g, .param .u64 p_m, .param .u64 p_v, .param .u32 p_n, .param .{pa} p_lr, .param .{pa} p_b1, .param .{pa} p_b2, .param .{pa} p_ob1, .param .{pa} p_ob2, .param .{pa} p_ic1, .param .{pa} p_ic2, .param .{pa} p_eps, .param .{pa} p_wd, .param .{pa} p_lrwd";
+        return $".param .u64 p_p, .param .u64 p_g, .param .u64 p_m, .param .u64 p_v, .param .u32 p_n, .param .{pa} p_lr, .param .{pa} p_b1, .param .{pa} p_b2, .param .{pa} p_ob1, .param .{pa} p_ob2, .param .{pa} p_ic1, .param .{pa} p_ic2, .param .{pa} p_eps, .param .{pa} p_wd, .param .{pa} p_lrwd, .param .u64 p_gs";
+    }
+
+    // The gradients' scale: the lane value at p_gs (a scaled step's last argument).
+    private static string GradientScale(PtxBuilder b, Lane lane)
+    {
+        string pgs = Param64(b, "p_gs"), gs = lane.NewReg(b);
+        b.L($"ld.global.{lane.Mem} {gs}, [{pgs}];");
+        return gs;
     }
 
     private sealed record StepScalars(string Lr, string B1, string B2, string Ob1, string Ob2, string Ic1, string Ic2, string Eps, string Wd, string LrWd)
@@ -120,11 +141,20 @@ internal static partial class Ptx
     }
 
     // One value's step: m (and v) updated in their registers, the new parameter returned.
+    //   sgd:          p = p − lr·(g + wd·p)
     //   sgd_momentum: m = b1·m + g + wd·p;  p = p − lr·m
     //   adam / adamw: m = b1·m + (1 − b1)·g; v = b2·v + (1 − b2)·g²; p = p − lr·m̂ / (√v̂ + eps) (adamw: then p − lr·wd·p)
     private static string Step(PtxBuilder b, Lane lane, string name, string p, string g, string mv, string vv, StepScalars k)
     {
         string pNew = lane.NewReg(b), t = lane.NewReg(b);
+        if (name == "sgd")
+        {
+            b.L(lane.Fma(t, k.Wd, p, g));
+            b.L(lane.Mul(t, k.Lr, t));
+            b.L($"sub.rn.{lane.Op} {pNew}, {p}, {t};");
+            return pNew;
+        }
+
         if (name == "sgd_momentum")
         {
             b.L(lane.Fma(t, k.Wd, p, g));

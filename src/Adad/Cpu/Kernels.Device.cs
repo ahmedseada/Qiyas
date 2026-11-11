@@ -191,7 +191,9 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
 
     // ---------------------------------------------------------------- optimizers, convolution, ctc
 
-    string IOptimizers<byte[]>.Optimizer<TN>(OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) => Optimizer<TN>(a, p, g, m, v, n);
+    string IOptimizers<byte[]>.Optimizer<TN>(OptimizerArgs a, byte[] p, byte[] g, byte[]? m, byte[]? v, int n) => Optimizer<TN>(a, p, g, m, v, n);
+
+    string IOptimizers<byte[]>.OptimizerMany<TN>(OptimizerArgs a, ReadOnlySpan<OptimizerTensor<byte[]>> tensors, byte[]? sumSquares) => OptimizerMany<TN>(a, tensors, sumSquares);
 
     string IConvolution<byte[]>.Conv<TN>(ConvArgs a, byte[] x, byte[] w, byte[]? bias, byte[] y) => Conv<TN>(a, x, w, bias, y);
 

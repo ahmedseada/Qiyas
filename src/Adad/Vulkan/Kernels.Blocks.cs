@@ -396,26 +396,36 @@ internal static partial class VkKernels
     /// <summary>An optimizer step's new parameters into blocks of p, the moments (lane storage) updated by the source for
     /// each value below n (the old p read before the compaction writes it). Slots: p, g, m, v, then the lane scalars of
     /// Optimizer at 4 .. 13.</summary>
-    public static SpvKernel BlockOptimizer(Vulkan vk, Fmt f, Lane lane, string name) =>
-        BlockEncoder(vk, f, $"optimizer_{name}_{lane.Name}", b =>
+    /// <summary>The slot a scaled block step reads the gradients' scale's address from: lr·wd's (13) for the sgd steps,
+    /// wd's (12) for adam and adamw — the scalar that step does not read.</summary>
+    public static int BlockOptimizerScaleSlot(string name) => name is "sgd" or "sgd_momentum" ? 13 : 12;
+
+    public static SpvKernel BlockOptimizer(Vulkan vk, Fmt f, Lane lane, string name, bool scaled = false) =>
+        BlockEncoder(vk, f, $"optimizer_{name}_{lane.Name}{(scaled ? "_gs" : "")}", b =>
         {
             var k = Kinds.Of(lane);
             V pp = b.Arg(0), pg = b.Arg(1), pm = b.Arg(2), pv = b.Arg(3);
-            var s = new StepScalars(b.Arg(4, k), b.Arg(5, k), b.Arg(6, k), b.Arg(7, k), b.Arg(8, k), b.Arg(9, k), b.Arg(10, k), b.Arg(11, k), b.Arg(12, k), b.Arg(13, k));
-            bool sgd = name == "sgd_momentum";
+            bool plain = name == "sgd", sgd = plain || name == "sgd_momentum";
+            // An encoder's source has slots 0 .. 13, all taken: where the gradients' scale is takes the slot of a scalar
+            // the step does not read (BlockOptimizerScaleSlot).
+            int scaleSlot = scaled ? BlockOptimizerScaleSlot(name) : -1;
+            V Scalar(int slot) => slot == scaleSlot ? b.C(k, 0) : b.Arg(slot, k);
+            var s = new StepScalars(Scalar(4), Scalar(5), Scalar(6), Scalar(7), Scalar(8), Scalar(9), Scalar(10), Scalar(11), Scalar(12), Scalar(13));
+            var gs = scaled ? b.Arg(scaleSlot) : default;
             return (at, inside) =>
             {
                 var p = Codec.UnpackAt(b, f, pp, at, lane);
                 var g = Codec.UnpackAt(b, f, pg, at, lane);
+                if (scaled) g = g * b.Load(k, gs);
                 var mAddress = b.At(pm, at, lane.Size);
                 var vAddress = b.At(pv, at, lane.Size);
-                var m = b.Load(k, mAddress);
+                var m = plain ? p : b.Load(k, mAddress);
                 var v = sgd ? m : b.Load(k, vAddress);
                 var (pNew, mNew, vNew) = Step(b, name, p, g, m, v, s);
                 b.If(inside, () =>
                 {
                     if (!sgd) b.Store(vAddress, vNew);
-                    b.Store(mAddress, mNew);
+                    if (!plain) b.Store(mAddress, mNew);
                 });
                 return pNew;
             };

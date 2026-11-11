@@ -136,6 +136,7 @@ internal sealed class Options
     public static readonly string[] Group4b = ["matmul_nt", "matmul_tn", "matmul_tt", "matmul_batched", "matmul_bwd", "matmul_blocks"];
     public static readonly string[] Group5 = ["attention", "attention_causal", "attention_fused", "attention_fused_causal", "attention_decode", "attention_bwd"];
     public static readonly string[] Group7 = [.. OptimizerArgs.Names.Select(n => "optimizer:" + n)];
+    public static readonly string[] Group7b = ["optimizer_many"];
     public static readonly string[] Group6 = ["conv", "conv_bwd"];
     public static readonly string[] Group8 = ["lstm_step", "gru_step", "lstm_step_bwd", "gru_step_bwd", "lstm_seq", "lstm_seq_bwd", "gru_seq", "gru_seq_bwd"];
     public static readonly string[] Group9 = ["topk_rows", "log_softmax_topk", "pick_rows", "sample_rows", "route", "route_wide", "cross_entropy", "ctc", "ctc_bwd"];
@@ -167,14 +168,14 @@ internal sealed class Options
                 case "--types": o.Types = Next(); break;
                 case "--ops":
                     o.Ops = Next();
-                    if (o.Ops.Contains("all")) o.Ops = [.. Core, .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name), .. Group2, .. Group3, .. Group4, .. Group4b, .. Group5, .. Group6, .. Group7, .. Group8, .. Group9, .. Group10, .. Group11, .. Group12];
+                    if (o.Ops.Contains("all")) o.Ops = [.. Core, .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name), .. Group2, .. Group3, .. Group4, .. Group4b, .. Group5, .. Group6, .. Group7, .. Group7b, .. Group8, .. Group9, .. Group10, .. Group11, .. Group12];
                     if (o.Ops.Contains("map")) o.Ops = [.. o.Ops.Where(n => n != "map"), .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name)];
                     if (o.Ops.Contains("reduce")) o.Ops = [.. o.Ops.Where(n => n != "reduce"), .. Group2];
                     if (o.Ops.Contains("rows")) o.Ops = [.. o.Ops.Where(n => n != "rows"), .. Group3];
                     if (o.Ops.Contains("layout")) o.Ops = [.. o.Ops.Where(n => n != "layout"), .. Group4];
                     if (o.Ops.Contains("products")) o.Ops = [.. o.Ops.Where(n => n != "products"), .. Group4b];
                     if (o.Ops.Contains("attention")) o.Ops = [.. o.Ops.Where(n => n != "attention"), .. Group5];
-                    if (o.Ops.Contains("optimizers")) o.Ops = [.. o.Ops.Where(n => n != "optimizers"), .. Group7];
+                    if (o.Ops.Contains("optimizers")) o.Ops = [.. o.Ops.Where(n => n != "optimizers"), .. Group7, .. Group7b];
                     if (o.Ops.Contains("conv")) o.Ops = [.. o.Ops.Where(n => n != "conv"), .. Group6];
                     if (o.Ops.Contains("recurrent")) o.Ops = [.. o.Ops.Where(n => n != "recurrent"), .. Group8];
                     if (o.Ops.Contains("routing")) o.Ops = [.. o.Ops.Where(n => n != "routing"), .. Group9];
@@ -311,6 +312,8 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         {
             if (options.Ops.Contains(name)) OptimizerRow(device, type, name[10..]);
         }
+
+        if (options.Ops.Contains("optimizer_many")) OptimizerManyRow(device, type);
 
         foreach (var name in Options.Group6)
         {
@@ -655,6 +658,33 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         var pv = Registry.Values(type, p, n);
         a.Reference(pv, Registry.Values(type, g, n), (double[])mv.Clone(), vv is null ? null : (double[])vv.Clone());
         Measure(device, "optimizer:" + name, type, $"{n}", pv, (s, o) => { p.CopyTo(o, 0); return s.Optimizer(device, type, a, o, g, (byte[])m.Clone(), v is null ? null : (byte[])v.Clone(), n); }, p.Length);
+    }
+
+    // An adamw step across 64 tensors under one clipping: optimizer:adamw's 16M parameters as 64 tensors (each a whole
+    // number of blocks of 256 values, the last with the rest), their gradients clipped to a norm of 1 (theirs is in the
+    // thousands: every gradient is scaled); p scored against float64. Its nearest equivalent is optimizer:adamw (the step
+    // of one tensor) with sum:whole's pass over the gradients before it.
+    private void OptimizerManyRow(Device device, string type)
+    {
+        if (!Registry.IsFloat(type)) return;
+        var a = new OptimizerArgs("adamw", 1e-3, 0.9, 0.999, 1e-8, 0.01, 7) { MaxNorm = 1 };
+        int Tensors = int.TryParse(Environment.GetEnvironmentVariable("QIYAS_MANY_TENSORS"), out int tn) ? tn : 64;
+        int n = MapCount, size = type == "float64" ? 8 : 4, per = n / Tensors / 256 * 256;
+        var counts = Enumerable.Repeat(per, Tensors).ToArray();
+        counts[^1] = n - (Tensors - 1) * per;
+        var p = Registry.Make(type, n, 71, -1, 1);
+        var g = Registry.Make(type, n, 72, -1, 1);
+        var mv = new double[n];
+        var vv = new double[n];
+        var random = new Random(73);
+        for (int i = 0; i < n; i++) { mv[i] = random.NextDouble() - 0.5; vv[i] = random.NextDouble(); }
+        byte[] m = LaneBytes(size, mv), v = LaneBytes(size, vv);
+        var pv = Registry.Values(type, p, n);
+        var gv = Registry.Values(type, g, n);
+        double sum = 0;
+        foreach (double x in gv) sum += x * x;
+        a.Reference(pv, gv, mv, vv, a.Factor(sum));
+        Measure(device, "optimizer_many", type, $"{Tensors} x {per}", pv, (s, o) => { p.CopyTo(o, 0); return s.OptimizerMany(device, type, a, o, g, (byte[])m.Clone(), (byte[])v.Clone(), counts); }, p.Length);
     }
 
     private static byte[] LaneBytes(int size, double[] values)

@@ -115,11 +115,7 @@ internal sealed partial class Kernels
             // One long row: split across the team into partial sums, then joined in the lane.
             // Parts of whole words (a multiple of g values), as many as cover every value: rounding a part down to words
             // and keeping the part count would leave the last values out.
-            int parts = Math.Min(Threads * 4, Math.Max(1, cols / 4096));
-            int per = ((cols + parts - 1) / parts + g - 1) / g * g;
-            parts = Math.Max(1, (cols + per - 1) / per);
-            var partials = new byte[parts * Unsafe.SizeOf<TAcc>()];
-            Team.For(parts, 1, (long)cols, new PartBody<TN, TIn, TAcc, TL>(x, partials, cols, per, g, squares));
+            var partials = WholeParts<TN, TIn, TAcc, TL>(squares, x, cols);
             var p = MemoryMarshal.Cast<byte, TAcc>(partials.AsSpan());
             TAcc total = TL.Zero;
             foreach (var v in p) total = TL.Add(total, v);
@@ -129,6 +125,45 @@ internal sealed partial class Kernels
 
         Team.For(rows, rowChunk, (long)rows * cols, rowBody);
         return result;
+    }
+
+    // A whole array's sum (or sum of squares) as its parts' sums, lane values in order: n values split across the team into
+    // parts of whole words (a multiple of g values), as many as cover every value. Joined in order they are the whole sum;
+    // several arrays' parts joined in one chain are one sum across them (Optimizers.cs).
+    internal static byte[] WholeParts<TN, TIn, TAcc, TL>(bool squares, byte[] x, int n)
+        where TN : struct, IAdad<TN, TIn>, IAdad<TN, TAcc> where TIn : unmanaged where TAcc : unmanaged where TL : struct, ILane<TL, TAcc>
+    {
+        int g = Unsafe.SizeOf<TAcc>() / Unsafe.SizeOf<TIn>();
+        var (parts, per) = WholePlan(n, g);
+        var partials = new byte[parts * Unsafe.SizeOf<TAcc>()];
+        Team.For(parts, 1, (long)n, new PartBody<TN, TIn, TAcc, TL>(x, partials, n, per, g, squares));
+        return partials;
+    }
+
+    // The parts of a whole sum over n values in words of g: how many, and the values of each.
+    internal static (int Parts, int Per) WholePlan(int n, int g)
+    {
+        int parts = Math.Min(Threads * 4, Math.Max(1, n / 4096));
+        int per = ((n + parts - 1) / parts + g - 1) / g * g;
+        return (Math.Max(1, (n + per - 1) / per), per);
+    }
+
+    // Several arrays' whole sums of squares as one run of the team: job i is part i − first[t] of array t, each array's
+    // parts as WholeParts makes them (into its own partials), so the arrays' parts joined in order are one sum across them.
+    internal readonly struct ManyPartsBody<TN, TIn, TAcc, TL>(byte[][] x, byte[][] partials, int[] n, int[] per, int[] first, int g) : Team.IBody
+        where TN : struct, IAdad<TN, TIn>, IAdad<TN, TAcc> where TIn : unmanaged where TAcc : unmanaged where TL : struct, ILane<TL, TAcc>
+    {
+        public void Run(int from, int to)
+        {
+            int t = 0;
+            while (from < to)
+            {
+                while (first[t + 1] <= from) t++;
+                int end = Math.Min(to, first[t + 1]);
+                new PartBody<TN, TIn, TAcc, TL>(x[t], partials[t], n[t], per[t], g, true).Run(from - first[t], end - first[t]);
+                from = end;
+            }
+        }
     }
 
     // Σ over one row's values [first, first + n): words of g inputs each, Fma against ones (sum) or themselves (squares).

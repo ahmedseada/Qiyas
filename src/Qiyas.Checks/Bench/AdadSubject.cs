@@ -554,6 +554,66 @@ public sealed class AdadSubject : IBenchSubject
         }
     }
 
+    public IBenchRun? OptimizerMany(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[]? m, byte[]? v, int[] counts) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new OptimizerManyVisitor(device, type, a, p, g, m, v, counts)) : null;
+
+    // As the one-tensor step: each run starts from the same state (the restore timed and named). On a device the tensors
+    // are the runs of one buffer each of p, g, m, v (addresses into it), the state restored by one copy a buffer; on the
+    // CPU, whose buffers are arrays, each tensor has its own arrays, restored from the state's and read back into p.
+    private sealed class OptimizerManyVisitor(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[]? m, byte[]? v, int[] counts) : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, OptimizerManyVisitor>(device, this);
+
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        {
+            int tensors = counts.Length, lane = type == "float64" ? 8 : 4;
+            var at = new long[tensors + 1];
+            for (int t = 0; t < tensors; t++) at[t + 1] = at[t] + counts[t];
+            long Bytes(long values) => Registry.Bytes(type, values);
+            var list = new OptimizerTensor<TB>[tensors];
+            if (typeof(TB) == typeof(ulong))
+            {
+                TB sp = s.In(p), dg = s.In(g), dp = s.Out(p);
+                TB? sm = s.InOrNone(m), dm = s.OutOrNone(m), sv = s.InOrNone(v), dv = s.OutOrNone(v);
+                TB At(TB? b, long bytes) => b is null ? default! : (TB)(object)((ulong)(object)b + (ulong)bytes);
+                for (int t = 0; t < tensors; t++) list[t] = new(At(dp, Bytes(at[t])), At(dg, Bytes(at[t])), m is null ? default : At(dm, at[t] * lane), v is null ? default : At(dv, at[t] * lane), counts[t]);
+                return s.Run(() =>
+                {
+                    s.D.Copy(sp, dp, p.Length);
+                    if (m is not null) s.D.Copy(sm!, dm!, m.Length);
+                    if (v is not null) s.D.Copy(sv!, dv!, v.Length);
+                    return s.D.OptimizerMany<TN>(a, list, default);
+                }, "; + restore of p, m, v");
+            }
+
+            byte[] p0 = (byte[])p.Clone();
+            byte[][] pt = new byte[tensors][], gt = new byte[tensors][];
+            byte[]?[] mt = new byte[]?[tensors], vt = new byte[]?[tensors];
+            for (int t = 0; t < tensors; t++)
+            {
+                int bytes = (int)(Bytes(at[t + 1]) - Bytes(at[t]));
+                pt[t] = new byte[bytes];
+                gt[t] = g.AsSpan((int)Bytes(at[t]), bytes).ToArray();
+                if (m is not null) mt[t] = new byte[counts[t] * lane];
+                if (v is not null) vt[t] = new byte[counts[t] * lane];
+                list[t] = new((TB)(object)pt[t], (TB)(object)gt[t], m is null ? default : (TB)(object)mt[t]!, v is null ? default : (TB)(object)vt[t]!, counts[t]);
+            }
+
+            s.Then(() => { for (int t = 0; t < tensors; t++) pt[t].CopyTo(p, (int)Bytes(at[t])); });
+            return s.Run(() =>
+            {
+                for (int t = 0; t < tensors; t++)
+                {
+                    Buffer.BlockCopy(p0, (int)Bytes(at[t]), pt[t], 0, pt[t].Length);
+                    if (m is not null) Buffer.BlockCopy(m, (int)(at[t] * lane), mt[t]!, 0, counts[t] * lane);
+                    if (v is not null) Buffer.BlockCopy(v, (int)(at[t] * lane), vt[t]!, 0, counts[t] * lane);
+                }
+
+                return s.D.OptimizerMany<TN>(a, list, default);
+            }, "; + restore of p, m, v");
+        }
+    }
+
     public IBenchRun? Conv(Device device, string type, ConvArgs a, byte[] x, byte[] w, byte[] y, byte[]? dx, byte[]? dw) =>
         dx is null ? Registry.With(type, new ConvVisitor(device, a, x, w, y)) : Registry.IsFloat(type) ? Registry.WithFloat(type, new ConvBackwardVisitor(device, a, x, w, y, dx, dw!)) : null;
 

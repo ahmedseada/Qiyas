@@ -964,9 +964,11 @@ internal static partial class Checks
                     if (v is not null) ok &= LanesClose(type, $"optimizer {name} v t{step}", where, v, wantV!, size);
                 }
             }
+
+            ok &= OptimizersMany(ops, where, type);
         }
 
-        if (ok) Console.WriteLine($"check optimizers             {where,-6} every float type{(blocks ? "" : " but the block formats")} at 1001 and 37 values: p, m, v within the lane's rounding");
+        if (ok) Console.WriteLine($"check optimizers             {where,-6} every float type{(blocks ? "" : " but the block formats")} at 1001 and 37 values (sgd, sgd_momentum, adam, adamw): p, m, v within the lane's rounding; a step across five tensors under one clipping of all their gradients (none, below their norm, above it): the sum of squares and each tensor's p, m, v within the lane's rounding");
         return ok;
     }
 
