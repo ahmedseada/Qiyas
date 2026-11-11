@@ -515,8 +515,10 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         }
     }
 
-    // A result of s32 indices, compared exactly with the reference (extra: a further check, 0 when it holds).
-    private void MeasureIndices(Device device, string op, string type, string shape, int[] reference, Func<IBenchSubject, int[], IBenchRun?> prepare, Func<int>? extra = null)
+    // A result of s32 indices, compared exactly with the reference (extra: a further check, 0 when it holds), or scored by
+    // `score` where the distance between two indices is not the error (a sampler's picks: the probability a pick is off by).
+    private void MeasureIndices(Device device, string op, string type, string shape, int[] reference, Func<IBenchSubject, int[], IBenchRun?> prepare, Func<int>? extra = null,
+        Func<IBenchSubject, int[], double>? score = null)
     {
         var cells = new List<Cell?>();
         foreach (var subject in subjects)
@@ -527,7 +529,8 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             if (TimeOrRefused(device, subject, run) is not { } ms) { cells.Add(null); continue; }
             run.Collect();
             double worst = extra?.Invoke() ?? 0;
-            for (int i = 0; i < reference.Length; i++) worst = Math.Max(worst, Math.Abs((double)output[i] - reference[i]));
+            if (score is not null) worst = Math.Max(worst, score(subject, output));
+            else for (int i = 0; i < reference.Length; i++) worst = Math.Max(worst, Math.Abs((double)output[i] - reference[i]));
             cells.Add(new Cell(subject.Name, run.Lane, ms, worst));
         }
 
@@ -717,15 +720,62 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
 
         // The draw (sample_rows's shape, 4096 rows of 32768 scores): every column kept (sample_plain: the weights and the
         // draw alone, sample_rows's nearest equivalent with cross_entropy's pass before it), and held to the top 40, the
-        // nucleus of 0.95 and min-p 0.02 at a temperature of 0.8 (sample_filtered); the picks scored as sample_rows's.
+        // nucleus of 0.95 and min-p 0.02 at a temperature of 0.8 (sample_filtered). The error is not a distance between
+        // columns: it is the probability the worst row's pick is off the float64 rule by (SamplingArgs.PickErrors: 0 where
+        // the draw lies in the pick's interval of the kept weights' running sum, the lane's rounding where a sum's rounding
+        // moved the pick to the next kept column, the probability in between where the column is wrong).
         {
             int rows = Prime(4096), cols = Prime(32768), step = 3;
             var a = name == "sample_plain" ? new SamplingArgs(rows, cols, 1, 0, 0, 0, 17) : new SamplingArgs(rows, cols, 0.8, 40, 0.95, 0.02, 17);
             var x = Registry.Make(type, rows * cols, 95, -4, 4);
-            var (want, _) = a.Reference(Registry.Values(type, x, rows * cols), step);
+            var xv = Registry.Values(type, x, rows * cols);
+            var (want, _) = a.Reference(xv, step);
             var probability = new byte[Registry.Bytes(type, rows)];
-            MeasureIndices(device, name, type, $"{rows}x{cols}", want, (s, picks) => s.SampleFiltered(device, type, a, x, step, picks, probability));
+            MeasureIndices(device, name, type, $"{rows}x{cols}", want, (s, picks) => s.SampleFiltered(device, type, a, x, step, picks, probability),
+                score: (s, picks) => PickScore(device, name, type, s.Name, a, xv, step, want, picks, Registry.Values(type, probability, rows)));
         }
+    }
+
+    // The largest of the picks' errors; with QIYAS_MAP_DEBUG=1, each row whose pick is not the reference's column, with the
+    // kept weights' running sum on both sides of its draw.
+    private static double PickScore(Device device, string name, string type, string subject, SamplingArgs a, double[] x, int step, int[] want, int[] picks, double[] probability)
+    {
+        var errors = a.PickErrors(x, step, picks);
+        if (Environment.GetEnvironmentVariable("QIYAS_MAP_DEBUG") == "1")
+        {
+            uint key = Draws.Key(a.Seed);
+            int shown = 0;
+            for (int r = 0; r < a.Rows && shown < 8; r++)
+            {
+                if (picks[r] == want[r]) continue;
+                shown++;
+                var e = a.Weights(x.AsSpan(r * a.Stride + a.RowOffset, a.Cols));
+                double t = a.Threshold(e), total = 0, u = Draws.Uniform(key, (uint)step, (uint)r);
+                int kept = 0;
+                for (int c = 0; c < a.Cols; c++) if (e[c] > 0 && e[c] >= t) { total += e[c]; kept++; }
+                string At(int col)
+                {
+                    if (col < 0 || col >= a.Cols) return $"column {col}: no column of the row";
+                    double before = 0;
+                    for (int c = 0; c < col; c++) if (e[c] > 0 && e[c] >= t) before += e[c];
+                    bool isKept = e[col] > 0 && e[col] >= t;
+                    return $"column {col} (weight {e[col]:R}, {(isKept ? "kept" : "not kept")}): running sum {before / total:R} .. {(before + (isKept ? e[col] : 0)) / total:R}";
+                }
+
+                Console.WriteLine($"  {name} {device} {type} {subject} row {r}: draw {u:R} of {kept} kept (threshold {t:R}, sum {total:R}); off by {errors[r]:E3}");
+                Console.WriteLine($"    the rule's {At(want[r])}");
+                Console.WriteLine($"    the pick's {At(picks[r])}");
+                if (picks[r] >= 0 && picks[r] < a.Cols && probability[r] > 0)
+                    Console.WriteLine($"    the subject's probability of its pick {probability[r]:R}: a kept sum of {e[picks[r]] / probability[r]:R}");
+                if (kept <= 64)
+                {
+                    var order = Enumerable.Range(0, a.Cols).OrderByDescending(c => e[c]).Take(kept + 6).ToArray();
+                    Console.WriteLine("    the largest weights: " + string.Join(" ", order.Select((c, i) => $"{i + 1}:{e[c]:R}@{c}(x {x[r * a.Stride + a.RowOffset + c]:R})")));
+                }
+            }
+        }
+
+        return errors.Length == 0 ? 0 : errors.Max();
     }
 
     // Key and value caches (float types). The write: 16 heads of 512 rows of d = 128 at row 1000 of a cache of 2048 rows, as

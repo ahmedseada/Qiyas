@@ -6,7 +6,8 @@
 // the nucleus, to min-p and to all three, top-k of 1 and top-k past the row, rows of 20011 scores, and a top-k that leaves
 // more columns than a device gathers (the nucleus then by the passes of the row); on the types with an infinity a row whose
 // largest score is +∞ (drawn among its +∞ columns), a row with a NaN among its scores (never drawn) and a row of −∞ (no
-// column: −1). Each row's column is held to the float64 rule within the lane's rounding: it is a column the rule keeps
+// column: −1), and rows whose scores at the threshold of top-k and of the nucleus are one step of the type apart (two
+// weights the lane may hold as one, kept together then). Each row's column is held to the float64 rule within the lane's rounding: it is a column the rule keeps
 // (the thresholds' weights taken a few lane steps either way, the weights the lane cannot hold not counted as kept), no
 // kept column before it has reached the seed's draw at (step, row), and it has (or it is the last kept one); its
 // probability within the type's step of its weight over the kept sum.
@@ -33,6 +34,8 @@ internal static partial class Checks
             ("rows of 20011, every column", new SamplingArgs(5, 20011, 1, 0, 0, 0, 19), 4, true),
             ("the top 600 of 20011 and the nucleus", new SamplingArgs(5, 20011, 1, 600, 0.9, 0, 23), 1, true),
             ("the top 300 of 601 and the nucleus", new SamplingArgs(5, 601, 1, 300, 0.9, 0, 23), 1, false),
+            ("scores a step apart at top-k", new SamplingArgs(37, 601, 0.8, 4, 0, 0, 29), 6, true),
+            ("scores a step apart at the nucleus", new SamplingArgs(37, 601, 0.8, 6, 0.66, 0, 29), 6, true),
         };
         foreach (var (name, a, step, withProbability) in cases)
         {
@@ -40,6 +43,40 @@ internal static partial class Checks
             int xn = (a.Rows - 1) * a.Stride + a.RowOffset + a.Cols;
             var x = Bench.Registry.Make(type, xn, 97, -4, 4);
             var xv = Bench.Registry.Values(type, x, xn);
+            if (name.StartsWith("scores a step apart", StringComparison.Ordinal))
+            {
+                // Each row's six largest scores planted, the fourth and fifth one step of the type apart (the same value where
+                // the type has no step that small): the threshold of top-k (4), and of the nucleus (0.66 of the six: reached at
+                // the fourth), lies between two weights the lane may hold as one. The float64 rule keeps four; a lane in which
+                // the two weights are equal keeps them together, five: either is the rule within the lane's rounding.
+                double TypeRound(double v) => Bench.Registry.Values(type, Bench.Registry.Encode(type, [v]), 1)[0];
+                double fifth = TypeRound(3.96), fourth = TypeRound(fifth + Math.Pow(2, Math.Floor(Math.Log2(fifth)) - mant));
+                // float32 and float64: the first such pair from 3.96 whose scores over the temperature are one value of the
+                // lane, so the lane's weights are equal (float64's are the reference's too: kept together by both).
+                if (type == "float32")
+                {
+                    float f = 3.96f, t = (float)a.Temperature;
+                    while (f / t != MathF.BitIncrement(f) / t) f = MathF.BitIncrement(f);
+                    fifth = f; fourth = MathF.BitIncrement(f);
+                }
+                else if (type == "float64")
+                {
+                    double f = 3.96;
+                    while (f / a.Temperature != Math.BitIncrement(f) / a.Temperature) f = Math.BitIncrement(f);
+                    fifth = f; fourth = Math.BitIncrement(f);
+                }
+
+                for (int r = 0; r < a.Rows; r++)
+                {
+                    int at = r * a.Stride + a.RowOffset;
+                    for (int c = 0; c < a.Cols; c++) if (xv[at + c] > 3.5) xv[at + c] -= 1;
+                    xv[at + 7] = 3.99; xv[at + 100] = 3.98; xv[at + 205] = 3.97; xv[at + 333] = fifth; xv[at + 420] = fourth; xv[at + 590] = 3.9;
+                }
+
+                x = Bench.Registry.Encode(type, xv);
+                xv = Bench.Registry.Values(type, x, xn);
+            }
+
             if (infinities && a.Rows > 3)
             {
                 // A row whose largest is +∞ (twice), a row with a NaN among its scores, a row of −∞.
@@ -59,7 +96,10 @@ internal static partial class Checks
             if (Environment.GetEnvironmentVariable("QIYAS_MAP_DEBUG") == "1")
             {
                 var (reference, _) = a.Reference(xv, step);
+                var off = a.PickErrors(xv, step, picks);
                 Console.WriteLine($"  {what} {where} {type}: {Enumerable.Range(0, a.Rows).Count(r => picks[r] == reference[r])} of {a.Rows} rows the reference's column");
+                for (int r = 0; r < a.Rows; r++)
+                    if (picks[r] != reference[r]) Console.WriteLine($"    row {r}: column {picks[r]}, the reference's {reference[r]}, off the draw by {off[r]:E3} of the probability (draw {Draws.Uniform(key, (uint)step, (uint)r):R})");
             }
 
             for (int r = 0; r < a.Rows && wrong is null; r++)

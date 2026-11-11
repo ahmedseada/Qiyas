@@ -26,7 +26,7 @@ internal static partial class Checks
             ok &= Samplings(ops, where, type);
         }
 
-        if (ok) Console.WriteLine($"check decoding               {where,-6} every float type{(blocks ? "" : " but the block formats")}: the top-k of each row as log-probabilities (TopK's indices exactly, the values within the lane's rounding of the row's log-sum-exp, k past the row); each row's ring of tokens pushed and advanced on the device, and the penalties of its window (repeat, presence, frequency: the last tokens, a wrapped ring, tokens outside the row, rows a stride apart) within the lane's rounding, every other score x's own; a column of each row drawn from its scores at a temperature, held to top-k, the nucleus and min-p (rows of +inf, with a NaN and of -inf; the seed's draw at the device's step), each within the lane's rounding of the float64 rule");
+        if (ok) Console.WriteLine($"check decoding               {where,-6} every float type{(blocks ? "" : " but the block formats")}: the top-k of each row as log-probabilities (TopK's indices exactly, the values within the lane's rounding of the row's log-sum-exp, k past the row); each row's ring of tokens pushed and advanced on the device, and the penalties of its window (repeat, presence, frequency: the last tokens, a wrapped ring, tokens outside the row, rows a stride apart) within the lane's rounding, every other score x's own; a column of each row drawn from its scores at a temperature, held to top-k, the nucleus and min-p (rows of +inf, with a NaN and of -inf, scores a step of the type apart at a threshold; the seed's draw at the device's step), each within the lane's rounding of the float64 rule");
         return ok;
     }
 

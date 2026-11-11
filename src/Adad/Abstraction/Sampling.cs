@@ -129,4 +129,32 @@ public sealed record SamplingArgs(int Rows, int Cols, double Temperature, int To
 
         return (picks, probability);
     }
+
+    /// <summary>How far each row's pick is from the float64 rule, as probability among the kept columns: the kept weights'
+    /// running sum over their total splits [0, 1] into a column's interval each, and the draw u lies in the rule's column's.
+    /// 0 when u lies in the pick's own interval; else the distance from u to it (a column the rule does not keep has an
+    /// empty interval at its place in the running sum, and its weight over the total is added: the probability it should
+    /// not have had). 1 for a pick that is no column of the row, or none where the rule has one. A pick a lane's rounding
+    /// moved across a boundary reads the rounding; a wrong column reads the probability between it and the draw.</summary>
+    public double[] PickErrors(double[] x, int step, int[] picks)
+    {
+        var errors = new double[Rows];
+        uint key = Draws.Key(Seed);
+        Parallel.For(0, Rows, r =>
+        {
+            var e = Weights(x.AsSpan(r * Stride + RowOffset, Cols));
+            double t = Threshold(e), total = 0;
+            for (int c = 0; c < Cols; c++) if (e[c] > 0 && e[c] >= t) total += e[c];
+            int pick = picks[r];
+            if (!(total > 0)) { errors[r] = pick == -1 ? 0 : 1; return; }
+            if (pick < 0 || pick >= Cols) { errors[r] = 1; return; }
+            double before = 0;
+            for (int c = 0; c < pick; c++) if (e[c] > 0 && e[c] >= t) before += e[c];
+            bool kept = e[pick] > 0 && e[pick] >= t;
+            double low = before / total, high = kept ? (before + e[pick]) / total : low, u = Draws.Uniform(key, (uint)step, (uint)r);
+            errors[r] = (u < low ? low - u : u > high ? u - high : 0) + (kept ? 0 : e[pick] / total);
+        });
+
+        return errors;
+    }
 }

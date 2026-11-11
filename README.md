@@ -103,7 +103,11 @@ embedding after an RMS normalization over 16 heads of 512 steps of d = 128, y's 
 `decoding` adds a decoder's steps (float types): `penalize` (512 rows of 32768 scores, a map row's 16M values, each row's
 window the last 64 tokens of a ring of 256 that has wrapped), `sample_plain` and `sample_filtered` (`sample_rows`'s
 4096 rows of 32768 scores: a column of each row drawn from every column, and from the top 40, the nucleus of 0.95 and
-min-p 0.02 at a temperature of 0.8).
+min-p 0.02 at a temperature of 0.8). Their error is not a distance between columns: it is the probability the worst
+row's pick is off the float64 rule by (`SamplingArgs.PickErrors`): 0 where the seed's draw lies in the pick's interval of
+the kept weights' running sum, the lane's rounding where a sum's rounding moved the pick to the next kept column, and up
+to a column's probability where the lane holds two weights at a threshold as one and keeps them together; with
+`QIYAS_MAP_DEBUG=1` each such row is printed with the running sum on both sides of its draw.
 `COVERAGE.md` lists every operation with its lane rule on each device. The block formats and bool run through every
 family: a block format's lane is float32, read a value at a time anywhere (both devices decode by index) and written a
 block at a time (the CPU re-encodes the blocks a store touches, tasks never sharing a block; the device computes
