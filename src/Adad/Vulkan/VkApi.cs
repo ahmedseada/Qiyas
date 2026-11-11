@@ -98,7 +98,7 @@ internal static unsafe partial class VkApi
 
     public const uint MemoryDeviceLocal = 0x1, MemoryHostVisible = 0x2, MemoryHostCoherent = 0x4, MemoryHostCached = 0x8;
 
-    public const uint BufferTransferSource = 0x1, BufferTransferDestination = 0x2, BufferStorage = 0x20, BufferDeviceAddress = 0x20000;
+    public const uint BufferTransferSource = 0x1, BufferTransferDestination = 0x2, BufferStorageBuffer = 0x20, BufferDeviceAddress = 0x20000;
     public const uint MemoryAllocateDeviceAddress = 0x2;
 
     public const uint ShaderStageCompute = 0x20;

@@ -368,7 +368,7 @@ public sealed unsafe class Vulkan : IDisposable
 
     private Allocation Allocate(long size, bool host)
     {
-        uint usage = VkApi.BufferStorage | VkApi.BufferTransferSource | VkApi.BufferTransferDestination | (host ? 0 : VkApi.BufferDeviceAddress);
+        uint usage = VkApi.BufferStorageBuffer | VkApi.BufferTransferSource | VkApi.BufferTransferDestination | (host ? 0 : VkApi.BufferDeviceAddress);
         var info = new VkBufferCreateInfo { SType = VkApi.StructureBufferCreateInfo, Size = (ulong)size, Usage = usage };
         VkApi.Check(VkApi.vkCreateBuffer(_device, &info, null, out ulong buffer), "vkCreateBuffer");
         VkMemoryRequirements req;
