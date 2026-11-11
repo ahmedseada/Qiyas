@@ -457,6 +457,31 @@ internal static partial class Checks
             var picked = new byte[Bench.Registry.Bytes(type, rows)];
             Bench.Registry.With(type, new TopKRun(ops, x, rows, cols, 0, null, null, index, picked, null, null));
             ok &= Close(type, "pick", where, picked, Routing.PickReference(xv, rows, cols, index), rows);
+            // k past the row (5 of 3 columns, the first row among them): the row's own values in order, then no column (-1)
+            // and the value 0; and pick at a column outside the row (-1, cols): 0, nothing read.
+            {
+                const int pr = 7, pc = 3, pk = 5;
+                var px = Bench.Registry.Make(type, pr * pc, 99, -4, 4);
+                var pxv = Bench.Registry.Values(type, px, pr * pc);
+                var (pv, pi) = Routing.TopKReference(pxv, pr, pc, pk);
+                var pvalues = new byte[Bench.Registry.Bytes(type, pr * pk)];
+                var pindices = new int[pr * pk];
+                Bench.Registry.With(type, new TopKRun(ops, px, pr, pc, pk, pvalues, pindices, null, null, null, null));
+                ok &= Close(type, "topk values past the row", where, pvalues, pv, pr * pk);
+                int pbad = 0;
+                for (int i = 0; i < pr * pk; i++)
+                {
+                    if (pindices[i] == pi[i]) continue;
+                    if (pi[i] < 0 || (uint)pindices[i] >= pc || pxv[i / pk * pc + pindices[i]] != pv[i]) pbad++;
+                }
+
+                if (pbad > 0) { Console.WriteLine($"check topk indices past the row {where,-6} {type,-12} DIFFERS at {pbad} places"); ok = false; }
+                var outside = Enumerable.Range(0, pr).Select(r => r % 3 == 0 ? -1 : r % 3 == 1 ? pc : r % pc).ToArray();
+                var ppicked = new byte[Bench.Registry.Bytes(type, pr)];
+                Bench.Registry.With(type, new TopKRun(ops, px, pr, pc, 0, null, null, outside, ppicked, null, null));
+                ok &= Close(type, "pick outside the row", where, ppicked, Routing.PickReference(pxv, pr, pc, outside), pr);
+            }
+
             if (Bench.Registry.IsFloat(type))
             {
                 var w = Bench.Registry.Make(type, rows * cols, 95, 0, 1);
@@ -521,7 +546,7 @@ internal static partial class Checks
 
         if (cuda is not null) cuda.TableCounts = null;
 
-        if (ok) Console.WriteLine($"check routing                {where,-6} every type{(blocks ? "" : " but the block formats")}: top-k, pick, sampling and the cross-entropy loss (float types; unweighted and with a weight a row, zeros among them) and the route as the references (also 1M into 64, 1 000 003 into 100 000, all into one, descending into 65 536)");
+        if (ok) Console.WriteLine($"check routing                {where,-6} every type{(blocks ? "" : " but the block formats")}: top-k (k past the row: -1 and 0), pick (a column outside the row: 0), sampling and the cross-entropy loss (float types; unweighted and with a weight a row, zeros among them) and the route as the references (also 1M into 64, 1 000 003 into 100 000, all into one, descending into 65 536)");
         return ok;
     }
 

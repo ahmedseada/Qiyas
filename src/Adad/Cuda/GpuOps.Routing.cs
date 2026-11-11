@@ -8,13 +8,15 @@ namespace Adad.Cuda;
 
 public sealed partial class GpuOps
 {
-    /// <summary>top-k of each row: values as the type (rows × k), indices s32; returns the lane's name.</summary>
+    /// <summary>top-k of each row: values as the type (rows × k), indices s32 (k past the row: −1 and the value 0); returns the
+    /// lane's name.</summary>
     public string TopK<TN>(ulong x, int rows, int cols, int k, ulong values, ulong indices) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
         var lane = f.Natural;
         if (f.IsBlock) lane = Lane.F32;                                           // a block format: its rows decoded in place, in f32
         if (k > 256) throw new NotSupportedException($"top-k: k = {k} exceeds the kernel's passes (256); a partial sort is the step");
+        if (rows == 0 || k == 0) return f.IsBlock ? "f32 (blocks in place)" : lane.Name;
         var fn = gpu.Cached($"topk:{f.Name}", (out string e) => Ptx.TopKRows(gpu, f, lane, out e));
         if (f.Bits < 8) Gpu.Clear(values, f.Words((long)rows * k) * 4);           // sub-byte values are OR-ed into their words
         Gpu.Launch(fn, (uint)rows, 1, 256, 1, 0, x, values, indices, Gpu.U(cols), Gpu.U(k));

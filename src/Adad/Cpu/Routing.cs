@@ -73,7 +73,7 @@ internal sealed partial class Kernels
                         best[j] = v; bestAt[j] = c;
                     }
 
-                    for (int i = taken; i < k; i++) { best[i] = TL.Zero; bestAt[i] = -1; }          // k past the row: as the passes left them
+                    for (int i = taken; i < k; i++) { best[i] = TL.Zero; bestAt[i] = -1; }          // k past the row: no column (−1), the value 0
 
                     if (lanes) best.AsSpan(0, k).CopyTo(MemoryMarshal.Cast<byte, TLane>(values.AsSpan()).Slice(r * k, k));
                     else TN.Store(best.AsSpan(0, k), values, r * k);
@@ -168,7 +168,7 @@ internal sealed partial class Kernels
         }
     }
 
-    /// <summary>out[r] = x[r][index[r]], stored as the type.</summary>
+    /// <summary>out[r] = x[r][index[r]], stored as the type (a column outside the row: 0).</summary>
     public static string Pick<TN>(byte[] x, int rows, int cols, int[] index, byte[] output) where TN : struct, IAdad<TN>
     {
         var v = new PickVisitor(x, rows, cols, index, output);
@@ -185,7 +185,13 @@ internal sealed partial class Kernels
             Lane = TL.Name;
             var picked = new TLane[rows];
             var one = new TLane[1];
-            for (int r = 0; r < rows; r++) { TN.Load(x, r * cols + index[r], one.AsSpan(0, 1)); picked[r] = one[0]; }
+            for (int r = 0; r < rows; r++)
+            {
+                // A column outside the row (top-k's −1 past the row among them) reads nothing: 0.
+                if ((uint)index[r] >= (uint)cols) { picked[r] = TL.Zero; continue; }
+                TN.Load(x, r * cols + index[r], one.AsSpan(0, 1));
+                picked[r] = one[0];
+            }
             TN.Store(picked, output, 0);
         }
     }

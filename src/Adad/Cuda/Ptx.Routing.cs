@@ -77,7 +77,15 @@ internal static partial class Ptx
             b.L($"mul.wide.u32 {iAddr}, {oIdx}, 4;");
             b.L($"add.u64 {iAddr}, {indices}, {iAddr};");
             b.L($"st.global.s32 [{iAddr}], {bi};");
-            if (!f.IsBlock) StoreAnyValue(b, f, lane, bv, values, oIdx);
+            if (!f.IsBlock)
+            {
+                // k past the row: no column was left (the index −1), the value 0.
+                string pNoCol = b.P(), kept = lane.NewReg(b);
+                b.L($"setp.eq.u32 {pNoCol}, {bi}, 0xFFFFFFFF;");
+                b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {kept}, {lane.Zero}, {bv}, {pNoCol};");
+                StoreAnyValue(b, f, lane, kept, values, oIdx);
+            }
+
             _ = vAddr;
         }
 
@@ -415,13 +423,17 @@ internal static partial class Ptx
         b.L($"mad.lo.u32 {r}, {bid}, 256, {tid};");
         b.L($"setp.ge.u32 {pEnd}, {r}, {rows};");
         b.L($"@{pEnd} bra DONE;");
-        string ia = b.RD(), col = b.R(), src = b.R();
+        string ia = b.RD(), col = b.R(), src = b.R(), pIn = b.P(), kept = lane.NewReg(b);
         b.L($"mul.wide.u32 {ia}, {r}, 4;");
         b.L($"add.u64 {ia}, {idx}, {ia};");
-        b.L($"ld.global.s32 {col}, [{ia}];");
+        b.L($"ld.global.u32 {col}, [{ia}];");
+        // A column outside the row (below 0 is past it unsigned) reads the row's first value, dropped: 0.
+        b.L($"setp.lt.u32 {pIn}, {col}, {cols};");
+        b.L($"selp.u32 {col}, {col}, 0, {pIn};");
         b.L($"mad.lo.u32 {src}, {r}, {cols}, {col};");
         string v = Codec.UnpackAt(b, f, x, src, lane);
-        StoreAnyValue(b, f, lane, v, outp, r);
+        b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {kept}, {v}, {lane.Zero}, {pIn};");
+        StoreAnyValue(b, f, lane, kept, outp, r);
         b.Label("DONE");
         b.L("ret;");
         return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_idx, .param .u64 p_out, .param .u32 p_rows, .param .u32 p_cols");
@@ -523,7 +535,8 @@ internal static partial class Ptx
     }
 
     /// <summary>out[r][j] = x[r][index[r·k + j]] (s32 columns) over rows · k values of block format f: a warp per output block,
-    /// each value decoded where it is stored and the block encoded (top-k's values, pick's with k = 1).</summary>
+    /// each value decoded where it is stored and the block encoded (top-k's values, pick's with k = 1). A column outside the
+    /// row (top-k's −1 past the row) reads the row's first value, dropped: 0.</summary>
     public static string GatherRowsBlocks(Gpu gpu, Fmt f, out string entry)
     {
         entry = $"gather_rows_{f.Name}_blocks";
@@ -533,13 +546,17 @@ internal static partial class Ptx
         var w = BlockWarp(b, f, n);
         EncodeBlock(b, f, po, w, n, at =>
         {
-            string r = b.R(), col = b.R(), ia = b.RD(), src = b.R();
+            string r = b.R(), col = b.R(), ia = b.RD(), src = b.R(), pIn = b.P(), kept = b.F();
             b.L($"div.u32 {r}, {at}, {k};");
             b.L($"mul.wide.u32 {ia}, {at}, 4;");
             b.L($"add.u64 {ia}, {index}, {ia};");
             b.L($"ld.global.u32 {col}, [{ia}];");
+            b.L($"setp.lt.u32 {pIn}, {col}, {cols};");
+            b.L($"selp.u32 {col}, {col}, 0, {pIn};");
             b.L($"mad.lo.u32 {src}, {r}, {cols}, {col};");
-            return Codec.UnpackAt(b, f, x, src, Lane.F32);
+            string v = Codec.UnpackAt(b, f, x, src, Lane.F32);
+            b.L($"selp.f32 {kept}, {v}, {Lane.F32.Zero}, {pIn};");
+            return kept;
         });
         b.Label("DONE");
         b.L("ret;");

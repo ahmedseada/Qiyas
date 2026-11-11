@@ -81,7 +81,8 @@ internal static partial class VkKernels
     }
 
     /// <summary>out[r·k + j] = x[r][index[r·k + j]] (s32 columns) over rows · k values, a thread per stored word: top-k's
-    /// values, pick's with k = 1. Arguments: x, index, out, rows, cols, k.</summary>
+    /// values, pick's with k = 1. A column outside the row (top-k's −1 past the row; below 0 is past it unsigned) reads the
+    /// row's first value, dropped: 0. Arguments: x, index, out, rows, cols, k.</summary>
     public static SpvKernel GatherByIndex(Vulkan vk, Fmt f)
     {
         var lane = f.Natural;
@@ -104,8 +105,9 @@ internal static partial class VkKernels
                 var inside = at < n;
                 var safe = b.Min(at, n - 1);
                 var col = b.Bitcast(b.Load(K.S32, b.At(index, safe, 4)), K.U32);
-                var v = Codec.UnpackAt(b, f, x, safe / k * cols + col, lane);
-                word = Codec.Pack(b, f, b.Select(inside, v, b.C(Kinds.Of(lane), 0)), lane, i, word);
+                var inRow = col < cols;
+                var v = Codec.UnpackAt(b, f, x, safe / k * cols + b.Select(inRow, col, b.U(0)), lane);
+                word = Codec.Pack(b, f, b.Select(inside & inRow, v, b.C(Kinds.Of(lane), 0)), lane, i, word);
             }
 
             b.Store(b.At(output, gid, f.WordBits / 8), word);

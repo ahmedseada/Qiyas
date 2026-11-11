@@ -11,7 +11,8 @@ namespace Adad.Abstraction;
 
 public static class Routing
 {
-    /// <summary>top-k of each row in float64: values and indices, largest first, ties by the lower index.</summary>
+    /// <summary>top-k of each row in float64: values and indices, largest first, ties by the lower index (k past the row:
+    /// −1 and 0).</summary>
     public static (double[] Values, int[] Indices) TopKReference(double[] x, int rows, int cols, int k)
     {
         var values = new double[rows * k];
@@ -19,7 +20,11 @@ public static class Routing
         for (int r = 0; r < rows; r++)
         {
             var order = Enumerable.Range(0, cols).OrderByDescending(c => x[r * cols + c]).ThenBy(c => c).Take(k).ToArray();
-            for (int i = 0; i < k; i++) { indices[r * k + i] = order[i]; values[r * k + i] = x[r * cols + order[i]]; }
+            for (int i = 0; i < k; i++)
+            {
+                indices[r * k + i] = i < order.Length ? order[i] : -1;
+                values[r * k + i] = i < order.Length ? x[r * cols + order[i]] : 0;
+            }
         }
 
         return (values, indices);
@@ -50,7 +55,7 @@ public static class Routing
     public static double[] PickReference(double[] x, int rows, int cols, int[] index)
     {
         var y = new double[rows];
-        for (int r = 0; r < rows; r++) y[r] = x[r * cols + index[r]];
+        for (int r = 0; r < rows; r++) y[r] = (uint)index[r] < (uint)cols ? x[r * cols + index[r]] : 0;      // a column outside the row: 0
         return y;
     }
 

@@ -6,7 +6,8 @@ namespace Adad.Abstraction;
 /// <summary>Routing, sampling and losses (Routing.cs): operations whose results are indices, or whose inputs are.</summary>
 public interface IRouting<TBuffer, TIndex>
 {
-    /// <summary>The k largest of each row (rows × cols): values (rows × k) and their columns, largest first.</summary>
+    /// <summary>The k largest of each row (rows × cols): values (rows × k) and their columns, largest first, an equal value by
+    /// the lower index; k past the row: no column (−1) and the value 0.</summary>
     string TopK<TN>(TBuffer x, int rows, int cols, int k, TBuffer values, TIndex indices) where TN : struct, IAdad<TN>;
 
     /// <summary>The k largest of each row of x (rows × cols) as log-probabilities (a beam's candidates, read instead of the
@@ -15,7 +16,7 @@ public interface IRouting<TBuffer, TIndex>
     /// type stores it; a block format's lowest value, an infinity having no block).</summary>
     string LogSoftmaxTopK<TN>(TBuffer x, int rows, int cols, int k, TBuffer values, TIndex indices) where TN : struct, IFloatAdad<TN>;
 
-    /// <summary>output[r] = x[r, index[r]].</summary>
+    /// <summary>output[r] = x[r, index[r]]; a column outside the row (below 0, or cols and past) reads nothing: 0.</summary>
     string Pick<TN>(TBuffer x, int rows, int cols, TIndex index, TBuffer output) where TN : struct, IAdad<TN>;
 
     /// <summary>picks[r] = the first column whose running sum of row r reaches u[r] · Σ row.</summary>

@@ -358,8 +358,10 @@ internal static partial class VkKernels
             V x = b.Arg(0), index = b.Arg(1), cols = b.Arg(2, K.U32), k = b.Arg(3, K.U32);
             return (at, _) =>
             {
+                // A column outside the row (top-k's −1 past the row) reads the row's first value, dropped: 0.
                 var col = b.Bitcast(b.Load(K.S32, b.At(index, at, 4)), K.U32);
-                return Codec.UnpackAt(b, f, x, at / k * cols + col, Lane.F32);
+                var inRow = col < cols;
+                return b.Select(inRow, Codec.UnpackAt(b, f, x, at / k * cols + b.Select(inRow, col, b.U(0)), Lane.F32), b.F(0));
             };
         });
 
