@@ -28,9 +28,10 @@ internal static partial class Ptx
     /// <summary>Each source row's scale max |x| / max in the lane, a CTA a row (row = head·steps + step). direct: stored as f at
     /// head·cap + p + step (a row past the capacity not written; f a type of 8 bits or more); else a lane value at ps[row].
     /// Params: x (f), ps, pos, steps, cap, d, max (lane).</summary>
-    public static string CacheScales(Gpu gpu, Fmt f, Lane lane, bool direct, out string entry)
+    public static string CacheScales(Gpu gpu, Fmt f, Lane lane, bool direct, out string entry, Fmt? source = null)
     {
-        entry = $"cache_scales_{f.Name}_{lane.Name}{(direct ? "" : "_lanes")}";
+        var fx = source ?? f;                                                   // x's format: the type's, or a composition's lane storage
+        entry = $"cache_scales_{f.Name}_{lane.Name}{(direct ? "" : "_lanes")}{(source is null ? "" : "_from_" + fx.Name)}";
         const int Threads = 256;
         var b = new PtxBuilder();
         string tid = b.R(), row = b.R();
@@ -50,7 +51,7 @@ internal static partial class Ptx
         {
             string idx = b.R(), ax = lane.NewReg(b);
             b.L($"add.u32 {idx}, {first}, {e};");
-            string x = Codec.UnpackAt(b, f, px, idx, lane);
+            string x = Codec.UnpackAt(b, fx, px, idx, lane);
             b.L($"abs.{lane.Op} {ax}, {x};");
             b.L($"max.{lane.Op} {amax}, {amax}, {ax};");
         }
@@ -148,9 +149,10 @@ internal static partial class Ptx
     /// where Fmt.ConvertPlan says); scaled: x / scale by the row's stored scale (f at head·cap + row; 0 where the scale is
     /// 0), an integer code rounded to the nearest (ties to even), held to [min, max]. Params: x, cache, scales, pos, rows
     /// (heads·steps), steps, cap, d, wpr, min, max (lane).</summary>
-    public static string CacheWrite(Gpu gpu, Fmt f, Fmt fc, Lane lane, bool scaled, out string entry)
+    public static string CacheWrite(Gpu gpu, Fmt f, Fmt fc, Lane lane, bool scaled, out string entry, Fmt? source = null)
     {
-        entry = $"cache_write_{f.Name}_{fc.Name}_{lane.Name}{(scaled ? "_scaled" : "")}";
+        var fx = source ?? f;                                                   // x's format: the type's, or a composition's lane storage
+        entry = $"cache_write_{f.Name}_{fc.Name}_{lane.Name}{(scaled ? "_scaled" : "")}{(source is null ? "" : "_from_" + fx.Name)}";
         var b = new PtxBuilder();
         string word = GlobalIndex(b);
         string px = Param64(b, "p_x"), pc = Param64(b, "p_c"), ps = Param64(b, "p_s"), pos = Param64(b, "p_pos");
@@ -188,7 +190,7 @@ internal static partial class Ptx
         {
             string idx = b.R();
             b.L($"add.u32 {idx}, {first}, {i};");
-            string v = Codec.UnpackAt(b, f, px, idx, lane);
+            string v = Codec.UnpackAt(b, fx, px, idx, lane);
             if (scaled)
             {
                 string q = LaneOp(b, lane, "div", v, scale), kept = lane.NewReg(b);

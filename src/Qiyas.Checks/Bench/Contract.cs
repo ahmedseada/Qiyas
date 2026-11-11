@@ -103,6 +103,16 @@ public interface IBenchSubject
     /// the type) when given.</summary>
     IBenchRun? AttentionCached(Device device, string type, string cacheType, AttentionArgs a, int position, byte[] q, byte[] k, byte[]? kScales, byte[] v, byte[]? vScales, byte[] o) => null;
 
+    /// <summary>The rotary embedding by tables (IRows.Rope): x's rows normalized (a gain given) and rotated into y (the type),
+    /// y's rows a head at a time when a.HeadsFirst; cos and sin the float lane's storage.</summary>
+    IBenchRun? Rope(Device device, string type, RopeArgs a, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] y) => null;
+
+    /// <summary>A layer's rows normalized, rotated and written into the cache (of cacheType) at the position (ICache.CacheWriteRope).</summary>
+    IBenchRun? CacheWriteRope(Device device, string type, string cacheType, CacheView c, RopeArgs a, int position, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] cache, byte[]? scales) => null;
+
+    /// <summary>O for Q, K, V and O a step at a time (AttentionArgs.StepsFirst).</summary>
+    IBenchRun? AttentionStepsFirst(Device device, string type, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) => null;
+
     /// <summary>The mask of rows decoder steps over capacity positions at the position (ICache.DecoderMask), as the type.</summary>
     IBenchRun? DecoderMask(Device device, string type, int rows, int capacity, int window, int position, byte[] mask) => null;
 

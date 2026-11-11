@@ -23,6 +23,16 @@ public sealed record AttentionArgs(int Heads, int Lq, int Lk, int D, double Scal
     /// <summary>A cap on the scores (0: none): s = Softcap·tanh(Scale·q·k / Softcap) in place of Scale·q·k.</summary>
     public double Softcap { get; init; }
 
+    /// <summary>Q and O a step at a time: query i of head h of batch b at ((b·Lq + i)·(Heads / Batch) + h)·D, and K and V the
+    /// same over Lk and their heads — the layout a layer's projections come in ([batch, steps, heads · d]); false: a head at
+    /// a time. Every form takes it (AttentionLayout); the log-sum-exp stays heads × Lq.</summary>
+    public bool StepsFirst { get; init; }
+
+    /// <summary>The batches the heads are of under StepsFirst (0: one): the heads of Q and of K and V whole multiples of it.</summary>
+    public int Batch { get; init; }
+
+    public int BatchCount => Batch == 0 ? 1 : Batch;
+
     public int KvHeadCount => KvHeads == 0 ? Heads : KvHeads;
 
     /// <summary>The query heads that share a head of K and V.</summary>
@@ -51,6 +61,7 @@ public sealed record AttentionArgs(int Heads, int Lq, int Lk, int D, double Scal
         if (Heads < 0 || Lq < 0 || Lk < 0 || D < 0) throw new ArgumentException($"attention: {Heads} heads of {Lq} × {Lk} at d {D}");
         if (KvHeads < 0 || (KvHeads > 0 && Heads % KvHeads != 0)) throw new ArgumentException($"attention: {Heads} query heads do not group over {KvHeads} key and value heads");
         if (Window < 0) throw new ArgumentException($"attention: a window of {Window} keys");
+        if (Batch < 0 || Heads % BatchCount != 0 || KvHeadCount % BatchCount != 0) throw new ArgumentException($"attention: {Heads} query heads and {KvHeadCount} of keys and values in {Batch} batches");
         if (!(Softcap >= 0) || double.IsInfinity(Softcap)) throw new ArgumentException($"attention: a score cap of {Softcap}");
     }
 

@@ -50,9 +50,13 @@ public sealed partial class GpuOps
         return lane.Name;
     }
 
-    public string Rope<TN>(RopeArgs a, ulong x, ulong gain, ulong cos, ulong sin, ulong positions, ulong y) where TN : struct, IFloatAdad<TN>
+    public string Rope<TN>(RopeArgs a, ulong x, ulong gain, ulong cos, ulong sin, ulong positions, ulong y) where TN : struct, IFloatAdad<TN> =>
+        RopeTo(a, Fmt.Of<TN>(), null, x, gain, cos, sin, positions, y);
+
+    /// <summary>IRows.Rope of x (f) into y stored as outFmt (null: f; the lane's own format for a composition's intermediate),
+    /// y's rows a head at a time when a.HeadsFirst.</summary>
+    internal string RopeTo(RopeArgs a, Fmt f, Fmt? outFmt, ulong x, ulong gain, ulong cos, ulong sin, ulong positions, ulong y)
     {
-        var f = Fmt.Of<TN>();
         var lane = RowLane(f);
         long n = (long)a.Rows * a.Cols;
         if (n == 0) return lane.Name;
@@ -61,11 +65,13 @@ public sealed partial class GpuOps
         try
         {
             if (norm) RowStatistics(f, lane, false, x, st, a.Rows, a.Cols, a.Eps);
-            var fn = gpu.Cached($"rope_out:{f.Name}:{lane.Name}:{norm}:{a.Interleaved}:{a.Inverse}:{a.Half > 0}",
-                (out string e) => Ptx.RopeOut(gpu, f, lane, norm, a.Interleaved, a.Inverse, a.Half > 0, out e));
-            uint grid = f.IsBlock ? BlockGrid(f, n) : Grid(f.Words(n), 256);
-            Gpu.Launch(fn, grid, 1, 256, 1, 0, x, gain, cos, sin, positions, st, y, Gpu.U((int)n), Gpu.U(a.Cols), Gpu.U(a.Heads), Gpu.U(a.Steps), Gpu.U(a.Half),
-                lane.Wide ? Gpu.D(a.Offset) : Gpu.F((float)a.Offset));
+            bool plain = outFmt is null && !a.HeadsFirst;
+            var fo = outFmt ?? f;
+            var fn = gpu.Cached($"rope_out:{f.Name}:{lane.Name}:{norm}:{a.Interleaved}:{a.Inverse}:{a.Half > 0}{(plain ? "" : $":{fo.Name}:{a.HeadsFirst}")}",
+                (out string e) => Ptx.RopeOut(gpu, f, lane, norm, a.Interleaved, a.Inverse, a.Half > 0, out e, plain ? null : fo, a.HeadsFirst));
+            ulong[] args = [x, gain, cos, sin, positions, st, y, Gpu.U((int)n), Gpu.U(a.Cols), Gpu.U(a.Heads), Gpu.U(a.Steps), Gpu.U(a.Half), lane.Wide ? Gpu.D(a.Offset) : Gpu.F((float)a.Offset)];
+            if (plain) Gpu.Launch(fn, f.IsBlock ? BlockGrid(f, n) : Grid(f.Words(n), 256), 1, 256, 1, 0, args);
+            else LaunchEach(fn, fo, n, args);
         }
         finally
         {

@@ -39,6 +39,8 @@ internal sealed partial class Kernels
     /// shape and type (once); returns the lane's name.</summary>
     public static string Attention<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) where TN : struct, IFloatAdad<TN>
     {
+        // Tensors a step at a time (AttentionArgs.StepsFirst): every form by AttentionLayout's strided copies.
+        if (a.StepsFirst) return StepsFirst<TN>(a, q, k, v, o, static (h, q, k, v, o) => Attention<TN>(h, q, k, v, o));
         a = a.Grouped();
         if (a.Softcap > 0) return AttentionComposed<TN>(a, q, k, v, o);
         string key = $"{TN.Name}:{a.Heads}x{a.Lq}x{a.Lk}x{a.D}:{a.Causal}:{a.Spans is not null}:{a.HasStarts}";
@@ -61,6 +63,7 @@ internal sealed partial class Kernels
     /// <summary>O for rows of queries: the composition; returns the lane's name.</summary>
     public static string AttentionComposed<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) where TN : struct, IFloatAdad<TN>
     {
+        if (a.StepsFirst) return StepsFirst<TN>(a, q, k, v, o, static (h, q, k, v, o) => AttentionComposed<TN>(h, q, k, v, o));
         var vis = new ComposeVisitor(a.Grouped(), q, k, v, o, null, null, null, null, null);
         TN.Float(ref vis);
         return vis.Lane;
@@ -69,6 +72,7 @@ internal sealed partial class Kernels
     /// <summary>O and each query's log-sum-exp of its scores (heads × Lq, as TN): the composition; returns the lane's name.</summary>
     public static string AttentionLse<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o, byte[] lse) where TN : struct, IFloatAdad<TN>
     {
+        if (a.StepsFirst) return StepsFirst<TN>(a, q, k, v, o, (h, q, k, v, o) => AttentionLse<TN>(h, q, k, v, o, lse));
         var vis = new ComposeVisitor(a.Grouped(), q, k, v, o, lse, null, null, null, null);
         TN.Float(ref vis);
         return vis.Lane;
@@ -200,6 +204,7 @@ internal sealed partial class Kernels
     /// this shape and type (once, as the forward's rows); returns the lane's name.</summary>
     public static string AttentionBackward<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] dO, byte[] dq, byte[] dk, byte[] dv) where TN : struct, IFloatAdad<TN>
     {
+        if (a.StepsFirst) return StepsFirstBackward<TN>(a, q, k, v, dO, dq, dk, dv);
         a = a.Grouped();
         if (a.Softcap > 0) return AttentionBackwardComposed<TN>(a, q, k, v, dO, dq, dk, dv);
         if (FusedBackwardCpu is bool forced) return forced ? AttentionBackwardRows<TN>(a, q, k, v, dO, dq, dk, dv) : AttentionBackwardComposed<TN>(a, q, k, v, dO, dq, dk, dv);
@@ -226,11 +231,108 @@ internal sealed partial class Kernels
         return vis.Lane;
     }
 
+    // ---------------------------------------------------------------- tensors a step at a time (AttentionArgs.StepsFirst)
+
+    // A row of whole storage units (a type of 8 bits or more; a block format whose row is whole blocks) is moved a head at
+    // a time as its bytes — exact, a task a run of rows, into pooled buffers — the form run on them, and its outputs' rows
+    // moved back. A block format whose rows share blocks goes by AttentionLayout's strided copies, which re-encode by
+    // blocks as every layout's output does.
+
+    // destination's rows (rented when null) = source's in the other order: [batch, steps, heads] to [batch, heads, steps]
+    // (toHeads) or back.
+    private static byte[] MoveRows<TN>(byte[] source, byte[]? destination, int batch, int steps, int heads, int d, bool toHeads) where TN : struct, IAdad<TN>
+    {
+        int rowBytes = (int)TN.Bytes(d), rows = batch * steps * heads;
+        destination ??= ArrayPool<byte>.Shared.Rent(Math.Max(1, rows * rowBytes));
+        if (rows > 0 && rowBytes > 0) Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)rows * rowBytes, new MoveRowsBody(source, destination, steps, heads, rowBytes, toHeads));
+        return destination;
+    }
+
+    private readonly struct MoveRowsBody(byte[] source, byte[] destination, int steps, int heads, int rowBytes, bool toHeads) : Team.IBody
+    {
+        public void Run(int first, int last)
+        {
+            int per = steps * heads;
+            for (int r = first; r < last; r++)
+            {
+                // Row r of the destination: (b, head rem / steps, step rem % steps) a head at a time, (b, step rem / heads,
+                // head rem % heads) a step at a time.
+                int b = r / per, rem = r % per;
+                int from = toHeads ? (b * steps + rem % steps) * heads + rem / steps : (b * heads + rem % heads) * steps + rem / heads;
+                source.AsSpan(from * rowBytes, rowBytes).CopyTo(destination.AsSpan(r * rowBytes, rowBytes));
+            }
+        }
+    }
+
+    private static string StepsFirst<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o, Func<AttentionArgs, byte[], byte[], byte[], byte[], string> run) where TN : struct, IFloatAdad<TN>
+    {
+        if (!AttentionLayout.WholeUnits<TN>(a.D)) return AttentionLayout.Forward<byte[], int[], TN>(CpuDevice.Device, a, q, k, v, o, (_, h, qh, kh, vh, oh) => run(h, qh, kh, vh, oh));
+        a.Validate();
+        int b = a.BatchCount, hq = a.Heads / b, hk = a.KvHeadCount / b;
+        var pool = ArrayPool<byte>.Shared;
+        byte[] qh = MoveRows<TN>(q, null, b, a.Lq, hq, a.D, true), kh = MoveRows<TN>(k, null, b, a.Lk, hk, a.D, true), vh = MoveRows<TN>(v, null, b, a.Lk, hk, a.D, true),
+            oh = pool.Rent(Math.Max(1, (int)TN.Bytes(a.QValues)));
+        try
+        {
+            string lane = run(a with { StepsFirst = false }, qh, kh, vh, oh);
+            MoveRows<TN>(oh, o, b, a.Lq, hq, a.D, false);
+            return lane;
+        }
+        finally
+        {
+            pool.Return(qh); pool.Return(kh); pool.Return(vh); pool.Return(oh);
+        }
+    }
+
+    /// <summary>O for Q and O a step at a time over tensors the form reads as they are (a cache's K and V).</summary>
+    internal static string StepsFirstQueries<TN>(AttentionArgs a, byte[] q, byte[] o, Func<AttentionArgs, byte[], byte[], string> run) where TN : struct, IFloatAdad<TN>
+    {
+        if (!AttentionLayout.WholeUnits<TN>(a.D)) return AttentionLayout.Queries<byte[], int[], TN>(CpuDevice.Device, a, q, o, (_, h, qh, oh) => run(h, qh, oh));
+        a.Validate();
+        int b = a.BatchCount, hq = a.Heads / b;
+        var pool = ArrayPool<byte>.Shared;
+        byte[] qh = MoveRows<TN>(q, null, b, a.Lq, hq, a.D, true), oh = pool.Rent(Math.Max(1, (int)TN.Bytes(a.QValues)));
+        try
+        {
+            string lane = run(a with { StepsFirst = false }, qh, oh);
+            MoveRows<TN>(oh, o, b, a.Lq, hq, a.D, false);
+            return lane;
+        }
+        finally
+        {
+            pool.Return(qh); pool.Return(oh);
+        }
+    }
+
+    private static string StepsFirstBackward<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] dO, byte[] dq, byte[] dk, byte[] dv) where TN : struct, IFloatAdad<TN>
+    {
+        if (!AttentionLayout.WholeUnits<TN>(a.D)) return AttentionLayout.Backward<byte[], int[], TN>(CpuDevice.Device, a, q, k, v, dO, dq, dk, dv);
+        a.Validate();
+        int b = a.BatchCount, hq = a.Heads / b, hk = a.KvHeadCount / b;
+        var pool = ArrayPool<byte>.Shared;
+        byte[] qh = MoveRows<TN>(q, null, b, a.Lq, hq, a.D, true), kh = MoveRows<TN>(k, null, b, a.Lk, hk, a.D, true), vh = MoveRows<TN>(v, null, b, a.Lk, hk, a.D, true),
+            gh = MoveRows<TN>(dO, null, b, a.Lq, hq, a.D, true);
+        byte[] dqh = pool.Rent(Math.Max(1, (int)TN.Bytes(a.QValues))), dkh = pool.Rent(Math.Max(1, (int)TN.Bytes(a.KValues))), dvh = pool.Rent(Math.Max(1, (int)TN.Bytes(a.KValues)));
+        try
+        {
+            string lane = AttentionBackward<TN>(a with { StepsFirst = false }, qh, kh, vh, gh, dqh, dkh, dvh);
+            MoveRows<TN>(dqh, dq, b, a.Lq, hq, a.D, false);
+            MoveRows<TN>(dkh, dk, b, a.Lk, hk, a.D, false);
+            MoveRows<TN>(dvh, dv, b, a.Lk, hk, a.D, false);
+            return lane;
+        }
+        finally
+        {
+            pool.Return(qh); pool.Return(kh); pool.Return(vh); pool.Return(gh); pool.Return(dqh); pool.Return(dkh); pool.Return(dvh);
+        }
+    }
+
     // ---------------------------------------------------------------- decode: one query at a time, K and V read once
 
     /// <summary>O for a few queries against a long cache, each query on its own: scores, softmax and the context in the lane.</summary>
     public static string AttentionDecode<TN>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) where TN : struct, IFloatAdad<TN>
     {
+        if (a.StepsFirst) return StepsFirst<TN>(a, q, k, v, o, static (h, q, k, v, o) => AttentionDecode<TN>(h, q, k, v, o));
         a = a.Grouped();
         if (a.Softcap > 0) return AttentionComposed<TN>(a, q, k, v, o);
         var vis = new DecodeVisitor(a, q, k, v, o);

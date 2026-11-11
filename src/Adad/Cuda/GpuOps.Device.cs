@@ -46,17 +46,24 @@ public sealed partial class GpuOps : IDevice<ulong, ulong>
     string IRows<ulong, ulong>.NormParamsBwd<TN>(ulong x, ulong dy, ulong dgamma, ulong dbeta, int rows, int cols, double eps, bool centered) =>
         NormParamsBwd<TN>(x, dy, dgamma, dbeta, rows, cols, eps, centered);
 
-    string IAttention<ulong>.Attention<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) => Attention<TN>(a, q, k, v, o);
+    // Tensors a step at a time (AttentionArgs.StepsFirst): every form by AttentionLayout's strided copies.
+    string IAttention<ulong>.Attention<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) =>
+        a.StepsFirst ? AttentionLayout.Forward<ulong, ulong, TN>(this, a, q, k, v, o, static (d, h, q, k, v, o) => d.Attention<TN>(h, q, k, v, o)) : Attention<TN>(a, q, k, v, o);
 
-    string IAttention<ulong>.AttentionComposed<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) => AttentionComposed<TN>(a, q, k, v, o);
+    string IAttention<ulong>.AttentionComposed<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) =>
+        a.StepsFirst ? AttentionLayout.Forward<ulong, ulong, TN>(this, a, q, k, v, o, static (d, h, q, k, v, o) => d.AttentionComposed<TN>(h, q, k, v, o)) : AttentionComposed<TN>(a, q, k, v, o);
 
-    string IAttention<ulong>.AttentionRows<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) => AttentionRows<TN>(a, q, k, v, o);
+    string IAttention<ulong>.AttentionRows<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) =>
+        a.StepsFirst ? AttentionLayout.Forward<ulong, ulong, TN>(this, a, q, k, v, o, static (d, h, q, k, v, o) => d.AttentionRows<TN>(h, q, k, v, o)) : AttentionRows<TN>(a, q, k, v, o);
 
-    string IAttention<ulong>.AttentionDecode<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) => AttentionDecode<TN>(a, q, k, v, o);
+    string IAttention<ulong>.AttentionDecode<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) =>
+        a.StepsFirst ? AttentionLayout.Forward<ulong, ulong, TN>(this, a, q, k, v, o, static (d, h, q, k, v, o) => d.AttentionDecode<TN>(h, q, k, v, o)) : AttentionDecode<TN>(a, q, k, v, o);
 
-    string IAttention<ulong>.AttentionLse<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o, ulong lse) => AttentionLse<TN>(a, q, k, v, o, lse);
+    string IAttention<ulong>.AttentionLse<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o, ulong lse) =>
+        a.StepsFirst ? AttentionLayout.Forward<ulong, ulong, TN>(this, a, q, k, v, o, (d, h, q, k, v, o) => d.AttentionLse<TN>(h, q, k, v, o, lse)) : AttentionLse<TN>(a, q, k, v, o, lse);
 
-    string IAttention<ulong>.AttentionBackward<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong dO, ulong dq, ulong dk, ulong dv) => AttentionBackward<TN>(a, q, k, v, dO, dq, dk, dv);
+    string IAttention<ulong>.AttentionBackward<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong dO, ulong dq, ulong dk, ulong dv) =>
+        a.StepsFirst ? AttentionLayout.Backward<ulong, ulong, TN>(this, a, q, k, v, dO, dq, dk, dv) : AttentionBackward<TN>(a, q, k, v, dO, dq, dk, dv);
 
     string IOptimizers<ulong>.Optimizer<TN>(OptimizerArgs a, ulong p, ulong g, ulong m, ulong v, int n) => Optimizer<TN>(a, p, g, m, v, n);
 

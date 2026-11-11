@@ -277,6 +277,48 @@ internal static partial class VkKernels
         return b.Build();
     }
 
+    // The index in x of value `at` of y laid a head at a time: y's row (b·heads + h)·steps + s is x's row (b·steps + s)·heads + h.
+    private static V RopeSource(Spv b, V at, V cols, V heads, V steps)
+    {
+        // Three divisions a value (each remainder from its quotient).
+        var row = at / cols;
+        var per = heads * steps;
+        var batch = row / per;
+        var rem = row - batch * per;
+        var head = rem / steps;
+        return ((batch * steps + (rem - head * steps)) * heads + head) * cols + (at - row * cols);
+    }
+
+    /// <summary>RopeOut with y stored as fo (the type, or the lane's own format for a composition's intermediate), its rows a
+    /// head at a time when headsFirst: an invocation a stored word of y, each value reading its source where it is. The same
+    /// arguments.</summary>
+    public static SpvKernel RopeTo(Vulkan vk, Fmt f, Fmt fo, Lane lane, bool gain, bool interleaved, bool inverse, bool rotate, bool headsFirst)
+    {
+        var k = Kinds.Of(lane);
+        var b = new Spv($"rope_to_{f.Name}_{fo.Name}_{lane.Name}{(gain ? "_norm" : "")}{(interleaved ? "_il" : "")}{(inverse ? "_inv" : "")}{(rotate ? "" : "_norot")}{(headsFirst ? "_heads" : "")}", Threads, vk.Controls);
+        V px = b.Arg(0), pg = b.Arg(1), pcos = b.Arg(2), psin = b.Arg(3), ppos = b.Arg(4), pst = b.Arg(5), py = b.Arg(6);
+        V n = b.Arg(7, K.U32), cols = b.Arg(8, K.U32), heads = b.Arg(9, K.U32), steps = b.Arg(10, K.U32), half = b.Arg(11, K.U32), off = b.Arg(12, k);
+        StoreEach(b, fo, lane, py, n, at =>
+        {
+            var src = headsFirst ? RopeSource(b, at, cols, heads, steps) : at;
+            return RopeValue(b, f, lane, k, gain, interleaved, inverse, rotate, px, pg, pcos, psin, ppos, pst, cols, heads, steps, half, off, src, Codec.UnpackAt(b, f, px, src, lane));
+        });
+        return b.Build();
+    }
+
+    /// <summary>The rotary embedding into blocks (f32), y's rows a head at a time. Slots as BlockRopeOut's.</summary>
+    public static SpvKernel BlockRopeHeads(Vulkan vk, Fmt f, bool gain, bool interleaved, bool inverse, bool rotate) =>
+        BlockEncoder(vk, f, $"rope_heads{(gain ? "_norm" : "")}{(interleaved ? "_il" : "")}{(inverse ? "_inv" : "")}{(rotate ? "" : "_norot")}", b =>
+        {
+            V px = b.Arg(0), pg = b.Arg(1), pcos = b.Arg(2), psin = b.Arg(3), ppos = b.Arg(4), pst = b.Arg(5);
+            V cols = b.Arg(6, K.U32), heads = b.Arg(7, K.U32), steps = b.Arg(8, K.U32), half = b.Arg(9, K.U32), off = b.Arg(10, K.F32);
+            return (at, _) =>
+            {
+                var src = RopeSource(b, at, cols, heads, steps);
+                return RopeValue(b, f, Lane.F32, K.F32, gain, interleaved, inverse, rotate, px, pg, pcos, psin, ppos, pst, cols, heads, steps, half, off, src, Codec.UnpackAt(b, f, px, src, Lane.F32));
+            };
+        });
+
     /// <summary>The rotary embedding into blocks (f32). Slots: x, g, cos, sin, positions, stats, cols, heads, steps, half, offset (f32).</summary>
     public static SpvKernel BlockRopeOut(Vulkan vk, Fmt f, bool gain, bool interleaved, bool inverse, bool rotate) =>
         BlockEncoder(vk, f, $"rope_out{(gain ? "_norm" : "")}{(interleaved ? "_il" : "")}{(inverse ? "_inv" : "")}{(rotate ? "" : "_norot")}", b =>

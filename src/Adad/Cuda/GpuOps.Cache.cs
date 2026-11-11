@@ -15,9 +15,14 @@ public sealed partial class GpuOps
     private static ulong LaneValue(Lane lane, double v) => lane.Wide ? Gpu.D(v) : Gpu.F((float)v);
 
     /// <summary>The source's rows into the cache at the position (ICache.CacheWrite); returns the lane's name.</summary>
-    public string CacheWrite<TN, TC>(CacheView c, int steps, ulong position, ulong source, ulong cache, ulong scales) where TN : struct, IFloatAdad<TN> where TC : struct, IAdad<TC>
+    public string CacheWrite<TN, TC>(CacheView c, int steps, ulong position, ulong source, ulong cache, ulong scales) where TN : struct, IFloatAdad<TN> where TC : struct, IAdad<TC> =>
+        CacheWriteFrom<TC>(Fmt.Of<TN>(), null, c, steps, position, source, cache, scales);
+
+    // The write with its source stored as `from` (null: f; a composition's rows in the lane's own storage), the scales f's.
+    private string CacheWriteFrom<TC>(Fmt f, Fmt? from, CacheView c, int steps, ulong position, ulong source, ulong cache, ulong scales) where TC : struct, IAdad<TC>
     {
-        Fmt f = Fmt.Of<TN>(), fc = Fmt.Of<TC>();
+        var fc = Fmt.Of<TC>();
+        string via = from is null ? "" : ":" + from.Name;
         c.Validate(fc);
         if (steps < 0 || (long)c.Heads * steps * c.D > int.MaxValue) throw new ArgumentException($"cache: a write of {steps} rows a head");
         var lane = RowLane(f);
@@ -31,7 +36,7 @@ public sealed partial class GpuOps
             ulong sl = direct ? scales : gpu.Rent(Math.Max(16, (long)rows * lane.Size));
             try
             {
-                var sfn = gpu.Cached($"cache_scales:{f.Name}:{lane.Name}:{direct}", (out string e) => Ptx.CacheScales(gpu, f, lane, direct, out e));
+                var sfn = gpu.Cached($"cache_scales:{f.Name}:{lane.Name}:{direct}{via}", (out string e) => Ptx.CacheScales(gpu, f, lane, direct, out e, from));
                 Gpu.Launch(sfn, (uint)rows, 1, 256, 1, 0, source, sl, position, Gpu.U(steps), Gpu.U(c.Capacity), Gpu.U(c.D), max);
                 if (!direct)
                 {
@@ -45,15 +50,38 @@ public sealed partial class GpuOps
             }
         }
 
-        var fn = gpu.Cached($"cache_write:{f.Name}:{fc.Name}:{lane.Name}:{scaled}", (out string e) => Ptx.CacheWrite(gpu, f, fc, lane, scaled, out e));
+        var fn = gpu.Cached($"cache_write:{f.Name}:{fc.Name}:{lane.Name}:{scaled}{via}", (out string e) => Ptx.CacheWrite(gpu, f, fc, lane, scaled, out e, from));
         Gpu.Launch(fn, Grid((long)rows * wpr, 256), 1, 256, 1, 0, source, cache, scales, position, Gpu.U(rows), Gpu.U(steps), Gpu.U(c.Capacity), Gpu.U(c.D), Gpu.U(wpr), min, max);
         return lane.Name;
+    }
+
+    /// <summary>A layer's projection rows, normalized and rotated in the lane, into the cache at the position
+    /// (ICache.CacheWriteRope): the rope kernel's rows a head at a time in the lane's own storage (not rounded), then
+    /// CacheWrite from them. Returns the lane's name.</summary>
+    public string CacheWriteRope<TN, TC>(CacheView c, RopeArgs a, ulong position, ulong x, ulong gain, ulong cos, ulong sin, ulong positions, ulong cache, ulong scales)
+        where TN : struct, IFloatAdad<TN> where TC : struct, IAdad<TC>
+    {
+        var f = Fmt.Of<TN>();
+        c.Validate(Fmt.Of<TC>());
+        c.ValidateRope(a);
+        var lane = RowLane(f);
+        long n = (long)a.Rows * a.Cols;
+        if (n == 0) return lane.Name;
+        ulong rows = gpu.Rent(Math.Max(16, n * lane.Size));
+        try
+        {
+            RopeTo(a with { HeadsFirst = true }, f, LaneFormat(lane), x, gain, cos, sin, positions, rows);
+            return CacheWriteFrom<TC>(f, LaneFormat(lane), c, a.Steps, position, rows, cache, scales);
+        }
+        finally { gpu.Return(rows); }
     }
 
     /// <summary>O for the queries at the position against the caches (ICache.AttentionCached): the decode kernel, a block a
     /// row of KvHeadCount heads of Group·Lq rows, its limits from the position on the device; returns the lane's name.</summary>
     public string AttentionCached<TN, TC>(AttentionArgs a, ulong position, ulong q, ulong k, ulong kScales, ulong v, ulong vScales, ulong o) where TN : struct, IFloatAdad<TN> where TC : struct, IAdad<TC>
     {
+        if (a.StepsFirst)
+            return AttentionLayout.Queries<ulong, ulong, TN>(this, a, q, o, (d, h, qh, oh) => d.AttentionCached<TN, TC>(h, position, qh, k, kScales, v, vScales, oh));
         CacheRule.Validate(a);
         Fmt f = Fmt.Of<TN>(), fc = Fmt.Of<TC>();
         new CacheView(a.KvHeadCount, a.Lk, a.D).Validate(fc);

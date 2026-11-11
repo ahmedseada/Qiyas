@@ -140,6 +140,7 @@ internal sealed class Options
     public static readonly string[] Group8 = ["lstm_step", "gru_step", "lstm_step_bwd", "gru_step_bwd", "lstm_seq", "lstm_seq_bwd", "gru_seq", "gru_seq_bwd"];
     public static readonly string[] Group9 = ["topk_rows", "pick_rows", "sample_rows", "route", "route_wide", "cross_entropy", "ctc", "ctc_bwd"];
     public static readonly string[] Group10 = ["cache_write", "cache_write_scaled", "quantize_rows", "attention_cached", "attention_cached_scaled", "decoder_mask"];
+    public static readonly string[] Group11 = ["rope_table", "rope_heads", "cache_write_rope", "attention_steps"];
     public List<string>? Subjects;
     public string? Baseline;
 
@@ -165,7 +166,7 @@ internal sealed class Options
                 case "--types": o.Types = Next(); break;
                 case "--ops":
                     o.Ops = Next();
-                    if (o.Ops.Contains("all")) o.Ops = [.. Core, .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name), .. Group2, .. Group3, .. Group4, .. Group4b, .. Group5, .. Group6, .. Group7, .. Group8, .. Group9, .. Group10];
+                    if (o.Ops.Contains("all")) o.Ops = [.. Core, .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name), .. Group2, .. Group3, .. Group4, .. Group4b, .. Group5, .. Group6, .. Group7, .. Group8, .. Group9, .. Group10, .. Group11];
                     if (o.Ops.Contains("map")) o.Ops = [.. o.Ops.Where(n => n != "map"), .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name)];
                     if (o.Ops.Contains("reduce")) o.Ops = [.. o.Ops.Where(n => n != "reduce"), .. Group2];
                     if (o.Ops.Contains("rows")) o.Ops = [.. o.Ops.Where(n => n != "rows"), .. Group3];
@@ -177,6 +178,7 @@ internal sealed class Options
                     if (o.Ops.Contains("recurrent")) o.Ops = [.. o.Ops.Where(n => n != "recurrent"), .. Group8];
                     if (o.Ops.Contains("routing")) o.Ops = [.. o.Ops.Where(n => n != "routing"), .. Group9];
                     if (o.Ops.Contains("cache")) o.Ops = [.. o.Ops.Where(n => n != "cache"), .. Group10];
+                    if (o.Ops.Contains("heads")) o.Ops = [.. o.Ops.Where(n => n != "heads"), .. Group11];
                     break;
                 case "--baseline": o.Baseline = args[++i]; break;
                 case "--shapes": o.Shapes = args[++i]; if (o.Shapes is not ("regular" or "odd")) throw new ArgumentException($"--shapes takes regular or odd, not {o.Shapes}"); break;
@@ -326,6 +328,11 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         foreach (var name in Options.Group10)
         {
             if (options.Ops.Contains(name)) CacheRow(device, type, name);
+        }
+
+        foreach (var name in Options.Group11)
+        {
+            if (options.Ops.Contains(name)) HeadsRow(device, type, name);
         }
 
         if (!Registry.IsFloat(type)) return;
@@ -742,6 +749,60 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
 
         var wantO = CacheRule.AtPosition(a, position).Reference(Registry.Values(type, q, (int)a.QValues), kv, vv);
         Measure(device, name, type, $"{a.Heads}h {a.Lq}x{a.Lk} d{a.D}{(scaled ? " int8" : "")}", wantO, (s, o) => s.AttentionCached(device, type, cacheType, a, position, q, k, ks, v, vs, o), q.Length);
+    }
+
+    // A layer's projections into the layouts attention reads (float types). The table rotary embedding after an RMS
+    // normalization over 16 heads of 512 steps of d = 128: rope_table (y's rows x's) and rope_heads (y's rows a head at a
+    // time); cache_write_rope: the same rows normalized, rotated and written into the cache_write row's cache (the type
+    // itself; a block format's float32), its equivalent rope_heads then cache_write. attention_steps: attention_causal's
+    // shape with Q, K, V and O a step at a time (the form's time and the strided copies').
+    private void HeadsRow(Device device, string type, string name)
+    {
+        if (!Registry.IsFloat(type)) return;
+        if (name == "attention_steps")
+        {
+            var a = new AttentionArgs(16, Prime(2048), Prime(2048), Prime(128), 1 / Math.Sqrt(128), true) { StepsFirst = true };
+            int nq = (int)a.QValues, nk = (int)a.KValues;
+            byte[] q = Registry.Make(type, nq, 41, -1, 1), k = Registry.Make(type, nk, 42, -1, 1), v = Registry.Make(type, nk, 43, -1, 1);
+            var wantHeads = (a with { StepsFirst = false }).Reference(AttentionLayout.ToHeads(Registry.Values(type, q, nq), 1, a.Lq, a.Heads, a.D),
+                AttentionLayout.ToHeads(Registry.Values(type, k, nk), 1, a.Lk, a.Heads, a.D), AttentionLayout.ToHeads(Registry.Values(type, v, nk), 1, a.Lk, a.Heads, a.D));
+            Measure(device, name, type, $"{a.Heads}h {a.Lq}x{a.Lk} d{a.D}", AttentionLayout.FromHeads(wantHeads, 1, a.Lq, a.Heads, a.D), (s, o) => s.AttentionStepsFirst(device, type, a, q, k, v, o), q.Length);
+            return;
+        }
+
+        int heads = 16, steps = Prime(512), d = Odd ? 4 * Prime(32) : 128, half = d / 2, rows = heads * steps, n = rows * d;
+        bool wide = type == "float64";
+        double[] cos = new double[steps * half], sin = new double[steps * half];
+        for (int p = 0; p < steps; p++)
+            for (int i = 0; i < half; i++)
+            {
+                double theta = p * Math.Pow(10000, -(double)i / half);
+                cos[p * half + i] = wide ? Math.Cos(theta) : (float)Math.Cos(theta);
+                sin[p * half + i] = wide ? Math.Sin(theta) : (float)Math.Sin(theta);
+            }
+
+        byte[] Lanes(double[] t) => wide ? System.Runtime.InteropServices.MemoryMarshal.AsBytes(t.AsSpan()).ToArray()
+            : System.Runtime.InteropServices.MemoryMarshal.AsBytes(t.Select(e => (float)e).ToArray().AsSpan()).ToArray();
+        byte[] cosBytes = Lanes(cos), sinBytes = Lanes(sin);
+        int[] positions = [.. Enumerable.Range(0, steps)];
+        var x = Registry.Make(type, n, 92, -1, 1);
+        var gain = Registry.Make(type, d, 93, 0.5, 2);
+        var a2 = new RopeArgs(rows, d, heads, steps, half, false) { HeadsFirst = name != "rope_table" };
+        var want = new double[n];
+        RowOps.RopeReference(Registry.Values(type, x, n), Registry.Values(type, gain, d), cos, sin, positions, a2, want);
+        if (name != "cache_write_rope")
+        {
+            Measure(device, name, type, $"{rows}x{d}", want, (s, y) => s.Rope(device, type, a2, x, gain, cosBytes, sinBytes, positions, y), x.Length);
+            return;
+        }
+
+        string own = Registry.IsBlock(type) ? "float32" : type;
+        int cap = Prime(2048), at = 1000;
+        var view = new CacheView(heads, cap, d);
+        var wantCache = new double[view.Values];
+        for (int h = 0; h < heads; h++) Array.Copy(want, (long)h * steps * d, wantCache, ((long)h * cap + at) * d, (long)steps * d);
+        Measure(device, name, type, $"{heads}h {steps}x{d} at {at}/{cap}", wantCache,
+            (s, cache) => s.CacheWriteRope(device, type, own, view, a2 with { HeadsFirst = false }, at, x, gain, cosBytes, sinBytes, positions, cache, null), (int)Registry.Bytes(own, view.Values), own);
     }
 
     // Products on views at the core product's size: transposed operands, 16 batches of a quarter size, the backward pair (dA and dB; dA scored).

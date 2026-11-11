@@ -14,6 +14,13 @@ public interface ICache<TBuffer, TIndex>
     /// even), held to TC's range, rounded to TC once.</summary>
     string CacheWrite<TN, TC>(CacheView c, int steps, TIndex position, TBuffer source, TBuffer cache, TBuffer? scales) where TN : struct, IFloatAdad<TN> where TC : struct, IAdad<TC>;
 
+    /// <summary>CacheWrite of a layer's projection rows x (a.Rows = Heads·a.Steps rows of D values of TN, a step at a time: row
+    /// (b·a.Steps + s)·a.Heads + h is step s of the cache's head b·a.Heads + h), each row first RMS-normalized (a gain given)
+    /// and rotated (a.Half above 0) by IRows.Rope's rule in the float lane, its values kept there (no rounding to TN) and
+    /// written by CacheWrite's rule: rounded once, to TC. No gain and no rotation: the rows as they are.</summary>
+    string CacheWriteRope<TN, TC>(CacheView c, RopeArgs a, TIndex position, TBuffer x, TBuffer? gain, TBuffer cos, TBuffer sin, TIndex positions, TBuffer cache, TBuffer? scales)
+        where TN : struct, IFloatAdad<TN> where TC : struct, IAdad<TC>;
+
     /// <summary>O (Heads × Lq × D, TN) for Lq queries a head (Q as TN) at positions p + i (p = position[0]) against caches of
     /// a.KvHeadCount heads of a.Lk = Capacity rows (CacheRule.AtPosition: query i sees rows up to p + i, the window's last),
     /// a decode kernel's: each row of K and V read where it is stored as TC (scaled: code·scale in the lane), the scores

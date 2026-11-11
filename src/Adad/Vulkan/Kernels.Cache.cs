@@ -43,16 +43,17 @@ internal static partial class VkKernels
     /// <summary>Each source row's scale max |x| / max in the lane, a workgroup a row (row = head·steps + step). direct: a lane
     /// value at head·cap + p + step of ps (a row past the capacity not written; the type's storage is the lane's); else at
     /// ps[row]. Slots: x (f), ps, pos, steps, cap, d, max (lane).</summary>
-    public static SpvKernel CacheScales(Vulkan vk, Fmt f, Lane lane, bool direct)
+    public static SpvKernel CacheScales(Vulkan vk, Fmt f, Lane lane, bool direct, Fmt? source = null)
     {
         var k = Kinds.Of(lane);
-        var b = new Spv($"cache_scales_{f.Name}_{lane.Name}{(direct ? "" : "_lanes")}", ReduceThreads, vk.Controls);
+        var fx = source ?? f;                                                   // x's format: the type's, or a composition's lane storage
+        var b = new Spv($"cache_scales_{f.Name}_{lane.Name}{(direct ? "" : "_lanes")}{(source is null ? "" : "_from_" + fx.Name)}", ReduceThreads, vk.Controls);
         V px = b.Arg(0), ps = b.Arg(1), pos = b.Arg(2);
         V steps = b.Arg(3, K.U32), cap = b.Arg(4, K.U32), d = b.Arg(5, K.U32), max = b.Arg(6, k);
         var tid = b.LocalIdX;
         var row = b.GroupX;
         var amax = b.Local(b.C(k, 0));
-        b.For(tid, d, b.U(ReduceThreads), e => amax.V = b.Max(amax.V, b.Abs(Codec.UnpackAt(b, f, px, row * d + e, lane))));
+        b.For(tid, d, b.U(ReduceThreads), e => amax.V = b.Max(amax.V, b.Abs(Codec.UnpackAt(b, fx, px, row * d + e, lane))));
         var top = GroupReduce(b, b.Shared(k, ReduceThreads), tid, amax.V, (x, y) => b.Max(x, y), ReduceThreads);
         var scale = top / max;
         b.If(tid == 0, () =>
@@ -153,10 +154,11 @@ internal static partial class VkKernels
     /// float32 first where Fmt.ConvertPlan says); scaled: x / scale by the row's stored scale (f at head·cap + row; 0 where
     /// the scale is 0), an integer code rounded to the nearest (ties to even), held to [min, max]. Slots: x, cache, scales,
     /// pos, rows (heads·steps), steps, cap, d, wpr, min, max (lane).</summary>
-    public static SpvKernel CacheWrite(Vulkan vk, Fmt f, Fmt fc, Lane lane, bool scaled)
+    public static SpvKernel CacheWrite(Vulkan vk, Fmt f, Fmt fc, Lane lane, bool scaled, Fmt? source = null)
     {
         var k = Kinds.Of(lane);
-        var b = new Spv($"cache_write_{f.Name}_{fc.Name}_{lane.Name}{(scaled ? "_scaled" : "")}", Threads, vk.Controls);
+        var fx = source ?? f;                                                   // x's format: the type's, or a composition's lane storage
+        var b = new Spv($"cache_write_{f.Name}_{fc.Name}_{lane.Name}{(scaled ? "_scaled" : "")}{(source is null ? "" : "_from_" + fx.Name)}", Threads, vk.Controls);
         V px = b.Arg(0), pc = b.Arg(1), ps = b.Arg(2), pos = b.Arg(3);
         V rows = b.Arg(4, K.U32), steps = b.Arg(5, K.U32), cap = b.Arg(6, K.U32), d = b.Arg(7, K.U32), wpr = b.Arg(8, K.U32), min = b.Arg(9, k), max = b.Arg(10, k);
         bool toOdd = Fmt.ConvertPlan(LaneFormat(lane), fc).ToOdd;
@@ -174,7 +176,7 @@ internal static partial class VkKernels
                 var first = row * d + wc * (double)fc.Per;
                 for (int i = 0; i < fc.Per; i++)
                 {
-                    var v = Codec.UnpackAt(b, f, px, first + i, lane);
+                    var v = Codec.UnpackAt(b, fx, px, first + i, lane);
                     if (scale is { } s)
                     {
                         var q = b.Select(s > 0.0, v / s, b.C(k, 0));

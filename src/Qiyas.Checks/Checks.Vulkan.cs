@@ -28,6 +28,7 @@ internal static partial class Checks
         ok &= Attentions(ops, "vulkan");
         ok &= AttentionOptions(ops, "vulkan");
         ok &= CacheCheck(ops, "vulkan");
+        ok &= HeadsCheck(ops, "vulkan");
         ok &= Convs(ops, "vulkan");
         ok &= Recurrents(ops, "vulkan");
         ok &= BlockFormats(ops);

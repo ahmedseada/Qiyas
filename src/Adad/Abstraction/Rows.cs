@@ -67,7 +67,19 @@ public readonly record struct GroupShape(int Outer, int Groups, int Inner, int C
 /// RMS-normalized: x·(gain + Offset) / √(mean x² + Eps).</summary>
 public sealed record RopeArgs(int Rows, int Cols, int Heads, int Steps, int Half, bool Interleaved, bool Inverse = false, double Eps = 1e-6, double Offset = 0)
 {
+    /// <summary>The output's rows a head at a time, the layout attention reads: row (b·Steps + s)·Heads + h of x is row
+    /// (b·Heads + h)·Steps + s of y (false: y's rows are x's).</summary>
+    public bool HeadsFirst { get; init; }
+
     public int Position(ReadOnlySpan<int> positions, int row) => positions[row / Heads % Steps];
+
+    /// <summary>The row of y that row <paramref name="row"/> of x goes to.</summary>
+    public int OutRow(int row)
+    {
+        if (!HeadsFirst) return row;
+        int per = Heads * Steps;
+        return (row / per * Heads + row % Heads) * Steps + row % per / Heads;
+    }
 
     /// <summary>The columns of pair p.</summary>
     public (int Low, int High) Pair(int p) => Interleaved ? (2 * p, 2 * p + 1) : (p, p + Half);
@@ -346,7 +358,7 @@ public static class RowOps
 
     // ---------------------------------------------------------------- rotary embedding by tables (RopeArgs)
 
-    /// <summary>The table rotary embedding in float64 (IRows.Rope): y; returns each row's error scale.</summary>
+    /// <summary>The table rotary embedding in float64 (IRows.Rope): y; returns the error scale of each row of y.</summary>
     public static double[] RopeReference(double[] x, double[]? gain, double[] cos, double[] sin, int[] positions, RopeArgs a, double[] y)
     {
         int n = a.Cols;
@@ -359,16 +371,17 @@ public static class RowOps
             if (gain is not null) { double ss = 0; foreach (var t in row) ss += t * t; rstd = 1 / Math.Sqrt(ss / n + a.Eps); }
             for (int i = 0; i < n; i++) v[i] = gain is null ? row[i] : row[i] * rstd * (gain[i] + a.Offset);
             int pos = a.Position(positions, r);
-            for (int i = 0; i < n; i++) y[r * n + i] = v[i];
+            int o = a.OutRow(r);
+            for (int i = 0; i < n; i++) y[o * n + i] = v[i];
             for (int p = 0; p < a.Half; p++)
             {
                 var (i, j) = a.Pair(p);
                 double c = cos[pos * a.Half + p], sn = a.Inverse ? -sin[pos * a.Half + p] : sin[pos * a.Half + p];
-                y[r * n + i] = v[i] * c - v[j] * sn;
-                y[r * n + j] = v[i] * sn + v[j] * c;
+                y[o * n + i] = v[i] * c - v[j] * sn;
+                y[o * n + j] = v[i] * sn + v[j] * c;
             }
 
-            scale[r] = 2 * MaxAbs(v) * (gain is null ? 1 : Math.Sqrt(n));
+            scale[o] = 2 * MaxAbs(v) * (gain is null ? 1 : Math.Sqrt(n));
         }
 
         return scale;

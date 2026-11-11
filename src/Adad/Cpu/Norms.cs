@@ -255,22 +255,53 @@ internal sealed partial class Kernels
         public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
         {
             Lane = TL.Name;
-            if (a.Rows == 0 || a.Cols == 0) return;
-            TLane[]? gl = null;
-            if (gain is not null)
-            {
-                gl = new TLane[a.Cols];
-                TN.Load(gain, 0, gl);
-                TLane off = TL.From(a.Offset);
-                for (int i = 0; i < a.Cols; i++) gl[i] = TL.Add(gl[i], off);                // the gain g + offset, as each value scales by it
-            }
-
-            Team.For(a.Rows, RowChunk<TN>(a.Rows, a.Cols, a.Rows / (Threads * 4)), (long)a.Rows * a.Cols * 3, new RopeBody<TN, TLane, TL>(a, x, gl, cos, sin, positions, y));
+            RopeRows<TN, TLane, TL>(a, x, gain, cos, sin, positions, y, false);
         }
     }
 
+    /// <summary>The rows of IRows.Rope into y: as TN, or (lanes) the lane's values as they are, in the lane's own storage (a
+    /// composition's intermediate: no rounding). Rows a head at a time (a.HeadsFirst) land out of x's order, so a type whose
+    /// values share a storage unit takes them through the lane's storage and is stored once, whole.</summary>
+    internal static void RopeRows<TN, TLane, TL>(RopeArgs a, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] y, bool lanes)
+        where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    {
+        if (a.Rows == 0 || a.Cols == 0) return;
+        TLane[]? gl = null;
+        if (gain is not null)
+        {
+            gl = new TLane[a.Cols];
+            TN.Load(gain, 0, gl);
+            TLane off = TL.From(a.Offset);
+            for (int i = 0; i < a.Cols; i++) gl[i] = TL.Add(gl[i], off);                // the gain g + offset, as each value scales by it
+        }
+
+        long work = (long)a.Rows * a.Cols * 3;
+        if (lanes)
+        {
+            Team.For(a.Rows, Math.Max(1, a.Rows / (Threads * 4)), work, new RopeBody<TN, TLane, TL>(a, x, gl, cos, sin, positions, y, true));
+            return;
+        }
+
+        if (a.HeadsFirst && TN.Granularity > 1)
+        {
+            // Every value of the pooled buffer below the count is written before it is read.
+            var target = ArrayPool<byte>.Shared.Rent(a.Rows * a.Cols * System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>());
+            try
+            {
+                Team.For(a.Rows, Math.Max(1, a.Rows / (Threads * 4)), work, new RopeBody<TN, TLane, TL>(a, x, gl, cos, sin, positions, target, true));
+                StoreLanes<TN, TLane>(target, y, 0, (long)a.Rows * a.Cols);
+            }
+            finally { ArrayPool<byte>.Shared.Return(target); }
+
+            return;
+        }
+
+        Team.For(a.Rows, RowChunk<TN>(a.Rows, a.Cols, a.Rows / (Threads * 4)), work, new RopeBody<TN, TLane, TL>(a, x, gl, cos, sin, positions, y, false));
+    }
+
     // v = x, or x·rstd·(g + offset); y = v with pair (i, j) rotated: y_i = fma(−v_j, s, v_i·c), y_j = fma(v_i, s, v_j·c) (s = −sin inverse).
-    private readonly struct RopeBody<TN, TLane, TL>(RopeArgs a, byte[] x, TLane[]? gl, byte[] cos, byte[] sin, int[] positions, byte[] y) : Team.IBody
+    // Row r of x into row a.OutRow(r) of y: stored as TN, or (lanes) the lane's values as they are.
+    private readonly struct RopeBody<TN, TLane, TL>(RopeArgs a, byte[] x, TLane[]? gl, byte[] cos, byte[] sin, int[] positions, byte[] y, bool lanes) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         public void Run(int first, int last)
@@ -308,7 +339,9 @@ internal sealed partial class Kernels
                         ys[j] = TL.Fma(xs[i], sn, TL.Mul(xs[j], c));
                     }
 
-                    TN.Store(ys, y, r * n);
+                    int o = a.OutRow(r);
+                    if (lanes) ys.CopyTo(MemoryMarshal.Cast<byte, TLane>(y.AsSpan()).Slice(o * n, n));
+                    else TN.Store(ys, y, o * n);
                 }
             }
             finally

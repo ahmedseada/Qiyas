@@ -25,6 +25,14 @@ public sealed record CacheView(int Heads, int Capacity, int D)
         if (Values > int.MaxValue) throw new ArgumentException("cache: past 2^31 values");
     }
 
+    /// <summary>A write of a layer's projection rows (ICache.CacheWriteRope): a.Rows = Heads·a.Steps rows of D values, a step
+    /// at a time, the cache's heads the batches' heads (Heads a whole multiple of a.Heads).</summary>
+    public void ValidateRope(RopeArgs a)
+    {
+        if (a.Cols != D || a.Heads <= 0 || a.Steps < 0 || Heads % a.Heads != 0 || a.Rows != (long)Heads * a.Steps || 2 * a.Half > a.Cols || a.Inverse)
+            throw new ArgumentException($"cache: {a.Rows} projection rows of {a.Cols} ({a.Steps} steps of {a.Heads} heads, half {a.Half}{(a.Inverse ? ", inverse" : "")}) into {Heads} heads of rows of {D}");
+    }
+
     /// <summary>The rows of each head a write of steps rows at the position fills: [First, End) = [max(position, 0),
     /// min(position + steps, Capacity)) (empty: End ≤ First).</summary>
     public (int First, int End) Written(int position, int steps) => (Math.Max(position, 0), (int)Math.Min((long)position + steps, Capacity));

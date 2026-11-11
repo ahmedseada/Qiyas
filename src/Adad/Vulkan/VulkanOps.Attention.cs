@@ -85,6 +85,8 @@ public sealed partial class VulkanOps
     /// shape and type (once); the composition past the fused kernel's head dimension. Returns the lane's name.</summary>
     public string Attention<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IFloatAdad<TN>
     {
+        // Tensors a step at a time: every form by AttentionLayout's strided copies.
+        if (a.StepsFirst) return AttentionLayout.Forward<ulong, ulong, TN>(this, a, q, k, v, o, static (d, h, q, k, v, o) => d.Attention<TN>(h, q, k, v, o));
         var f = AttentionFormat<TN>("attention");
         a = a.Grouped();
         if (a.D > VkKernels.FusedHeadMax || !RowsFit(RowLane(f), a.D) || a.Softcap > 0) return AttentionComposed<TN>(a, q, k, v, o);
@@ -103,6 +105,7 @@ public sealed partial class VulkanOps
     /// <summary>O for rows of queries by the fused rows (no scores in memory); d ≤ 128. Returns the lane's name.</summary>
     public string AttentionRows<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IFloatAdad<TN>
     {
+        if (a.StepsFirst) return AttentionLayout.Forward<ulong, ulong, TN>(this, a, q, k, v, o, static (d, h, q, k, v, o) => d.AttentionRows<TN>(h, q, k, v, o));
         a = a.Grouped();
         if (a.Softcap > 0) return AttentionComposed<TN>(a, q, k, v, o);
         var f = AttentionFormat<TN>("attention rows");
@@ -131,11 +134,13 @@ public sealed partial class VulkanOps
 
     /// <summary>O for rows of queries by the composition: per head S = Q·Kᵀ (lane storage; capped when there is a cap), the
     /// scaled masked softmax, O = P·V, the products reading Q, K, V where they are stored. Returns the lane's name.</summary>
-    public string AttentionComposed<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IFloatAdad<TN> => Composed<TN>(a, q, k, v, o, 0);
+    public string AttentionComposed<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IFloatAdad<TN> =>
+        a.StepsFirst ? AttentionLayout.Forward<ulong, ulong, TN>(this, a, q, k, v, o, static (d, h, q, k, v, o) => d.AttentionComposed<TN>(h, q, k, v, o)) : Composed<TN>(a, q, k, v, o, 0);
 
     /// <summary>O and each query's log-sum-exp of its scores (heads × Lq, as the type): the composition, the softmax's row
     /// values (lane storage) stored as the type after. Returns the lane's name.</summary>
-    public string AttentionLse<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o, ulong lse) where TN : struct, IFloatAdad<TN> => Composed<TN>(a, q, k, v, o, lse);
+    public string AttentionLse<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o, ulong lse) where TN : struct, IFloatAdad<TN> =>
+        a.StepsFirst ? AttentionLayout.Forward<ulong, ulong, TN>(this, a, q, k, v, o, (d, h, q, k, v, o) => d.AttentionLse<TN>(h, q, k, v, o, lse)) : Composed<TN>(a, q, k, v, o, lse);
 
     private string Composed<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o, ulong lse) where TN : struct, IFloatAdad<TN>
     {
@@ -210,6 +215,7 @@ public sealed partial class VulkanOps
     /// <summary>O for a few queries against a long cache, a workgroup per query, K and V read once; returns the lane's name.</summary>
     public string AttentionDecode<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong o) where TN : struct, IFloatAdad<TN>
     {
+        if (a.StepsFirst) return AttentionLayout.Forward<ulong, ulong, TN>(this, a, q, k, v, o, static (d, h, q, k, v, o) => d.AttentionDecode<TN>(h, q, k, v, o));
         a = a.Grouped();
         if (a.Softcap > 0) return AttentionComposed<TN>(a, q, k, v, o);
         var f = AttentionFormat<TN>("attention decode");
@@ -240,6 +246,7 @@ public sealed partial class VulkanOps
     /// returns the lane's name.</summary>
     public string AttentionBackward<TN>(AttentionArgs a, ulong q, ulong k, ulong v, ulong dO, ulong dq, ulong dk, ulong dv) where TN : struct, IFloatAdad<TN>
     {
+        if (a.StepsFirst) return AttentionLayout.Backward<ulong, ulong, TN>(this, a, q, k, v, dO, dq, dk, dv);
         var f = AttentionFormat<TN>("attention backward");
         var lane = RowLane(f);
         a = a.Grouped();

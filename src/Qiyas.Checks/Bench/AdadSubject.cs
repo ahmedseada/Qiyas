@@ -437,6 +437,60 @@ public sealed class AdadSubject : IBenchSubject
         public byte[] O => o;
     }
 
+    public IBenchRun? AttentionStepsFirst(Device device, string type, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new AttentionVisitor(device, a, q, k, v, o, false, null, null, null)) : null;
+
+    public IBenchRun? Rope(Device device, string type, RopeArgs a, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] y) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new RopeVisitor(device, a, x, gain, cos, sin, positions, y)) : null;
+
+    private sealed class RopeVisitor(Device device, RopeArgs a, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] y) : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, RopeVisitor>(device, this);
+
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        {
+            int pad = s.Slack;
+            TB dx = s.In(x, pad), dc = s.In(cos, pad), ds = s.In(sin, pad), dy = s.Out(y, pad);
+            TB? dg = s.InOrNone(gain, pad);
+            TI at = s.Index(positions);
+            return s.Run(() => s.D.Rope<TN>(a, dx, dg, dc, ds, at, dy));
+        }
+    }
+
+    public IBenchRun? CacheWriteRope(Device device, string type, string cacheType, CacheView c, RopeArgs a, int position, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] cache, byte[]? scales) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new CacheRopeVisitor(device, cacheType, c, a, position, x, gain, cos, sin, positions, cache, scales)) : null;
+
+    private sealed class CacheRopeVisitor(Device device, string cacheType, CacheView c, RopeArgs a, int position, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] cache, byte[]? scales)
+        : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, CacheRopeVisitor>(device, this);
+
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => Registry.With(cacheType, new Typed<TN, TB, TI>(this, s));
+
+        private sealed class Typed<TN, TB, TI>(CacheRopeVisitor r, Staged<TB, TI> s) : ITypeVisitor<IBenchRun> where TN : struct, IFloatAdad<TN>
+        {
+            public IBenchRun Visit<TC>() where TC : struct, IAdad<TC, float>
+            {
+                int pad = s.Slack;
+                TB dx = s.In(r.X, pad), dc = s.In(r.Cos, pad), ds = s.In(r.Sin, pad), dst = s.InOut(r.Cache, pad);
+                TB? dg = s.InOrNone(r.Gain, pad), sc = s.InOutOrNone(r.Scales, pad);
+                TI at = s.Index([r.Position]), steps = s.Index(r.Positions);
+                return s.Run(() => s.D.CacheWriteRope<TN, TC>(r.C, r.A, at, dx, dg, dc, ds, steps, dst, sc));
+            }
+        }
+
+        public CacheView C => c;
+        public RopeArgs A => a;
+        public int Position => position;
+        public byte[] X => x;
+        public byte[]? Gain => gain;
+        public byte[] Cos => cos;
+        public byte[] Sin => sin;
+        public int[] Positions => positions;
+        public byte[] Cache => cache;
+        public byte[]? Scales => scales;
+    }
+
     public IBenchRun? DecoderMask(Device device, string type, int rows, int capacity, int window, int position, byte[] mask) =>
         Registry.IsFloat(type) ? Registry.WithFloat(type, new DecoderMaskVisitor(device, rows, capacity, window, position, mask)) : null;
 

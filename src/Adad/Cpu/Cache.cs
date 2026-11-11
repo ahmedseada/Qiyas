@@ -32,10 +32,12 @@ internal sealed partial class Kernels
     {
         c.Validate(Fmt.Of<TC>());
         if (steps < 0 || (long)c.Heads * steps * c.D > int.MaxValue) throw new ArgumentException($"cache: a write of {steps} rows a head");
-        return Mixed<TN, CacheWriteCall<TC>>(new CacheWriteCall<TC>(c, steps, position[0], source, cache, scales));
+        return Mixed<TN, CacheWriteCall<TC>>(new CacheWriteCall<TC>(c, steps, position[0], source, cache, scales, false));
     }
 
-    private readonly struct CacheWriteCall<TC>(CacheView c, int steps, int position, byte[] source, byte[] cache, byte[]? scales) : IMixed where TC : struct, IAdad<TC>
+    // lanes: the source's rows are the lane's values in its own storage (a composition's rows: CacheWriteRope), the scales
+    // still TN's.
+    private readonly struct CacheWriteCall<TC>(CacheView c, int steps, int position, byte[] source, byte[] cache, byte[]? scales, bool lanes) : IMixed where TC : struct, IAdad<TC>
     {
         public string Run<TN, TS, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
         {
@@ -45,18 +47,25 @@ internal sealed partial class Kernels
             if (scales is not null)
             {
                 rowScales = new TLane[rows];
-                Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)rows * c.D * 2, new CacheScaleBody<TN, TLane, TL>(c.D, source, TL.From(TC.Max), rowScales));
+                Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)rows * c.D * 2, new CacheScaleBody<TN, TLane, TL>(c.D, source, lanes, TL.From(TC.Max), rowScales));
                 StoreRowScales<TN, TLane>(c, steps, position, rowScales, scales);
             }
 
-            var write = new CacheWriteVisitor<TN, TS, TLane, TL>(c, steps, position, source, cache, rowScales);
+            var write = new CacheWriteVisitor<TN, TS, TLane, TL>(c, steps, position, source, lanes, cache, rowScales);
             TC.Elementwise(ref write);
             return TL.Name;
         }
     }
 
     // Each source row's scale max |x| / max (max(hi, −lo) of its range with 0) in the lane.
-    private readonly struct CacheScaleBody<TN, TLane, TL>(int d, byte[] source, TLane max, TLane[] rowScales) : Team.IBody
+    // Row r of a write's source into the lane: TN's values, or (lanes) the lane's own.
+    private static void SourceRow<TN, TLane>(byte[] source, bool lanes, int r, Span<TLane> x) where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
+    {
+        if (lanes) MemoryMarshal.Cast<byte, TLane>(source.AsSpan()).Slice(r * x.Length, x.Length).CopyTo(x);
+        else TN.Load(source, r * x.Length, x);
+    }
+
+    private readonly struct CacheScaleBody<TN, TLane, TL>(int d, byte[] source, bool laneRows, TLane max, TLane[] rowScales) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         public void Run(int first, int last)
@@ -68,7 +77,7 @@ internal sealed partial class Kernels
                 var x = v.AsSpan(0, d);
                 for (int r = first; r < last; r++)
                 {
-                    TN.Load(source, r * d, x);
+                    SourceRow<TN, TLane>(source, laneRows, r, x);
                     Vector<TLane> vlo = Vector<TLane>.Zero, vhi = Vector<TLane>.Zero;
                     TLane lo = TL.Zero, hi = TL.Zero;
                     int i = 0;
@@ -121,20 +130,20 @@ internal sealed partial class Kernels
         for (int h = 0; h < c.Heads; h++) TN.Load(scales, h * cap + w0, rowScales.AsSpan(h * steps + t0, run));
     }
 
-    private readonly struct CacheWriteVisitor<TN, TS, TLane, TL>(CacheView c, int steps, int position, byte[] source, byte[] cache, TLane[]? rowScales) : ILaneVisitor
+    private readonly struct CacheWriteVisitor<TN, TS, TLane, TL>(CacheView c, int steps, int position, byte[] source, bool lanes, byte[] cache, TLane[]? rowScales) : ILaneVisitor
         where TN : struct, IAdad<TN, TLane> where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         public void Run<TW, TLW, TLWL>() where TW : struct, IAdad<TW, TLW> where TLW : unmanaged where TLWL : struct, ILane<TLWL, TLW>
         {
             int rows = c.Heads * steps;
             bool toOdd = Fmt.ConvertPlan(Fmt.Of<TS>(), Fmt.Of<TW>()).ToOdd;
-            Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)rows * c.D * 4, new CacheWriteBody<TN, TW, TLW, TLane, TL>(c, steps, position, source, cache, rowScales, toOdd));
+            Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)rows * c.D * 4, new CacheWriteBody<TN, TW, TLW, TLane, TL>(c, steps, position, source, lanes, cache, rowScales, toOdd));
         }
     }
 
     // Source rows [first, last) (row r: head r / steps, step r % steps), each into its cache row (whole 32-bit words of TW:
     // no stored word is two tasks'); a scaled cache's codes by the row's scale as stored.
-    private readonly struct CacheWriteBody<TN, TW, TLW, TLane, TL>(CacheView c, int steps, int position, byte[] source, byte[] cache, TLane[]? rowScales, bool toOdd) : Team.IBody
+    private readonly struct CacheWriteBody<TN, TW, TLW, TLane, TL>(CacheView c, int steps, int position, byte[] source, bool lanes, byte[] cache, TLane[]? rowScales, bool toOdd) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TW : struct, IAdad<TW, TLW> where TLW : unmanaged where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         public void Run(int first, int last)
@@ -153,7 +162,7 @@ internal sealed partial class Kernels
                     long at = (long)position + r % steps;
                     if (at < 0 || at >= c.Capacity) continue;
                     int row = (int)((long)(r / steps) * c.Capacity + at);
-                    TN.Load(source, r * d, x);
+                    SourceRow<TN, TLane>(source, lanes, r, x);
                     if (rowScales is not null)
                     {
                         TLane s = rowScales[r];
@@ -186,10 +195,40 @@ internal sealed partial class Kernels
         }
     }
 
+    /// <summary>A layer's projection rows, normalized and rotated in the lane, into the cache at the position
+    /// (ICache.CacheWriteRope): the rows a head at a time in the lane's own storage (IRows.Rope's values, not rounded), then
+    /// CacheWrite from them. Returns the lane's name.</summary>
+    public static string CacheWriteRope<TN, TC>(CacheView c, RopeArgs a, int[] position, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] cache, byte[]? scales)
+        where TN : struct, IFloatAdad<TN> where TC : struct, IAdad<TC>
+    {
+        c.Validate(Fmt.Of<TC>());
+        c.ValidateRope(a);
+        return Mixed<TN, CacheRopeCall<TC>>(new CacheRopeCall<TC>(c, a with { HeadsFirst = true }, position, x, gain, cos, sin, positions, cache, scales));
+    }
+
+    private readonly struct CacheRopeCall<TC>(CacheView c, RopeArgs a, int[] position, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] cache, byte[]? scales) : IMixed
+        where TC : struct, IAdad<TC>
+    {
+        public string Run<TN, TS, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+        {
+            if (a.Rows == 0 || a.Cols == 0) return TL.Name;
+            // The rows in the lane's own storage, a pooled buffer (every value written before the write reads it).
+            var rows = ArrayPool<byte>.Shared.Rent(a.Rows * a.Cols * System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>());
+            try
+            {
+                RopeRows<TN, TLane, TL>(a, x, gain, cos, sin, positions, rows, true);
+                return new CacheWriteCall<TC>(c, a.Steps, position[0], rows, cache, scales, true).Run<TN, TS, TLane, TL>();
+            }
+            finally { ArrayPool<byte>.Shared.Return(rows); }
+        }
+    }
+
     /// <summary>O for the queries at the position against the caches (ICache.AttentionCached); returns the lane's name.</summary>
     public static string AttentionCached<TN, TC>(AttentionArgs a, int[] position, byte[] q, byte[] k, byte[]? kScales, byte[] v, byte[]? vScales, byte[] o)
         where TN : struct, IFloatAdad<TN> where TC : struct, IAdad<TC>
     {
+        if (a.StepsFirst)
+            return StepsFirstQueries<TN>(a, q, o, (h, qh, oh) => AttentionCached<TN, TC>(h, position, qh, k, kScales, v, vScales, oh));
         CacheRule.Validate(a);
         new CacheView(a.KvHeadCount, a.Lk, a.D).Validate(Fmt.Of<TC>());
         return Mixed<TN, CachedCall<TC>>(new CachedCall<TC>(CacheRule.AtPosition(a, position[0]), q, k, kScales, v, vScales, o));
