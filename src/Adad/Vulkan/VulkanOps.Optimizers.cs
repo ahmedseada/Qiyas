@@ -18,13 +18,21 @@ public sealed partial class VulkanOps
     }
 
     // The step; factor: where the gradients' scale is (a lane value), 0 for none.
-    private string Step(Fmt f, OptimizerArgs a, ulong p, ulong g, ulong m, ulong v, int n, ulong factor)
+    // words: 0, or the words of a step table's tensors together (p is then the table and n its rows: VkKernels.Optimizer's table).
+    private string Step(Fmt f, OptimizerArgs a, ulong p, ulong g, ulong m, ulong v, int n, ulong factor, long words = 0)
     {
         var lane = RowLane(f);
         if (n == 0) return lane.Name;
         double c1 = 1 - Math.Pow(a.B1, a.Step), c2 = 1 - Math.Pow(a.B2, a.Step);
         ulong S(double x) => Slot(lane, x);
         bool scaled = factor != 0;
+        if (words > 0)
+        {
+            var ft = vk.Cached($"optimizer:{a.Name}:{f.Name}:{scaled}:table", () => VkKernels.Optimizer(vk, f, lane, a.Name, scaled, table: true));
+            vk.Launch(ft, Groups(words, VkKernels.Threads), 1, p, g, m, v, Vulkan.U(n), S(a.Lr), S(a.B1), S(a.B2), S(1 - a.B1), S(1 - a.B2), S(1 / c1), S(1 / c2), S(a.Eps), S(a.Wd), S(a.Lr * a.Wd), factor);
+            return lane.Name;
+        }
+
         if (f.IsBlock)
         {
             ulong[] slots = [p, g, m, v, S(a.Lr), S(a.B1), S(a.B2), S(1 - a.B1), S(1 - a.B2), S(1 / c1), S(1 / c2), S(a.Eps), S(a.Wd), S(a.Lr * a.Wd)];
@@ -41,7 +49,10 @@ public sealed partial class VulkanOps
     /// <summary>A step across several tensors under one clipping (IOptimizers.OptimizerMany; CUDA's): every tensor's
     /// whole-sum pass of its gradients' squares into one buffer of float64 partials, the partials of all the tensors joined
     /// once in float64 and rounded once to the lane — one sum across the tensors — the factor from it by the map's
-    /// clip_factor in the lane, then each tensor's step reading the factor where it is. Returns the lane's name.</summary>
+    /// clip_factor in the lane, then each tensor's step reading the factor where it is. The passes and the steps of all
+    /// the tensors are a dispatch each: the kernels read their tensor from a table on the device (VkKernels.TableRow),
+    /// uploaded a call (a block format's steps: a tensor at a time, its encoder's blocks being one buffer's). Returns the
+    /// lane's name.</summary>
     public string OptimizerMany<TN>(OptimizerArgs a, ReadOnlySpan<OptimizerTensor<ulong>> tensors, ulong sumSquares) where TN : struct, IFloatAdad<TN>
     {
         a.Validate();
@@ -62,19 +73,23 @@ public sealed partial class VulkanOps
                 {
                     var lf = VkKernels.LaneFormat(Lane.F64);
                     var pass = lane.Wide
-                        ? vk.Cached($"reduce_rows:sum:True:{f.Name}:f64", () => VkKernels.ReduceRows(vk, f, Lane.F64, "sum", true))
-                        : vk.Cached($"reduce_rows:sum:True:{f.Name}:f32:kahan", () => VkKernels.ReduceRows(vk, f, Lane.F32, "sum", true, compensated: true));
+                        ? vk.Cached($"reduce_rows:sum:True:{f.Name}:f64:table", () => VkKernels.ReduceRows(vk, f, Lane.F64, "sum", true, table: true))
+                        : vk.Cached($"reduce_rows:sum:True:{f.Name}:f32:kahan:table", () => VkKernels.ReduceRows(vk, f, Lane.F32, "sum", true, compensated: true, table: true));
                     var join = vk.Cached($"reduce_rows:sum:False:{lf.Name}:f64", () => VkKernels.ReduceRows(vk, lf, Lane.F64, "sum", false));
                     ulong partials = Rent(blocks * 8), wide = lane.Wide ? sum : Rent(8);
+                    // The sum's table: a row a tensor with gradients (its first block, its values, its chunk, where they are).
+                    var rows = new List<ulong>();
                     long at = 0;
                     foreach (var t in tensors)
                     {
                         if (t.N == 0) continue;
-                        int tb = WholeBlocks(t.N);
-                        vk.Launch(pass, (uint)tb, 1, t.G, partials + (ulong)(at * 8), Vulkan.U(t.N), Vulkan.U(WholeChunk(t.N)));
-                        at += tb;
+                        rows.AddRange([(ulong)at, (ulong)t.N, (ulong)WholeChunk(t.N), t.G]);
+                        at += WholeBlocks(t.N);
                     }
 
+                    ulong sums = Rent(rows.Count * 8L);
+                    vk.Upload<ulong>(rows.ToArray(), sums);
+                    vk.Launch(pass, (uint)blocks, 1, sums, partials, Vulkan.U(rows.Count / VkKernels.SumRow), Vulkan.U(1));
                     vk.Launch(join, 1, 1, partials, wide, Vulkan.U((int)blocks), Vulkan.U(0));
                     if (!lane.Wide) Back(VkKernels.LaneFormat(Lane.F32), Lane.F64, wide, sum, 1);
                 }
@@ -87,7 +102,30 @@ public sealed partial class VulkanOps
                 }
             }
 
-            foreach (var t in tensors) Step(f, a, t.P, t.G, t.M, t.V, t.N, factor);
+            if (f.IsBlock)
+            {
+                foreach (var t in tensors) Step(f, a, t.P, t.G, t.M, t.V, t.N, factor);
+                return lane.Name;
+            }
+
+            // The step's table: a row a tensor with values (its first word, its values, where its p, g, m and v are).
+            var steps = new List<ulong>();
+            long words = 0;
+            foreach (var t in tensors)
+            {
+                if (t.N == 0) continue;
+                steps.AddRange([(ulong)words, (ulong)t.N, t.P, t.G, t.M, t.V]);
+                words += f.Words(t.N);
+            }
+
+            if (words > uint.MaxValue) throw new NotSupportedException($"vulkan: {words} words of {f.Name} across the tensors of an optimizer step exceed a dispatch's 2^32");
+            if (steps.Count == VkKernels.StepRow) Step(f, a, steps[2], steps[3], steps[4], steps[5], (int)steps[1], factor);      // one tensor: its own step, no table
+            else if (words > 0)
+            {
+                ulong table = Rent(steps.Count * 8L);
+                vk.Upload<ulong>(steps.ToArray(), table);
+                Step(f, a, table, 0, 0, 0, steps.Count / VkKernels.StepRow, factor, words);
+            }
         }
         finally { foreach (var d in rented) vk.Return(d); }
 

@@ -99,18 +99,32 @@ internal static partial class VkKernels
     /// <param name="compensated">A float sum's chunk pass in f32: each invocation's running sum compensated (Kahan), the
     /// invocations' sums joined in float64 and stored as f64 partials (or, <paramref name="storeF32"/>, joined as exact f32
     /// pairs and rounded once to f32: a row's sum).</param>
-    public static SpvKernel ReduceRows(Vulkan vk, Fmt f, Lane lane, string op, bool squares, bool compensated = false, bool storeF32 = false)
+    /// <param name="table">The chunk pass of several arrays in one dispatch: slot 0 is a table on the device (TableRow) of
+    /// `cols` rows — an array's first block, its values, its chunk, where it is — and the workgroup is the array's its
+    /// index falls in; the partials at dst in block order.</param>
+    public static SpvKernel ReduceRows(Vulkan vk, Fmt f, Lane lane, string op, bool squares, bool compensated = false, bool storeF32 = false, bool table = false)
     {
         if (storeF32 && !compensated) throw new ArgumentException("the f32 store is the compensated pass's");
         if (compensated && (lane.Name != "f32" || op != "sum")) throw new ArgumentException("the compensated pass is a float sum in the f32 lane");
+        if (table && storeF32) throw new ArgumentException("the table is the chunk pass's");
         var k = Kinds.Of(lane);
-        var b = new Spv($"reduce_rows_{op}{(squares ? "sq" : "")}_{f.Name}_{lane.Name}{(compensated ? "_kahan" : "")}{(storeF32 ? "_f32" : "")}", ReduceThreads, vk.Controls);
+        var b = new Spv($"reduce_rows_{op}{(squares ? "sq" : "")}_{f.Name}_{lane.Name}{(compensated ? "_kahan" : "")}{(storeF32 ? "_f32" : "")}{(table ? "_tab" : "")}", ReduceThreads, vk.Controls);
         var src = b.Arg(0);
         var dst = b.Arg(1);
         var cols = b.Arg(2, K.U32);
         var chunk = b.Arg(3, K.U32);
         var tid = b.LocalIdX;
         var row = b.GroupX;
+        if (table)
+        {
+            var (tr, local) = TableRow(b, src, cols, row, SumRow);
+            dst = dst + b.Load(K.U64, tr) * (double)(compensated ? 8 : lane.Size);
+            cols = b.Convert(b.Load(K.U64, b.At(tr, b.U(0), 8, 8)), K.U32);
+            chunk = b.Convert(b.Load(K.U64, b.At(tr, b.U(0), 8, 16)), K.U32);
+            src = b.Load(K.U64, b.At(tr, b.U(0), 8, 24));
+            row = local;
+        }
+
         var byChunk = chunk != 0;
         var cs = row * chunk;
         var start = b.Select(byChunk, cs, row * cols);

@@ -39,16 +39,38 @@ internal static partial class Ptx
     /// rounding lost by every add kept and taken back), the threads' sums joined in float64 and stored as f64 partials.</param>
     /// <param name="storeF32">With <paramref name="compensated"/>: the threads' sums joined as exact f32 pairs (no f64) and
     /// rounded once to the f32 lane (a row's sum, not a partial).</param>
-    public static string ReduceRows(Gpu gpu, Fmt f, Lane lane, string op, bool squares, out string entry, bool compensated = false, bool storeF32 = false)
+    /// <param name="table">The chunk pass of several arrays in one launch: p_x is a table on the device (Ptx.TableRow) of
+    /// p_cols rows — an array's first block, its values, its chunk, where it is — and the block is the array's its index
+    /// falls in; the partials at p_out in block order.</param>
+    /// <summary>A sum table's row: the array's first block, its values, its chunk, where it is.</summary>
+    public const int SumRow = 4;
+
+    public static string ReduceRows(Gpu gpu, Fmt f, Lane lane, string op, bool squares, out string entry, bool compensated = false, bool storeF32 = false, bool table = false)
     {
-        entry = $"reduce_rows_{op}{(squares ? "sq" : "")}_{f.Name}_{lane.Name}{(compensated ? "_kahan" : "")}{(storeF32 ? "_f32" : "")}";
+        entry = $"reduce_rows_{op}{(squares ? "sq" : "")}_{f.Name}_{lane.Name}{(compensated ? "_kahan" : "")}{(storeF32 ? "_f32" : "")}{(table ? "_tab" : "")}";
         if (storeF32 && !compensated) throw new ArgumentException("the f32 store is the compensated pass's");
+        if (table && storeF32) throw new ArgumentException("the table is the chunk pass's");
         if (compensated && (lane.Name != "f32" || op != "sum")) throw new ArgumentException("the compensated pass is a float sum in the f32 lane");
         var b = new PtxBuilder();
         string tid = b.R(), row = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {row}, %ctaid.x;");
         string src = Param64(b, "p_x"), dst = Param64(b, "p_out"), cols = Param32(b, "p_cols"), chunk = Param32(b, "p_chunk");
+        if (table)
+        {
+            var (tr, local) = TableRow(b, src, cols, row, SumRow);
+            string t = b.RD();
+            b.L($"ld.global.u64 {t}, [{tr}];");
+            b.L($"mul.lo.u64 {t}, {t}, {(compensated ? 8 : lane.Size)};");
+            b.L($"add.u64 {dst}, {dst}, {t};");
+            b.L($"ld.global.u64 {t}, [{tr}+8];");
+            b.L($"cvt.u32.u64 {cols}, {t};");
+            b.L($"ld.global.u64 {t}, [{tr}+16];");
+            b.L($"cvt.u32.u64 {chunk}, {t};");
+            b.L($"ld.global.u64 {src}, [{tr}+24];");
+            b.L($"mov.u32 {row}, {local};");
+        }
+
         string start = b.R(), count = b.R(), pChunk = b.P(), end = b.R();
         b.L($"setp.ne.u32 {pChunk}, {chunk}, 0;");
         b.L($"mul.lo.u32 {start}, {row}, {cols};");

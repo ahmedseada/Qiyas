@@ -4,15 +4,53 @@
 // The device's optimizer steps (Optimizers.cs): a thread per word of the parameters (its Per values), the gradients'
 // word alongside, the moments as lane values at the value's index; the parameters packed back into their word. Scaled:
 // every gradient times the lane value at p_gs as it is read (a clipping factor made on the device: GpuOps.Optimizers.cs).
+// Table: the step of several tensors in one launch — a thread's word falls in a row of a table on the device (TableRow:
+// the tensor's first word, its count, where its p, g, m and v are), and the thread steps that tensor's word.
 using Adad.Abstraction;
 
 namespace Adad.Cuda;
 
 internal static partial class Ptx
 {
-    public static string Optimizer(Gpu gpu, Fmt f, Lane lane, string name, out string entry, bool scaled = false)
+    /// <summary>The row of a table on the device an index falls in. The table: `count` rows of `width` 64-bit entries, the
+    /// first entry of each the first index of its row (ascending, row 0's 0). Returns the address of the last row whose
+    /// first index is at most `index` (the last row for an index past them all: the caller's own bound drops it) and the
+    /// index past that first, by halving: a few loads a thread, the same for every thread of a block.</summary>
+    internal static (string Row, string Local) TableRow(PtxBuilder b, string tab, string count, string index, int width)
     {
-        entry = $"optimizer_{name}_{f.Name}_{lane.Name}{(scaled ? "_gs" : "")}";
+        string lo = b.R(), hi = b.R(), mid = b.R(), gap = b.R(), done = b.P(), le = b.P(), addr = b.RD(), first = b.RD(), wide = b.RD();
+        b.L($"cvt.u64.u32 {wide}, {index};");
+        b.L($"mov.u32 {lo}, 0;");
+        b.L($"mov.u32 {hi}, {count};");
+        b.Label("TAB_LOOP");
+        b.L($"sub.u32 {gap}, {hi}, {lo};");
+        b.L($"setp.le.u32 {done}, {gap}, 1;");
+        b.L($"@{done} bra TAB_END;");
+        b.L($"add.u32 {mid}, {lo}, {hi};");
+        b.L($"shr.u32 {mid}, {mid}, 1;");
+        b.L($"mul.wide.u32 {addr}, {mid}, {width * 8};");
+        b.L($"add.u64 {addr}, {tab}, {addr};");
+        b.L($"ld.global.u64 {first}, [{addr}];");
+        b.L($"setp.le.u64 {le}, {first}, {wide};");
+        b.L($"selp.u32 {lo}, {mid}, {lo}, {le};");
+        b.L($"selp.u32 {hi}, {hi}, {mid}, {le};");
+        b.L("bra TAB_LOOP;");
+        b.Label("TAB_END");
+        string row = b.RD(), local = b.R();
+        b.L($"mul.wide.u32 {row}, {lo}, {width * 8};");
+        b.L($"add.u64 {row}, {tab}, {row};");
+        b.L($"ld.global.u64 {first}, [{row}];");
+        b.L($"sub.u64 {wide}, {wide}, {first};");
+        b.L($"cvt.u32.u64 {local}, {wide};");
+        return (row, local);
+    }
+
+    /// <summary>A step table's row: the tensor's first word, its values, where its p, g, m and v are.</summary>
+    public const int StepRow = 6;
+
+    public static string Optimizer(Gpu gpu, Fmt f, Lane lane, string name, out string entry, bool scaled = false, bool table = false)
+    {
+        entry = $"optimizer_{name}_{f.Name}_{lane.Name}{(scaled ? "_gs" : "")}{(table ? "_tab" : "")}";
         var b = new PtxBuilder();
         string tid = b.R(), bid = b.R(), word = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
@@ -21,6 +59,20 @@ internal static partial class Ptx
         string pp = Param64(b, "p_p"), pg = Param64(b, "p_g"), pm = Param64(b, "p_m"), pv = Param64(b, "p_v"), n = Param32(b, "p_n");
         var k = StepScalars.Load(b, lane);
         string? gs = scaled ? GradientScale(b, lane) : null;
+        if (table)
+        {
+            // p_p is the table and p_n its rows: the thread's tensor, and its word of it.
+            var (row, local) = TableRow(b, pp, n, word, StepRow);
+            string count = b.RD();
+            b.L($"ld.global.u64 {count}, [{row}+8];");
+            b.L($"cvt.u32.u64 {n}, {count};");
+            b.L($"ld.global.u64 {pg}, [{row}+24];");
+            b.L($"ld.global.u64 {pm}, [{row}+32];");
+            b.L($"ld.global.u64 {pv}, [{row}+40];");
+            b.L($"ld.global.u64 {pp}, [{row}+16];");
+            b.L($"mov.u32 {word}, {local};");
+        }
+
         string words = b.R(), pw = b.P();
         if (f.WordBits == 64) b.L($"mov.u32 {words}, {n};");
         else { b.L($"add.u32 {words}, {n}, {f.Per - 1};"); b.L($"div.u32 {words}, {words}, {f.Per};"); }
