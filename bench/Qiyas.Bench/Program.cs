@@ -138,7 +138,7 @@ internal sealed class Options
     public static readonly string[] Group7 = [.. OptimizerArgs.Names.Select(n => "optimizer:" + n)];
     public static readonly string[] Group6 = ["conv", "conv_bwd"];
     public static readonly string[] Group8 = ["lstm_step", "gru_step", "lstm_step_bwd", "gru_step_bwd", "lstm_seq", "lstm_seq_bwd", "gru_seq", "gru_seq_bwd"];
-    public static readonly string[] Group9 = ["topk_rows", "pick_rows", "sample_rows", "route", "route_wide", "cross_entropy", "ctc", "ctc_bwd"];
+    public static readonly string[] Group9 = ["topk_rows", "log_softmax_topk", "pick_rows", "sample_rows", "route", "route_wide", "cross_entropy", "ctc", "ctc_bwd"];
     public static readonly string[] Group10 = ["cache_write", "cache_write_scaled", "quantize_rows", "attention_cached", "attention_cached_scaled", "decoder_mask"];
     public static readonly string[] Group11 = ["rope_table", "rope_heads", "cache_write_rope", "attention_steps"];
     public List<string>? Subjects;
@@ -407,6 +407,16 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
                 var (want, _) = Routing.TopKReference(Registry.Values(type, x, rows * cols), rows, cols, k);
                 var indices = new int[rows * k];
                 Measure(device, name, type, $"{rows}x{cols} k{k}", want, (s, values) => s.TopK(device, type, x, rows, cols, k, values, indices), (int)Registry.Bytes(type, rows * k));
+                return;
+            }
+
+            case "log_softmax_topk":
+            {
+                if (!Registry.IsFloat(type)) return;
+                var x = Registry.Make(type, rows * cols, 95, -4, 4);
+                var (want, _) = Routing.LogSoftmaxTopKReference(Registry.Values(type, x, rows * cols), rows, cols, k);
+                var indices = new int[rows * k];
+                Measure(device, name, type, $"{rows}x{cols} k{k}", want, (s, values) => s.LogSoftmaxTopK(device, type, x, rows, cols, k, values, indices), (int)Registry.Bytes(type, rows * k));
                 return;
             }
 

@@ -25,6 +25,28 @@ public static class Routing
         return (values, indices);
     }
 
+    /// <summary>The top-k of each row as log-probabilities in float64 (IRouting.LogSoftmaxTopK): each value less its row's
+    /// log-sum-exp (−∞ and −1 past the row).</summary>
+    public static (double[] Values, int[] Indices) LogSoftmaxTopKReference(double[] x, int rows, int cols, int k)
+    {
+        var values = new double[rows * k];
+        var indices = new int[rows * k];
+        for (int r = 0; r < rows; r++)
+        {
+            double m = double.NegativeInfinity, sum = 0;
+            for (int c = 0; c < cols; c++) m = Math.Max(m, x[r * cols + c]);
+            for (int c = 0; c < cols; c++) sum += Math.Exp(x[r * cols + c] - m);
+            var order = Enumerable.Range(0, cols).OrderByDescending(c => x[r * cols + c]).ThenBy(c => c).Take(k).ToArray();
+            for (int i = 0; i < k; i++)
+            {
+                indices[r * k + i] = i < order.Length ? order[i] : -1;
+                values[r * k + i] = i < order.Length ? x[r * cols + order[i]] - m - Math.Log(sum) : double.NegativeInfinity;
+            }
+        }
+
+        return (values, indices);
+    }
+
     public static double[] PickReference(double[] x, int rows, int cols, int[] index)
     {
         var y = new double[rows];

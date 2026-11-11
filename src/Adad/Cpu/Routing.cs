@@ -87,6 +87,87 @@ internal sealed partial class Kernels
         }
     }
 
+    /// <summary>The top-k of each row as log-probabilities (IRouting.LogSoftmaxTopK): the row in the float lane, TopK's
+    /// selection, then each chosen value less the row's largest and less the log of the row's Σ exp(x − largest); stored as
+    /// the type once. Returns the lane's name.</summary>
+    public static string LogSoftmaxTopK<TN>(byte[] x, int rows, int cols, int k, byte[] values, int[] indices) where TN : struct, IFloatAdad<TN>
+    {
+        var v = new LogTopKVisitor(x, rows, cols, k, values, indices);
+        TN.Float(ref v);
+        return v.Lane;
+    }
+
+    private struct LogTopKVisitor(byte[] x, int rows, int cols, int k, byte[] values, int[] indices) : IFloatLaneVisitor
+    {
+        public string Lane = "";
+
+        public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+        {
+            Lane = TL.Name;
+            if (rows == 0 || k == 0) return;
+            // A block format's values as the lane's, encoded once after (a row's k values would re-encode their block row by row).
+            bool lanes = TN.Granularity > 8;
+            var output = lanes ? ArrayPool<byte>.Shared.Rent(rows * k * Unsafe.SizeOf<TLane>()) : values;
+            try
+            {
+                Team.For(rows, Kernels.RowChunk<TN>(rows, k, rows / (Threads * 4)), (long)rows * cols * 6, new LogTopKBody<TN, TLane, TL>(x, cols, k, output, indices, lanes));
+                if (lanes) StoreLanes<TN, TLane>(output, values, 0, (long)rows * k);
+            }
+            finally
+            {
+                if (lanes) ArrayPool<byte>.Shared.Return(output);
+            }
+        }
+    }
+
+    private readonly struct LogTopKBody<TN, TLane, TL>(byte[] x, int cols, int k, byte[] values, int[] indices, bool lanes) : Team.IBody
+        where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    {
+        public void Run(int first, int last)
+        {
+            var pool = ArrayPool<TLane>.Shared;
+            var row = pool.Rent(Math.Max(1, cols));
+            var best = pool.Rent(k);
+            var bestAt = ArrayPool<int>.Shared.Rent(k);
+            try
+            {
+                for (int r = first; r < last; r++)
+                {
+                    var xs = row.AsSpan(0, cols);
+                    TN.Load(x, r * cols, xs);
+                    // TopK's pass: the k largest in order, an equal value after the earlier ones.
+                    int taken = 0;
+                    for (int c = 0; c < cols; c++)
+                    {
+                        TLane v = xs[c];
+                        if (taken == k && Widths.Compare(v, best[k - 1]) <= 0) continue;
+                        int j = taken < k ? taken++ : k - 1;
+                        while (j > 0 && Widths.Compare(v, best[j - 1]) > 0) { best[j] = best[j - 1]; bestAt[j] = bestAt[j - 1]; j--; }
+                        best[j] = v; bestAt[j] = c;
+                    }
+
+                    // The row's largest (the first chosen) and the log of Σ exp(x − largest) (the row is the sum's scratch after
+                    // the selection).
+                    if (taken > 0)
+                    {
+                        TLane m = best[0];
+                        TLane logSum = TL.Log(new System.Numerics.Vector<TLane>(RowMath<TLane, TL>.ExpSum(xs, m, xs)))[0];
+                        for (int i = 0; i < taken; i++) best[i] = TL.Sub(TL.Sub(best[i], m), logSum);
+                    }
+
+                    for (int i = taken; i < k; i++) { best[i] = lanes ? TL.From(TN.Min) : TL.NegativeInfinity; bestAt[i] = -1; }
+                    if (lanes) best.AsSpan(0, k).CopyTo(MemoryMarshal.Cast<byte, TLane>(values.AsSpan()).Slice(r * k, k));
+                    else TN.Store(best.AsSpan(0, k), values, r * k);
+                    Array.Copy(bestAt, 0, indices, r * k, k);
+                }
+            }
+            finally
+            {
+                pool.Return(row); pool.Return(best); ArrayPool<int>.Shared.Return(bestAt);
+            }
+        }
+    }
+
     /// <summary>out[r] = x[r][index[r]], stored as the type.</summary>
     public static string Pick<TN>(byte[] x, int rows, int cols, int[] index, byte[] output) where TN : struct, IAdad<TN>
     {

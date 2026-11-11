@@ -234,6 +234,8 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
 
     string IRouting<byte[], int[]>.TopK<TN>(byte[] x, int rows, int cols, int k, byte[] values, int[] indices) => TopK<TN>(x, rows, cols, k, values, indices);
 
+    string IRouting<byte[], int[]>.LogSoftmaxTopK<TN>(byte[] x, int rows, int cols, int k, byte[] values, int[] indices) => LogSoftmaxTopK<TN>(x, rows, cols, k, values, indices);
+
     string IRouting<byte[], int[]>.Pick<TN>(byte[] x, int rows, int cols, int[] index, byte[] output) => Pick<TN>(x, rows, cols, index, output);
 
     string IRouting<byte[], int[]>.Sample<TN>(byte[] x, int rows, int cols, byte[] u, int[] picks) => Sample<TN>(x, rows, cols, u, picks);

@@ -29,6 +29,35 @@ public sealed partial class GpuOps
         return lane.Name;
     }
 
+    /// <summary>The top-k of each row as log-probabilities (IRouting.LogSoftmaxTopK): TopK's indices, then Ptx.LogProbRows
+    /// (the row's largest the first chosen, Σ exp(x − largest) by the block's reduction, a thread a chosen column storing
+    /// (x − m) − log Σ as a lane value); stored as the type once after. Returns the lane's name.</summary>
+    public string LogSoftmaxTopK<TN>(ulong x, int rows, int cols, int k, ulong values, ulong indices) where TN : struct, IFloatAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        var lane = RowLane(f);
+        if (rows == 0 || k == 0) return lane.Name;
+        if (k > 256) throw new NotSupportedException($"top-k: k = {k} exceeds the kernel's passes (256); a partial sort is the step");
+        // TopK's indices (its kernel alone: the values it leaves in `values` for a type of whole values are replaced below).
+        var top = gpu.Cached($"topk:{f.Name}", (out string e) => Ptx.TopKRows(gpu, f, f.IsBlock ? Lane.F32 : f.Natural, out e));
+        Gpu.Launch(top, (uint)rows, 1, 256, 1, 0, x, values, indices, Gpu.U(cols), Gpu.U(k));
+        bool own = f.Is("float32") || f.Is("float64");
+        ulong lanes = own ? values : gpu.Rent(Math.Max(16, (long)rows * k * lane.Size));
+        try
+        {
+            var fn = gpu.Cached($"log_probs:{f.Name}", (out string e) => Ptx.LogProbRows(gpu, f, lane, out e));
+            double none = f.IsBlock ? TN.Min : double.NegativeInfinity;                // past the row
+            Gpu.Launch(fn, (uint)rows, 1, Ptx.ReduceThreads, 1, 0, x, indices, lanes, Gpu.U(cols), Gpu.U(k), lane.Wide ? Gpu.D(none) : Gpu.F((float)none));
+            FromLane(f, lanes, values, (long)rows * k);
+        }
+        finally
+        {
+            if (!own) gpu.Return(lanes);
+        }
+
+        return lane.Name;
+    }
+
     /// <summary>out[r] = x[r][index[r]] as the type.</summary>
     public string Pick<TN>(ulong x, int rows, int cols, ulong index, ulong output) where TN : struct, IAdad<TN>
     {

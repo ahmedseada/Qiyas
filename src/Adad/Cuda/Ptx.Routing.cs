@@ -183,6 +183,90 @@ internal static partial class Ptx
     /// row, any row length, stored as the type: one pass, each thread's running max m and Σ exp(x − m) (a larger value
     /// rescales the sum: one exp a value, e = exp(−|x − m|)), the threads' pairs joined by the same rule, then
     /// (m − x[t]) + log Σ.</summary>
+    /// <summary>The top-k's values as log-probabilities (IRouting.LogSoftmaxTopK), a CTA a row: p_t holds p_k columns a row
+    /// (s32, TopK's: the first the row's largest; one below 0 or past the row: none). m = x at the first column; Σ exp(x − m)
+    /// over the row, each thread four sums over its columns (the exps independent of one another, a fixed order) joined by
+    /// the block's reduction; then a thread a chosen column: (x[t] − m) − log Σ as a lane value at p_out[row·k + j] (p_none
+    /// for none). Params: x, t, out, cols, k, none (lane).</summary>
+    public static string LogProbRows(Gpu gpu, Fmt f, Lane lane, out string entry)
+    {
+        entry = $"log_prob_rows_{f.Name}_{lane.Name}";
+        const int Threads = ReduceThreads, Sums = 4;
+        var b = new PtxBuilder();
+        string tid = b.R(), row = b.R();
+        b.L($"mov.u32 {tid}, %tid.x;");
+        b.L($"mov.u32 {row}, %ctaid.x;");
+        string x = Param64(b, "p_x"), tp = Param64(b, "p_t"), outp = Param64(b, "p_out"), cols = Param32(b, "p_cols"), k = Param32(b, "p_k");
+        string none = lane.NewReg(b);
+        b.L($"ld.param.{lane.Op} {none}, [p_none];");
+        string start = b.R(), last = b.R(), first = b.R(), fa = b.RD(), has = b.P(), at0 = b.R();
+        b.L($"mul.lo.u32 {start}, {row}, {cols};");
+        b.L($"sub.u32 {last}, {cols}, 1;");
+        b.L($"mul.wide.u32 {fa}, {row}, {k};");
+        b.L($"shl.b64 {fa}, {fa}, 2;");
+        b.L($"add.u64 {fa}, {tp}, {fa};");
+        b.L($"ld.global.u32 {first}, [{fa}];");
+        b.L($"setp.lt.u32 {has}, {first}, {cols};");
+        b.L($"selp.u32 {first}, {first}, 0, {has};");
+        b.L($"add.u32 {at0}, {start}, {first};");
+        string m = Codec.UnpackAt(b, f, x, at0, lane);
+        var sums = new string[Sums];
+        for (int u = 0; u < Sums; u++) { sums[u] = lane.NewReg(b); b.L($"mov.{lane.Reg} {sums[u]}, {lane.Zero};"); }
+        string i = b.R(), pEnd = b.P();
+        b.L($"mov.u32 {i}, {tid};");
+        b.Label("SUM");
+        b.L($"setp.ge.u32 {pEnd}, {i}, {cols};");
+        b.L($"@{pEnd} bra SUM_END;");
+        for (int u = 0; u < Sums; u++)
+        {
+            // Column i + u·threads (one past the row reads the last column, its term dropped).
+            string c = b.R(), inside = b.P(), idx = b.R(), d = lane.NewReg(b), term = lane.NewReg(b);
+            b.L($"add.u32 {c}, {i}, {u * Threads};");
+            b.L($"setp.lt.u32 {inside}, {c}, {cols};");
+            b.L($"min.u32 {c}, {c}, {last};");
+            b.L($"add.u32 {idx}, {start}, {c};");
+            string v = Codec.UnpackAt(b, f, x, idx, lane);
+            b.L($"sub.rn.{lane.Op} {d}, {v}, {m};");
+            string e = Codec.Exp(b, lane, d);
+            b.L($"selp.{lane.Op} {term}, {e}, {lane.Zero}, {inside};");
+            b.L($"add.rn.{lane.Op} {sums[u]}, {sums[u]}, {term};");
+        }
+
+        b.L($"add.u32 {i}, {i}, {Sums * Threads};");
+        b.L("bra SUM;");
+        b.Label("SUM_END");
+        string mine = lane.NewReg(b), other = lane.NewReg(b);
+        b.L($"add.rn.{lane.Op} {mine}, {sums[0]}, {sums[1]};");
+        b.L($"add.rn.{lane.Op} {other}, {sums[2]}, {sums[3]};");
+        b.L($"add.rn.{lane.Op} {mine}, {mine}, {other};");
+        string total = BlockReduce(b, lane, tid, mine, "add", Threads);
+        string logSum = Fn.Log(b, lane, total);
+        string j = b.R(), pK = b.P(), oi = b.R(), ia = b.RD(), col = b.R(), valid = b.P(), at = b.R(), oa = b.RD(), lp = lane.NewReg(b);
+        b.L($"mov.u32 {j}, {tid};");
+        b.Label("LP");
+        b.L($"setp.ge.u32 {pK}, {j}, {k};");
+        b.L($"@{pK} bra OUT;");
+        b.L($"mad.lo.u32 {oi}, {row}, {k}, {j};");
+        b.L($"mul.wide.u32 {ia}, {oi}, 4;");
+        b.L($"add.u64 {ia}, {tp}, {ia};");
+        b.L($"ld.global.u32 {col}, [{ia}];");
+        b.L($"setp.lt.u32 {valid}, {col}, {cols};");                                   // −1 (no column) is past every row
+        b.L($"selp.u32 {col}, {col}, 0, {valid};");
+        b.L($"add.u32 {at}, {start}, {col};");
+        string xv = Codec.UnpackAt(b, f, x, at, lane);
+        b.L($"sub.rn.{lane.Op} {lp}, {xv}, {m};");
+        b.L($"sub.rn.{lane.Op} {lp}, {lp}, {logSum};");
+        b.L($"selp.{lane.Op} {lp}, {lp}, {none}, {valid};");
+        b.L($"mul.wide.u32 {oa}, {oi}, {lane.Size};");
+        b.L($"add.u64 {oa}, {outp}, {oa};");
+        b.L($"st.global.{lane.Mem} [{oa}], {lp};");
+        b.L($"add.u32 {j}, {j}, {Threads};");
+        b.L("bra LP;");
+        b.Label("OUT");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, $".param .u64 p_x, .param .u64 p_t, .param .u64 p_out, .param .u32 p_cols, .param .u32 p_k, .param .{lane.Op} p_none", ReduceBytes);
+    }
+
     /// <summary>Each row's loss as the type; a block format's as f32 (one a row, the rows' result before its blocks are encoded);
     /// weighted: times the row's weight (p_w, as the type).</summary>
     public static string CrossEntropyRows(Gpu gpu, Fmt f, Lane lane, bool weighted, out string entry)

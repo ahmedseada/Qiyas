@@ -23,6 +23,32 @@ public sealed partial class VulkanOps
         return lane.Name;
     }
 
+    /// <summary>The top-k of each row as log-probabilities (IRouting.LogSoftmaxTopK): TopK's indices, then
+    /// VkKernels.LogProbRows (the row's largest the first chosen, Σ exp(x − largest) by the workgroup's tree, an invocation a
+    /// chosen column storing (x − m) − log Σ as a lane value); stored as the type once after. Returns the lane's name.</summary>
+    public string LogSoftmaxTopK<TN>(ulong x, int rows, int cols, int k, ulong values, ulong indices) where TN : struct, IFloatAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        var lane = RowLane(f);
+        if (k > VkKernels.MaxTopK) throw new NotSupportedException($"vulkan: top-k with k = {k} exceeds the kernel's passes ({VkKernels.MaxTopK}); a partial sort is the step");
+        if (rows == 0 || k == 0) return lane.Name;
+        vk.Launch(vk.Cached($"topk:{f.Name}", () => VkKernels.TopKRows(vk, f, f.Natural)), (uint)rows, 1, x, indices, Vulkan.U(cols), Vulkan.U(k));
+        bool own = f.Is("float32") || f.Is("float64");
+        ulong lanes = own ? values : vk.Rent(Math.Max(16, (long)rows * k * lane.Size));
+        try
+        {
+            var fn = vk.Cached($"log_probs:{f.Name}", () => VkKernels.LogProbRows(vk, f, lane));
+            vk.Launch(fn, (uint)rows, 1, x, indices, lanes, Vulkan.U(cols), Vulkan.U(k), Slot(lane, f.IsBlock ? TN.Min : double.NegativeInfinity));
+            if (!own) Back(f, lane, lanes, values, (long)rows * k);
+        }
+        finally
+        {
+            if (!own) vk.Return(lanes);
+        }
+
+        return lane.Name;
+    }
+
     /// <summary>out[r] = x[r][index[r]] as the type.</summary>
     public string Pick<TN>(ulong x, int rows, int cols, ulong index, ulong output) where TN : struct, IAdad<TN>
     {

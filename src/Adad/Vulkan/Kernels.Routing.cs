@@ -125,6 +125,49 @@ internal static partial class VkKernels
         return (b.Max(m, v), b.Select(d > 0, up, keep));
     }
 
+    /// <summary>The top-k's values as log-probabilities (IRouting.LogSoftmaxTopK), a workgroup a row: targets holds `count`
+    /// columns a row (TopK's: the first the row's largest; one below 0 or past the row: none). m = x at the first column;
+    /// Σ exp(x − m) over the row, each invocation four sums over its columns (a fixed order) joined by the workgroup's tree;
+    /// then an invocation a chosen column: (x[t] − m) − log Σ as a lane value at losses[row·count + j] (`none` for none).
+    /// Arguments: x, targets, losses, cols, count, none (lane).</summary>
+    public static SpvKernel LogProbRows(Vulkan vk, Fmt f, Lane lane)
+    {
+        const int Sums = 4;
+        var k = Kinds.Of(lane);
+        var b = new Spv($"log_prob_rows_{f.Name}_{lane.Name}", ReduceThreads, vk.Controls);
+        V x = b.Arg(0), targets = b.Arg(1), losses = b.Arg(2);
+        V cols = b.Arg(3, K.U32), count = b.Arg(4, K.U32), none = b.Arg(5, k);
+        var tid = b.LocalIdX;
+        var row = b.GroupX;
+        var start = row * cols;
+        var last = cols - 1;
+        var first = b.Load(K.U32, b.At(targets, row * count, 4));
+        var m = Codec.UnpackAt(b, f, x, start + b.Select(first < cols, first, b.U(0)), lane);
+        var sums = new Var[Sums];
+        for (int u = 0; u < Sums; u++) sums[u] = b.Local(b.C(k, 0));
+        b.For(tid, cols, b.U(Sums * ReduceThreads), i =>
+        {
+            for (int u = 0; u < Sums; u++)
+            {
+                // Column i + u·threads (one past the row reads the last column, its term dropped).
+                var c = i + (double)(u * ReduceThreads);
+                var term = Fn.Exp(b, Codec.UnpackAt(b, f, x, start + b.Min(c, last), lane) - m);
+                sums[u].V = sums[u].V + b.Select(c < cols, term, b.C(k, 0));
+            }
+        });
+        var total = GroupReduce(b, b.Shared(k, ReduceThreads), tid, (sums[0].V + sums[1].V) + (sums[2].V + sums[3].V), static (p, q) => p + q, ReduceThreads);
+        var logSum = Fn.Log(b, total);
+        b.For(tid, count, b.U(ReduceThreads), j =>
+        {
+            var at = row * count + j;
+            var col = b.Load(K.U32, b.At(targets, at, 4));
+            var valid = col < cols;                                                   // −1 (no column) is past every row
+            var chosen = Codec.UnpackAt(b, f, x, start + b.Select(valid, col, b.U(0)), lane);
+            b.Store(b.At(losses, at, lane.Size), b.Select(valid, (chosen - m) - logSum, none));
+        });
+        return b.Build();
+    }
+
     /// <summary>loss[r] = log Σ_c exp(x[r][c]) − x[r][t[r]] as lane values (stored as the type after), a workgroup per row;
     /// weighted: times the row's weight (as the type). Arguments: x, targets, losses, cols (, weights).</summary>
     public static SpvKernel CrossEntropyRows(Vulkan vk, Fmt f, Lane lane, bool weighted)

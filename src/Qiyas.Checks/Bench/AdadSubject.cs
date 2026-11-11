@@ -594,6 +594,21 @@ public sealed class AdadSubject : IBenchSubject
         }
     }
 
+    public IBenchRun? LogSoftmaxTopK(Device device, string type, byte[] x, int rows, int cols, int k, byte[] values, int[] indices) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new LogTopKVisitor(device, x, rows, cols, k, values, indices)) : null;
+
+    private sealed class LogTopKVisitor(Device device, byte[] x, int rows, int cols, int k, byte[] values, int[] indices) : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, LogTopKVisitor>(device, this);
+
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        {
+            TB dx = s.In(x, s.Slack), dv = s.Out(values, s.Slack);
+            TI di = s.IndexOut(indices);
+            return s.Run(() => s.D.LogSoftmaxTopK<TN>(dx, rows, cols, k, dv, di));
+        }
+    }
+
     public IBenchRun? Pick(Device device, string type, byte[] x, int rows, int cols, int[] index, byte[] output) =>
         Registry.With(type, new PickVisitor(device, x, rows, cols, index, output));
 

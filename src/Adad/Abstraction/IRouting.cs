@@ -9,6 +9,12 @@ public interface IRouting<TBuffer, TIndex>
     /// <summary>The k largest of each row (rows × cols): values (rows × k) and their columns, largest first.</summary>
     string TopK<TN>(TBuffer x, int rows, int cols, int k, TBuffer values, TIndex indices) where TN : struct, IAdad<TN>;
 
+    /// <summary>The k largest of each row of x (rows × cols) as log-probabilities (a beam's candidates, read instead of the
+    /// rows): indices as TopK's (largest first, an equal value by the lower index, −1 past the row); values[r·k + j] =
+    /// (x[r][index] − m) − log Σ_c exp(x[r][c] − m), m the row's largest, in the float lane, rounded to TN once (past the row: −∞ as the
+    /// type stores it; a block format's lowest value, an infinity having no block).</summary>
+    string LogSoftmaxTopK<TN>(TBuffer x, int rows, int cols, int k, TBuffer values, TIndex indices) where TN : struct, IFloatAdad<TN>;
+
     /// <summary>output[r] = x[r, index[r]].</summary>
     string Pick<TN>(TBuffer x, int rows, int cols, TIndex index, TBuffer output) where TN : struct, IAdad<TN>;
 
