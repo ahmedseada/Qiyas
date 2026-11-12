@@ -919,6 +919,10 @@ public sealed partial class GpuOps(Gpu gpu)
     /// checks prove the routes that take it at their small shapes); null: measured.</summary>
     public bool? SlicedChoice { get; set; }
 
+    /// <summary>A measurement's override of the sliced product's split in k (true: wherever its tiles are fewer than the
+    /// multiprocessors; false: never); null: the rule.</summary>
+    public bool? SlicedSplitChoice { get; set; }
+
     /// <summary>Whether the sliced product beats the plain float64 kernel at this shape (measured once per shape).</summary>
     private bool SlicedFaster(int m, int n, int k, ulong a, ulong b, ulong c) => SlicedFaster(m, n, k, a, b, c, 1, 0, 0, 0);
 
@@ -1022,12 +1026,14 @@ public sealed partial class GpuOps(Gpu gpu)
             // One product per diagonal d: the digit pairs (t, u) with t + u = d. B's digits are stacked most significant last,
             // so for d below the slice count A's first d + 1 slices meet B's last d + 1; above it, A's last 15 − d meet B's first.
             var fn = MmaFunction(kind, out uint shared, out int bn, batched: batches > 1);
-            // Split-k (a single product whose tiles fill at most half the multiprocessors; at 64 tiles of 70 a split measured
-            // slower, 2.32 ms against 2.20 at 128 × 16384 × 640): a diagonal's k-range in parts, each
+            // Split-k (a single product whose tiles fill at most a third of the multiprocessors, rounded up; measured once
+            // at 128 rows, k 640, 2048 and 16384: a split gains 1.4-3.3x at 3-8 tiles, 1.2-1.4x at 16, 1.04-1.06x at 24,
+            // nothing at 32 with a long k and 0.82x with k 640, 0.87-0.91x from 40 to 64): a diagonal's k-range in parts, each
             // part's 8-bit product a z of one launch (A and B advanced by the part's bytes, its integer sums at z·m·n),
             // the parts' sums added in order (SumSlices in s32). Integers: exactly the unsplit diagonal's sums.
             long tiles = (long)Grid(n, bn) * Grid(m, 128);
-            int want = batches == 1 && tiles * 2 <= gpu.Multiprocessors ? (int)((2L * gpu.Multiprocessors + tiles - 1) / tiles) : 1;
+            bool splits = SlicedSplitChoice ?? tiles <= (gpu.Multiprocessors + 2) / 3;
+            int want = batches == 1 && splits && tiles < gpu.Multiprocessors ? (int)((2L * gpu.Multiprocessors + tiles - 1) / tiles) : 1;
             var fparts = want > 1 ? MmaFunction(kind, out _, out _, batched: true) : IntPtr.Zero;
             var joinParts = want > 1 ? gpu.Cached($"sum_slices:{Lane.S32.Name}", (out string x) => Ptx.SumSlices(gpu, Lane.S32, out x)) : IntPtr.Zero;
             ulong parts = want > 1 ? gpu.Rent(want * mn * 4) : 0;
