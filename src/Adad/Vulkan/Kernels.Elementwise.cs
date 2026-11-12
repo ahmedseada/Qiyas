@@ -12,25 +12,25 @@ internal static partial class VkKernels
 {
     // ---------------------------------------------------------------- draws
 
-    // Draws.Mix: h ^= h >> 16; h *= 0x7FEB352D; h ^= h >> 15; h *= 0x846CA68B; h ^= h >> 16.
+    // Draws.Mix: h ^= h >> 16; h *= M1; h ^= h >> S; h *= M2; h ^= h >> 16.
     private static V Mix(V h)
     {
         h ^= h >> 16;
-        h *= (double)0x7FEB352Du;
-        h ^= h >> 15;
-        h *= (double)0x846CA68Bu;
+        h *= (double)Draws.M1;
+        h ^= h >> Draws.S;
+        h *= (double)Draws.M2;
         return h ^ (h >> 16);
     }
 
-    /// <summary>Draws.Bits(key, idx) (u32 values).</summary>
-    internal static V Draw(V key, V idx) => Mix(Mix(idx ^ key) + key);
+    /// <summary>Draws.Bits((ka, kb), idx) (u32 values).</summary>
+    internal static V Draw(V ka, V kb, V idx) => Mix(Mix(idx ^ ka) + kb);
 
     // The kept value or the dropped one: x·s (+ r, one fma) where bits ≥ thr, else r (+0 without a residual).
     private static V DropValue(Spv b, K k, V x, V? r, V s, V bits, V thr) =>
         b.Select(bits >= thr, r is null ? x * s : b.Fma(x, s, r.Value), r ?? b.C(k, 0));
 
     /// <summary>output = residual + x·s where the seed's draw keeps a value, the residual where it does not, over n values of
-    /// f in its float lane: a thread per word. Slots: x, residual, output, n, key, threshold, s.</summary>
+    /// f in its float lane: a thread per word. Slots: x, residual, output, n, key A, threshold, s, key B.</summary>
     public static SpvKernel Dropout(Vulkan vk, Fmt f, Lane lane, bool residual)
     {
         var k = Kinds.Of(lane);
@@ -42,6 +42,7 @@ internal static partial class VkKernels
         var key = b.Arg(4, K.U32);
         var thr = b.Arg(5, K.U32);
         var s = b.Arg(6, k);
+        var kb = b.Arg(7, K.U32);
         var gid = b.GlobalX;
         var wk = Codec.WordKind(f);
         b.If(gid < WordCount(b, f, n), () =>
@@ -55,7 +56,7 @@ internal static partial class VkKernels
                 var x = Codec.Unpack(b, f, wx, i, lane);
                 V? r = residual ? Codec.Unpack(b, f, wr, i, lane) : null;
                 var idx = gid * (double)f.Per + i;
-                wo = Codec.Pack(b, f, DropValue(b, k, x, r, s, Draw(key, idx), thr), lane, i, wo);
+                wo = Codec.Pack(b, f, DropValue(b, k, x, r, s, Draw(key, kb, idx), thr), lane, i, wo);
             }
 
             b.Store(b.At(po, gid, bytes), wo);
@@ -63,12 +64,12 @@ internal static partial class VkKernels
         return b.Build();
     }
 
-    /// <summary>Dropout into blocks, in f32. Slots: x, residual, key, threshold, s (f32).</summary>
+    /// <summary>Dropout into blocks, in f32. Slots: x, residual, key A, threshold, s (f32), key B.</summary>
     public static SpvKernel BlockDropout(Vulkan vk, Fmt f, bool residual) =>
         BlockEncoder(vk, f, $"dropout{(residual ? "_res" : "")}", b =>
         {
-            V px = b.Arg(0), pr = b.Arg(1), key = b.Arg(2, K.U32), thr = b.Arg(3, K.U32), s = b.Arg(4, K.F32);
-            return (at, _) => DropValue(b, K.F32, Codec.UnpackAt(b, f, px, at, Lane.F32), residual ? Codec.UnpackAt(b, f, pr, at, Lane.F32) : null, s, Draw(key, at), thr);
+            V px = b.Arg(0), pr = b.Arg(1), key = b.Arg(2, K.U32), thr = b.Arg(3, K.U32), s = b.Arg(4, K.F32), kb = b.Arg(5, K.U32);
+            return (at, _) => DropValue(b, K.F32, Codec.UnpackAt(b, f, px, at, Lane.F32), residual ? Codec.UnpackAt(b, f, pr, at, Lane.F32) : null, s, Draw(key, kb, at), thr);
         });
 
     // ---------------------------------------------------------------- conversion

@@ -106,7 +106,7 @@ public sealed record SamplingArgs(int Rows, int Cols, double Temperature, int To
     {
         var picks = new int[Rows];
         var probability = new double[Rows];
-        uint key = Draws.Key(Seed);
+        var key = Draws.Key(Seed);
         Parallel.For(0, Rows, r =>
         {
             var e = Weights(x.AsSpan(r * Stride + RowOffset, Cols));
@@ -139,7 +139,7 @@ public sealed record SamplingArgs(int Rows, int Cols, double Temperature, int To
     public double[] PickErrors(double[] x, int step, int[] picks)
     {
         var errors = new double[Rows];
-        uint key = Draws.Key(Seed);
+        var key = Draws.Key(Seed);
         Parallel.For(0, Rows, r =>
         {
             var e = Weights(x.AsSpan(r * Stride + RowOffset, Cols));

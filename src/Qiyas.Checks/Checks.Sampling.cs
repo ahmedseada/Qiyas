@@ -91,7 +91,7 @@ internal static partial class Checks
             var probability = withProbability ? new byte[Bench.Registry.Bytes(type, a.Rows)] : null;
             Bench.Registry.WithFloat(type, new SampleFilteredRun(ops, a, x, step, picks, probability));
             var got = probability is null ? null : Bench.Registry.Values(type, probability, a.Rows);
-            uint key = Draws.Key(a.Seed);
+            var key = Draws.Key(a.Seed);
             string? wrong = null;
             if (Environment.GetEnvironmentVariable("QIYAS_MAP_DEBUG") == "1")
             {

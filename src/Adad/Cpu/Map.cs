@@ -491,7 +491,7 @@ internal sealed partial class Kernels
         return v.Lane;
     }
 
-    private struct DropoutVisitor(byte[] x, byte[]? residual, byte[] output, int n, uint key, uint threshold, double scale) : IFloatLaneVisitor
+    private struct DropoutVisitor(byte[] x, byte[]? residual, byte[] output, int n, DrawKey key, uint threshold, double scale) : IFloatLaneVisitor
     {
         public string Lane = "";
 
@@ -503,7 +503,7 @@ internal sealed partial class Kernels
         }
     }
 
-    private readonly struct DropoutBody<TN, TLane, TL>(byte[] x, byte[]? residual, byte[] output, uint key, uint threshold, TLane scale) : Team.IBody
+    private readonly struct DropoutBody<TN, TLane, TL>(byte[] x, byte[]? residual, byte[] output, DrawKey key, uint threshold, TLane scale) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]

@@ -54,7 +54,7 @@ internal static partial class VkKernels
 
     /// <summary>picks[row] and (prob not 0) prob[row] (lane storage) from the row's weights w (lane storage, rows × cols,
     /// read only). Slots: w, picks, prob, step (the device's, read where it is), cols, k (0:
-    /// no top-k), key (the seed's), p (0: no nucleus), q (0: no min-p) (lane); a workgroup a row.</summary>
+    /// no top-k), the seed's key A, p (0: no nucleus), q (0: no min-p) (lane), the key's B; a workgroup a row.</summary>
     public static SpvKernel SampleDraw(Vulkan vk, Lane lane)
     {
         var k = Kinds.Of(lane);
@@ -62,7 +62,7 @@ internal static partial class VkKernels
         ulong oneBits = lane.Wide ? 0x3FF0000000000000UL : 0x3F800000UL;
         var b = new Spv($"sample_draw_{lane.Name}", ReduceThreads, vk.Controls);
         V pw = b.Arg(0), picks = b.Arg(1), prob = b.Arg(2), pstep = b.Arg(3);
-        V cols = b.Arg(4, K.U32), kk = b.Arg(5, K.U32), key = b.Arg(6, K.U32), p = b.Arg(7, k), q = b.Arg(8, k);
+        V cols = b.Arg(4, K.U32), kk = b.Arg(5, K.U32), key = b.Arg(6, K.U32), p = b.Arg(7, k), q = b.Arg(8, k), kb = b.Arg(9, K.U32);
         var tid = b.LocalIdX;
         var row = b.GroupX;
         var wbase = row * cols;
@@ -242,8 +242,8 @@ internal static partial class VkKernels
         });
         b.Barrier();
         var total2 = whole[b.U(0)];
-        // The draw: Draws.Uniform(key, step, row) = the top 24 bits of Bits(Bits(key, step), row) over 2^24, times the total.
-        var u = b.Convert(Draw(Draw(key, b.Load(K.U32, pstep)), row) >> 8, k) * (1.0 / 16777216);
+        // The draw: Draws.Uniform(key, step, row) = Bits(Stream(key, step), row) · 2^−32 in the lane, times the total.
+        var u = b.Convert(Draw(Draw(key, kb, b.Load(K.U32, pstep)), kb, row), k) * (1.0 / 4294967296);
         var target2 = u * total2;
         var run = b.Local(sums[tid]);
         var found = b.Local(cols);

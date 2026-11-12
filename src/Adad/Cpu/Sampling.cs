@@ -44,7 +44,7 @@ internal sealed partial class Kernels
             int cols = a.Cols, width = Vector<TLane>.Count, padded = (cols + width - 1) / width * width;
             var row = ArrayPool<TLane>.Shared.Rent(Math.Max(width, padded));
             var top = ArrayPool<TLane>.Shared.Rent(TopGathered);
-            uint key = Draws.Key(a.Seed);
+            var key = Draws.Key(a.Seed);
             TLane temperature = TL.From(a.Temperature), none = TL.From(double.NaN);
             try
             {

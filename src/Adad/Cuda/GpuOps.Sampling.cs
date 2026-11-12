@@ -26,8 +26,9 @@ public sealed partial class GpuOps
             ulong Slot(double v) => lane.Wide ? Gpu.D(v) : Gpu.F((float)v);
             var weigh = gpu.Cached($"sample_weights:{f.Name}:{lane.Name}", (out string e) => Ptx.SampleWeights(gpu, f, lane, out e));
             Gpu.Launch(weigh, (uint)a.Rows, 1, 256, 1, 0, x, w, Gpu.U(a.Cols), Gpu.U(a.Stride), Gpu.U(a.RowOffset), Slot(a.Temperature));
+            var key = Draws.Key(a.Seed);
             var draw = gpu.Cached($"sample_draw:{lane.Name}", (out string e) => Ptx.SampleDraw(gpu, lane, out e));
-            Gpu.Launch(draw, (uint)a.Rows, 1, 256, 1, 0, w, picks, p, step, Gpu.U(a.Cols), Gpu.U(a.HasTopK ? a.TopK : 0), Draws.Key(a.Seed), Slot(a.HasTopP ? a.TopP : 0), Slot(a.MinP));
+            Gpu.Launch(draw, (uint)a.Rows, 1, 256, 1, 0, w, picks, p, step, Gpu.U(a.Cols), Gpu.U(a.HasTopK ? a.TopK : 0), key.A, Slot(a.HasTopP ? a.TopP : 0), Slot(a.MinP), key.B);
             if (probability != 0) FromLane(f, p, probability, a.Rows);
         }
         finally

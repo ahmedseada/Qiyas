@@ -167,19 +167,20 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
     public string Dropout<TN>(ulong x, ulong residual, ulong output, int n, double p, ulong seed) where TN : struct, IFloatAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        ulong key = Draws.Key(seed), thr = Draws.Threshold(p);
+        var key = Draws.Key(seed);
+        ulong thr = Draws.Threshold(p);
         double s = 1 / (1 - p);
         bool res = residual != 0;
         ulong r = res ? residual : x;
         if (f.IsBlock)
         {
-            Encode(f, n, vk.Cached($"block_dropout:{f.Name}:{res}", () => VkKernels.BlockDropout(vk, f, res)), output, x, r, key, thr, Vulkan.F((float)s));
+            Encode(f, n, vk.Cached($"block_dropout:{f.Name}:{res}", () => VkKernels.BlockDropout(vk, f, res)), output, x, r, key.A, thr, Vulkan.F((float)s), key.B);
             return "f32 (blocks in place)";
         }
 
         var lane = RowLane(f);
         var k = vk.Cached($"dropout:{f.Name}:{res}", () => VkKernels.Dropout(vk, f, lane, res));
-        vk.Launch(k, Groups(f.Words(n), VkKernels.Threads), 1, x, r, output, Vulkan.U(n), key, thr, Slot(lane, s));
+        vk.Launch(k, Groups(f.Words(n), VkKernels.Threads), 1, x, r, output, Vulkan.U(n), key.A, thr, Slot(lane, s), key.B);
         return lane.Name;
     }
 

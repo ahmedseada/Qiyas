@@ -807,7 +807,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         var errors = a.PickErrors(x, step, picks);
         if (Environment.GetEnvironmentVariable("QIYAS_MAP_DEBUG") == "1")
         {
-            uint key = Draws.Key(a.Seed);
+            var key = Draws.Key(a.Seed);
             int shown = 0;
             for (int r = 0; r < a.Rows && shown < 8; r++)
             {

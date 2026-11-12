@@ -24,7 +24,7 @@ internal static partial class Checks
     // ---------------------------------------------------------------- dropout
 
     /// <summary>Every float type at 1001 and 4099 values, with and without a residual: the CPU within the type's rounding of
-    /// keep(i) ? x·s + r : r (s rounded to the lane), the device the CPU's values; and the draws' rate and independence.</summary>
+    /// keep(i) ? x/(1 − p) + r : r in float64, the device the CPU's values; and the draws' rate and independence.</summary>
     private static bool Dropouts(IDevice<ulong, ulong>? ops, string device)
     {
         bool ok = true;
@@ -33,21 +33,51 @@ internal static partial class Checks
         const ulong Seed = 0x1234_5678_9ABC_DEF0;
         if (ops is null)
         {
-            // The draws: the kept share within 5σ of 1 − p, and two seeds' masks agreeing as independent ones would.
+            // The draws: the kept share within 5σ of 1 − p; the masks of seeds one apart in either word, and of neighbouring
+            // values, agreeing as independent ones would; a sampler's streams one step apart the same.
             const int M = 1 << 20;
-            uint k1 = Draws.Key(Seed), k2 = Draws.Key(Seed + 1), thr = Draws.Threshold(P);
-            int kept = 0, agree = 0;
+            var k1 = Draws.Key(Seed);
+            DrawKey k2 = Draws.Key(Seed + 1), k3 = Draws.Key(Seed + (1UL << 32)), s1 = Draws.Stream(k1, 7), s2 = Draws.Stream(k1, 8);
+            uint thr = Draws.Threshold(P);
+            int kept = 0;
+            var agree = new int[4];
             for (uint i = 0; i < M; i++)
             {
-                bool a = Draws.Keep(k1, i, thr), b = Draws.Keep(k2, i, thr);
+                bool a = Draws.Keep(k1, i, thr);
                 if (a) kept++;
-                if (a == b) agree++;
+                if (a == Draws.Keep(k2, i, thr)) agree[0]++;
+                if (a == Draws.Keep(k3, i, thr)) agree[1]++;
+                if (a == Draws.Keep(k1, i + 1, thr)) agree[2]++;
+                if (Draws.Keep(s1, i, thr) == Draws.Keep(s2, i, thr)) agree[3]++;
             }
 
-            double share = kept / (double)M, sigma = Math.Sqrt(P * (1 - P) / M), same = agree / (double)M, pSame = P * P + (1 - P) * (1 - P);
-            if (Math.Abs(share - (1 - P)) > 5 * sigma || Math.Abs(same - pSame) > 5 * Math.Sqrt(pSame * (1 - pSame) / M))
+            double share = kept / (double)M, sigma = Math.Sqrt(P * (1 - P) / M), pSame = P * P + (1 - P) * (1 - P), sameSigma = Math.Sqrt(pSame * (1 - pSame) / M);
+            string[] pairs = ["seeds one apart", "seeds 2^32 apart", "neighbouring values", "streams one step apart"];
+            for (int t = 0; t < 4; t++)
             {
-                Console.WriteLine($"check dropout draws          cpu    kept {share:0.#####} (want {1 - P}), two seeds agree {same:0.#####} (want {pSame:0.#####})");
+                double same = agree[t] / (double)M;
+                if (Math.Abs(same - pSame) <= 5 * sameSigma) continue;
+                Console.WriteLine($"check dropout draws          cpu    {pairs[t]} agree {same:0.#####} (want {pSame:0.#####})");
+                ok = false;
+            }
+
+            if (Math.Abs(share - (1 - P)) > 5 * sigma)
+            {
+                Console.WriteLine($"check dropout draws          cpu    kept {share:0.#####} (want {1 - P})");
+                ok = false;
+            }
+
+            // Over a key's 2^32 draws exactly 2^32 − threshold are kept (Bits a bijection of the counter).
+            long all = 0;
+            Parallel.For(0, 1 << 16, () => 0L, (hi, _, sum) =>
+            {
+                uint at = (uint)hi << 16;
+                for (uint lo = 0; lo < 1u << 16; lo++) if (Draws.Keep(k1, at + lo, thr)) sum++;
+                return sum;
+            }, sum => Interlocked.Add(ref all, sum));
+            if (all != (1L << 32) - thr)
+            {
+                Console.WriteLine($"check dropout draws          cpu    {all} of 2^32 draws kept (want {(1L << 32) - thr})");
                 ok = false;
             }
         }
@@ -67,12 +97,20 @@ internal static partial class Checks
                     {
                         var xv = Bench.Registry.Values(type, x, n);
                         var rv = r is null ? null : Bench.Registry.Values(type, r, n);
-                        uint key = Draws.Key(Seed), thr = Draws.Threshold(P);
-                        double s = type == "float64" ? 1 / (1 - P) : (float)(1 / (1 - P));
+                        var key = Draws.Key(Seed);
+                        uint thr = Draws.Threshold(P);
                         var want = new double[n];
+                        var terms = new double[n];
                         for (int i = 0; i < n; i++)
-                            want[i] = Draws.Keep(key, (uint)i, thr) ? Math.FusedMultiplyAdd(xv[i], s, rv?[i] ?? 0) : rv?[i] ?? 0;
-                        ok &= Close(type, $"{what} n={n}", where, cpu, want, n);
+                        {
+                            double kept = Draws.Keep(key, (uint)i, thr) ? xv[i] / (1 - P) : 0;
+                            want[i] = kept + (rv?[i] ?? 0);
+                            terms[i] = Math.Abs(kept) + Math.Abs(rv?[i] ?? 0);
+                        }
+
+                        // Within the type's step and two lane steps of the terms: s read into the lane, and the sum's rounding.
+                        double worst = Excess(type, what, cpu, want, i => terms[i], 2);
+                        if (worst > 0) { Console.WriteLine($"check {what} n={n,-12} {where,-6} {type,-12} DIFFERS by {worst:0.##} steps"); ok = false; }
                         continue;
                     }
 
@@ -82,7 +120,7 @@ internal static partial class Checks
                 }
         }
 
-        if (ok) Console.WriteLine($"check dropout                {where,-6} every float type, 1001 and 4099 values, with and without a residual: {(ops is null ? "within the type's rounding of keep(i) ? x·s + r : r; the draws' rate and independence" : "the CPU's values")}");
+        if (ok) Console.WriteLine($"check dropout                {where,-6} every float type, 1001 and 4099 values, with and without a residual: {(ops is null ? "within the type's rounding of keep(i) ? x/(1 − p) + r : r; the draws' rate and independence" : "the CPU's values")}");
         return ok;
     }
 

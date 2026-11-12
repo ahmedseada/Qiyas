@@ -22,9 +22,10 @@ public interface IElementwise<TBuffer>
     /// <summary>MapRow for a float type: every formula, the float formulas in its float lane (a row of biases and its gelu).</summary>
     string MapRowFloat<TN>(MapOp op, TBuffer x, TBuffer v, TBuffer output, int rows, int cols) where TN : struct, IFloatAdad<TN>;
 
-    /// <summary>output = residual + x·(1/(1 − p)) where the seed's draw i keeps value i (Draws.Keep), the residual where it
-    /// does not (no residual: 0), over n values in the type's float lane: dropout, and its backward from dy with the same seed
-    /// (the residual: the gradient accumulated so far).</summary>
+    /// <summary>Dropout: output[i] = r[i] + x[i]·s where the seed's draw i keeps value i (Draws.Keep: its bits at least
+    /// Draws.Threshold(p)), r[i] where it does not, s = 1/(1 − p) and r a residual added in the same pass (absent: 0), over n
+    /// values in the type's float lane (x·s + r one fused multiply-add, s read into the lane). Its backward is the same
+    /// operation on the gradient with the same seed.</summary>
     string Dropout<TN>(TBuffer x, TBuffer? residual, TBuffer output, int n, double p, ulong seed) where TN : struct, IFloatAdad<TN>;
 
     /// <summary>output (TTo) = x (TFrom) over n values, each value rounded once into TTo (to nearest, ties to even) and held to

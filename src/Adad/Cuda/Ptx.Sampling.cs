@@ -99,7 +99,7 @@ internal static partial class Ptx
 
     /// <summary>picks[row] and (prob not 0) prob[row] (lane storage) from the row's weights w (lane storage, rows × cols,
     /// read only). Params: w, picks, prob, step (the device's, read where it is), cols,
-    /// k (0: no top-k), key (the seed's), p (0: no nucleus), q (0: no min-p) (lane); a CTA a row.</summary>
+    /// k (0: no top-k), the seed's key A, p (0: no nucleus), q (0: no min-p) (lane), the key's B; a CTA a row.</summary>
     public static string SampleDraw(Gpu gpu, Lane lane, out string entry)
     {
         entry = $"sample_draw_{lane.Name}";
@@ -110,7 +110,7 @@ internal static partial class Ptx
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {row}, %ctaid.x;");
         string pw = Param64(b, "p_w"), picks = Param64(b, "p_picks"), prob = Param64(b, "p_prob"), pstep = Param64(b, "p_step");
-        string cols = Param32(b, "p_cols"), k = Param32(b, "p_k"), key = Param32(b, "p_key");
+        string cols = Param32(b, "p_cols"), k = Param32(b, "p_k"), ka = Param32(b, "p_ka"), kb = Param32(b, "p_kb");
         string p = lane.NewReg(b), q = lane.NewReg(b), wbase = b.R(), smem = b.R();
         b.L($"ld.param.{lane.Op} {p}, [p_p];");
         b.L($"ld.param.{lane.Op} {q}, [p_q];");
@@ -408,14 +408,13 @@ internal static partial class Ptx
         string prefix = lane.NewReg(b), total2 = lane.NewReg(b), target2 = lane.NewReg(b);
         b.L($"ld.shared.{lane.Mem} {prefix}, [{mine}+{ReduceBytes}];");
         b.L($"ld.shared.{lane.Mem} {total2}, [{smem}+{ReduceBytes + 256 * 8}];");
-        // The draw: Draws.Uniform(key, step, row) = the top 24 bits of Bits(Bits(key, step), row) over 2^24, times the total.
+        // The draw: Draws.Uniform(key, step, row) = Bits(Stream(key, step), row) · 2^−32 in the lane, times the total.
         {
-            string step = b.R(), top = b.R(), u = lane.NewReg(b);
+            string step = b.R(), u = lane.NewReg(b);
             b.L($"ld.global.u32 {step}, [{pstep}];");
-            string bits = Draw(b, Draw(b, key, step), row);
-            b.L($"shr.u32 {top}, {bits}, 8;");
-            b.L($"cvt.rn.{lane.Op}.u32 {u}, {top};");
-            b.L(lane.Mul(u, u, lane.Literal(1.0 / 16777216)));
+            string bits = Draw(b, Draw(b, ka, kb, step), kb, row);
+            b.L($"cvt.rn.{lane.Op}.u32 {u}, {bits};");
+            b.L(lane.Mul(u, u, lane.Literal(1.0 / 4294967296)));
             b.L(lane.Mul(target2, u, total2));
         }
 
@@ -473,7 +472,7 @@ internal static partial class Ptx
         b.Label("DONE");
         b.L("ret;");
         return b.Finish(Header(gpu), entry,
-            $".param .u64 p_w, .param .u64 p_picks, .param .u64 p_prob, .param .u64 p_step, .param .u32 p_cols, .param .u32 p_k, .param .u32 p_key, .param .{lane.Op} p_p, .param .{lane.Op} p_q",
+            $".param .u64 p_w, .param .u64 p_picks, .param .u64 p_prob, .param .u64 p_step, .param .u32 p_cols, .param .u32 p_k, .param .u32 p_ka, .param .{lane.Op} p_p, .param .{lane.Op} p_q, .param .u32 p_kb",
             SampleDrawShared);
     }
 }

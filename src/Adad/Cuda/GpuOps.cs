@@ -241,19 +241,20 @@ public sealed partial class GpuOps(Gpu gpu)
     public string Dropout<TN>(ulong x, ulong residual, ulong output, int n, double p, ulong seed) where TN : struct, IFloatAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        ulong key = Draws.Key(seed), thr = Draws.Threshold(p);
+        var key = Draws.Key(seed);
+        ulong thr = Draws.Threshold(p);
         double s = 1 / (1 - p);
         bool res = residual != 0;
         if (f.IsBlock)
         {
             var fb = gpu.Cached($"dropout_blocks:{f.Name}:{res}", (out string e) => Ptx.DropoutBlocks(gpu, f, res, out e));
-            Gpu.Launch(fb, BlockGrid(f, n), 1, 256, 1, 0, x, residual, output, Gpu.U(n), key, thr, Gpu.F((float)s));
+            Gpu.Launch(fb, BlockGrid(f, n), 1, 256, 1, 0, x, residual, output, Gpu.U(n), key.A, key.B, thr, Gpu.F((float)s));
             return "f32 (blocks in place)";
         }
 
         var lane = f.Bits == 64 ? Lane.F64 : Lane.F32;
         var fn = gpu.Cached($"dropout:{f.Name}:{res}", (out string e) => Ptx.Dropout(gpu, f, lane, res, out e));
-        Gpu.Launch(fn, Grid(f.Words(n), 256), 1, 256, 1, 0, x, residual, output, Gpu.U(n), key, thr, lane.Wide ? Gpu.D(s) : Gpu.F((float)s));
+        Gpu.Launch(fn, Grid(f.Words(n), 256), 1, 256, 1, 0, x, residual, output, Gpu.U(n), key.A, key.B, thr, lane.Wide ? Gpu.D(s) : Gpu.F((float)s));
         return lane.Name;
     }
 

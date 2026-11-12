@@ -26,8 +26,9 @@ public sealed partial class VulkanOps
             ulong p = probability == 0 ? 0 : Own(f) ? probability : Rent((long)a.Rows * lane.Size);
             vk.Launch(vk.Cached($"sample_weights:{f.Name}:{lane.Name}", () => VkKernels.SampleWeights(vk, f, lane)), (uint)a.Rows, 1,
                 x, w, Vulkan.U(a.Cols), Vulkan.U(a.Stride), Vulkan.U(a.RowOffset), Slot(lane, a.Temperature));
+            var key = Draws.Key(a.Seed);
             vk.Launch(vk.Cached($"sample_draw:{lane.Name}", () => VkKernels.SampleDraw(vk, lane)), (uint)a.Rows, 1,
-                w, picks, p, step, Vulkan.U(a.Cols), Vulkan.U(a.HasTopK ? a.TopK : 0), Draws.Key(a.Seed), Slot(lane, a.HasTopP ? a.TopP : 0), Slot(lane, a.MinP));
+                w, picks, p, step, Vulkan.U(a.Cols), Vulkan.U(a.HasTopK ? a.TopK : 0), key.A, Slot(lane, a.HasTopP ? a.TopP : 0), Slot(lane, a.MinP), key.B);
             if (probability != 0 && !Own(f)) Back(f, lane, p, probability, a.Rows);
         }
         finally

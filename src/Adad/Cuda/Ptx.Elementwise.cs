@@ -11,28 +11,28 @@ internal static partial class Ptx
 {
     // ---------------------------------------------------------------- draws
 
-    // Draws.Mix: h ^= h >> 16; h *= 0x7FEB352D; h ^= h >> 15; h *= 0x846CA68B; h ^= h >> 16.
+    // Draws.Mix: h ^= h >> 16; h *= M1; h ^= h >> S; h *= M2; h ^= h >> 16.
     private static string Mix(PtxBuilder b, string h0)
     {
         string h = b.R(), t = b.R();
         b.L($"shr.u32 {t}, {h0}, 16;");
         b.L($"xor.b32 {h}, {h0}, {t};");
-        b.L($"mul.lo.u32 {h}, {h}, 0x7FEB352D;");
-        b.L($"shr.u32 {t}, {h}, 15;");
+        b.L($"mul.lo.u32 {h}, {h}, 0x{Draws.M1:X8};");
+        b.L($"shr.u32 {t}, {h}, {Draws.S};");
         b.L($"xor.b32 {h}, {h}, {t};");
-        b.L($"mul.lo.u32 {h}, {h}, 0x846CA68B;");
+        b.L($"mul.lo.u32 {h}, {h}, 0x{Draws.M2:X8};");
         b.L($"shr.u32 {t}, {h}, 16;");
         b.L($"xor.b32 {h}, {h}, {t};");
         return h;
     }
 
-    /// <summary>Draws.Bits(key, idx): a u32 register.</summary>
-    internal static string Draw(PtxBuilder b, string key, string idx)
+    /// <summary>Draws.Bits((ka, kb), idx): a u32 register.</summary>
+    internal static string Draw(PtxBuilder b, string ka, string kb, string idx)
     {
         string a = b.R(), c = b.R();
-        b.L($"xor.b32 {a}, {idx}, {key};");
+        b.L($"xor.b32 {a}, {idx}, {ka};");
         string m = Mix(b, a);
-        b.L($"add.u32 {c}, {m}, {key};");
+        b.L($"add.u32 {c}, {m}, {kb};");
         return Mix(b, c);
     }
 
@@ -65,7 +65,7 @@ internal static partial class Ptx
         entry = $"dropout_{f.Name}_{lane.Name}{(residual ? "_res" : "")}";
         var b = new PtxBuilder();
         string gid = GlobalIndex(b);
-        string px = Param64(b, "p_x"), pr = Param64(b, "p_r"), po = Param64(b, "p_o"), n = Param32(b, "p_n"), key = Param32(b, "p_key"), thr = Param32(b, "p_thr");
+        string px = Param64(b, "p_x"), pr = Param64(b, "p_r"), po = Param64(b, "p_o"), n = Param32(b, "p_n"), ka = Param32(b, "p_ka"), kb = Param32(b, "p_kb"), thr = Param32(b, "p_thr");
         string s = lane.NewReg(b);
         b.L($"ld.param.{lane.Mem} {s}, [p_s];");
         string words = WordsOf(b, f, n), p = b.P();
@@ -87,13 +87,13 @@ internal static partial class Ptx
             string? r = residual ? Codec.Unpack(b, f, wr, i, lane) : null;
             string idx = b.R();
             b.L($"mad.lo.u32 {idx}, {gid}, {f.Per}, {i};");
-            Codec.Pack(b, f, DropValue(b, lane, x, r, s, Draw(b, key, idx), thr), lane, i, wo);
+            Codec.Pack(b, f, DropValue(b, lane, x, r, s, Draw(b, ka, kb, idx), thr), lane, i, wo);
         }
 
         b.L($"st.global.{wt} [{ao}], {wo};");
         b.Label("DONE");
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, $".param .u64 p_x, .param .u64 p_r, .param .u64 p_o, .param .u32 p_n, .param .u32 p_key, .param .u32 p_thr, .param .{lane.Mem} p_s");
+        return b.Finish(Header(gpu), entry, $".param .u64 p_x, .param .u64 p_r, .param .u64 p_o, .param .u32 p_n, .param .u32 p_ka, .param .u32 p_kb, .param .u32 p_thr, .param .{lane.Mem} p_s");
     }
 
     /// <summary>Dropout over a block format: each block's values decoded in place, kept or dropped in f32, the block encoded.</summary>
@@ -101,7 +101,7 @@ internal static partial class Ptx
     {
         entry = $"dropout_{f.Name}_blocks{(residual ? "_res" : "")}";
         var b = new PtxBuilder();
-        string px = Param64(b, "p_x"), pr = Param64(b, "p_r"), po = Param64(b, "p_o"), n = Param32(b, "p_n"), key = Param32(b, "p_key"), thr = Param32(b, "p_thr");
+        string px = Param64(b, "p_x"), pr = Param64(b, "p_r"), po = Param64(b, "p_o"), n = Param32(b, "p_n"), ka = Param32(b, "p_ka"), kb = Param32(b, "p_kb"), thr = Param32(b, "p_thr");
         string s = b.F();
         b.L($"ld.param.f32 {s}, [p_s];");
         var w = BlockWarp(b, f, n);
@@ -109,11 +109,11 @@ internal static partial class Ptx
         {
             string x = Codec.UnpackAt(b, f, px, at, Lane.F32);
             string? r = residual ? Codec.UnpackAt(b, f, pr, at, Lane.F32) : null;
-            return DropValue(b, Lane.F32, x, r, s, Draw(b, key, at), thr);
+            return DropValue(b, Lane.F32, x, r, s, Draw(b, ka, kb, at), thr);
         });
         b.Label("DONE");
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_r, .param .u64 p_o, .param .u32 p_n, .param .u32 p_key, .param .u32 p_thr, .param .f32 p_s");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_r, .param .u64 p_o, .param .u32 p_n, .param .u32 p_ka, .param .u32 p_kb, .param .u32 p_thr, .param .f32 p_s");
     }
 
     // Words that hold n values of f (a u32 register).
