@@ -2,12 +2,11 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // Key and value caches on Vulkan (Abstraction/Cache.cs, ICache; VulkanOps.Cache.cs), CUDA's (Cuda/Ptx.Cache.cs): the
-// position (an s32 at the device) read by each kernel where it is. The write's kernels: each source row's scale (a
-// workgroup a row), stored as the type at its row — float32 and float64 by the scale's kernel itself; a narrower float by
-// an invocation a 32-bit word of the scales, the word's other values kept as they are; a block format's by its encoder
-// over the scales' blocks and a compaction that writes the touched blocks only — then the codes, an invocation a stored
-// word of the cache (a row is whole 32-bit words). Attention over the caches is the decode kernel's (Kernels.Attention.cs,
-// DecodeCache). No sub-word stores: every stored word has one writer.
+// position (an s32 at the device) read by each kernel where it is. The write: an invocation a stored word of the cache (a
+// row is whole 32-bit words); a block format's cache by the block encoder into staging, then the words of the touched
+// blocks (rows that share blocks) or of the written rows (rows of whole blocks) compacted into the cache. Attention over
+// the caches is the decode kernel's (Kernels.Attention.cs, DecodeCache). No sub-word stores: every stored word has one
+// writer.
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
@@ -32,14 +31,6 @@ internal static partial class VkKernels
         return w.Any & (x0 < end);
     }
 
-    // Value `at` of the scales: whether the write fills it, and its new scale's index (head·steps + step; 0 when not).
-    private static (V Written, V Index) WrittenAt(Spv b, V at, V cap, V steps, (V P, V W0, V W1, V Any) w)
-    {
-        var r = at % cap;
-        var written = w.Any & (r >= w.W0) & (r < w.W1);
-        return (written, b.Select(written, at / cap * steps + (r - w.P), b.U(0)));
-    }
-
     // Value `at` of rows of `unit` values: whether the write fills it, and its source's index ((head·steps + step)·unit +
     // column; 0 when not).
     private static (V Written, V Index) WrittenAt(Spv b, V at, V cap, V steps, V unit, (V P, V W0, V W1, V Any) w)
@@ -51,65 +42,8 @@ internal static partial class VkKernels
         return (written, b.Select(written, (head * steps + (r - w.P)) * unit + (at - row * unit), b.U(0)));
     }
 
-    /// <summary>Each source row's scale max |x| / max in the lane, a workgroup a row (row = head·steps + step). direct: a lane
-    /// value at head·cap + p + step of ps (a row past the capacity not written; the type's storage is the lane's); else at
-    /// ps[row]. Slots: x (f), ps, pos, steps, cap, d, max (lane).</summary>
-    public static SpvKernel CacheScales(Vulkan vk, Fmt f, Lane lane, bool direct, Fmt? source = null)
-    {
-        var k = Kinds.Of(lane);
-        var fx = source ?? f;                                                   // x's format: the type's, or a composition's lane storage
-        var b = new Spv($"cache_scales_{f.Name}_{lane.Name}{(direct ? "" : "_lanes")}{(source is null ? "" : "_from_" + fx.Name)}", ReduceThreads, vk.Controls);
-        V px = b.Arg(0), ps = b.Arg(1), pos = b.Arg(2);
-        V steps = b.Arg(3, K.U32), cap = b.Arg(4, K.U32), d = b.Arg(5, K.U32), max = b.Arg(6, k);
-        var tid = b.LocalIdX;
-        var row = b.GroupX;
-        var amax = b.Local(b.C(k, 0));
-        b.For(tid, d, b.U(ReduceThreads), e => amax.V = b.Max(amax.V, b.Abs(Codec.UnpackAt(b, fx, px, row * d + e, lane))));
-        var top = GroupReduce(b, b.Shared(k, ReduceThreads), tid, amax.V, (x, y) => b.Max(x, y), ReduceThreads);
-        var scale = top / max;
-        b.If(tid == 0, () =>
-        {
-            if (!direct) { b.Store(b.At(ps, row, lane.Size), scale); return; }
-            var at = b.Convert(b.Load(K.S32, pos) + b.Convert(row % steps, K.S32), K.U32);      // below 0: past the capacity (unsigned)
-            b.If(at < cap, () => b.Store(b.At(ps, row / steps * cap + at, lane.Size), scale));
-        });
-        return b.Build();
-    }
-
-    /// <summary>The row scales (lane values at px[head·steps + step]) into the scales of f (a float of 8 or 16 bits; n =
-    /// heads·cap values), an invocation a 32-bit word: the written rows' values packed, the word's other values kept; a word
-    /// with no written row not stored. Slots: x, scales, pos, n, cap, steps.</summary>
-    public static SpvKernel CacheScalesWords(Vulkan vk, Fmt f, Lane lane)
-    {
-        var k = Kinds.Of(lane);
-        var b = new Spv($"cache_scales_words_{f.Name}_{lane.Name}", Threads, vk.Controls);
-        V px = b.Arg(0), ps = b.Arg(1), pos = b.Arg(2);
-        V n = b.Arg(3, K.U32), cap = b.Arg(4, K.U32), steps = b.Arg(5, K.U32);
-        var gid = b.GlobalX;
-        var w = WrittenRows(b, pos, steps, cap);
-        b.If(gid < WordCount(b, f, n), () =>
-        {
-            var address = b.At(ps, gid, 4);
-            var word = b.Load(K.U32, address);
-            var touched = b.Bool(false);
-            var last = n - 1;
-            for (int i = 0; i < f.Per; i++)
-            {
-                var at = gid * (double)f.Per + i;
-                var (written, index) = WrittenAt(b, b.Min(at, last), cap, steps, w);
-                written = written & (at < n);
-                var fresh = b.Load(k, b.At(px, b.Select(written, index, b.U(0)), lane.Size));
-                word = b.Select(written, Codec.Pack(b, f, fresh, lane, i, word), word);
-                touched = touched | written;
-            }
-
-            b.If(touched, () => b.Store(address, word));
-        });
-        return b.Build();
-    }
-
-    /// <summary>Rows of a block format written where rows share blocks (a block-format type's row scales, unit 1; a block
-    /// format cache's rows of `unit` values not whole blocks) into blocks (f32): the written rows' values (fx at
+    /// <summary>Rows of a block format written where rows share blocks (a block format cache's rows of `unit` values not
+    /// whole blocks) into blocks (f32): the written rows' values (fx at
     /// x[(head·steps + step)·unit + column]) where the write fills the value, else the value as it is stored. Slots: x,
     /// destination, pos, cap, steps, unit.</summary>
     public static SpvKernel CacheBlocksEncoder(Vulkan vk, Fmt fb, Fmt fx) =>
@@ -212,17 +146,13 @@ internal static partial class VkKernels
     }
 
     /// <summary>The source's rows into the cache at the device's position, an invocation a stored word of fc (a row: wpr
-    /// words): each value of f read into the lane and rounded to fc once (Convert's rule: the lane's value, to odd at
-    /// float32 first where Fmt.ConvertPlan says); scaled: x / scale by the row's stored scale (f at head·cap + row; 0 where
-    /// the scale is 0), an integer code rounded to the nearest (ties to even), held to [min, max]. Slots: x, cache, scales,
-    /// pos, rows (heads·steps), steps, cap, d, wpr, min, max (lane).</summary>
-    public static SpvKernel CacheWrite(Vulkan vk, Fmt f, Fmt fc, Lane lane, bool scaled, Fmt? source = null)
+    /// words): each value of f read into the lane and rounded to fc once (Convert's rule: the lane's value, to odd at float32
+    /// first where Fmt.ConvertPlan says). Slots: x, cache, pos, rows (heads·steps), steps, cap, d, wpr.</summary>
+    public static SpvKernel CacheWrite(Vulkan vk, Fmt f, Fmt fc, Lane lane)
     {
-        var k = Kinds.Of(lane);
-        var fx = source ?? f;                                                   // x's format: the type's, or a composition's lane storage
-        var b = new Spv($"cache_write_{f.Name}_{fc.Name}_{lane.Name}{(scaled ? "_scaled" : "")}{(source is null ? "" : "_from_" + fx.Name)}", Threads, vk.Controls);
-        V px = b.Arg(0), pc = b.Arg(1), ps = b.Arg(2), pos = b.Arg(3);
-        V rows = b.Arg(4, K.U32), steps = b.Arg(5, K.U32), cap = b.Arg(6, K.U32), d = b.Arg(7, K.U32), wpr = b.Arg(8, K.U32), min = b.Arg(9, k), max = b.Arg(10, k);
+        var b = new Spv($"cache_write_{f.Name}_{fc.Name}_{lane.Name}", Threads, vk.Controls);
+        V px = b.Arg(0), pc = b.Arg(1), pos = b.Arg(2);
+        V rows = b.Arg(3, K.U32), steps = b.Arg(4, K.U32), cap = b.Arg(5, K.U32), d = b.Arg(6, K.U32), wpr = b.Arg(7, K.U32);
         bool toOdd = Fmt.ConvertPlan(LaneFormat(lane), fc).ToOdd;
         var gid = b.GlobalX;
         var row = gid / wpr;
@@ -233,19 +163,11 @@ internal static partial class VkKernels
             b.If(at < cap, () =>
             {
                 var crow = row / steps * cap + at;
-                V? scale = scaled ? Codec.UnpackAt(b, f, ps, crow, lane) : null;
                 var word = b.CBits(Codec.WordKind(fc), 0);
                 var first = row * d + wc * (double)fc.Per;
                 for (int i = 0; i < fc.Per; i++)
                 {
-                    var v = Codec.UnpackAt(b, fx, px, first + i, lane);
-                    if (scale is { } s)
-                    {
-                        var q = b.Select(s > 0.0, v / s, b.C(k, 0));
-                        if (!fc.IsFloat) q = b.RoundEven(q);
-                        v = b.Min(b.Max(q, min), max);
-                    }
-
+                    var v = Codec.UnpackAt(b, f, px, first + i, lane);
                     word = toOdd ? Codec.Pack(b, fc, ToOddF32(b, lane, v), Lane.F32, i, word) : Codec.Pack(b, fc, v, lane, i, word);
                 }
 

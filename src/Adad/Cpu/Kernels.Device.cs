@@ -213,14 +213,11 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
 
     // ---------------------------------------------------------------- caches
 
-    string ICache<byte[], int[]>.CacheWrite<TN, TC>(CacheView c, int steps, int[] position, byte[] source, byte[] cache, byte[]? scales) =>
-        CacheWrite<TN, TC>(c, steps, position, source, cache, scales);
+    string ICache<byte[], int[]>.CacheWrite<TN, TC>(CacheView c, int steps, int[] position, byte[] source, byte[] cache) =>
+        CacheWrite<TN, TC>(c, steps, position, source, cache);
 
-    string ICache<byte[], int[]>.CacheWriteRope<TN, TC>(CacheView c, RopeArgs a, int[] position, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] cache, byte[]? scales) =>
-        CacheWriteRope<TN, TC>(c, a, position, x, gain, cos, sin, positions, cache, scales);
-
-    string ICache<byte[], int[]>.AttentionCached<TN, TC>(AttentionArgs a, int[] position, byte[] q, byte[] k, byte[]? kScales, byte[] v, byte[]? vScales, byte[] o) =>
-        AttentionCached<TN, TC>(a, position, q, k, kScales, v, vScales, o);
+    string ICache<byte[], int[]>.AttentionCached<TN, TC>(AttentionArgs a, int[] position, byte[] q, byte[] k, byte[] v, byte[] o) =>
+        AttentionCached<TN, TC>(a, position, q, k, v, o);
 
     string ICache<byte[], int[]>.DecoderMask<TN>(int rows, int capacity, int window, int[] position, byte[] mask) => DecoderMask<TN>(rows, capacity, window, position, mask);
 

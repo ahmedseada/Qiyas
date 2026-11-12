@@ -8,40 +8,27 @@
 namespace Adad.Abstraction;
 
 /// <summary>A key or value cache: Heads × Capacity rows of D values stored as the cache's type, filled from row 0 up to the
-/// position the device holds. A scaled cache's rows are codes, each with a scale (stored as the values' type, at
-/// head·Capacity + row): value = code·scale. A row of a plain type is whole 32-bit words (D·bits a multiple of 32). A
-/// block format's rows are its blocks' values (no row scales: its values are scaled by their blocks): whole blocks where D
-/// is a multiple of the format's block, written a block at a time; else rows share blocks, and a write re-encodes each
-/// block it touches with the block's other values kept (the type's partial store: lossy, as the type is).</summary>
+/// position the device holds. A row of a plain type is whole 32-bit words (D·bits a multiple of 32). A block format's rows
+/// are its blocks' values: whole blocks where D is a multiple of the format's block, written a block at a time; else rows
+/// share blocks, and a write re-encodes each block it touches with the block's other values kept (the type's partial
+/// store: lossy, as the type is).</summary>
 public sealed record CacheView(int Heads, int Capacity, int D)
 {
     public long Values => (long)Heads * Capacity * D;
 
-    /// <summary>The rows (and a scaled cache's scales).</summary>
+    /// <summary>The rows.</summary>
     public long Rows => (long)Heads * Capacity;
 
-    public void Validate(Fmt fc, bool scaled = false)
+    public void Validate(Fmt fc)
     {
         if (Heads < 0 || Capacity < 0 || D < 0) throw new ArgumentException($"cache: {Heads} heads of {Capacity} rows of {D}");
-        if (fc.IsBlock)
-        {
-            if (scaled) throw new ArgumentException($"cache: codes of the block format {fc.Name} with row scales (a block format's values are scaled by their blocks)");
-        }
-        else if ((long)D * fc.Bits % 32 != 0) throw new ArgumentException($"cache: a row of {D} values of {fc.Name} is not whole 32-bit words");
+        if (!fc.IsBlock && (long)D * fc.Bits % 32 != 0) throw new ArgumentException($"cache: a row of {D} values of {fc.Name} is not whole 32-bit words");
 
         if (Values > int.MaxValue) throw new ArgumentException("cache: past 2^31 values");
     }
 
     /// <summary>Whether a row of the cache is whole blocks of the block format fc (a write then touches no other row's block).</summary>
     public bool WholeBlocks(Fmt fc) => fc.IsBlock && D % fc.BlockValues == 0;
-
-    /// <summary>A write of a layer's projection rows (ICache.CacheWriteRope): a.Rows = Heads·a.Steps rows of D values, a step
-    /// at a time, the cache's heads the batches' heads (Heads a whole multiple of a.Heads).</summary>
-    public void ValidateRope(RopeArgs a)
-    {
-        if (a.Cols != D || a.Heads <= 0 || a.Steps < 0 || Heads % a.Heads != 0 || a.Rows != (long)Heads * a.Steps || 2 * a.Half > a.Cols || a.Inverse)
-            throw new ArgumentException($"cache: {a.Rows} projection rows of {a.Cols} ({a.Steps} steps of {a.Heads} heads, half {a.Half}{(a.Inverse ? ", inverse" : "")}) into {Heads} heads of rows of {D}");
-    }
 
     /// <summary>The rows of each head a write of steps rows at the position fills: [First, End) = [max(position, 0),
     /// min(position + steps, Capacity)) (empty: End ≤ First).</summary>
@@ -59,22 +46,50 @@ public sealed record CacheView(int Heads, int Capacity, int D)
     /// <summary>Whether step i at position p sees position j (ICache.DecoderMask's rule).</summary>
     public static bool Sees(long position, int i, int j, int window) => j <= position + i && (window == 0 || j > position + i - window);
 
-    /// <summary>The float64 reference of a write's rows: each source row's (Heads × steps × D) scale max |x| / max, and the
-    /// cache row it goes to (head·Capacity + position + t; −1 past Capacity, not written).</summary>
-    public (double[] Scales, int[] Rows) WriteRows(double[] source, int steps, int position, double max)
+    /// <summary>The score a decoder's mask excludes a key by, as TN stores it: −∞ where the type holds it beside a 0 (its exp
+    /// is 0), else the type's lowest value (a type without an infinity; a block format, whose block holds no −∞ beside its
+    /// other values). Read back from the type's own store of −∞ and 0 in one storage unit (once a type), so no type is named.</summary>
+    public static double Excluded<TN>() where TN : struct, IFloatAdad<TN> => ExcludedOf<TN>.Value;
+
+    private static class ExcludedOf<TN> where TN : struct, IFloatAdad<TN>
     {
-        var scales = new double[Heads * steps];
+        public static readonly double Value = Find();
+
+        private static double Find()
+        {
+            var v = new ExcludedVisitor();
+            TN.Float(ref v);
+            return v.Value;
+        }
+    }
+
+    private struct ExcludedVisitor : IFloatLaneVisitor
+    {
+        public double Value;
+
+        public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+        {
+            int g = Math.Max(2, TN.Granularity);
+            var lanes = new TLane[g];
+            lanes[0] = TL.NegativeInfinity;
+            var stored = new byte[TN.Bytes(g)];
+            TN.Store(lanes, stored, 0);
+            TN.Load(stored, 0, lanes);
+            var same = EqualityComparer<TLane>.Default;
+            bool held = same.Equals(lanes[0], TL.NegativeInfinity) && same.Equals(lanes[1], TL.Zero);
+            Value = held ? double.NegativeInfinity : TN.Min;
+        }
+    }
+
+    /// <summary>The cache row each of a write's source rows (Heads × steps) goes to: head·Capacity + position + t; −1 past
+    /// Capacity or before row 0 (not written).</summary>
+    public int[] WriteRows(int steps, int position)
+    {
         var rows = new int[Heads * steps];
         for (int h = 0; h < Heads; h++)
             for (int t = 0; t < steps; t++)
-            {
-                double amax = 0;
-                for (int c = 0; c < D; c++) amax = Math.Max(amax, Math.Abs(source[((long)h * steps + t) * D + c]));
-                scales[h * steps + t] = amax / max;
                 rows[h * steps + t] = position + t < Capacity && position + t >= 0 ? h * Capacity + position + t : -1;
-            }
-
-        return (scales, rows);
+        return rows;
     }
 }
 

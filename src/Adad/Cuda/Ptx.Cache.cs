@@ -2,10 +2,10 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // Key and value caches on CUDA (Abstraction/Cache.cs, ICache; GpuOps.Cache.cs), the position (an s32 at the device) read by
-// each kernel where it is. The write's kernels: each source row's scale (a CTA a row, the block reduction), stored as the
-// type at its row (a value of 8 bits or more by its own store; a block format's by re-encoding the blocks the write
-// touches, their other values kept), then the codes, a thread a stored word of the cache (a row is whole 32-bit words).
-// Attention over the caches is the decode kernel's (Ptx.Attention.cs, DecodeCache). The mask is a StoreEach kernel.
+// each kernel where it is. The write's kernels: a thread a stored word of the cache (a row is whole 32-bit words); a block
+// format's cache a warp a block (rows of whole blocks: the written rows' blocks; rows that share blocks: every block of the
+// cache launched, the touched ones re-encoded with their other values kept). Attention over the caches is the decode
+// kernel's (Ptx.Attention.cs, DecodeCache). The mask is a StoreEach kernel.
 using Adad.Abstraction;
 
 namespace Adad.Cuda;
@@ -25,74 +25,9 @@ internal static partial class Ptx
         return (p, w0, w1, any);
     }
 
-    /// <summary>Each source row's scale max |x| / max in the lane, a CTA a row (row = head·steps + step). direct: stored as f at
-    /// head·cap + p + step (a row past the capacity not written; f a type of 8 bits or more); else a lane value at ps[row].
-    /// Params: x (f), ps, pos, steps, cap, d, max (lane).</summary>
-    public static string CacheScales(Gpu gpu, Fmt f, Lane lane, bool direct, out string entry, Fmt? source = null)
-    {
-        var fx = source ?? f;                                                   // x's format: the type's, or a composition's lane storage
-        entry = $"cache_scales_{f.Name}_{lane.Name}{(direct ? "" : "_lanes")}{(source is null ? "" : "_from_" + fx.Name)}";
-        const int Threads = 256;
-        var b = new PtxBuilder();
-        string tid = b.R(), row = b.R();
-        b.L($"mov.u32 {tid}, %tid.x;");
-        b.L($"mov.u32 {row}, %ctaid.x;");
-        string px = Param64(b, "p_x"), ps = Param64(b, "p_s"), pos = Param64(b, "p_pos");
-        string steps = Param32(b, "p_steps"), cap = Param32(b, "p_cap"), d = Param32(b, "p_d");
-        string max = lane.NewReg(b);
-        b.L($"ld.param.{lane.Op} {max}, [p_max];");
-        string amax = lane.NewReg(b), e = b.R(), pEnd = b.P(), first = b.R();
-        b.L($"mov.{lane.Reg} {amax}, {lane.Zero};");
-        b.L($"mul.lo.u32 {first}, {row}, {d};");
-        b.L($"mov.u32 {e}, {tid};");
-        b.Label("CS_LOOP");
-        b.L($"setp.ge.u32 {pEnd}, {e}, {d};");
-        b.L($"@{pEnd} bra CS_END;");
-        {
-            string idx = b.R(), ax = lane.NewReg(b);
-            b.L($"add.u32 {idx}, {first}, {e};");
-            string x = Codec.UnpackAt(b, fx, px, idx, lane);
-            b.L($"abs.{lane.Op} {ax}, {x};");
-            b.L($"max.{lane.Op} {amax}, {amax}, {ax};");
-        }
-
-        b.L($"add.u32 {e}, {e}, {Threads};");
-        b.L("bra CS_LOOP;");
-        b.Label("CS_END");
-        string top = BlockReduce(b, lane, tid, amax, "max", Threads);
-        string scale = LaneOp(b, lane, "div", top, max);
-        string rest = b.P();
-        b.L($"setp.ne.u32 {rest}, {tid}, 0;");
-        b.L($"@{rest} bra DONE;");
-        if (direct)
-        {
-            string h = b.R(), t = b.R(), p = b.R(), at = b.R(), si = b.R(), past = b.P();
-            b.L($"div.u32 {h}, {row}, {steps};");
-            b.L($"mul.lo.u32 {t}, {h}, {steps};");
-            b.L($"sub.u32 {t}, {row}, {t};");
-            b.L($"ld.global.s32 {p}, [{pos}];");
-            b.L($"add.s32 {at}, {p}, {t};");
-            b.L($"setp.ge.u32 {past}, {at}, {cap};");                     // below 0 too (unsigned)
-            b.L($"@{past} bra DONE;");
-            b.L($"mad.lo.u32 {si}, {h}, {cap}, {at};");
-            StoreAnyValue(b, f, lane, scale, ps, si);
-        }
-        else
-        {
-            string a = b.RD();
-            b.L($"mul.wide.u32 {a}, {row}, {lane.Size};");
-            b.L($"add.u64 {a}, {ps}, {a};");
-            b.L($"st.global.{lane.Mem} [{a}], {scale};");
-        }
-
-        b.Label("DONE");
-        b.L("ret;");
-        return b.Finish(Header(gpu), entry, $".param .u64 p_x, .param .u64 p_s, .param .u64 p_pos, .param .u32 p_steps, .param .u32 p_cap, .param .u32 p_d, .param .{lane.Op} p_max", ReduceBytes);
-    }
-
-    /// <summary>Rows of a block format written where rows share blocks (a block-format type's row scales, unit 1; a block
-    /// format cache's rows of `unit` values not whole blocks): each block of the destination (fb, n values: heads·cap rows
-    /// of unit values) that holds a written value re-encoded, a warp a block, from the written rows' values (fx at
+    /// <summary>Rows of a block format written where rows share blocks (a block format cache's rows of `unit` values not
+    /// whole blocks): each block of the destination (fb, n values: heads·cap rows of unit values) that holds a written value
+    /// re-encoded, a warp a block, from the written rows' values (fx at
     /// px[(head·steps + step)·unit + column], read as float32) and its other values as they are stored; a block the write
     /// does not touch is left as it is. Params: x, destination, pos, n, cap, steps, unit.</summary>
     public static string CacheBlocks(Gpu gpu, Fmt fb, Fmt fx, out string entry)
@@ -187,20 +122,14 @@ internal static partial class Ptx
 
     /// <summary>The source's rows into the cache at the device's position, a thread a stored word of fc (a row: wpr words):
     /// each value of f read into the lane and rounded to fc once (Convert's rule: the lane's value, to odd at float32 first
-    /// where Fmt.ConvertPlan says); scaled: x / scale by the row's stored scale (f at head·cap + row; 0 where the scale is
-    /// 0), an integer code rounded to the nearest (ties to even), held to [min, max]. Params: x, cache, scales, pos, rows
-    /// (heads·steps), steps, cap, d, wpr, min, max (lane).</summary>
-    public static string CacheWrite(Gpu gpu, Fmt f, Fmt fc, Lane lane, bool scaled, out string entry, Fmt? source = null)
+    /// where Fmt.ConvertPlan says). Params: x, cache, pos, rows (heads·steps), steps, cap, d, wpr.</summary>
+    public static string CacheWrite(Gpu gpu, Fmt f, Fmt fc, Lane lane, out string entry)
     {
-        var fx = source ?? f;                                                   // x's format: the type's, or a composition's lane storage
-        entry = $"cache_write_{f.Name}_{fc.Name}_{lane.Name}{(scaled ? "_scaled" : "")}{(source is null ? "" : "_from_" + fx.Name)}";
+        entry = $"cache_write_{f.Name}_{fc.Name}_{lane.Name}";
         var b = new PtxBuilder();
         string word = GlobalIndex(b);
-        string px = Param64(b, "p_x"), pc = Param64(b, "p_c"), ps = Param64(b, "p_s"), pos = Param64(b, "p_pos");
+        string px = Param64(b, "p_x"), pc = Param64(b, "p_c"), pos = Param64(b, "p_pos");
         string rows = Param32(b, "p_rows"), steps = Param32(b, "p_steps"), cap = Param32(b, "p_cap"), d = Param32(b, "p_d"), wpr = Param32(b, "p_wpr");
-        string min = lane.NewReg(b), max = lane.NewReg(b);
-        b.L($"ld.param.{lane.Op} {min}, [p_min];");
-        b.L($"ld.param.{lane.Op} {max}, [p_max];");
         bool toOdd = Fmt.ConvertPlan(lane.Wide ? new Fmt("float64", 64, true, true) : new Fmt("float32", 32, true, true), fc).ToOdd;
         string row = b.R(), wc = b.R(), t = b.R(), h = b.R(), p = b.R(), at = b.R(), crow = b.R(), past = b.P();
         b.L($"div.u32 {row}, {word}, {wpr};");
@@ -216,13 +145,6 @@ internal static partial class Ptx
         b.L($"setp.ge.u32 {past}, {at}, {cap};");                         // below 0 too (unsigned)
         b.L($"@{past} bra DONE;");
         b.L($"mad.lo.u32 {crow}, {h}, {cap}, {at};");
-        string scale = "", positive = b.P();
-        if (scaled)
-        {
-            scale = Codec.UnpackAt(b, f, ps, crow, lane);
-            b.L($"setp.gt.{lane.Op} {positive}, {scale}, {lane.Zero};");
-        }
-
         string code = fc.WordBits == 64 ? b.RD() : b.R(), first = b.R();
         if (fc.WordBits == 32) b.L($"mov.b32 {code}, 0;");
         b.L($"mul.lo.u32 {first}, {row}, {d};");
@@ -231,15 +153,7 @@ internal static partial class Ptx
         {
             string idx = b.R();
             b.L($"add.u32 {idx}, {first}, {i};");
-            string v = Codec.UnpackAt(b, fx, px, idx, lane);
-            if (scaled)
-            {
-                string q = LaneOp(b, lane, "div", v, scale), kept = lane.NewReg(b);
-                b.L($"selp.{lane.Op} {kept}, {q}, {lane.Zero}, {positive};");
-                v = fc.IsFloat ? kept : RoundLane(b, lane, kept);
-                v = HeldLane(b, lane, v, min, max);
-            }
-
+            string v = Codec.UnpackAt(b, f, px, idx, lane);
             if (toOdd) Codec.Pack(b, fc, ToOddF32(b, lane, v), Lane.F32, i, code);
             else Codec.Pack(b, fc, v, lane, i, code);
         }
@@ -252,11 +166,11 @@ internal static partial class Ptx
         b.Label("DONE");
         b.L("ret;");
         return b.Finish(Header(gpu), entry,
-            $".param .u64 p_x, .param .u64 p_c, .param .u64 p_s, .param .u64 p_pos, .param .u32 p_rows, .param .u32 p_steps, .param .u32 p_cap, .param .u32 p_d, .param .u32 p_wpr, .param .{lane.Op} p_min, .param .{lane.Op} p_max");
+            ".param .u64 p_x, .param .u64 p_c, .param .u64 p_pos, .param .u32 p_rows, .param .u32 p_steps, .param .u32 p_cap, .param .u32 p_d, .param .u32 p_wpr");
     }
 
     /// <summary>The mask of a decoder's steps (n = rows·cap values of f): 0 where p + i − win &lt; j ≤ p + i (win 0: every
-    /// j ≤ p + i) for value i·cap + j, else `low`. Params: y, pos, n, cap, win, low (lane).</summary>
+    /// j ≤ p + i) for value i·cap + j, else `low` (the excluded score, CacheView.Excluded). Params: y, pos, n, cap, win, low (lane).</summary>
     public static string DecoderMask(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"decoder_mask_{f.Name}_{lane.Name}";

@@ -96,19 +96,15 @@ public interface IBenchSubject
     IBenchRun? AttentionBackward(Device device, string type, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] dO, byte[] dq, byte[] dk, byte[] dv) => null;
 
     /// <summary>The source's rows (c.Heads × steps × c.D of the type) into the cache (of cacheType) at the position
-    /// (ICache.CacheWrite); with scales (of the type) given: the rows' codes and their scales.</summary>
-    IBenchRun? CacheWrite(Device device, string type, string cacheType, CacheView c, int steps, int position, byte[] source, byte[] cache, byte[]? scales) => null;
+    /// (ICache.CacheWrite).</summary>
+    IBenchRun? CacheWrite(Device device, string type, string cacheType, CacheView c, int steps, int position, byte[] source, byte[] cache) => null;
 
-    /// <summary>O for the queries at the position against caches of cacheType (ICache.AttentionCached), their row scales (of
-    /// the type) when given.</summary>
-    IBenchRun? AttentionCached(Device device, string type, string cacheType, AttentionArgs a, int position, byte[] q, byte[] k, byte[]? kScales, byte[] v, byte[]? vScales, byte[] o) => null;
+    /// <summary>O for the queries at the position against caches of cacheType (ICache.AttentionCached).</summary>
+    IBenchRun? AttentionCached(Device device, string type, string cacheType, AttentionArgs a, int position, byte[] q, byte[] k, byte[] v, byte[] o) => null;
 
     /// <summary>The rotary embedding by tables (IRows.Rope): x's rows normalized (a gain given) and rotated into y (the type),
     /// y's rows a head at a time when a.HeadsFirst; cos and sin the float lane's storage.</summary>
     IBenchRun? Rope(Device device, string type, RopeArgs a, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] y) => null;
-
-    /// <summary>A layer's rows normalized, rotated and written into the cache (of cacheType) at the position (ICache.CacheWriteRope).</summary>
-    IBenchRun? CacheWriteRope(Device device, string type, string cacheType, CacheView c, RopeArgs a, int position, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] cache, byte[]? scales) => null;
 
     /// <summary>O for Q, K, V and O a step at a time (AttentionArgs.StepsFirst).</summary>
     IBenchRun? AttentionStepsFirst(Device device, string type, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) => null;

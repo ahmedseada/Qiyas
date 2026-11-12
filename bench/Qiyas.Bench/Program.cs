@@ -140,8 +140,8 @@ internal sealed class Options
     public static readonly string[] Group6 = ["conv", "conv_bwd"];
     public static readonly string[] Group8 = ["lstm_step", "gru_step", "lstm_step_bwd", "gru_step_bwd", "lstm_seq", "lstm_seq_bwd", "gru_seq", "gru_seq_bwd"];
     public static readonly string[] Group9 = ["topk_rows", "log_softmax_topk", "pick_rows", "sample_rows", "route", "route_wide", "cross_entropy", "ctc", "ctc_bwd"];
-    public static readonly string[] Group10 = ["cache_write", "cache_write_scaled", "quantize_rows", "attention_cached", "attention_cached_scaled", "decoder_mask"];
-    public static readonly string[] Group11 = ["rope_table", "rope_heads", "cache_write_rope", "attention_steps"];
+    public static readonly string[] Group10 = ["cache_write", "quantize_rows", "attention_cached", "decoder_mask"];
+    public static readonly string[] Group11 = ["rope_table", "rope_heads", "attention_steps"];
     public static readonly string[] Group12 = ["penalize", "sample_filtered", "sample_plain"];
     public static readonly string[] Group13 = ["memory:copy", "memory:clear", "memory:rent_zeroed"];
     public List<string>? Subjects;
@@ -836,11 +836,11 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
     }
 
     // Key and value caches (float types). The write: 16 heads of 512 rows of d = 128 at row 1000 of a cache of 2048 rows, as
-    // the type itself (a block format's rows whole blocks for Q8_0 and Q4_0, shared blocks for Q4_K and Q6_K) — the cache
-    // scored — and as int8 codes with a scale a row — the scales scored; quantize_rows is the same rows through Quantize (a scale a row), the write's nearest equivalent. Attention:
+    // the type itself (a block format's rows whole blocks for Q8_0 and Q4_0, shared blocks for Q4_K and Q6_K), the cache
+    // scored; quantize_rows: the same rows through Quantize as int8 codes with a scale a row (the scales scored). Attention:
     // attention_decode's shape (32 heads, one query over 4096 keys) with the position at the cache's last row, over a cache
-    // of the type and over int8 codes with row scales. The mask: 512 steps over 4096 positions. Odd shapes keep a row of
-    // the cache whole 32-bit words (d a multiple of 4).
+    // of the type. The mask: 512 steps over 4096 positions. Odd shapes keep a row of the cache whole 32-bit words (d a
+    // multiple of 4).
     private void CacheRow(Device device, string type, string name)
     {
         if (!Registry.IsFloat(type)) return;
@@ -849,14 +849,14 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         if (name == "decoder_mask")
         {
             int rows = Prime(512), cap = Prime(4096), at = 1000;
-            double lowest = Registry.Lowest(type);
+            double excluded = Registry.WithFloat(type, new Excluded());
             var want = new double[rows * cap];
-            for (int i = 0; i < want.Length; i++) want[i] = CacheView.Sees(at, i / cap, i % cap, 0) ? 0 : lowest;
+            for (int i = 0; i < want.Length; i++) want[i] = CacheView.Sees(at, i / cap, i % cap, 0) ? 0 : excluded;
             Measure(device, name, type, $"{rows}x{cap}", want, (s, mask) => s.DecoderMask(device, type, rows, cap, 0, at, mask), (int)Registry.Bytes(type, want.Length));
             return;
         }
 
-        if (name is "cache_write" or "cache_write_scaled" or "quantize_rows")
+        if (name is "cache_write" or "quantize_rows")
         {
             int heads = 16, steps = Prime(512), cap = Prime(2048), at = 1000, n = heads * steps * d;
             var view = new CacheView(heads, cap, d);
@@ -867,51 +867,36 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             {
                 var want = new double[view.Values];
                 for (int h = 0; h < heads; h++) Array.Copy(x, (long)h * steps * d, want, ((long)h * cap + at) * d, (long)steps * d);
-                Measure(device, name, type, shape, want, (s, cache) => s.CacheWrite(device, type, own, view, steps, at, source, cache, null), (int)Registry.Bytes(own, view.Values), own);
+                Measure(device, name, type, shape, want, (s, cache) => s.CacheWrite(device, type, own, view, steps, at, source, cache), (int)Registry.Bytes(own, view.Values), own);
                 return;
             }
 
-            if (name == "quantize_rows")
-            {
-                var w = ScaledWeight.PerRow(heads * steps, d);
-                var codes = new byte[Registry.Bytes("int8", w.Values)];
-                var (wantScales, _) = w.QuantizeReference(x, -128, 127, false);
-                Measure(device, name, type, $"{heads * steps}x{d} int8", wantScales, (s, scales) => s.Quantize(device, type, "int8", w, source, codes, scales), (int)Registry.Bytes(type, w.Scales));
-                return;
-            }
-
-            var (rowScales, rowsAt) = view.WriteRows(x, steps, at, 127);
-            var wantAll = new double[view.Rows];
-            for (int i = 0; i < rowsAt.Length; i++) if (rowsAt[i] >= 0) wantAll[rowsAt[i]] = rowScales[i];
-            var codesOut = new byte[Registry.Bytes("int8", view.Values)];
-            Measure(device, name, type, shape + " int8", wantAll, (s, scales) => s.CacheWrite(device, type, "int8", view, steps, at, source, codesOut, scales), (int)Registry.Bytes(type, view.Rows));
+            var w = ScaledWeight.PerRow(heads * steps, d);
+            var codes = new byte[Registry.Bytes("int8", w.Values)];
+            var (wantScales, _) = w.QuantizeReference(x, -128, 127, false);
+            Measure(device, name, type, $"{heads * steps}x{d} int8", wantScales, (s, scales) => s.Quantize(device, type, "int8", w, source, codes, scales), (int)Registry.Bytes(type, w.Scales));
             return;
         }
 
-        bool scaled = name == "attention_cached_scaled";
-        string cacheType = scaled ? "int8" : own;
         var a = new AttentionArgs(32, 1, Prime(4096), d, 1 / Math.Sqrt(128), true);
-        int keys = (int)a.KValues, rowsK = a.KvHeadCount * a.Lk, position = a.Lk - 1;
+        int keys = (int)a.KValues, position = a.Lk - 1;
         var q = Registry.Make(type, (int)a.QValues, 41, -1, 1);
-        var k = Registry.Make(cacheType, keys, 42, -1, 1);
-        var v = Registry.Make(cacheType, keys, 43, -1, 1);
-        byte[]? ks = scaled ? Registry.Make(type, rowsK, 44, 0.25, 0.5) : null, vs = scaled ? Registry.Make(type, rowsK, 45, 0.25, 0.5) : null;
-        double[] kv = Registry.Values(cacheType, k, keys), vv = Registry.Values(cacheType, v, keys);
-        if (scaled)
-        {
-            double[] sk = Registry.Values(type, ks!, rowsK), sv = Registry.Values(type, vs!, rowsK);
-            for (int i = 0; i < keys; i++) { kv[i] *= sk[i / d]; vv[i] *= sv[i / d]; }
-        }
+        var k = Registry.Make(own, keys, 42, -1, 1);
+        var v = Registry.Make(own, keys, 43, -1, 1);
+        var wantO = CacheRule.AtPosition(a, position).Reference(Registry.Values(type, q, (int)a.QValues), Registry.Values(own, k, keys), Registry.Values(own, v, keys));
+        Measure(device, name, type, $"{a.Heads}h {a.Lq}x{a.Lk} d{a.D}", wantO, (s, o) => s.AttentionCached(device, type, own, a, position, q, k, v, o), q.Length);
+    }
 
-        var wantO = CacheRule.AtPosition(a, position).Reference(Registry.Values(type, q, (int)a.QValues), kv, vv);
-        Measure(device, name, type, $"{a.Heads}h {a.Lq}x{a.Lk} d{a.D}{(scaled ? " int8" : "")}", wantO, (s, o) => s.AttentionCached(device, type, cacheType, a, position, q, k, ks, v, vs, o), q.Length);
+    // The score a decoder's mask excludes by, as the type stores it (CacheView.Excluded).
+    private readonly struct Excluded : IFloatTypeVisitor<double>
+    {
+        public double Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => CacheView.Excluded<TN>();
     }
 
     // A layer's projections into the layouts attention reads (float types). The table rotary embedding after an RMS
     // normalization over 16 heads of 512 steps of d = 128: rope_table (y's rows x's) and rope_heads (y's rows a head at a
-    // time); cache_write_rope: the same rows normalized, rotated and written into the cache_write row's cache (the type
-    // itself; a block format's float32), its equivalent rope_heads then cache_write. attention_steps: attention_causal's
-    // shape with Q, K, V and O a step at a time (the form's time and the strided copies').
+    // time). attention_steps: attention_causal's shape with Q, K, V and O a step at a time (the form's time and the strided
+    // copies').
     private void HeadsRow(Device device, string type, string name)
     {
         if (!Registry.IsFloat(type)) return;
@@ -946,19 +931,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         var a2 = new RopeArgs(rows, d, heads, steps, half, false) { HeadsFirst = name != "rope_table" };
         var want = new double[n];
         RowOps.RopeReference(Registry.Values(type, x, n), Registry.Values(type, gain, d), cos, sin, positions, a2, want);
-        if (name != "cache_write_rope")
-        {
-            Measure(device, name, type, $"{rows}x{d}", want, (s, y) => s.Rope(device, type, a2, x, gain, cosBytes, sinBytes, positions, y), x.Length);
-            return;
-        }
-
-        string own = Registry.IsBlock(type) ? "float32" : type;
-        int cap = Prime(2048), at = 1000;
-        var view = new CacheView(heads, cap, d);
-        var wantCache = new double[view.Values];
-        for (int h = 0; h < heads; h++) Array.Copy(want, (long)h * steps * d, wantCache, ((long)h * cap + at) * d, (long)steps * d);
-        Measure(device, name, type, $"{heads}h {steps}x{d} at {at}/{cap}", wantCache,
-            (s, cache) => s.CacheWriteRope(device, type, own, view, a2 with { HeadsFirst = false }, at, x, gain, cosBytes, sinBytes, positions, cache, null), (int)Registry.Bytes(own, view.Values), own);
+        Measure(device, name, type, $"{rows}x{d}", want, (s, y) => s.Rope(device, type, a2, x, gain, cosBytes, sinBytes, positions, y), x.Length);
     }
 
     // Products on views at the core product's size: transposed operands, 16 batches of a quarter size, the backward pair (dA and dB; dA scored).
@@ -1093,7 +1066,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         double worst = 0;
         for (int i = 0; i < v.Length; i++)
         {
-            double e = Math.Abs(v[i] - reference[i]);
+            double e = v[i] == reference[i] ? 0 : Math.Abs(v[i] - reference[i]);           // an infinity where the reference has it: none
             worst = double.IsNaN(e) ? double.PositiveInfinity : Math.Max(worst, e);
         }
 

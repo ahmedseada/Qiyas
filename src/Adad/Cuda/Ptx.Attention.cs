@@ -18,16 +18,16 @@ internal static partial class Ptx
     public static int DecodeShared(Lane lane, int dCap) => ReduceBytes + (dCap + 2 * DecodeThreads) * lane.Size;
 
     /// <summary>The decode kernel over caches at a position the device holds (ICache.AttentionCached): K and V stored as Fc,
-    /// each row's scale (the queries' type, at head·lk + row) multiplied into its values as they are read, the scores capped.</summary>
-    internal sealed record DecodeCache(Fmt Fc, bool KScales, bool VScales, bool Capped)
+    /// the scores capped.</summary>
+    internal sealed record DecodeCache(Fmt Fc, bool Capped)
     {
-        public string Key => $"{Fc.Name}{(KScales ? "_k" : "")}{(VScales ? "_v" : "")}{(Capped ? "_cap" : "")}";
+        public string Key => $"{Fc.Name}{(Capped ? "_cap" : "")}";
     }
 
     /// <summary>cache null: a block a (head, query), each query's limit and start read from p_lim and p_start. Over caches:
     /// lq is the rows a head of K and V serves (a group's query heads × p_lq0 queries), p_lim the position (an s32 at the
     /// device): row r's query i = r mod p_lq0 sees keys [max(0, limit − p_win) when a window, limit), limit = p + i + 1 held
-    /// to [0, lk]; p_ks and p_vs the row scales; p_cap the cap.</summary>
+    /// to [0, lk]; p_cap the cap.</summary>
     /// runs (K and V a block format, d a multiple of 8): a key's row read in runs of 8 values (Codec.UnpackRun: the block's
     /// and the sub-block's scales read once a run), each value's arithmetic and the sum's order as without.
     public static string AttentionDecode(Gpu gpu, Fmt f, Lane lane, int dCap, out string entry, Fmt? outFmt = null, DecodeCache? cache = null, bool runs = false)
@@ -42,7 +42,7 @@ internal static partial class Ptx
         string lq = Param32(b, "p_lq"), lk = Param32(b, "p_lk"), d = Param32(b, "p_d");
         string scale = lane.NewReg(b);
         b.L($"ld.param.{lane.Op} {scale}, [p_scale];");
-        string ks = "", vs = "", cap = "";
+        string cap = "";
         string h = b.R(), i = b.R(), t = b.R(), limit = b.R(), qBase = b.R(), kBase = b.R(), hk = b.R(), la = b.RD();
         b.L($"div.u32 {h}, {bid}, {lq};");
         b.L($"mul.lo.u32 {t}, {h}, {lq};");
@@ -60,8 +60,6 @@ internal static partial class Ptx
         }
         else
         {
-            ks = Param64(b, "p_ks");
-            vs = Param64(b, "p_vs");
             string lq0 = Param32(b, "p_lq0"), win = Param32(b, "p_win"), pos = b.R(), i0 = b.R(), noWin = b.P();
             cap = lane.NewReg(b);
             b.L($"ld.param.{lane.Op} {cap}, [p_cap];");
@@ -116,7 +114,7 @@ internal static partial class Ptx
         b.L($"setp.ge.u32 {pDone}, {chunk}, {limit};");
         b.L($"@{pDone} bra CHUNK_END;");
         // This thread's key: its score.
-        string j = b.R(), pValid = b.P(), s = lane.NewReg(b), jc = b.R(), keyRow = b.R();
+        string j = b.R(), pValid = b.P(), s = lane.NewReg(b), jc = b.R();
         b.L($"add.u32 {j}, {chunk}, {tid};");
         b.L($"setp.lt.u32 {pValid}, {j}, {limit};");
         b.L($"mov.{lane.Reg} {s}, {lane.Zero};");
@@ -128,8 +126,6 @@ internal static partial class Ptx
             b.L($"sub.u32 {lastKey}, {limit}, 1;");
             b.L($"min.u32 {jc}, {j}, {lastKey};");                           // a thread past the limit reads a valid row (dropped)
             b.L($"mad.lo.u32 {rowBase}, {jc}, {d}, {kBase};");
-            b.L($"add.u32 {keyRow}, {hk}, {jc};");
-            string kScale = cache is { KScales: true } ? Codec.UnpackAt(b, f, ks, keyRow, lane) : "";
             b.L($"mov.u32 {tt}, 0;");
             b.Label("DOT");
             b.L($"setp.ge.u32 {pEnd}, {tt}, {d};");
@@ -141,7 +137,6 @@ internal static partial class Ptx
             for (int r = 0; r < run; r++)
             {
                 string kv = keys[r];
-                if (cache is { KScales: true }) kv = LaneOp(b, lane, "mul", kv, kScale);      // the row's value: code·scale
                 b.L($"ld.shared.{lane.Mem} {qv}, [{addr}+{r * lane.Size}];");
                 b.L(lane.Fma(s, qv, kv, s));
             }
@@ -173,14 +168,6 @@ internal static partial class Ptx
         string pAddr = b.R();
         b.L($"mad.lo.u32 {pAddr}, {tid}, {lane.Size}, {sp};");
         b.L($"st.shared.{lane.Mem} [{pAddr}], {p};");
-        if (cache is { VScales: true })
-        {
-            // This key's V scale beside its weight, for the dimensions' threads.
-            string vScale = Codec.UnpackAt(b, f, vs, keyRow, lane), vAddr = b.R();
-            b.L($"mad.lo.u32 {vAddr}, {tid}, {lane.Size}, {ss};");
-            b.L($"st.shared.{lane.Mem} [{vAddr}], {vScale};");
-        }
-
         string csum = BlockReduce(b, lane, tid, p, "add", DecodeThreads);
         b.L(lane.Fma(l, l, alpha, csum));
         b.L($"mov.{lane.Reg} {m}, {mNew};");
@@ -206,14 +193,6 @@ internal static partial class Ptx
             b.L($"ld.shared.{lane.Mem} {pw}, [{wAddr}];");
             b.L($"mad.lo.u32 {idx}, {jj}, {d}, {vBase};");
             string vv = Codec.UnpackAt(b, fk, v, idx, lane);
-            if (cache is { VScales: true })
-            {
-                string sv = lane.NewReg(b), svAddr = b.R();
-                b.L($"mad.lo.u32 {svAddr}, {jj}, {lane.Size}, {ss};");
-                b.L($"ld.shared.{lane.Mem} {sv}, [{svAddr}];");
-                vv = LaneOp(b, lane, "mul", vv, sv);                                       // the row's value: code·scale
-            }
-
             b.L(lane.Fma(acc[a], pw, vv, acc[a]));
             b.L($"add.u32 {jj}, {jj}, 1;");
             b.L($"bra CTX{a};");
@@ -265,7 +244,7 @@ internal static partial class Ptx
 
         b.L("ret;");
         string pa = lane.Wide ? "f64" : "f32";
-        string over = cache is null ? "" : $", .param .u64 p_ks, .param .u64 p_vs, .param .u32 p_lq0, .param .u32 p_win, .param .{pa} p_cap";
+        string over = cache is null ? "" : $", .param .u32 p_lq0, .param .u32 p_win, .param .{pa} p_cap";
         return b.Finish(Header(gpu), entry, $".param .u64 p_q, .param .u64 p_k, .param .u64 p_v, .param .u64 p_o, .param .u64 p_lim, .param .u64 p_start, .param .u32 p_lq, .param .u32 p_lk, .param .u32 p_d, .param .{pa} p_scale{over}", DecodeShared(lane, dCap));
     }
 
