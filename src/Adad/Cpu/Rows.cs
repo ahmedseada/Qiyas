@@ -496,12 +496,15 @@ internal sealed partial class Kernels
         private readonly void Go<TN, TLane, TL, TK>()
             where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane> where TK : struct, IRowKernel<TLane, TL>
         {
-            var body = new RowOpBody<TN, TLane, TL, TK>(op, x, x2, g, bt, s, pos, y, y2, cols, TL.From(a), TL.From(b));
+            // Rows well past the caches (their inputs and outputs) stream their outputs (Streams), each row of whole storage units.
+            long rowBytes = TN.Bytes(cols), passBytes = (long)rows * rowBytes * (1 + (x2 is null ? 0 : 1) + 1 + (y2 is null || op.RowOut ? 0 : 1));
+            bool stream = Streams.Past(passBytes) && cols % TN.Granularity == 0;
+            var body = new RowOpBody<TN, TLane, TL, TK>(op, x, x2, g, bt, s, pos, y, y2, cols, TL.From(a), TL.From(b), stream);
             Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)rows * cols * 4, body);
         }
     }
 
-    private struct RowOpBody<TN, TLane, TL, TK>(RowOp op, byte[] x, byte[]? x2, byte[]? g, byte[]? bt, byte[]? s, int[]? pos, byte[] y, byte[]? y2, int cols, TLane a, TLane b) : Team.IBody
+    private struct RowOpBody<TN, TLane, TL, TK>(RowOp op, byte[] x, byte[]? x2, byte[]? g, byte[]? bt, byte[]? s, int[]? pos, byte[] y, byte[]? y2, int cols, TLane a, TLane b, bool stream) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane> where TK : struct, IRowKernel<TLane, TL>
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -511,8 +514,10 @@ internal sealed partial class Kernels
             // Lane rows for what the stored bytes are not (direct types read and write their own storage).
             var xl = TN.Direct ? null : pool.Rent(cols);
             var x2l = x2 is null || TN.Direct ? null : pool.Rent(cols);
-            var yl = TN.Direct ? null : pool.Rent(cols);
-            var y2l = y2 is null || TN.Direct || op.RowOut ? null : pool.Rent(cols);
+            var yl = TN.Direct && !stream ? null : pool.Rent(cols);
+            var y2l = y2 is null || (TN.Direct && !stream) || op.RowOut ? null : pool.Rent(cols);
+            int rowBytes = (int)TN.Bytes(cols);
+            var stored = stream && !TN.Direct ? ArrayPool<byte>.Shared.Rent(rowBytes) : null;     // a row's bytes before they stream
             var gl = g is null ? null : pool.Rent(cols);
             var btl = bt is null ? null : pool.Rent(cols);
             var sl = s is null ? null : pool.Rent(1);
@@ -528,8 +533,8 @@ internal sealed partial class Kernels
                     {
                         xs = MemoryMarshal.Cast<byte, TLane>(x.AsSpan()).Slice(r * cols, cols);
                         if (x2 is not null) x2s = MemoryMarshal.Cast<byte, TLane>(x2.AsSpan()).Slice(r * cols, cols);
-                        ys = MemoryMarshal.Cast<byte, TLane>(y.AsSpan()).Slice(r * cols, cols);
-                        if (y2 is not null && !op.RowOut) y2s = MemoryMarshal.Cast<byte, TLane>(y2.AsSpan()).Slice(r * cols, cols);
+                        ys = stream ? yl.AsSpan(0, cols) : MemoryMarshal.Cast<byte, TLane>(y.AsSpan()).Slice(r * cols, cols);
+                        if (y2 is not null && !op.RowOut) y2s = stream ? y2l.AsSpan(0, cols) : MemoryMarshal.Cast<byte, TLane>(y2.AsSpan()).Slice(r * cols, cols);
                     }
                     else
                     {
@@ -546,15 +551,32 @@ internal sealed partial class Kernels
                     if (s is not null) { TN.Load(s, r, sl.AsSpan(0, 1)); sv = sl![0]; }
                     int p = pos is null ? r : pos[r];
                     TK.Row(xs, x2s, g is null ? default : gl.AsSpan(0, cols), bt is null ? default : btl.AsSpan(0, cols), sv, p, r, a, b, ys, y2s);
-                    if (!TN.Direct)
+                    if (stream)
+                    {
+                        Out(ys, y, r);
+                        if (y2 is not null && !op.RowOut) Out(y2s, y2, r);
+                    }
+                    else if (!TN.Direct)
                     {
                         TN.Store(ys, y, r * cols);
                         if (y2 is not null && !op.RowOut) TN.Store(y2s, y2, r * cols);
                     }
                 }
+
+                if (stream) Streams.Fence();
+
+                // Row r's values streamed into its place in an output: as they are (direct), or through the type's store.
+                void Out(Span<TLane> row, byte[] output, int r)
+                {
+                    var bytes = output.AsSpan(r * rowBytes, rowBytes);
+                    if (TN.Direct) { Streams.Copy(MemoryMarshal.AsBytes(row), bytes); return; }
+                    TN.Store(row, stored.AsSpan(0, rowBytes), 0);
+                    Streams.Copy(stored.AsSpan(0, rowBytes), bytes);
+                }
             }
             finally
             {
+                if (stored is not null) ArrayPool<byte>.Shared.Return(stored);
                 if (xl is not null) pool.Return(xl);
                 if (x2l is not null) pool.Return(x2l);
                 if (yl is not null) pool.Return(yl);

@@ -767,17 +767,32 @@ internal sealed partial class Kernels
     public struct SoftmaxVisitor(byte[] x, byte[] y, int rows, int cols) : IFloatLaneVisitor
     {
         public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane> =>
-            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)rows * cols * 8, new SoftmaxBody<TN, TLane, TL>(x, y, cols));
+            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)rows * cols * 8, new SoftmaxBody<TN, TLane, TL>(x, y, cols, RowsStream<TN>(rows, cols)));
     }
 
-    private struct SoftmaxBody<TN, TLane, TL>(byte[] x, byte[] y, int cols) : Team.IBody
+    // A row pass's outputs streamed past the caches (Streams): its input and output rows well past them, rows of whole units.
+    private static bool RowsStream<TN>(int rows, int cols) where TN : struct, IAdad<TN> => Streams.Past(2 * rows * TN.Bytes(cols)) && cols % TN.Granularity == 0;
+
+    // A row computed in lanes, streamed into its place: as it is (direct), or through the type's store into `stored` first.
+    private static void StreamRow<TN, TLane>(ReadOnlySpan<TLane> row, byte[] output, int r, int cols, byte[]? stored) where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
+    {
+        int rowBytes = (int)TN.Bytes(cols);
+        var bytes = output.AsSpan(r * rowBytes, rowBytes);
+        if (TN.Direct) { Streams.Copy(MemoryMarshal.AsBytes(row), bytes); return; }
+        TN.Store(row, stored.AsSpan(0, rowBytes), 0);
+        Streams.Copy(stored.AsSpan(0, rowBytes), bytes);
+    }
+
+    private struct SoftmaxBody<TN, TLane, TL>(byte[] x, byte[] y, int cols, bool stream) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public readonly void Run(int first, int last)
         {
-            TLane[]? rented = TN.Direct || cols <= 4096 ? null : ArrayPool<TLane>.Shared.Rent(cols);
-            Span<TLane> row = TN.Direct ? default : rented is null ? stackalloc TLane[cols] : rented.AsSpan(0, cols);
+            bool own = TN.Direct && !stream;                              // the row computed in the output itself
+            TLane[]? rented = own || cols <= 4096 ? null : ArrayPool<TLane>.Shared.Rent(cols);
+            Span<TLane> row = own ? default : rented is null ? stackalloc TLane[cols] : rented.AsSpan(0, cols);
+            var stored = stream && !TN.Direct ? ArrayPool<byte>.Shared.Rent((int)TN.Bytes(cols)) : null;
             try
             {
                 for (int r = first; r < last; r++)
@@ -786,21 +801,25 @@ internal sealed partial class Kernels
                     if (TN.Direct)
                     {
                         var src = MemoryMarshal.Cast<byte, TLane>(x.AsSpan()).Slice(r * cols, cols);
-                        v = MemoryMarshal.Cast<byte, TLane>(y.AsSpan()).Slice(r * cols, cols);
+                        if (own) v = MemoryMarshal.Cast<byte, TLane>(y.AsSpan()).Slice(r * cols, cols);
                         Softmax<TLane, TL>(src, v);
                     }
                     else
                     {
-                        v = row;
                         TN.Load(x, r * cols, v);
                         Softmax<TLane, TL>(v, v);
-                        TN.Store(v, y, r * cols);
+                        if (!stream) TN.Store(v, y, r * cols);
                     }
+
+                    if (stream) StreamRow<TN, TLane>(v, y, r, cols, stored);
                 }
+
+                if (stream) Streams.Fence();
             }
             finally
             {
                 if (rented is not null) ArrayPool<TLane>.Shared.Return(rented);
+                if (stored is not null) ArrayPool<byte>.Shared.Return(stored);
             }
         }
     }
@@ -868,17 +887,19 @@ internal sealed partial class Kernels
     public struct RmsNormVisitor(byte[] x, byte[] y, int rows, int cols, double eps) : IFloatLaneVisitor
     {
         public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane> =>
-            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)rows * cols * 2, new RmsBody<TN, TLane, TL>(x, y, cols, TL.From(eps)));
+            Team.For(rows, RowChunk<TN>(rows, cols, rows / (Threads * 4)), (long)rows * cols * 2, new RmsBody<TN, TLane, TL>(x, y, cols, TL.From(eps), RowsStream<TN>(rows, cols)));
     }
 
-    private struct RmsBody<TN, TLane, TL>(byte[] x, byte[] y, int cols, TLane eps) : Team.IBody
+    private struct RmsBody<TN, TLane, TL>(byte[] x, byte[] y, int cols, TLane eps, bool stream) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public readonly void Run(int first, int last)
         {
-            TLane[]? rented = TN.Direct || cols <= 4096 ? null : ArrayPool<TLane>.Shared.Rent(cols);
-            Span<TLane> row = TN.Direct ? default : rented is null ? stackalloc TLane[cols] : rented.AsSpan(0, cols);
+            bool own = TN.Direct && !stream;                              // the row written in the output itself
+            TLane[]? rented = own || cols <= 4096 ? null : ArrayPool<TLane>.Shared.Rent(cols);
+            Span<TLane> row = own ? default : rented is null ? stackalloc TLane[cols] : rented.AsSpan(0, cols);
+            var stored = stream && !TN.Direct ? ArrayPool<byte>.Shared.Rent((int)TN.Bytes(cols)) : null;
             TLane count = TL.From(cols);
             try
             {
@@ -889,7 +910,7 @@ internal sealed partial class Kernels
                     if (TN.Direct)
                     {
                         src = MemoryMarshal.Cast<byte, TLane>(x.AsSpan()).Slice(r * cols, cols);
-                        dst = MemoryMarshal.Cast<byte, TLane>(y.AsSpan()).Slice(r * cols, cols);
+                        if (own) dst = MemoryMarshal.Cast<byte, TLane>(y.AsSpan()).Slice(r * cols, cols);
                     }
                     else
                     {
@@ -923,12 +944,16 @@ internal sealed partial class Kernels
                     int q = 0;
                     for (; q < vec; q += w) (Vector.LoadUnsafe(ref rs, (nuint)q) * sv).StoreUnsafe(ref rd, (nuint)q);
                     for (; q < cols; q++) dst[q] = TL.Mul(src[q], scale);
-                    if (!TN.Direct) TN.Store(row, y, r * cols);
+                    if (stream) StreamRow<TN, TLane>(dst, y, r, cols, stored);
+                    else if (!TN.Direct) TN.Store(row, y, r * cols);
                 }
+
+                if (stream) Streams.Fence();
             }
             finally
             {
                 if (rented is not null) ArrayPool<TLane>.Shared.Return(rented);
+                if (stored is not null) ArrayPool<byte>.Shared.Return(stored);
             }
         }
     }
