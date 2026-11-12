@@ -343,13 +343,13 @@ internal sealed partial class Kernels
 
     /// <summary>A strided copy whose output rows run across the input (the last dimension's stride not 1) while an outer
     /// dimension has stride 1 (a transposition): taken by tiles of output rows along the innermost such dimension (see
-    /// StridedTileBody). Rows ending on whole bytes only (each row stored by one thread), values read in place or through
-    /// the task's reader.</summary>
+    /// StridedTileBody). Rows of whole storage units only (a row's spans stored by one thread each, no two threads writing
+    /// one byte or one block), values read in place or through the task's reader.</summary>
     private static bool StridedTiled<TN, TLane>(LayoutArgs k, int cols, out int dim) where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
     {
         dim = -1;
         int rank = k.P.Length / 2;
-        if (k.Name != "strided" || rank < 2 || k.P[2 * rank - 1] == 1 || (long)cols * TN.Bits % 8 != 0) return false;
+        if (k.Name != "strided" || rank < 2 || k.P[2 * rank - 1] == 1 || cols % TN.Granularity != 0) return false;
         for (int j = rank - 2; j >= 0; j--) if (k.P[rank + j] == 1 && k.P[j] > 1) { dim = j; return true; }
         return false;
     }
