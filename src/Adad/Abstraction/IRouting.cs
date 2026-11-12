@@ -7,13 +7,12 @@ namespace Adad.Abstraction;
 public interface IRouting<TBuffer, TIndex>
 {
     /// <summary>The k largest of each row (rows × cols): values (rows × k) and their columns, largest first, an equal value by
-    /// the lower index; k past the row: no column (−1) and the value 0.</summary>
+    /// the lower index; k is at most cols (Routing.ValidateTopK: refused past it).</summary>
     string TopK<TN>(TBuffer x, int rows, int cols, int k, TBuffer values, TIndex indices) where TN : struct, IAdad<TN>;
 
     /// <summary>The k largest of each row of x (rows × cols) as log-probabilities (a beam's candidates, read instead of the
-    /// rows): indices as TopK's (largest first, an equal value by the lower index, −1 past the row); values[r·k + j] =
-    /// (x[r][index] − m) − log Σ_c exp(x[r][c] − m), m the row's largest, in the float lane, rounded to TN once (past the row: −∞ as the
-    /// type stores it; a block format's lowest value, an infinity having no block).</summary>
+    /// rows): indices as TopK's (largest first, an equal value by the lower index; k at most cols); values[r·k + j] =
+    /// (x[r][index] − m) − log Σ_c exp(x[r][c] − m), m the row's largest, in the float lane, rounded to TN once.</summary>
     string LogSoftmaxTopK<TN>(TBuffer x, int rows, int cols, int k, TBuffer values, TIndex indices) where TN : struct, IFloatAdad<TN>;
 
     /// <summary>output[r] = x[r, index[r]]; a column outside the row (below 0, or cols and past) reads nothing: 0.</summary>

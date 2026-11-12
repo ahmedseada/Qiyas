@@ -81,7 +81,7 @@ internal static partial class VkKernels
     }
 
     /// <summary>out[r·k + j] = x[r][index[r·k + j]] (s32 columns) over rows · k values, a thread per stored word: top-k's
-    /// values, pick's with k = 1. A column outside the row (top-k's −1 past the row; below 0 is past it unsigned) reads the
+    /// values, pick's with k = 1. A column outside the row (below 0 or past it; below 0 is past it unsigned) reads the
     /// row's first value, dropped: 0. Arguments: x, index, out, rows, cols, k.</summary>
     public static SpvKernel GatherByIndex(Vulkan vk, Fmt f)
     {

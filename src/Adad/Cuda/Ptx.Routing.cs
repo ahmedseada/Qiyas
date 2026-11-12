@@ -79,7 +79,7 @@ internal static partial class Ptx
             b.L($"st.global.s32 [{iAddr}], {bi};");
             if (!f.IsBlock)
             {
-                // k past the row: no column was left (the index −1), the value 0.
+                // A pass that found no column (the index −1): the value 0, as Pick of no column.
                 string pNoCol = b.P(), kept = lane.NewReg(b);
                 b.L($"setp.eq.u32 {pNoCol}, {bi}, 0xFFFFFFFF;");
                 b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {kept}, {lane.Zero}, {bv}, {pNoCol};");
@@ -536,7 +536,7 @@ internal static partial class Ptx
 
     /// <summary>out[r][j] = x[r][index[r·k + j]] (s32 columns) over rows · k values of block format f: a warp per output block,
     /// each value decoded where it is stored and the block encoded (top-k's values, pick's with k = 1). A column outside the
-    /// row (top-k's −1 past the row) reads the row's first value, dropped: 0.</summary>
+    /// row (below 0 or past it) reads the row's first value, dropped: 0.</summary>
     public static string GatherRowsBlocks(Gpu gpu, Fmt f, out string entry)
     {
         entry = $"gather_rows_{f.Name}_blocks";

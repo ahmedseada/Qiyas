@@ -8,10 +8,10 @@ namespace Adad.Cuda;
 
 public sealed partial class GpuOps
 {
-    /// <summary>top-k of each row: values as the type (rows × k), indices s32 (k past the row: −1 and the value 0); returns the
-    /// lane's name.</summary>
+    /// <summary>top-k of each row: values as the type (rows × k), indices s32 (k at most cols); returns the lane's name.</summary>
     public string TopK<TN>(ulong x, int rows, int cols, int k, ulong values, ulong indices) where TN : struct, IAdad<TN>
     {
+        Routing.ValidateTopK(rows, cols, k);
         var f = Fmt.Of<TN>();
         var lane = f.Natural;
         if (f.IsBlock) lane = Lane.F32;                                           // a block format: its rows decoded in place, in f32
@@ -36,6 +36,7 @@ public sealed partial class GpuOps
     /// (x − m) − log Σ as a lane value); stored as the type once after. Returns the lane's name.</summary>
     public string LogSoftmaxTopK<TN>(ulong x, int rows, int cols, int k, ulong values, ulong indices) where TN : struct, IFloatAdad<TN>
     {
+        Routing.ValidateTopK(rows, cols, k);
         var f = Fmt.Of<TN>();
         var lane = RowLane(f);
         if (rows == 0 || k == 0) return lane.Name;
@@ -48,7 +49,7 @@ public sealed partial class GpuOps
         try
         {
             var fn = gpu.Cached($"log_probs:{f.Name}", (out string e) => Ptx.LogProbRows(gpu, f, lane, out e));
-            double none = f.IsBlock ? TN.Min : double.NegativeInfinity;                // past the row
+            double none = f.IsBlock ? TN.Min : double.NegativeInfinity;                // a pass that found no column (no score in reach)
             Gpu.Launch(fn, (uint)rows, 1, Ptx.ReduceThreads, 1, 0, x, indices, lanes, Gpu.U(cols), Gpu.U(k), lane.Wide ? Gpu.D(none) : Gpu.F((float)none));
             FromLane(f, lanes, values, (long)rows * k);
         }

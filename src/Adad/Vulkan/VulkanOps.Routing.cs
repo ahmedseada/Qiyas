@@ -13,6 +13,7 @@ public sealed partial class VulkanOps
     /// <summary>top-k of each row: values as the type (rows × k), indices s32; returns the lane's name.</summary>
     public string TopK<TN>(ulong x, int rows, int cols, int k, ulong values, ulong indices) where TN : struct, IAdad<TN>
     {
+        Routing.ValidateTopK(rows, cols, k);
         var f = Fmt.Of<TN>();
         var lane = f.Natural;
         if (k > VkKernels.MaxTopK) throw new NotSupportedException($"vulkan: top-k with k = {k} exceeds the kernel's passes ({VkKernels.MaxTopK}); a partial sort is the step");
@@ -28,6 +29,7 @@ public sealed partial class VulkanOps
     /// chosen column storing (x − m) − log Σ as a lane value); stored as the type once after. Returns the lane's name.</summary>
     public string LogSoftmaxTopK<TN>(ulong x, int rows, int cols, int k, ulong values, ulong indices) where TN : struct, IFloatAdad<TN>
     {
+        Routing.ValidateTopK(rows, cols, k);
         var f = Fmt.Of<TN>();
         var lane = RowLane(f);
         if (k > VkKernels.MaxTopK) throw new NotSupportedException($"vulkan: top-k with k = {k} exceeds the kernel's passes ({VkKernels.MaxTopK}); a partial sort is the step");

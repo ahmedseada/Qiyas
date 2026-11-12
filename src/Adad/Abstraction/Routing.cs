@@ -11,8 +11,14 @@ namespace Adad.Abstraction;
 
 public static class Routing
 {
-    /// <summary>top-k of each row in float64: values and indices, largest first, ties by the lower index (k past the row:
-    /// −1 and 0).</summary>
+    /// <summary>Refuses a top-k the definition does not cover: k from 0 to the row's columns (the k largest of fewer than k
+    /// values are not defined), rows and columns not negative.</summary>
+    public static void ValidateTopK(int rows, int cols, int k)
+    {
+        if (rows < 0 || cols < 0 || k < 0 || k > cols) throw new ArgumentException($"top-k: the {k} largest of rows of {cols} values (k is at most the row's columns)");
+    }
+
+    /// <summary>top-k of each row in float64: values and indices, largest first, ties by the lower index.</summary>
     public static (double[] Values, int[] Indices) TopKReference(double[] x, int rows, int cols, int k)
     {
         var values = new double[rows * k];
@@ -22,8 +28,8 @@ public static class Routing
             var order = Enumerable.Range(0, cols).OrderByDescending(c => x[r * cols + c]).ThenBy(c => c).Take(k).ToArray();
             for (int i = 0; i < k; i++)
             {
-                indices[r * k + i] = i < order.Length ? order[i] : -1;
-                values[r * k + i] = i < order.Length ? x[r * cols + order[i]] : 0;
+                indices[r * k + i] = order[i];
+                values[r * k + i] = x[r * cols + order[i]];
             }
         }
 
@@ -31,7 +37,7 @@ public static class Routing
     }
 
     /// <summary>The top-k of each row as log-probabilities in float64 (IRouting.LogSoftmaxTopK): each value less its row's
-    /// log-sum-exp (−∞ and −1 past the row).</summary>
+    /// log-sum-exp.</summary>
     public static (double[] Values, int[] Indices) LogSoftmaxTopKReference(double[] x, int rows, int cols, int k)
     {
         var values = new double[rows * k];
@@ -44,8 +50,8 @@ public static class Routing
             var order = Enumerable.Range(0, cols).OrderByDescending(c => x[r * cols + c]).ThenBy(c => c).Take(k).ToArray();
             for (int i = 0; i < k; i++)
             {
-                indices[r * k + i] = i < order.Length ? order[i] : -1;
-                values[r * k + i] = i < order.Length ? x[r * cols + order[i]] - m - Math.Log(sum) : double.NegativeInfinity;
+                indices[r * k + i] = order[i];
+                values[r * k + i] = x[r * cols + order[i]] - m - Math.Log(sum);
             }
         }
 

@@ -25,6 +25,7 @@ internal sealed partial class Kernels
     /// <summary>top-k of each row: values stored as the type (rows × k), indices s32; returns the lane's name.</summary>
     public static string TopK<TN>(byte[] x, int rows, int cols, int k, byte[] values, int[] indices) where TN : struct, IAdad<TN>
     {
+        Routing.ValidateTopK(rows, cols, k);
         var v = new TopKVisitor(x, rows, cols, k, values, indices);
         TN.Elementwise(ref v);
         return v.Lane;
@@ -73,8 +74,6 @@ internal sealed partial class Kernels
                         best[j] = v; bestAt[j] = c;
                     }
 
-                    for (int i = taken; i < k; i++) { best[i] = TL.Zero; bestAt[i] = -1; }          // k past the row: no column (−1), the value 0
-
                     if (lanes) best.AsSpan(0, k).CopyTo(MemoryMarshal.Cast<byte, TLane>(values.AsSpan()).Slice(r * k, k));
                     else TN.Store(best.AsSpan(0, k), values, r * k);
                     Array.Copy(bestAt, 0, indices, r * k, k);
@@ -92,6 +91,7 @@ internal sealed partial class Kernels
     /// the type once. Returns the lane's name.</summary>
     public static string LogSoftmaxTopK<TN>(byte[] x, int rows, int cols, int k, byte[] values, int[] indices) where TN : struct, IFloatAdad<TN>
     {
+        Routing.ValidateTopK(rows, cols, k);
         var v = new LogTopKVisitor(x, rows, cols, k, values, indices);
         TN.Float(ref v);
         return v.Lane;
@@ -187,7 +187,7 @@ internal sealed partial class Kernels
             var one = new TLane[1];
             for (int r = 0; r < rows; r++)
             {
-                // A column outside the row (top-k's −1 past the row among them) reads nothing: 0.
+                // A column outside the row reads nothing: 0.
                 if ((uint)index[r] >= (uint)cols) { picked[r] = TL.Zero; continue; }
                 TN.Load(x, r * cols + index[r], one.AsSpan(0, 1));
                 picked[r] = one[0];
