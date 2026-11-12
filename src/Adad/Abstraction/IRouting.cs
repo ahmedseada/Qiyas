@@ -19,7 +19,10 @@ public interface IRouting<TBuffer, TIndex>
     /// <summary>output[r] = x[r, index[r]]; a column outside the row (below 0, or cols and past) reads nothing: 0.</summary>
     string Pick<TN>(TBuffer x, int rows, int cols, TIndex index, TBuffer output) where TN : struct, IAdad<TN>;
 
-    /// <summary>picks[r] = the first column whose running sum of row r reaches u[r] · Σ row.</summary>
+    /// <summary>picks[r] = the column of row r whose interval of the positive weights' running sum holds u[r] · their sum:
+    /// the first at which the running sum passes it, strictly (the last column of positive weight where rounding leaves
+    /// none); a weight that is not positive is never drawn; −1 where the positive weights do not sum to a positive finite
+    /// number or u[r] is a NaN (Routing.SampleReference: SampleFiltered's draw over every column).</summary>
     string Sample<TN>(TBuffer x, int rows, int cols, TBuffer u, TIndex picks) where TN : struct, IFloatAdad<TN>;
 
     /// <summary>output[r] = log Σ exp(x[r]) − x[r, targets[r]].</summary>

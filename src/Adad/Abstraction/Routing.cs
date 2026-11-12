@@ -132,21 +132,70 @@ public static class Routing
         return y;
     }
 
+    /// <summary>Sample's rule (SampleFiltered's draw over every column): each column of positive weight w the interval
+    /// [before, before + w) of [0, total), total the positive weights' sum and before the sum of those ahead of it; the pick
+    /// the column whose interval holds u·total: the first at which the running sum passes it, strictly (the last column of
+    /// positive weight where rounding leaves none). A weight that is not positive has an empty interval and is never drawn.
+    /// A row whose positive weights do not sum to a positive finite number (none, a NaN among them, an infinite one), or a
+    /// NaN u, draws nothing: −1.</summary>
     public static int[] SampleReference(double[] x, int rows, int cols, double[] u)
     {
         var y = new int[rows];
         for (int r = 0; r < rows; r++)
         {
-            double total = 0;
-            for (int c = 0; c < cols; c++) total += x[r * cols + c];
-            double threshold = u[r] * total, run = 0;
-            int pick = cols - 1;
-            for (int c = 0; c < cols; c++) { run += x[r * cols + c]; if (run >= threshold) { pick = c; break; } }
+            var w = x.AsSpan(r * cols, cols);
+            double total = SampleTotal(w), target = u[r] * total, run = 0;
+            int pick = -1;
+            if (SampleDraws(total, target))
+                for (int c = 0; c < cols; c++)
+                {
+                    if (!(w[c] > 0)) continue;
+                    pick = c;
+                    run += w[c];
+                    if (run > target) break;
+                }
+
             y[r] = pick;
         }
 
         return y;
     }
+
+    /// <summary>How far each row's pick is from Sample's rule, as probability: 0 where u lies in the pick's interval
+    /// [before, before + w) / total (the first positive column's reaching down past 0 and the last's up past 1, as the rule
+    /// draws them for u outside [0, 1)); else the distance from u to it. 1 for a pick that is no positive column of the
+    /// row, or −1 where the rule draws a column; for a row the rule draws nothing from, 0 for −1 and 1 for any column.</summary>
+    public static double[] SampleErrors(double[] x, int rows, int cols, double[] u, int[] picks)
+    {
+        var errors = new double[rows];
+        for (int r = 0; r < rows; r++)
+        {
+            var w = x.AsSpan(r * cols, cols);
+            double total = SampleTotal(w);
+            int pick = picks[r];
+            if (!SampleDraws(total, u[r] * total)) { errors[r] = pick == -1 ? 0 : 1; continue; }
+            if (pick < 0 || pick >= cols || !(w[pick] > 0)) { errors[r] = 1; continue; }
+            double before = 0;
+            bool first = true, last = true;
+            for (int c = 0; c < pick; c++) if (w[c] > 0) { before += w[c]; first = false; }
+            for (int c = pick + 1; c < cols && last; c++) if (w[c] > 0) last = false;
+            double low = first ? double.NegativeInfinity : before / total, high = last ? double.PositiveInfinity : (before + w[pick]) / total;
+            errors[r] = u[r] < low ? low - u[r] : u[r] > high ? u[r] - high : 0;
+        }
+
+        return errors;
+    }
+
+    // The positive weights' sum: a weight below 0 adds nothing, a NaN carries into it.
+    private static double SampleTotal(ReadOnlySpan<double> w)
+    {
+        double total = 0;
+        foreach (double v in w) if (!(v <= 0)) total += v;
+        return total;
+    }
+
+    // Whether the rule draws a column: a positive finite total and a number to draw at.
+    private static bool SampleDraws(double total, double target) => total > 0 && !double.IsPositiveInfinity(total) && !double.IsNaN(target);
 
     public static (int[] Counts, int[] Offsets, int[] Order) RouteReference(int[] index, int buckets)
     {

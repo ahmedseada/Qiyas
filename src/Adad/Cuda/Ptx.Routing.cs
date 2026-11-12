@@ -490,7 +490,9 @@ internal static partial class Ptx
         return (rm, rs);
     }
 
-    /// <summary>picks[r] = the first column whose running sum reaches u[r] · Σ row (the last column when none): a block per row.</summary>
+    /// <summary>picks[r] = the first column of positive weight at which the running sum of the positive weights passes
+    /// u[r] times their sum, strictly (the last column of positive weight when none; −1 where the sum is not a positive
+    /// finite number or u[r] is a NaN): Routing.SampleReference's rule, a block per row.</summary>
     public static string SampleRows(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"sample_rows_{f.Name}_{lane.Name}";
@@ -507,8 +509,8 @@ internal static partial class Ptx
         b.L($"mul.lo.u32 {c0}, {tid}, {chunk};");
         b.L($"add.u32 {c1}, {c0}, {chunk};");
         b.L($"min.u32 {c1}, {c1}, {cols};");
-        // This thread's chunk sum.
-        string sum = lane.NewReg(b), c = b.R(), pEnd = b.P(), idx = b.R();
+        // This thread's chunk sum of the positive weights (a weight below 0 adds nothing, a NaN carries into it).
+        string sum = lane.NewReg(b), c = b.R(), pEnd = b.P(), idx = b.R(), pNeg = b.P(), vp = lane.NewReg(b);
         b.L($"mov.{lane.Reg} {sum}, {lane.Zero};");
         b.L($"mov.u32 {c}, {c0};");
         b.Label("SUM");
@@ -516,7 +518,9 @@ internal static partial class Ptx
         b.L($"@{pEnd} bra SUM_END;");
         b.L($"add.u32 {idx}, {start}, {c};");
         string v = Codec.UnpackAt(b, f, x, idx, lane);
-        b.L(lane.Add(sum, sum, v));
+        b.L($"setp.lt.{lane.Op} {pNeg}, {v}, {lane.Zero};");
+        b.L($"selp.{lane.Reg} {vp}, {lane.Zero}, {v}, {pNeg};");
+        b.L(lane.Add(sum, sum, vp));
         b.L($"add.u32 {c}, {c}, 1;");
         b.L("bra SUM;");
         b.Label("SUM_END");
@@ -549,21 +553,28 @@ internal static partial class Ptx
         string uval = Codec.UnpackAt(b, f, u, row, lane);
         b.L($"mov.{lane.Reg} {uv}, {uval};");
         b.L(lane.Mul(threshold, uv, total));
-        // The first crossing in this thread's chunk (cols when none), then the least over the block.
-        string run = lane.NewReg(b), found = b.R(), pGe = b.P(), pDone = b.P();
+        // The first crossing in this thread's chunk at a column of positive weight (cols when none), the least over the
+        // block; the chunk's last column of positive weight (+ 1; 0: none), the greatest over the block.
+        string run = lane.NewReg(b), found = b.R(), pGe = b.P(), pDone = b.P(), pPos = b.P(), wp = lane.NewReg(b), lastMine = b.R(), next = b.R();
         b.L($"mov.{lane.Reg} {run}, {prefix};");
         b.L($"mov.u32 {found}, {cols};");
+        b.L($"mov.u32 {lastMine}, 0;");
         b.L($"mov.u32 {c}, {c0};");
         b.Label("FIND");
         b.L($"setp.ge.u32 {pEnd}, {c}, {c1};");
         b.L($"@{pEnd} bra FIND_END;");
         b.L($"add.u32 {idx}, {start}, {c};");
         string v2 = Codec.UnpackAt(b, f, x, idx, lane);
-        b.L(lane.Add(run, run, v2));
-        b.L($"setp.ge.{lane.Op} {pGe}, {run}, {threshold};");
+        b.L($"setp.gt.{lane.Op} {pPos}, {v2}, {lane.Zero};");
+        b.L($"selp.{lane.Reg} {wp}, {v2}, {lane.Zero}, {pPos};");
+        b.L(lane.Add(run, run, wp));
+        b.L($"add.u32 {next}, {c}, 1;");
+        b.L($"selp.u32 {lastMine}, {next}, {lastMine}, {pPos};");               // the chunk's columns ascend
+        b.L($"setp.gt.{lane.Op} {pGe}, {run}, {threshold};");
         b.L($"setp.ne.u32 {pDone}, {found}, {cols};");
         b.L($"not.pred {pDone}, {pDone};");
         b.L($"and.pred {pGe}, {pGe}, {pDone};");
+        b.L($"and.pred {pGe}, {pGe}, {pPos};");
         b.L($"selp.u32 {found}, {c}, {found}, {pGe};");
         b.L($"add.u32 {c}, {c}, 1;");
         b.L("bra FIND;");
@@ -571,12 +582,19 @@ internal static partial class Ptx
         string foundF = b.R();
         b.L($"mov.u32 {foundF}, {found};");
         string least = BlockReduce(b, Lane.U32, tid, foundF, "min", 256);
-        string pFirst = b.P(), pa = b.RD(), lastCol = b.R(), pick = b.R(), pNone = b.P();
+        string lastPos = BlockReduce(b, Lane.U32, tid, lastMine, "max", 256);
+        string pFirst = b.P(), pa = b.RD(), lastCol = b.R(), pick = b.R(), pNone = b.P(), pValid = b.P(), pTest = b.P();
         b.L($"setp.ne.u32 {pFirst}, {tid}, 0;");
         b.L($"@{pFirst} bra DONE;");
-        b.L($"sub.u32 {lastCol}, {cols}, 1;");
+        b.L($"sub.u32 {lastCol}, {lastPos}, 1;");                                // the last column of positive weight
         b.L($"setp.ge.u32 {pNone}, {least}, {cols};");
         b.L($"selp.u32 {pick}, {lastCol}, {least}, {pNone};");
+        b.L($"setp.gt.{lane.Op} {pValid}, {total}, {lane.Zero};");                // a positive finite total (not a NaN)
+        b.L($"testp.finite.{lane.Op} {pTest}, {total};");
+        b.L($"and.pred {pValid}, {pValid}, {pTest};");
+        b.L($"testp.number.{lane.Op} {pTest}, {threshold};");                     // and a number to draw at (u not a NaN)
+        b.L($"and.pred {pValid}, {pValid}, {pTest};");
+        b.L($"selp.u32 {pick}, {pick}, 0xFFFFFFFF, {pValid};");
         b.L($"mul.wide.u32 {pa}, {row}, 4;");
         b.L($"add.u64 {pa}, {picks}, {pa};");
         b.L($"st.global.s32 [{pa}], {pick};");

@@ -264,8 +264,10 @@ internal static partial class VkKernels
         return b.Build();
     }
 
-    /// <summary>picks[r] = the first column whose running sum reaches u[r] · Σ row (the last column when none): a workgroup per
-    /// row, each invocation a contiguous chunk. Arguments: x, u, picks, cols.</summary>
+    /// <summary>picks[r] = the first column of positive weight at which the running sum of the positive weights passes
+    /// u[r] times their sum, strictly (the last column of positive weight when none; −1 where the sum is not a positive
+    /// finite number or u[r] is a NaN): Routing.SampleReference's rule, a workgroup per row, each invocation a contiguous
+    /// chunk. Arguments: x, u, picks, cols.</summary>
     public static SpvKernel SampleRows(Vulkan vk, Fmt f, Lane lane)
     {
         var k = Kinds.Of(lane);
@@ -280,9 +282,14 @@ internal static partial class VkKernels
         var chunk = (cols + (ReduceThreads - 1)) >> 8;
         var c0 = tid * chunk;
         var c1 = b.Min(c0 + chunk, cols);
-        // This invocation's chunk sum.
-        var sum = b.Local(b.C(k, 0));
-        b.For(c0, c1, c => sum.V = sum.V + Codec.UnpackAt(b, f, x, start + c, lane));
+        // This invocation's chunk sum of the positive weights (a weight below 0 adds nothing, a NaN carries into it).
+        var zero = b.C(k, 0);
+        var sum = b.Local(zero);
+        b.For(c0, c1, c =>
+        {
+            var v = Codec.UnpackAt(b, f, x, start + c, lane);
+            sum.V = sum.V + b.Select(v < zero, zero, v);
+        });
         var sums = b.Shared(k, ReduceThreads);
         var total = b.Shared(k, 1);
         sums[tid] = sum.V;
@@ -301,16 +308,25 @@ internal static partial class VkKernels
         });
         b.Barrier();
         var threshold = Codec.UnpackAt(b, f, u, row, lane) * total[0];
-        // The first crossing in this invocation's chunk (cols when none), then the least over the workgroup.
+        // The first crossing in this invocation's chunk at a column of positive weight (cols when none), the least over the
+        // workgroup; the chunk's last column of positive weight (+ 1; 0: none), the greatest over it.
         var run = b.Local(sums[tid]);
         var found = b.Local(cols);
+        var lastMine = b.Local(b.U(0));
         b.For(c0, c1, c =>
         {
-            run.V = run.V + Codec.UnpackAt(b, f, x, start + c, lane);
-            found.V = b.Select((run.V >= threshold) & (found.V == cols), c, found.V);
+            var w = Codec.UnpackAt(b, f, x, start + c, lane);
+            var positive = w > zero;
+            run.V = run.V + b.Select(positive, w, zero);
+            lastMine.V = b.Select(positive, c + 1, lastMine.V);
+            found.V = b.Select((run.V > threshold) & positive & (found.V == cols), c, found.V);
         });
         var least = GroupReduce(b, b.Shared(K.U32, ReduceThreads), tid, found.V, b.Min, ReduceThreads);
-        b.If(tid == 0, () => b.Store(b.At(picks, row, 4), b.Bitcast(b.Select(least >= cols, cols - 1, least), K.S32)));
+        var lastPos = GroupReduce(b, b.Shared(K.U32, ReduceThreads), tid, lastMine.V, b.Max, ReduceThreads);
+        // −1 for a total that is not a positive finite number, or a NaN u.
+        var t = total[0];
+        var draws = (t > zero) & !b.IsInf(t) & !b.IsNan(threshold);
+        b.If(tid == 0, () => b.Store(b.At(picks, row, 4), b.Bitcast(b.Select(draws, b.Select(least >= cols, lastPos - 1, least), b.U(0xFFFFFFFF)), K.S32)));
         return b.Build();
     }
 }

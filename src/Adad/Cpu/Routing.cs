@@ -284,14 +284,31 @@ internal sealed partial class Kernels
                 {
                     TN.Load(x, r * cols, row.AsSpan(0, cols));
                     TN.Load(u, r, one.AsSpan(0, 1));
-                    TLane total = RowMath<TLane, TL>.Sum(row.AsSpan(0, cols));
-                    TLane threshold = TL.Mul(one[0], total), run = TL.Zero;
-                    int pick = cols - 1;
-                    for (int c = 0; c < cols; c++)
+                    // The positive weights' sum (a weight below 0 adds nothing, a NaN carries into it), whole vectors first.
+                    int width = System.Numerics.Vector<TLane>.Count, i = 0;
+                    var acc = System.Numerics.Vector<TLane>.Zero;
+                    for (; i + width <= cols; i += width)
                     {
-                        run = TL.Add(run, row[c]);
-                        if (Widths.Compare(run, threshold) >= 0) { pick = c; break; }
+                        var e = new System.Numerics.Vector<TLane>(row, i);
+                        acc = TL.Add(acc, TL.Select(TL.Greater(System.Numerics.Vector<TLane>.Zero, e), System.Numerics.Vector<TLane>.Zero, e));
                     }
+
+                    TLane total = TL.Zero;
+                    for (int l = 0; l < width; l++) total = TL.Add(total, acc[l]);
+                    for (; i < cols; i++) if (!(LaneValue(row[i]) < 0)) total = TL.Add(total, row[i]);
+                    // The first column of positive weight at which the running sum passes u times the total (the last such
+                    // column when rounding leaves none); −1 for a total that is not a positive finite number, or a NaN u.
+                    TLane target = TL.Mul(one[0], total), run = TL.Zero;
+                    double t = LaneValue(total);
+                    int pick = -1;
+                    if (t > 0 && !double.IsPositiveInfinity(t) && !double.IsNaN(LaneValue(target)))
+                        for (int c = 0; c < cols; c++)
+                        {
+                            if (!(LaneValue(row[c]) > 0)) continue;
+                            pick = c;
+                            run = TL.Add(run, row[c]);
+                            if (Widths.Compare(run, target) > 0) break;
+                        }
 
                     picks[r] = pick;
                 }

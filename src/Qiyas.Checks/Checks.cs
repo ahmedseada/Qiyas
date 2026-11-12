@@ -488,14 +488,7 @@ internal static partial class Checks
             if (Bench.Registry.IsFloat(type))
             {
                 ok &= TopKOrder(ops, where, type);
-                var w = Bench.Registry.Make(type, rows * cols, 95, 0, 1);
-                var u = Bench.Registry.Make(type, rows, 96, 0, 1);
-                var wantS = Routing.SampleReference(Bench.Registry.Values(type, w, rows * cols), rows, cols, Bench.Registry.Values(type, u, rows));
-                var picks = new int[rows];
-                Bench.Registry.WithFloat(type, new SampleRun(ops, w, rows, cols, u, picks));
-                int off = 0;
-                for (int r = 0; r < rows; r++) if (Math.Abs(picks[r] - wantS[r]) > 1) off++;
-                if (off > 0) { Console.WriteLine($"check sample        {where,-6} {type,-12} DIFFERS at {off} rows by more than one column"); ok = false; }
+                ok &= SampleRule(ops, where, type, rows, cols);
                 // The cross-entropy loss per row: the type's step at the loss plus the lane's rounding of a sum of cols terms.
                 var loss = new byte[Bench.Registry.Bytes(type, rows)];
                 using (var ce = new Bench.AdadSubject().CrossEntropy(DeviceOf(ops), type, x, rows, cols, index, loss)!) { ce.Run(); ce.Collect(); }
@@ -555,7 +548,7 @@ internal static partial class Checks
 
         if (cuda is not null) cuda.TableCounts = null;
 
-        if (ok) Console.WriteLine($"check routing                {where,-6} every type{(blocks ? "" : " but the block formats")}: top-k in Adad's order (ties by the lower column; rows of NaN, ±0, ±inf and ties exactly, with log-softmax top-k; k = cols; k past the row refused), pick (a column outside the row: 0), sampling and the cross-entropy loss (float types; unweighted and with a weight a row, zeros among them) and the route as the references (also 1M into 64, 1 000 003 into 100 000, all into one, descending into 65 536; indices outside the buckets in none, the order −1 past the placed)");
+        if (ok) Console.WriteLine($"check routing                {where,-6} every type{(blocks ? "" : " but the block formats")}: top-k in Adad's order (ties by the lower column; rows of NaN, ±0, ±inf and ties exactly, with log-softmax top-k; k = cols; k past the row refused), pick (a column outside the row: 0), sampling (the column whose interval of the positive weights' running sum holds the draw, within the lane's rounding; leading zero weights at u = 0, negative weights, trailing zeros at u = 1; −1 for no positive weight, a NaN or an infinite weight, a NaN draw) and the cross-entropy loss (float types; unweighted and with a weight a row, zeros among them) and the route as the references (also 1M into 64, 1 000 003 into 100 000, all into one, descending into 65 536; indices outside the buckets in none, the order −1 past the placed)");
         return ok;
     }
 
@@ -629,6 +622,50 @@ internal static partial class Checks
             run.Run(); run.Collect();
             return true;
         }
+    }
+
+    // IRouting.Sample against its rule (Routing.SampleReference, SampleErrors): each row's pick the column whose interval
+    // of the positive weights' running sum holds u, within the lane's rounding of the sums ((cols + 16) steps of the lane,
+    // as probability); −1 exactly where the rule draws nothing. Random rows (weights and u in [0, 1)) and rows made for the
+    // rule's edges: leading zero weights at u = 0 (the first positive column, never a zero one), negative weights and
+    // zeros ahead of it, trailing zeros at u = 1 (the last positive column), no positive weight (−1); and, but in the block
+    // formats (a scale shared across the rows), a NaN weight, an infinite one and a NaN u (−1).
+    private static bool SampleRule(IDevice<ulong, ulong>? ops, string where, string type, int rows, int cols)
+    {
+        var wv = Bench.Registry.Values(type, Bench.Registry.Make(type, rows * cols, 95, 0, 1), rows * cols);
+        var uv = Bench.Registry.Values(type, Bench.Registry.Make(type, rows, 96, 0, 1), rows);
+        void Row(int r, Func<int, double> weight, double u)
+        {
+            for (int c = 0; c < cols; c++) wv[r * cols + c] = weight(c);
+            uv[r] = u;
+        }
+
+        Row(0, c => c < 9 ? 0 : 0.5, 0);
+        Row(1, c => c < 5 ? -0.5 : c % 3 == 0 ? 0 : 0.25, 0);
+        Row(2, c => c < 30 ? 0.125 : 0, 1);
+        Row(3, c => 0, 0.5);
+        if (!Bench.Registry.IsBlock(type))
+        {
+            Row(4, c => c == 7 ? double.NaN : 0.5, 0.25);
+            Row(5, c => c == 11 ? double.PositiveInfinity : 0.5, 0.25);
+            Row(6, c => 0.5, double.NaN);
+        }
+
+        var w = Bench.Registry.Encode(type, wv);
+        var u = Bench.Registry.Encode(type, uv);
+        wv = Bench.Registry.Values(type, w, rows * cols);
+        uv = Bench.Registry.Values(type, u, rows);
+        var picks = new int[rows];
+        Bench.Registry.WithFloat(type, new SampleRun(ops, w, rows, cols, u, picks));
+        var errors = Routing.SampleErrors(wv, rows, cols, uv, picks);
+        var want = Routing.SampleReference(wv, rows, cols, uv);
+        double eps = (cols + 16) * (type == "float64" ? Math.Pow(2, -52) : Math.Pow(2, -23));
+        int bad = 0;
+        string first = "";
+        for (int r = 0; r < rows; r++)
+            if (!(errors[r] <= eps) && bad++ == 0) first = $"row {r}: column {picks[r]} where the rule draws {want[r]} (u = {uv[r]:R}, {errors[r]:R} off its interval)";
+        if (bad > 0) Console.WriteLine($"check sample        {where,-6} {type,-12} DIFFERS at {bad} rows; {first}");
+        return bad == 0;
     }
 
     private sealed class SampleRun(IDevice<ulong, ulong>? ops, byte[] x, int rows, int cols, byte[] u, int[] picks) : Bench.IFloatTypeVisitor<bool>
