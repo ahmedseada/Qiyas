@@ -14,8 +14,8 @@ internal static partial class Ptx
 {
     public const int DecodeThreads = 256;
 
-    /// <summary>Shared bytes the decode kernel takes for a head dimension capacity: the reduction's slots, the query, the chunk's scores and weights.</summary>
-    public static int DecodeShared(Lane lane, int dCap) => ReduceBytes + (dCap + 2 * DecodeThreads) * lane.Size;
+    /// <summary>Shared bytes the decode kernel takes for a head dimension capacity: the reduction's slots, the query, the chunk's weights.</summary>
+    public static int DecodeShared(Lane lane, int dCap) => ReduceBytes + (dCap + DecodeThreads) * lane.Size;
 
     /// <summary>The decode kernel over caches at a position the device holds (ICache.AttentionCached): K and V stored as Fc,
     /// the scores capped.</summary>
@@ -79,12 +79,11 @@ internal static partial class Ptx
         b.L($"mad.lo.u32 {qBase}, {bid}, {d}, 0;");                       // (h·lq + i)·d = bid·d
         b.L($"mul.lo.u32 {hk}, {h}, {lk};");
         b.L($"mul.lo.u32 {kBase}, {hk}, {d};");
-        // Shared: [smem] the reduction's slots; the query at ReduceBytes; the scores and weights after it.
-        string smem = b.R(), sq = b.R(), ss = b.R(), sp = b.R();
+        // Shared: [smem] the reduction's slots; the query at ReduceBytes; the chunk's weights after it.
+        string smem = b.R(), sq = b.R(), sp = b.R();
         b.L($"mov.u32 {smem}, smem;");
         b.L($"add.u32 {sq}, {smem}, {ReduceBytes};");
-        b.L($"add.u32 {ss}, {sq}, {dCap * lane.Size};");
-        b.L($"add.u32 {sp}, {ss}, {DecodeThreads * lane.Size};");
+        b.L($"add.u32 {sp}, {sq}, {dCap * lane.Size};");
         // The query into shared memory.
         {
             string tt = b.R(), pEnd = b.P(), idx = b.R(), addr = b.R();
