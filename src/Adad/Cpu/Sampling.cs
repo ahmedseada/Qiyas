@@ -3,11 +3,12 @@
 
 // A decoder's sampling on the CPU (Abstraction/Sampling.cs has the rule): a task a row. The row's scores read once in the
 // type's natural lane (exact) and taken into its float lane; the first-ranked score by Adad's order, the weights exp((x −
-// m) / temperature) over whole vectors. Each rule keeps a prefix of the order: where one is on, each column's order key
-// (Routing.OrderKey: its stored score as an unsigned integer that orders as Adad's order does) and the
-// prefix's last column found by halving the keys — a pass of vector compares a step counting the keys at least a value
-// (top-k) until few are left, those gathered and ordered (the nucleus summed over them in order), or summing their
-// weights (the nucleus over a row top-k did not narrow) — and equal keys at the end of the prefix cut by column. Then
+// m) / temperature) over whole vectors (where top-k gathered its columns, theirs alone). Each rule keeps a prefix of the
+// order: where one is on, each column's order key (Routing.OrderKey: its stored score as an unsigned integer that orders
+// as Adad's order does) and the prefix's last column found — top-k's in one pass gathering the keys at least a rising
+// threshold (StreamTop), else by halving the keys, a pass of vector compares a step counting the keys at least a value
+// until few are left; those gathered and ordered (the nucleus summed over them in order), or summing their weights (the
+// nucleus over a row top-k did not narrow) — and equal keys at the end of the prefix cut by column. Then
 // the draw: the kept weights' sum, and the column at which their running sum, in column order, passes the seed's uniform
 // of it.
 using System.Buffers;
@@ -55,6 +56,8 @@ internal sealed partial class Kernels
             var keys = ranked ? ArrayPool<ulong>.Shared.Rent(cols) : null;
             var top = ranked ? ArrayPool<(ulong, int)>.Shared.Rent(TopGathered) : null;
             var candidates = ranked ? ArrayPool<int>.Shared.Rent(TopGathered) : null;
+            var sorted = a.HasTopK ? ArrayPool<ulong>.Shared.Rent(TopGathered) : null;
+            var few = a.HasTopK ? ArrayPool<TLane>.Shared.Rent(TopGathered + width) : null;
             var key = Draws.Key(a.Seed);
             TLane temperature = TL.From(a.Temperature), q = TL.From(a.MinP);
             try
@@ -77,16 +80,20 @@ internal sealed partial class Kernels
                         continue;
                     }
 
-                    Weigh<TLane, TL>(w, m, temperature);
                     var b = new Boundary(false, 0, 0);
                     int gathered = 0;
                     if (ranked)
                     {
-                        var k = keys.AsSpan(0, cols);
-                        OrderKeys<TE>(v, k);
-                        if (a.HasTopK) (b, gathered) = TopBoundary(k, a.TopK, top!);
-                        if (a.HasTopP) b = gathered > 0 ? NucleusOfTop<TLane, TL>(top.AsSpan(0, gathered), w, a.TopK, TL.From(a.TopP)) : NucleusBoundary<TLane, TL>(k, w, b, TL.From(a.TopP));
+                        OrderKeys<TE>(v, keys.AsSpan(0, cols));
+                        if (a.HasTopK) (b, gathered) = TopBoundary(keys.AsSpan(0, cols), a.TopK, top!, sorted!);
                     }
+
+                    // The weights: where top-k gathered its columns, nothing past them is read, so theirs alone (the same
+                    // vector operation on each value, so the same weights).
+                    if (gathered > 0) WeighAt<TLane, TL>(w, top.AsSpan(0, gathered), m, temperature, few!);
+                    else Weigh<TLane, TL>(w, m, temperature);
+                    if (a.HasTopP)
+                        b = gathered > 0 ? NucleusOfTop<TLane, TL>(top.AsSpan(0, gathered), w, a.TopK, TL.From(a.TopP)) : NucleusBoundary<TLane, TL>(keys.AsSpan(0, cols), w, b, TL.From(a.TopP));
 
                     var u = TL.From(Draws.Uniform(key, (uint)step, (uint)r));
                     var (pick, p) = gathered > 0 ? DrawOfTop<TLane, TL>(w[..cols], top.AsSpan(0, gathered), b, a.HasMinP, q, u, candidates!)
@@ -102,6 +109,8 @@ internal sealed partial class Kernels
                 if (keys is not null) ArrayPool<ulong>.Shared.Return(keys);
                 if (top is not null) ArrayPool<(ulong, int)>.Shared.Return(top);
                 if (candidates is not null) ArrayPool<int>.Shared.Return(candidates);
+                if (sorted is not null) ArrayPool<ulong>.Shared.Return(sorted);
+                if (few is not null) ArrayPool<TLane>.Shared.Return(few);
             }
         }
     }
@@ -144,6 +153,19 @@ internal sealed partial class Kernels
         for (int i = 0; i < w.Length; i += width) TL.Exp(TL.Div(TL.Sub(new Vector<TLane>(w[i..]), mv), tv)).CopyTo(w[i..]);
     }
 
+    // Weigh's weights at the gathered columns alone: their values side by side (the last vector filled with m), Weigh over
+    // them, each put back at its column.
+    private static void WeighAt<TLane, TL>(Span<TLane> w, ReadOnlySpan<(ulong Key, int Col)> at, TLane m, TLane temperature, TLane[] few)
+        where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    {
+        int width = Vector<TLane>.Count, n = at.Length, padded = (n + width - 1) / width * width;
+        var side = few.AsSpan(0, padded);
+        for (int i = 0; i < n; i++) side[i] = w[at[i].Col];
+        side[n..].Fill(m);
+        Weigh<TLane, TL>(side, m, temperature);
+        for (int i = 0; i < n; i++) w[at[i].Col] = side[i];
+    }
+
     // The keys at least v.
     private static long CountAtLeast(ReadOnlySpan<ulong> k, ulong v)
     {
@@ -160,8 +182,10 @@ internal sealed partial class Kernels
     // until few columns are left at or above it (64 or more, four times k, `top`'s room at most); those gathered and
     // ordered (`top`: key descending, then column), the k-th read from them. Where equal keys keep more than the room the
     // halving runs to its end and the key's columns are cut by column order. Returns how many were gathered (0: none).
-    private static (Boundary, int) TopBoundary(ReadOnlySpan<ulong> k, int topK, (ulong Key, int Col)[] top)
+    private static (Boundary, int) TopBoundary(ReadOnlySpan<ulong> k, int topK, (ulong Key, int Col)[] top, ulong[] sorted)
     {
+        var streamed = StreamTop(k, topK, top, sorted);
+        if (streamed.Item2 > 0) return streamed;
         var (lo, hi) = KeyRange(k);
         int room = Math.Min(TopGathered, Math.Max(64, 4 * topK));
         long count = k.Length;
@@ -203,6 +227,60 @@ internal sealed partial class Kernels
         for (int c = 0; c < k.Length; c++)
             if (k[c] == lo && --need == 0) return (new Boundary(true, lo, c), 0);
         return (new Boundary(true, lo, k.Length - 1), 0);
+    }
+
+    // Top-k's prefix in one pass, where its room (TopBoundary's) holds twice k: the keys at least a threshold gathered with
+    // their columns as the pass meets them (a vector of keys all below it skipped whole), the threshold raised to the k-th
+    // largest gathered key each time the room fills and the gathered below it dropped. The threshold is the k-th of a part
+    // of the row, so at most the row's k-th: the k first of the order stay gathered. At the end the gathered at least
+    // their k-th key, ordered (key descending, then column), the k-th read from them: TopBoundary's prefix and its first k
+    // the same. Equal keys that keep the room full: 0, the halving's way instead.
+    private static (Boundary, int) StreamTop(ReadOnlySpan<ulong> k, int topK, (ulong Key, int Col)[] top, ulong[] sorted)
+    {
+        int room = Math.Min(TopGathered, Math.Max(64, 4 * topK));
+        if (2 * topK > room || k.Length <= room) return (default, 0);
+        int width = Vector<ulong>.Count, n = 0, c = 0;
+        ulong t = 0;
+        var tv = Vector<ulong>.Zero;
+        for (; c + width <= k.Length; c += width)
+        {
+            var v = new Vector<ulong>(k[c..]);
+            if (!Vector.GreaterThanOrEqualAny(v, tv)) continue;
+            for (int l = 0; l < width; l++)
+            {
+                if (v[l] < t) continue;
+                top[n++] = (v[l], c + l);
+                if (n < room) continue;
+                (t, n) = Raise(top, n, topK, sorted);
+                if (n >= room - 1) return (default, 0);
+                tv = new Vector<ulong>(t);
+            }
+        }
+
+        for (; c < k.Length; c++)
+        {
+            if (k[c] < t) continue;
+            top[n++] = (k[c], c);
+            if (n < room) continue;
+            (t, n) = Raise(top, n, topK, sorted);
+            if (n >= room - 1) return (default, 0);
+        }
+
+        (_, n) = Raise(top, n, topK, sorted);
+        Array.Sort(top, 0, n, ByOrder.Instance);
+        return (new Boundary(true, top[topK - 1].Key, top[topK - 1].Col), n);
+
+        // The k-th largest of the n gathered keys, and the gathered kept at least it (in the order they came).
+        static (ulong, int) Raise((ulong Key, int Col)[] top, int n, int topK, ulong[] sorted)
+        {
+            var keys = sorted.AsSpan(0, n);
+            for (int i = 0; i < n; i++) keys[i] = top[i].Key;
+            keys.Sort();
+            ulong t = keys[n - topK];
+            int kept = 0;
+            for (int i = 0; i < n; i++) if (top[i].Key >= t) top[kept++] = top[i];
+            return (t, kept);
+        }
     }
 
     // The keys' least and largest (vectors of keys, then the tail).
