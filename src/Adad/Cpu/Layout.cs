@@ -296,7 +296,7 @@ internal sealed partial class Kernels
         return (f[0], TL.Sub(new Vector<TLane>(TL.From(1)), f)[0]);
     }
 
-    // An interpolation's column axis, the same for every row (found once a task): nearest, each output column's source;
+    // An interpolation's column axis, the same for every row (made once a call, SharedAxis): nearest, each output column's source;
     // bilinear, each output column's two sources (the result) and weights f g (w); a backward, for each input column its
     // outputs (the result: W + 1 starts, then the outputs in order) and their weights (w).
     private static int[] InterpolateAxis<TLane, TL>(string name, int[] p, out TLane[]? w) where TLane : unmanaged where TL : struct, ILane<TL, TLane>
@@ -339,6 +339,16 @@ internal sealed partial class Kernels
         starts[W] = outs.Count;
         w = [.. weights];
         return [.. starts, .. outs];
+    }
+
+    // The column axis of a call's interpolation (InterpolateAxis), made by the first task that needs it and read by the
+    // call's others (keyed by the call's own LayoutArgs, which ForKernels makes anew each call).
+    private static readonly ConditionalWeakTable<LayoutArgs, object> s_axes = new();
+
+    private static (int[] At, TLane[]? W) SharedAxis<TLane, TL>(LayoutArgs k) where TLane : unmanaged where TL : struct, ILane<TL, TLane>
+    {
+        var t = (Tuple<int[], TLane[]?>)s_axes.GetValue(k, key => Tuple.Create(InterpolateAxis<TLane, TL>(key.Name, key.P, out var w), w));
+        return (t.Item1, t.Item2);
     }
 
     // The weight output o of an interpolation axis gives input position i: nearest 1 where it reads i; bilinear the first
@@ -533,7 +543,7 @@ internal sealed partial class Kernels
             TLane[]? source = null, source2 = null;
             TLane[]? weights = null;                                                    // an interpolation backward's row weights and their places
             int[]? places = null;
-            // An interpolation's column axis, found once a task (InterpolateAxis): the sources and weights of every column.
+            // An interpolation's column axis (InterpolateAxis, SharedAxis): the sources and weights of every column, once a call.
             int[]? axis = null;
             TLane[]? axisW = null;
             var input = new Reader<TN, TLane>(k.X, k.InputCount, inLanes);
@@ -618,7 +628,7 @@ internal sealed partial class Kernels
                             int ih = LayoutArgs.NearestAt(oh, H, p[5], p[6], p[7]);
                             source ??= pool.Rent(W);
                             var line = input.Span(((long)c * H + ih) * W, W, source);
-                            axis ??= InterpolateAxis<TLane, TL>(k.Name, p, out axisW);
+                            if (axis is null) (axis, axisW) = SharedAxis<TLane, TL>(k);
                             for (int ow = 0; ow < OW; ow++) o[ow] = line[axis[ow]];
                             break;
                         }
@@ -634,7 +644,7 @@ internal sealed partial class Kernels
                             source2 ??= pool.Rent(W);
                             var row0 = input.Span(((long)c * H + y0) * W, W, source);
                             var row1 = input.Span(((long)c * H + y1) * W, W, source2);
-                            axis ??= InterpolateAxis<TLane, TL>(k.Name, p, out axisW);
+                            if (axis is null) (axis, axisW) = SharedAxis<TLane, TL>(k);
                             for (int ow = 0; ow < OW; ow++)
                             {
                                 int x0 = axis[2 * ow], x1 = axis[2 * ow + 1];
@@ -652,7 +662,7 @@ internal sealed partial class Kernels
                         {
                             weights ??= pool.Rent(p[3]);
                             places ??= ArrayPool<int>.Shared.Rent(p[3]);
-                            axis ??= InterpolateAxis<TLane, TL>(k.Name, p, out axisW);
+                            if (axis is null) (axis, axisW) = SharedAxis<TLane, TL>(k);
                             InterpolateBackRow(k.Name == "interpolate_bilinear_bwd", input, p, r, o, weights, places, axis, axisW!);
                             break;
                         }
@@ -1004,7 +1014,7 @@ internal sealed partial class Kernels
 
         // An interpolation's backward, input row r (c, ih): each position iw sums the outputs whose source rows and columns
         // include it (oh, then ow ascending), each dy by its weight there: acc = fma(dy, wy·wx, acc). The row's weights wy
-        // are found once a row (weights and places: OH each) and the columns' wx once a task (axis and axisW, InterpolateAxis:
+        // are found once a row (weights and places: OH each) and the columns' wx once a call (axis and axisW, InterpolateAxis:
         // W + 1 starts, then each input column's outputs, and their weights), not again for every term: the same terms in
         // the same order.
         [MethodImpl(MethodImplOptions.NoInlining)]
