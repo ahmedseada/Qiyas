@@ -456,6 +456,23 @@ public sealed class AdadSubject : IBenchSubject
         }
     }
 
+    public IBenchRun? BoxLoss(Device device, string type, BoxOverlap overlap, byte[] predicted, byte[] target, byte[]? dloss, byte[] output, int count) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new BoxVisitor(device, overlap, predicted, target, dloss, output, count)) : null;
+
+    private sealed class BoxVisitor(Device device, BoxOverlap overlap, byte[] predicted, byte[] target, byte[]? dloss, byte[] output, int count) : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, BoxVisitor>(device, this);
+
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        {
+            int pad = s.Slack;
+            TB dp = s.In(predicted, pad), dt = s.In(target, pad), dy = s.Out(output, pad);
+            if (dloss is null) return s.Run(() => s.D.BoxLoss<TN>(overlap, dp, dt, dy, count));
+            TB dl = s.In(dloss, pad);
+            return s.Run(() => s.D.BoxLossBackward<TN>(overlap, dp, dt, dl, dy, count));
+        }
+    }
+
     public IBenchRun? DecoderMask(Device device, string type, int rows, int capacity, int window, int position, byte[] mask) =>
         Registry.IsFloat(type) ? Registry.WithFloat(type, new DecoderMaskVisitor(device, rows, capacity, window, position, mask)) : null;
 

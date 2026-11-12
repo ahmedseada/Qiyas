@@ -189,6 +189,11 @@ public interface IBenchSubject
     /// <summary>C = A·Bᵀ (A m × k, B n × k, C m × n) by the block-scaled product of two Q8_0 / Q4_0 operands (k in whole blocks).</summary>
     IBenchRun? MatMulBlocks(Device device, string type, int m, int n, int k, byte[] a, byte[] b, byte[] c) => null;
 
+    /// <summary>The box overlap loss (IBoxes.BoxLoss) of count pairs of corner boxes (predicted, target: count × 4 values as
+    /// the type) into output (count values as the type); with dloss given (count values) its gradient (IBoxes.BoxLossBackward)
+    /// into output instead (count × 4 values).</summary>
+    IBenchRun? BoxLoss(Device device, string type, BoxOverlap overlap, byte[] predicted, byte[] target, byte[]? dloss, byte[] output, int count) => null;
+
     /// <summary>A GRU sequence of T steps (x: T × B × D; h0; W, U, b, bh as the step's; h out: T × B × H).</summary>
     IBenchRun? GruSequence(Device device, string type, CellArgs a, int T, byte[] x, byte[] h0, byte[] w, byte[] u, byte[] b, byte[] bh, byte[] hOut) => null;
 

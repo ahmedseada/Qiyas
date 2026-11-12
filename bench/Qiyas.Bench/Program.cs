@@ -186,6 +186,7 @@ internal sealed class Options
     public static readonly string[] Group12 = ["penalize", "sample_filtered", "sample_plain"];
     public static readonly string[] Group13 = ["memory:copy", "memory:clear", "memory:rent_zeroed"];
     public static readonly string[] Group14 = ["route_topk", "expert_matmul", "expert_gated"];
+    public static readonly string[] Group15 = [.. Enum.GetValues<BoxOverlap>().SelectMany(o => new[] { "box_loss:" + Boxes.Name(o), "box_loss_bwd:" + Boxes.Name(o) })];
     public List<string>? Subjects;
     public string? Baseline;
 
@@ -216,7 +217,7 @@ internal sealed class Options
                 case "--types": o.Types = Next(); break;
                 case "--ops":
                     o.Ops = Next();
-                    if (o.Ops.Contains("all")) o.Ops = [.. Core, .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name), .. Group2, .. Group3, .. Group4, .. Group4b, .. Group5, .. Group6, .. Group7, .. Group7b, .. Group8, .. Group9, .. Group10, .. Group11, .. Group12, .. Group13, .. Group14];
+                    if (o.Ops.Contains("all")) o.Ops = [.. Core, .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name), .. Group2, .. Group3, .. Group4, .. Group4b, .. Group5, .. Group6, .. Group7, .. Group7b, .. Group8, .. Group9, .. Group10, .. Group11, .. Group12, .. Group13, .. Group14, .. Group15];
                     if (o.Ops.Contains("map")) o.Ops = [.. o.Ops.Where(n => n != "map"), .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name)];
                     if (o.Ops.Contains("reduce")) o.Ops = [.. o.Ops.Where(n => n != "reduce"), .. Group2];
                     if (o.Ops.Contains("rows")) o.Ops = [.. o.Ops.Where(n => n != "rows"), .. Group3];
@@ -232,6 +233,7 @@ internal sealed class Options
                     if (o.Ops.Contains("decoding")) o.Ops = [.. o.Ops.Where(n => n != "decoding"), .. Group12];
                     if (o.Ops.Contains("memory")) o.Ops = [.. o.Ops.Where(n => n != "memory"), .. Group13];
                     if (o.Ops.Contains("experts")) o.Ops = [.. o.Ops.Where(n => n != "experts"), .. Group14];
+                    if (o.Ops.Contains("boxes")) o.Ops = [.. o.Ops.Where(n => n != "boxes"), .. Group15];
                     break;
                 case "--baseline": o.Baseline = args[++i]; break;
                 case "--shapes": o.Shapes = args[++i]; if (o.Shapes is not ("regular" or "odd")) throw new ArgumentException($"--shapes takes regular or odd, not {o.Shapes}"); break;
@@ -417,6 +419,11 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         foreach (var name in Options.Group14)
         {
             if (options.Ops.Contains(name)) ExpertsRow(device, type, name);
+        }
+
+        foreach (var name in Options.Group15)
+        {
+            if (options.Ops.Contains(name)) BoxRow(device, type, name);
         }
 
         if (!Registry.IsFloat(type)) return;
@@ -998,6 +1005,61 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         for (int i = 0; i < g.Length; i++) want2[i] = gate.Reference(g[i], u[i], 0, 0, 0);
         want2 = Held(want2);
         Measure(device, name, type, shape + " " + gate.Name, new Work(Work.B(type, v.XValues) + 2 * (Work.B(type, v.WeightValues) + Work.B(type, v.BiasValues)) + Work.B(type, v.YValues) + 4.0 * (groups + 1), 4.0 * v.Rows * v.N * v.K + 8.0 * v.YValues), want2, (s, y) => s.ExpertProducts(device, type, v, gate.Name, x, offsets2, gw, gb, uw, ub, y), (int)Registry.Bytes(type, v.YValues));
+    }
+
+    // The box overlap losses (float types) over 4M pairs of corner boxes (a map row's 16M values a side): each box's corner
+    // within (−6, 1)², its sides in [2, 4), the target moved from the prediction by up to 2 a corner and resized (the pairs
+    // overlap, nest, touch and lie apart). box_loss: the loss scored; box_loss_bwd: the gradient by a dloss in [−1, 1).
+    // A pair's work: its eight corners read; the overlap's areas, union and quotients (IoU 13 operations; GIoU's enclosing
+    // box 8 more, DIoU's centres and diagonal 12 more, CIoU's two arctangents and α 10 more); the backward about twice.
+    private void BoxRow(Device device, string type, string name)
+    {
+        if (!Registry.IsFloat(type)) return;
+        bool backward = name.StartsWith("box_loss_bwd:", StringComparison.Ordinal);
+        var overlap = Enum.GetValues<BoxOverlap>().First(o => Boxes.Name(o) == name[(name.IndexOf(':') + 1)..]);
+        int count = MapCount / 4;
+        var random = new Random(101);
+        double U(double lo, double hi) => lo + (hi - lo) * random.NextDouble();
+        var pv = new double[4 * count];
+        var tv = new double[4 * count];
+        for (int i = 0; i < count; i++)
+        {
+            double x = U(-6, 1), y = U(-6, 1), w = U(2, 4), h = U(2, 4), tx = x + U(-2, 2), ty = y + U(-2, 2), tw = U(2, 4), th = U(2, 4);
+            (pv[4 * i], pv[4 * i + 1], pv[4 * i + 2], pv[4 * i + 3]) = (x, y, x + w, y + h);
+            (tv[4 * i], tv[4 * i + 1], tv[4 * i + 2], tv[4 * i + 3]) = (tx, ty, tx + tw, ty + th);
+        }
+
+        byte[] p = Registry.Encode(type, pv), t = Registry.Encode(type, tv);
+        double[] ps = Registry.Values(type, p, 4 * count), ts = Registry.Values(type, t, 4 * count);
+        double eps = Registry.WithFloat(type, new Epsilon());
+        double per = overlap switch { BoxOverlap.IoU => 13, BoxOverlap.GIoU => 21, BoxOverlap.DIoU => 25, _ => 35 };
+        string shape = $"{count} pairs";
+        if (!backward)
+        {
+            var want = new double[count];
+            for (int i = 0; i < count; i++) want[i] = Boxes.Reference(overlap, ps.AsSpan(4 * i, 4), ts.AsSpan(4 * i, 4), eps).Loss;
+            Measure(device, name, type, shape, new Work(2 * Work.B(type, 4L * count) + Work.B(type, count), per * count), want, (s, o) => s.BoxLoss(device, type, overlap, p, t, null, o, count), (int)Registry.Bytes(type, count));
+            return;
+        }
+
+        var dl = Registry.Make(type, count, 102, -1, 1);
+        var ds = Registry.Values(type, dl, count);
+        var wantGrad = new double[4 * count];
+        for (int i = 0; i < count; i++)
+        {
+            var g = wantGrad.AsSpan(4 * i, 4);
+            Boxes.Reference(overlap, ps.AsSpan(4 * i, 4), ts.AsSpan(4 * i, 4), eps, g);
+            for (int k = 0; k < 4; k++) g[k] *= ds[i];
+        }
+
+        Measure(device, name, type, shape, new Work(2 * Work.B(type, 4L * count) + Work.B(type, count) + Work.B(type, 4L * count), 2 * per * count), wantGrad,
+            (s, o) => s.BoxLoss(device, type, overlap, p, t, dl, o, count), (int)Registry.Bytes(type, 4L * count));
+    }
+
+    // The type's precision (IFloatAdad.Epsilon), the eps the box losses add to a divisor.
+    private readonly struct Epsilon : IFloatTypeVisitor<double>
+    {
+        public double Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => TN.Epsilon;
     }
 
     // The score a decoder's mask excludes by, as the type stores it (CacheView.Excluded).
