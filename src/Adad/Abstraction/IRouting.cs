@@ -30,7 +30,4 @@ public interface IRouting<TBuffer, TIndex>
     /// count indices into buckets.</summary>
     void Route(TIndex index, int count, int buckets, TIndex counts, TIndex offsets, TIndex order);
 
-    /// <summary>output[r] = 1 where row r of the predictions (rows × cols) is right, else 0: with one column, whether
-    /// (p ≥ threshold) is (t ≥ ½); with more, whether the first largest column of p is the first largest of t.</summary>
-    string ClassMatch<TN>(TBuffer predictions, TBuffer targets, TBuffer output, int rows, int cols, double threshold) where TN : struct, IAdad<TN>;
 }

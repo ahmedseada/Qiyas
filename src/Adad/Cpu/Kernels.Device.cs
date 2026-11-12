@@ -305,8 +305,6 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
     void IRouting<byte[], int[]>.Route(int[] index, int count, int buckets, int[] counts, int[] offsets, int[] order) =>
         Route(count == index.Length ? index : index[..count], buckets, counts, offsets, order);
 
-    string IRouting<byte[], int[]>.ClassMatch<TN>(byte[] predictions, byte[] targets, byte[] output, int rows, int cols, double threshold) =>
-        ClassMatch<TN>(predictions, targets, output, rows, cols, threshold);
 
     // ---------------------------------------------------------------- the lanes
 

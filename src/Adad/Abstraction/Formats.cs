@@ -54,15 +54,4 @@ public sealed record Lane(string Name, int Size, bool IsFloat)
     public static readonly Lane U64 = new("u64", 8, false);
 
     public bool Wide => Size == 8;
-
-    /// <summary>The smallest value of this lane at least <paramref name="v"/> (so x ≥ v in the lane is x ≥ v exactly): float32
-    /// the next float up where the nearest is below; an integer lane the ceiling, held to the lane's range.</summary>
-    public double AtLeast(double v)
-    {
-        if (double.IsNaN(v)) return v;
-        if (this == F64) return v;
-        if (this == F32) { float f = (float)v; return f < v ? MathF.BitIncrement(f) : f; }
-        double c = Math.Ceiling(v), lo = this == S32 ? int.MinValue : this == S64 ? long.MinValue : 0, hi = this == S32 ? int.MaxValue : this == U32 ? uint.MaxValue : this == S64 ? long.MaxValue : ulong.MaxValue;
-        return Math.Clamp(c, lo, hi);
-    }
 }

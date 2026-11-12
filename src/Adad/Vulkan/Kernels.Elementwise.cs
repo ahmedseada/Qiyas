@@ -3,7 +3,7 @@
 
 // Element-wise kernels past the formulas on Vulkan: dropout from a seed (Draws: the same 32-bit arithmetic as the CPU),
 // the conversion between any two types (Fmt.ConvertPlan: one rounding; the rounding to odd done on the bits, so a device
-// that flushes float32 subnormals keeps them), and the class match of rows.
+// that flushes float32 subnormals keeps them).
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
@@ -183,45 +183,4 @@ internal static partial class VkKernels
             var px = b.Arg(0);
             return (at, _) => Codec.UnpackAt(b, ff, px, at, Lane.F32);
         });
-
-    // ---------------------------------------------------------------- class match
-
-    /// <summary>scratch[r] (lane) = 1 where row r of p (rows × cols of f) is right, else 0: one column, (p ≥ th) is (t ≥ half)
-    /// in the lane; more, the first largest column of p (by >, from column 0) is t's. A thread per row. Slots: p, t, scratch,
-    /// rows, cols, th, half.</summary>
-    public static SpvKernel ClassMatchRows(Vulkan vk, Fmt f, Lane lane)
-    {
-        var k = Kinds.Of(lane);
-        var b = new Spv($"class_match_{f.Name}_{lane.Name}", Threads, vk.Controls);
-        var pp = b.Arg(0);
-        var pt = b.Arg(1);
-        var po = b.Arg(2);
-        var rows = b.Arg(3, K.U32);
-        var cols = b.Arg(4, K.U32);
-        var th = b.Arg(5, k);
-        var half = b.Arg(6, k);
-        var r = b.GlobalX;
-        b.If(r < rows, () =>
-        {
-            var start = r * cols;
-            var bp = b.Local(Codec.UnpackAt(b, f, pp, start, lane));
-            var bt = b.Local(Codec.UnpackAt(b, f, pt, start, lane));
-            var right = b.Local(b.U(0));
-            b.If(cols == 1.0, () => right.V = b.Select((bp.V >= th) == (bt.V >= half), b.U(1), b.U(0)), () =>
-            {
-                var bi = b.Local(b.U(0));
-                var ti = b.Local(b.U(0));
-                b.For(b.U(1), cols, c =>
-                {
-                    var vp = Codec.UnpackAt(b, f, pp, start + c, lane);
-                    b.If(vp > bp.V, () => { bp.V = vp; bi.V = c; });
-                    var vt = Codec.UnpackAt(b, f, pt, start + c, lane);
-                    b.If(vt > bt.V, () => { bt.V = vt; ti.V = c; });
-                });
-                right.V = b.Select(bi.V == ti.V, b.U(1), b.U(0));
-            });
-            b.Store(b.At(po, r, lane.Size), b.Select(right.V == 1.0, b.C(k, 1), b.C(k, 0)));
-        });
-        return b.Build();
-    }
 }

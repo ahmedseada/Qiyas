@@ -79,28 +79,6 @@ public sealed partial class GpuOps
         return f.Natural.Name;
     }
 
-    /// <summary>output[r] = 1 where row r's prediction is right, else 0 (Ptx.ClassMatchRows): a thread per row, each bound the
-    /// lane's smallest value at least it; a block format's matches encoded from f32 after.</summary>
-    public string ClassMatch<TN>(ulong predictions, ulong targets, ulong output, int rows, int cols, double threshold) where TN : struct, IAdad<TN>
-    {
-        var f = Fmt.Of<TN>();
-        var lane = f.IsBlock ? Lane.F32 : f.Natural;
-        var fo = f.IsBlock ? Fmt.Of<Float32>() : f;
-        ulong dst = f.IsBlock ? gpu.Rent(rows * 4L) : output;
-        try
-        {
-            var fn = gpu.Cached($"class_match:{f.Name}", (out string e) => Ptx.ClassMatchRows(gpu, f, fo, lane, out e));
-            if (fo.Bits < 8) Gpu.Clear(dst, fo.Words(rows) * 4);
-            ulong Slot(double v) => lane.IsFloat ? lane.Wide ? Gpu.D(v) : Gpu.F((float)v) : lane.Wide ? (ulong)(long)v : (uint)(long)v;
-            Gpu.Launch(fn, Grid(rows, 256), 1, 256, 1, 0, predictions, targets, dst, Gpu.U(rows), Gpu.U(cols), Slot(lane.AtLeast(threshold)), Slot(lane.AtLeast(0.5)));
-            if (f.IsBlock) FromLanes<TN>(Lane.F32, dst, output, rows);
-            return lane.Name;
-        }
-        finally
-        {
-            if (f.IsBlock) gpu.Return(dst);
-        }
-    }
 
     /// <summary>loss[r] = w[r]·(log Σ exp(x[r]) − x[r][t[r]]) as the type (t: s32 targets; weights as the type, 0 for none), in
     /// the type's float lane: a block per row.</summary>

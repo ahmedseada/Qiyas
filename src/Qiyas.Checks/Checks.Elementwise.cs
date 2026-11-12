@@ -3,8 +3,8 @@
 
 // The element-wise operations past the formulas, on the CPU against their references and on a device against the CPU:
 // dropout from a seed, the conversion between every pair of types (against an exact reference: the source's value, as
-// a dyadic rational or an integer, rounded once into the target by the format's definition), the class match, and a
-// float formula over a row vector.
+// a dyadic rational or an integer, rounded once into the target by the format's definition), and a float formula over a
+// row vector.
 using System.Numerics;
 using System.Runtime.InteropServices;
 
@@ -17,7 +17,6 @@ internal static partial class Checks
         bool ok = true;
         ok &= Dropouts(ops, device);
         ok &= Converts(ops, device);
-        ok &= ClassMatches(ops, device);
         ok &= RowFloats(ops, device);
         return ok;
     }
@@ -370,108 +369,6 @@ internal static partial class Checks
                 }
                 finally { ops.Return(dx); ops.Return(dout); }
             }
-        }
-    }
-
-    // ---------------------------------------------------------------- class match
-
-    /// <summary>Every type at 37 × 1, 37 × 7 and 5 × 1001 (half the rows' largest columns agreeing): the CPU against the
-    /// rule on the values, the device the CPU's.</summary>
-    private static bool ClassMatches(IDevice<ulong, ulong>? ops, string device)
-    {
-        bool ok = true;
-        string where = ops is null ? "cpu" : device;
-        var random = new Random(83);
-        foreach (var type in Bench.Registry.Names)
-            foreach (var (rows, cols) in new[] { (37, 1), (37, 7), (5, 1001) })
-                foreach (double threshold in new[] { 0.5, 0.3 })
-                {
-                    var pv = new double[rows * cols];
-                    var tv = new double[rows * cols];
-                    bool floats = Bench.Registry.IsFloat(type);
-                    for (int r = 0; r < rows; r++)
-                    {
-                        for (int c = 0; c < cols; c++)
-                        {
-                            pv[r * cols + c] = floats ? random.NextDouble() * 2 - 0.5 : random.Next(0, 2);
-                            tv[r * cols + c] = floats && cols == 1 ? random.NextDouble() : 0;
-                        }
-
-                        if (cols > 1)
-                        {
-                            int t = random.Next(cols);
-                            tv[r * cols + t] = 1;
-                            if (r % 2 == 0) pv[r * cols + t] = floats ? 3 : 1;
-                        }
-                        else if (!floats) tv[r] = random.Next(0, 2);
-                    }
-
-                    var p = Bench.Registry.Encode(type, pv);
-                    var t2 = Bench.Registry.Encode(type, tv);
-                    var cpu = new byte[Bench.Registry.Bytes(type, rows)];
-                    Bench.Registry.With(type, new ClassMatchRun(null, p, t2, cpu, rows, cols, threshold));
-                    if (ops is not null)
-                    {
-                        var dev = new byte[cpu.Length];
-                        Bench.Registry.With(type, new ClassMatchRun(ops, p, t2, dev, rows, cols, threshold));
-                        if (!SameValues(type, $"class_match {rows}x{cols}", where, dev, cpu, rows)) ok = false;
-                        continue;
-                    }
-
-                    var ps = Bench.Registry.Values(type, p, rows * cols);
-                    var ts = Bench.Registry.Values(type, t2, rows * cols);
-                    var got = Bench.Registry.Values(type, cpu, rows);
-                    var rule = new double[rows];
-                    for (int r = 0; r < rows; r++)
-                    {
-                        bool right;
-                        if (cols == 1) right = ps[r] >= threshold == ts[r] >= 0.5;
-                        else
-                        {
-                            int bp = 0, bt = 0;
-                            for (int c = 1; c < cols; c++)
-                            {
-                                if (ps[r * cols + c] > ps[r * cols + bp]) bp = c;
-                                if (ts[r * cols + c] > ts[r * cols + bt]) bt = c;
-                            }
-
-                            right = bp == bt;
-                        }
-
-                        rule[r] = right ? 1 : 0;
-                    }
-
-                    // The rule's 0s and 1s as the type stores them (a block format's 1 is its scale's nearest).
-                    var want = Bench.Registry.Values(type, Bench.Registry.Encode(type, rule), rows);
-                    for (int r = 0; r < rows; r++)
-                    {
-                        if (got[r] == want[r]) continue;
-                        Console.WriteLine($"check class_match {rows}x{cols,-6}    cpu    {type,-12} row {r}: {got[r]}, the rule gives {want[r]}");
-                        ok = false;
-                        break;
-                    }
-                }
-
-        if (ok) Console.WriteLine($"check class match            {where,-6} every type at 37 × 1, 37 × 7, 5 × 1001, thresholds ½ and 0.3: {(ops is null ? "as the rule on the values" : "the CPU's")}");
-        return ok;
-    }
-
-    private sealed class ClassMatchRun(IDevice<ulong, ulong>? ops, byte[] p, byte[] t, byte[] output, int rows, int cols, double threshold) : Bench.ITypeVisitor<bool>
-    {
-        public bool Visit<TN>() where TN : struct, IAdad<TN, float>
-        {
-            if (ops is null) { CpuDevice.Device.ClassMatch<TN>(p, t, output, rows, cols, threshold); return true; }
-            ulong dp = ops.Rent(p.Length + 16), dt = ops.Rent(t.Length + 16), dout = ops.Rent(output.Length + 16);
-            try
-            {
-                ops.Upload(p, dp);
-                ops.Upload(t, dt);
-                ops.ClassMatch<TN>(dp, dt, dout, rows, cols, threshold);
-                ops.Synchronize();
-                ops.Download(dout, output);
-                return true;
-            }
-            finally { ops.Return(dp); ops.Return(dt); ops.Return(dout); }
         }
     }
 

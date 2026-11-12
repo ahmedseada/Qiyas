@@ -2,7 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // Element-wise kernels past the formulas: dropout from a seed (Draws: the same 32-bit arithmetic as the CPU), the
-// conversion between any two types (Fmt.ConvertPlan: one rounding), and the class match of rows.
+// conversion between any two types (Fmt.ConvertPlan: one rounding).
 using Adad.Abstraction;
 
 namespace Adad.Cuda;
@@ -247,67 +247,5 @@ internal static partial class Ptx
         b.Label("DONE");
         b.L("ret;");
         return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_o, .param .u32 p_n");
-    }
-
-    // ---------------------------------------------------------------- class match
-
-    /// <summary>output[r] (fo, from lane) = 1 where row r of p (rows × cols of f) is right, else 0: one column, (p ≥ th) is
-    /// (t ≥ half) in the lane; more, the first largest column of p (by >, from column 0) is t's. A thread per row.</summary>
-    public static string ClassMatchRows(Gpu gpu, Fmt f, Fmt fo, Lane lane, out string entry)
-    {
-        entry = $"class_match_{f.Name}_{fo.Name}_{lane.Name}";
-        var b = new PtxBuilder();
-        string r = GlobalIndex(b);
-        string pp = Param64(b, "p_p"), pt = Param64(b, "p_t"), po = Param64(b, "p_o"), rows = Param32(b, "p_rows"), cols = Param32(b, "p_cols");
-        string th = lane.NewReg(b), half = lane.NewReg(b);
-        b.L($"ld.param.{lane.Mem} {th}, [p_th];");
-        b.L($"ld.param.{lane.Mem} {half}, [p_half];");
-        string pEnd = b.P(), start = b.R(), right = b.P(), one = b.P();
-        b.L($"setp.ge.u32 {pEnd}, {r}, {rows};");
-        b.L($"@{pEnd} bra DONE;");
-        b.L($"mul.lo.u32 {start}, {r}, {cols};");
-        b.L($"setp.eq.u32 {one}, {cols}, 1;");
-        string bp = Codec.UnpackAt(b, f, pp, start, lane), bt = Codec.UnpackAt(b, f, pt, start, lane);
-        b.L($"@!{one} bra MANY;");
-        {
-            string a = b.P(), c = b.P(), ua = b.R(), uc = b.R();
-            b.L($"setp.ge.{lane.Op} {a}, {bp}, {th};");
-            b.L($"setp.ge.{lane.Op} {c}, {bt}, {half};");
-            b.L($"selp.u32 {ua}, 1, 0, {a};");
-            b.L($"selp.u32 {uc}, 1, 0, {c};");
-            b.L($"setp.eq.u32 {right}, {ua}, {uc};");
-            b.L("bra STORE;");
-        }
-
-        b.Label("MANY");
-        {
-            string bi = b.R(), ti = b.R(), c = b.R(), idx = b.R(), done = b.P(), gp = b.P(), gt = b.P();
-            b.L($"mov.u32 {bi}, 0;");
-            b.L($"mov.u32 {ti}, 0;");
-            b.L($"mov.u32 {c}, 1;");
-            b.Label("LOOP");
-            b.L($"setp.ge.u32 {done}, {c}, {cols};");
-            b.L($"@{done} bra END;");
-            b.L($"add.u32 {idx}, {start}, {c};");
-            string vp = Codec.UnpackAt(b, f, pp, idx, lane), vt = Codec.UnpackAt(b, f, pt, idx, lane);
-            b.L($"setp.gt.{lane.Op} {gp}, {vp}, {bp};");
-            b.L($"@{gp} mov.{lane.Reg} {bp}, {vp};");
-            b.L($"@{gp} mov.u32 {bi}, {c};");
-            b.L($"setp.gt.{lane.Op} {gt}, {vt}, {bt};");
-            b.L($"@{gt} mov.{lane.Reg} {bt}, {vt};");
-            b.L($"@{gt} mov.u32 {ti}, {c};");
-            b.L($"add.u32 {c}, {c}, 1;");
-            b.L("bra LOOP;");
-            b.Label("END");
-            b.L($"setp.eq.u32 {right}, {bi}, {ti};");
-        }
-
-        b.Label("STORE");
-        string val = lane.NewReg(b);
-        b.L($"selp.{lane.Reg} {val}, {lane.Literal(1)}, {lane.Literal(0)}, {right};");
-        StoreAnyValue(b, fo, lane, val, po, r);
-        b.Label("DONE");
-        b.L("ret;");
-        return b.Finish(Header(gpu), entry, $".param .u64 p_p, .param .u64 p_t, .param .u64 p_o, .param .u32 p_rows, .param .u32 p_cols, .param .{lane.Mem} p_th, .param .{lane.Mem} p_half");
     }
 }

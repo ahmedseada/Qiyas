@@ -152,25 +152,4 @@ public sealed partial class VulkanOps
             vk.Return(keysA); vk.Return(keysB); vk.Return(valuesA); vk.Return(valuesB);
         }
     }
-
-    /// <summary>output[r] = 1 where row r's prediction is right, else 0 (VkKernels.ClassMatchRows): a thread per row into the
-    /// lane's storage (each bound the lane's smallest value at least it), stored as the type after.</summary>
-    public string ClassMatch<TN>(ulong predictions, ulong targets, ulong output, int rows, int cols, double threshold) where TN : struct, IAdad<TN>
-    {
-        var f = Fmt.Of<TN>();
-        var lane = f.IsBlock ? Lane.F32 : f.Natural;
-        ulong Bound(double v) => lane.IsFloat ? Slot(lane, v) : lane == Lane.U32 ? (uint)v : lane == Lane.U64 ? (ulong)v : Slot(lane, v);
-        ulong scratch = vk.Rent(rows * (long)lane.Size);
-        try
-        {
-            var k = vk.Cached($"class_match:{f.Name}", () => VkKernels.ClassMatchRows(vk, f, lane));
-            vk.Launch(k, Groups(rows, VkKernels.Threads), 1, predictions, targets, scratch, Vulkan.U(rows), Vulkan.U(cols), Bound(lane.AtLeast(threshold)), Bound(lane.AtLeast(0.5)));
-            Back(f, lane, scratch, output, rows);
-            return lane.Name;
-        }
-        finally
-        {
-            vk.Return(scratch);
-        }
-    }
 }
