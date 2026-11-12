@@ -4,9 +4,11 @@
 // The INumberBase<T> version as a bench subject: one implementation over T : INumberBase<T> (CpuGeneric.cs on the
 // CPU, GenericPtx.cs on CUDA; there is no Vulkan version, so a Vulkan row has no number cell), for the types .NET has
 // such a T for. Stored bytes of those types are the .NET layout, so they are used in place. Its runs hold nothing
-// beyond their operands but rms_norm's row of inverse norms (a value a row on the CPU, 8 bytes a row on CUDA) and ctc's
-// α, β and frames' log-sum-exp (per sequence), prepared with the run and said in Held; rent_zeroed's new byte[] the host
-// meter counts.
+// beyond their operands but rms_norm's row of inverse norms (a value a row on the CPU, 8 bytes a row on CUDA), ctc's
+// α, β and frames' log-sum-exp (per sequence), the convolution's columns and its backward's transposes,
+// optimizer_many's partial sums of squares on CUDA (1024 of the moments' type, and their copy on the host) and
+// rent_zeroed's buffer on CUDA, prepared with the run and said in Held; the CPU's rent_zeroed new byte[] the host meter
+// counts.
 using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -70,30 +72,29 @@ public sealed class NumberSubject : IBenchSubject
         _ => null,
     };
 
-    // The rows below have a CPU version only so far (the device's comes with GenericPtx's kernels for them).
-
     // One image of one group (the bench's row); images and groups are not this version's.
-    public IBenchRun? Conv(Device device, string type, ConvArgs a, byte[] x, byte[] w, byte[] y, byte[]? dx, byte[]? dw) => device != Device.Cpu || a.N != 1 || a.Groups != 1 ? null : type switch
+    public IBenchRun? Conv(Device device, string type, ConvArgs a, byte[] x, byte[] w, byte[] y, byte[]? dx, byte[]? dw) => !Runs(device) || a.N != 1 || a.Groups != 1 ? null : type switch
     {
-        "float64" => Conv<double>(a, x, w, y, dx, dw),
-        "float32" => Conv<float>(a, x, w, y, dx, dw),
-        "float16" => Conv<Half>(a, x, w, y, dx, dw),
-        "int64" => Conv<long>(a, x, w, y, dx, dw),
-        "int32" => Conv<int>(a, x, w, y, dx, dw),
-        "int16" => Conv<short>(a, x, w, y, dx, dw),
-        "int8" => Conv<sbyte>(a, x, w, y, dx, dw),
-        "uint64" => Conv<ulong>(a, x, w, y, dx, dw),
-        "uint32" => Conv<uint>(a, x, w, y, dx, dw),
-        "uint16" => Conv<ushort>(a, x, w, y, dx, dw),
-        "uint8" => Conv<byte>(a, x, w, y, dx, dw),
+        "float64" => Conv<double>(device, a, x, w, y, dx, dw),
+        "float32" => Conv<float>(device, a, x, w, y, dx, dw),
+        "float16" => Conv<Half>(device, a, x, w, y, dx, dw),
+        "int64" => Conv<long>(device, a, x, w, y, dx, dw),
+        "int32" => Conv<int>(device, a, x, w, y, dx, dw),
+        "int16" => Conv<short>(device, a, x, w, y, dx, dw),
+        "int8" => Conv<sbyte>(device, a, x, w, y, dx, dw),
+        "uint64" => Conv<ulong>(device, a, x, w, y, dx, dw),
+        "uint32" => Conv<uint>(device, a, x, w, y, dx, dw),
+        "uint16" => Conv<ushort>(device, a, x, w, y, dx, dw),
+        "uint8" => Conv<byte>(device, a, x, w, y, dx, dw),
         _ => null,
     };
 
     // The convolution as the generic code writes it: im2col, then the product (the backward: wᵀ·dy then col2im for dx;
     // im2col, its transpose, then dy·colsᵀ for dw), every step in T. y is dy for the backward. The columns and the
     // backward's transposes are kept with the run (Held).
-    private static IBenchRun Conv<T>(ConvArgs a, byte[] x, byte[] w, byte[] y, byte[]? dx, byte[]? dw) where T : unmanaged, INumberBase<T>
+    private static IBenchRun Conv<T>(Device device, ConvArgs a, byte[] x, byte[] w, byte[] y, byte[]? dx, byte[]? dw) where T : unmanaged, INumberBase<T>
     {
+        if (device == Device.Cuda) return ConvCuda<T>(a, x, w, y, dx, dw);
         int rows = a.Rows, cols = a.Cols, oc = a.OC, size = Marshal.SizeOf<T>();
         T[] xs = Of<T>(x), ws = Of<T>(w), c = new T[rows * cols];
         string Lane() => CpuGeneric.Vectorized<T>() ? $"Vector<{typeof(T).Name}>" : "scalar";
@@ -117,44 +118,44 @@ public sealed class NumberSubject : IBenchSubject
     }
 
     // The moments come as float64 for float64, float32 otherwise: the step is in that type (TM).
-    public IBenchRun? Optimizer(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) => device != Device.Cpu ? null : type switch
+    public IBenchRun? Optimizer(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) => !Runs(device) ? null : type switch
     {
-        "float64" => Optimizer<double, double>(a, p, g, m, v, [n], false),
-        "float32" => Optimizer<float, float>(a, p, g, m, v, [n], false),
-        "float16" => Optimizer<Half, float>(a, p, g, m, v, [n], false),
+        "float64" => Optimizer<double, double>(device, a, p, g, m, v, [n], false),
+        "float32" => Optimizer<float, float>(device, a, p, g, m, v, [n], false),
+        "float16" => Optimizer<Half, float>(device, a, p, g, m, v, [n], false),
         _ => null,
     };
 
-    public IBenchRun? OptimizerMany(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[]? m, byte[]? v, int[] counts) => device != Device.Cpu ? null : type switch
+    public IBenchRun? OptimizerMany(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[]? m, byte[]? v, int[] counts) => !Runs(device) ? null : type switch
     {
-        "float64" => Optimizer<double, double>(a, p, g, m, v, counts, true),
-        "float32" => Optimizer<float, float>(a, p, g, m, v, counts, true),
-        "float16" => Optimizer<Half, float>(a, p, g, m, v, counts, true),
+        "float64" => Optimizer<double, double>(device, a, p, g, m, v, counts, true),
+        "float32" => Optimizer<float, float>(device, a, p, g, m, v, counts, true),
+        "float16" => Optimizer<Half, float>(device, a, p, g, m, v, counts, true),
         _ => null,
     };
 
     // The tables come as float64 for float64, float32 otherwise: the rotation is in that type (TL).
-    public IBenchRun? Rope(Device device, string type, RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y) => device != Device.Cpu ? null : type switch
+    public IBenchRun? Rope(Device device, string type, RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y) => !Runs(device) ? null : type switch
     {
-        "float64" => Rope<double, double>(a, x, cos, sin, positions, y),
-        "float32" => Rope<float, float>(a, x, cos, sin, positions, y),
-        "float16" => Rope<Half, float>(a, x, cos, sin, positions, y),
+        "float64" => Rope<double, double>(device, a, x, cos, sin, positions, y),
+        "float32" => Rope<float, float>(device, a, x, cos, sin, positions, y),
+        "float16" => Rope<Half, float>(device, a, x, cos, sin, positions, y),
         _ => null,
     };
 
-    public IBenchRun? BoxLoss(Device device, string type, BoxOverlap overlap, byte[] predicted, byte[] target, byte[]? dloss, byte[] output, int count) => device != Device.Cpu ? null : type switch
+    public IBenchRun? BoxLoss(Device device, string type, BoxOverlap overlap, byte[] predicted, byte[] target, byte[]? dloss, byte[] output, int count) => !Runs(device) ? null : type switch
     {
-        "float64" => BoxLoss<double>(overlap, predicted, target, dloss, output, count),
-        "float32" => BoxLoss<float>(overlap, predicted, target, dloss, output, count),
-        "float16" => BoxLoss<Half>(overlap, predicted, target, dloss, output, count),
+        "float64" => BoxLoss<double>(device, overlap, predicted, target, dloss, output, count),
+        "float32" => BoxLoss<float>(device, overlap, predicted, target, dloss, output, count),
+        "float16" => BoxLoss<Half>(device, overlap, predicted, target, dloss, output, count),
         _ => null,
     };
 
-    public IBenchRun? Ctc(Device device, string type, CtcArgs a, byte[] logits, byte[] loss, byte[]? grad) => device != Device.Cpu ? null : type switch
+    public IBenchRun? Ctc(Device device, string type, CtcArgs a, byte[] logits, byte[] loss, byte[]? grad) => !Runs(device) ? null : type switch
     {
-        "float64" => Ctc<double>(a, logits, loss, grad),
-        "float32" => Ctc<float>(a, logits, loss, grad),
-        "float16" => Ctc<Half>(a, logits, loss, grad),
+        "float64" => Ctc<double>(device, a, logits, loss, grad),
+        "float32" => Ctc<float>(device, a, logits, loss, grad),
+        "float16" => Ctc<Half>(device, a, logits, loss, grad),
         _ => null,
     };
 
@@ -164,6 +165,7 @@ public sealed class NumberSubject : IBenchSubject
     public IBenchRun? Memory(Device device, string op, byte[] source, byte[] output, int offset)
     {
         int n = source.Length, bytes = n - 2 * offset;
+        if (device == Device.Cuda) return MemoryCuda(op, source, output, offset);
         if (device != Device.Cpu) return null;
         return op switch
         {
@@ -177,9 +179,10 @@ public sealed class NumberSubject : IBenchSubject
     // An optimizer step over the tensors of counts (one: the single step; many: every gradient clipped together, by
     // min(1, MaxNorm / √Σ g²), the sum in TM). A run is the step alone, from the state the runs before it left; Collect
     // restores p, m, v to the row's state, takes one step and reads them back, so the scored p is one step from it.
-    private static IBenchRun Optimizer<T, TM>(OptimizerArgs a, byte[] p, byte[] g, byte[]? m, byte[]? v, int[] counts, bool many)
+    private static IBenchRun Optimizer<T, TM>(Device device, OptimizerArgs a, byte[] p, byte[] g, byte[]? m, byte[]? v, int[] counts, bool many)
         where T : unmanaged, INumberBase<T> where TM : unmanaged, IFloatingPointIeee754<TM>
     {
+        if (device == Device.Cuda) return OptimizerCuda<T, TM>(a, p, g, m, v, counts, many);
         var s = CpuGeneric.Step<TM>.Of(a);
         int tensors = counts.Length;
         var at = new int[tensors + 1];
@@ -208,28 +211,31 @@ public sealed class NumberSubject : IBenchSubject
         }, lane: () => lane, held: () => new(0, null));
     }
 
-    private static IBenchRun Rope<T, TL>(RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y)
+    private static IBenchRun Rope<T, TL>(Device device, RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y)
         where T : unmanaged, INumberBase<T> where TL : unmanaged, IFloatingPointIeee754<TL>
     {
+        if (device == Device.Cuda) return RopeCuda<T, TL>(a, x, cos, sin, positions, y);
         T[] xa = Of<T>(x), ya = new T[xa.Length];
         TL[] ca = Of<TL>(cos), sa = Of<TL>(sin);
         string lane = !a.Interleaved && typeof(T) == typeof(TL) && CpuGeneric.Vectorized<TL>() ? $"Vector<{typeof(TL).Name}>" : $"scalar, in {typeof(TL).Name}";
         return new BenchRun(() => CpuGeneric.Rope(a, xa, ca, sa, positions, ya), () => Back(ya, y), lane: () => lane, held: () => new(0, null));
     }
 
-    private static IBenchRun BoxLoss<T>(BoxOverlap overlap, byte[] predicted, byte[] target, byte[]? dloss, byte[] output, int count)
+    private static IBenchRun BoxLoss<T>(Device device, BoxOverlap overlap, byte[] predicted, byte[] target, byte[]? dloss, byte[] output, int count)
         where T : unmanaged, IFloatingPointIeee754<T>
     {
+        if (device == Device.Cuda) return BoxLossCuda<T>(overlap, predicted, target, dloss, output, count);
         T[] pa = Of<T>(predicted), ta = Of<T>(target), ya = new T[output.Length / Marshal.SizeOf<T>()];
         T[]? da = dloss is null ? null : Of<T>(dloss);
         return new BenchRun(() => CpuGeneric.BoxLoss(overlap, pa, ta, da, ya, count), () => Back(ya, output), lane: () => "scalar", held: () => new(0, null));
     }
 
     // A sequence per Parallel.For iteration, its α (and β: frames × states) and its frames' log-sum-exp kept with the run.
-    private static IBenchRun Ctc<T>(CtcArgs a, byte[] logits, byte[] loss, byte[]? grad) where T : unmanaged, IFloatingPointIeee754<T>
+    private static IBenchRun Ctc<T>(Device device, CtcArgs a, byte[] logits, byte[] loss, byte[]? grad) where T : unmanaged, IFloatingPointIeee754<T>
     {
         var offsets = new int[a.B];
         for (int b = 1; b < a.B; b++) offsets[b] = offsets[b - 1] + a.LabelLengths[b - 1];
+        if (device == Device.Cuda) return CtcCuda<T>(a, offsets, logits, loss, grad);
         T[] x = Of<T>(logits), la = new T[a.B];
         T[]? ga = grad is null ? null : new T[a.Values];
         T[][] alpha = new T[a.B][], lse = new T[a.B][];
@@ -250,6 +256,220 @@ public sealed class NumberSubject : IBenchSubject
             Back(la, loss);
             if (ga is not null) Back(ga, grad!);
         }, lane: () => "scalar", held: () => new(kept, null));
+    }
+
+    // ---------------------------------------------------------------- CUDA's versions (GenericPtx's kernels)
+
+    // The range of bytes on device buffers, addresses into them: cuMemcpyDtoD, cuMemsetD8; the rent by cuMemAlloc,
+    // cuMemsetD8 and cuMemFree (its buffer the run's own).
+    private static IBenchRun? MemoryCuda(string op, byte[] source, byte[] output, int offset)
+    {
+        if (op is not ("copy" or "clear" or "rent_zeroed")) return null;
+        int n = source.Length, bytes = n - 2 * offset;
+        var gpu = Devices.Gpu;
+        ulong src = gpu.Rent(n), dst = gpu.Rent(n), at = (ulong)offset;
+        Gpu.Upload<byte>(source, src);
+        Gpu.Upload<byte>(output, dst);
+        Action run = op switch
+        {
+            "copy" => () => { Gpu.Copy(src + at, dst + at, bytes); Gpu.Synchronize(); },
+            "clear" => () => { Gpu.Clear(dst + at, bytes); Gpu.Synchronize(); },
+            _ => () =>
+            {
+                Driver.Check(Driver.cuMemAlloc(out ulong b, (nuint)n), "cuMemAlloc");
+                Gpu.Clear(b, n);
+                Gpu.Synchronize();
+                Driver.Check(Driver.cuMemFree(b), "cuMemFree");
+            },
+        };
+        string lane = op switch { "copy" => "cuMemcpyDtoD", "clear" => "cuMemsetD8", _ => "cuMemAlloc, cuMemsetD8, cuMemFree" };
+        return new BenchRun(run, () => Gpu.Download<byte>(dst, output), () => { gpu.Return(src); gpu.Return(dst); }, () => lane, () => new(0, op == "rent_zeroed" ? n : 0));
+    }
+
+    // The step on the device: a thread a value (GenericPtx.Optimizer), many's sum of squares by 1024 blocks read back and
+    // added on the host in TM (a sync inside the step), a launch a tensor. Held: many's partial sums (device and host).
+    private static IBenchRun OptimizerCuda<T, TM>(OptimizerArgs a, byte[] p, byte[] g, byte[]? m, byte[]? v, int[] counts, bool many)
+        where T : unmanaged, INumberBase<T> where TM : unmanaged, IFloatingPointIeee754<TM>
+    {
+        var s = CpuGeneric.Step<TM>.Of(a);
+        int tensors = counts.Length;
+        var at = new int[tensors + 1];
+        for (int i = 0; i < tensors; i++) at[i + 1] = at[i] + counts[i];
+        int n = at[tensors];
+        bool hasM = a.Moments > 0 && m is not null, hasV = a.Moments > 1 && v is not null;
+        TM Factor(TM sum) => a.MaxNorm > 0 && sum > TM.Zero ? TM.Min(TM.One, TM.CreateTruncating(a.MaxNorm) / TM.Sqrt(sum)) : TM.One;
+        const int Blocks = 1024;
+        int tSize = Marshal.SizeOf<T>(), mSize = Marshal.SizeOf<TM>();
+        var gpu = Devices.Gpu;
+        ulong dp = gpu.Rent(p.Length), sp = gpu.Rent(p.Length), dg = gpu.Rent(g.Length);
+        ulong dm = hasM ? gpu.Rent(m!.Length) : 0, sm = hasM ? gpu.Rent(m!.Length) : 0, dv = hasV ? gpu.Rent(v!.Length) : 0, sv = hasV ? gpu.Rent(v!.Length) : 0;
+        ulong dpart = many ? gpu.Rent(Blocks * mSize) : 0;
+        Gpu.Upload<byte>(p, sp);
+        Gpu.Upload<byte>(g, dg);
+        if (hasM) Gpu.Upload<byte>(m!, sm);
+        if (hasV) Gpu.Upload<byte>(v!, sv);
+        void Restore()
+        {
+            Gpu.Copy(sp, dp, p.Length);
+            if (hasM) Gpu.Copy(sm, dm, m!.Length);
+            if (hasV) Gpu.Copy(sv, dv, v!.Length);
+        }
+
+        Restore();
+        var f = gpu.Function(GenericPtx.Optimizer<T, TM>(a.Name, out string entry), entry);
+        var sq = many ? gpu.Function(GenericPtx.SumSquares<T, TM>(out string sqEntry), sqEntry) : IntPtr.Zero;
+        var part = new TM[many ? Blocks : 0];
+        static ulong Param(TM x) => typeof(TM) == typeof(double) ? Gpu.D(double.CreateTruncating(x)) : Gpu.F(float.CreateTruncating(x));
+        void Step()
+        {
+            TM scale = TM.One;
+            if (many)
+            {
+                Gpu.Launch(sq, Blocks, 1, 256, 1, 0, dg, dpart, Gpu.U(n));
+                Gpu.Download<TM>(dpart, part);                                // waits for the sums
+                TM sum = TM.Zero;
+                foreach (TM x in part) sum += x;
+                scale = Factor(sum);
+            }
+
+            for (int t = 0; t < tensors; t++)
+            {
+                ulong first = (ulong)at[t];
+                Gpu.Launch(f, (uint)((counts[t] + 255) / 256), 1, 256, 1, 0, dp + first * (ulong)tSize, dg + first * (ulong)tSize,
+                    hasM ? dm + first * (ulong)mSize : 0, hasV ? dv + first * (ulong)mSize : 0, Gpu.U(counts[t]),
+                    Param(s.Lr), Param(s.B1), Param(s.B2), Param(s.Eps), Param(s.Wd), Param(s.C1), Param(s.C2), Param(s.B1c), Param(s.B2c), Param(scale));
+            }
+
+            Gpu.Synchronize();
+        }
+
+        return new BenchRun(Step, () =>
+        {
+            Restore();
+            Step();
+            Gpu.Download<byte>(dp, p);
+            if (hasM) Gpu.Download<byte>(dm, m!);
+            if (hasV) Gpu.Download<byte>(dv, v!);
+        }, () =>
+        {
+            foreach (ulong b in new[] { dp, sp, dg, dm, sm, dv, sv, dpart }) if (b != 0) gpu.Return(b);
+        }, () => entry, () => new(many ? Blocks * mSize : 0, many ? Blocks * mSize : 0));
+    }
+
+    private static IBenchRun RopeCuda<T, TL>(RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y)
+        where T : unmanaged, INumberBase<T> where TL : unmanaged, IFloatingPointIeee754<TL>
+    {
+        var gpu = Devices.Gpu;
+        ulong dx = gpu.Rent(x.Length), dc = gpu.Rent(cos.Length), ds = gpu.Rent(sin.Length), dpos = gpu.Rent(positions.Length * 4L), dy = gpu.Rent(y.Length);
+        Gpu.Upload<byte>(x, dx);
+        Gpu.Upload<byte>(cos, dc);
+        Gpu.Upload<byte>(sin, ds);
+        Gpu.Upload<int>(positions, dpos);
+        var f = gpu.Function(GenericPtx.Rope<T, TL>(out string entry), entry);
+        int n = a.Rows * a.Cols;
+        return new BenchRun(() =>
+        {
+            Gpu.Launch(f, (uint)((n + 255) / 256), 1, 256, 1, 0, dx, dc, ds, dpos, dy, Gpu.U(n), Gpu.U(a.Cols), Gpu.U(a.Heads), Gpu.U(a.Steps), Gpu.U(a.Half),
+                Gpu.U(a.Interleaved ? 1 : 0), Gpu.U(a.Inverse ? 1 : 0));
+            Gpu.Synchronize();
+        }, () => Gpu.Download<byte>(dy, y), () => { gpu.Return(dx); gpu.Return(dc); gpu.Return(ds); gpu.Return(dpos); gpu.Return(dy); }, () => entry, () => new(0, 0));
+    }
+
+    private static IBenchRun BoxLossCuda<T>(BoxOverlap overlap, byte[] predicted, byte[] target, byte[]? dloss, byte[] output, int count)
+        where T : unmanaged, IFloatingPointIeee754<T>
+    {
+        var gpu = Devices.Gpu;
+        ulong dp = gpu.Rent(predicted.Length), dt = gpu.Rent(target.Length), dl = dloss is null ? 0 : gpu.Rent(dloss.Length), dy = gpu.Rent(output.Length);
+        Gpu.Upload<byte>(predicted, dp);
+        Gpu.Upload<byte>(target, dt);
+        if (dloss is not null) Gpu.Upload<byte>(dloss, dl);
+        var f = gpu.Function(GenericPtx.BoxLoss<T>(overlap, dloss is not null, out string entry), entry);
+        return new BenchRun(() =>
+        {
+            Gpu.Launch(f, (uint)((count + 255) / 256), 1, 256, 1, 0, dp, dt, dl, dy, Gpu.U(count));
+            Gpu.Synchronize();
+        }, () => Gpu.Download<byte>(dy, output), () => { gpu.Return(dp); gpu.Return(dt); if (dl != 0) gpu.Return(dl); gpu.Return(dy); }, () => entry, () => new(0, 0));
+    }
+
+    // A block a sequence (GenericPtx.Ctc), the scratch α (β) of T × the most states and the log-sum-exp of T frames a sequence.
+    private static IBenchRun CtcCuda<T>(CtcArgs a, int[] offsets, byte[] logits, byte[] loss, byte[]? grad) where T : unmanaged, IFloatingPointIeee754<T>
+    {
+        var gpu = Devices.Gpu;
+        int states = 2 * a.LabelLengths.Max() + 1;
+        long lseBytes = (long)a.B * a.T * Marshal.SizeOf<T>(), alphaBytes = lseBytes * states;
+        ulong dx = gpu.Rent(logits.Length), dloss = gpu.Rent(loss.Length), dgrad = grad is null ? 0 : gpu.Rent(grad.Length);
+        ulong dlse = gpu.Rent(lseBytes), dalpha = gpu.Rent(alphaBytes), dbeta = grad is null ? 0 : gpu.Rent(alphaBytes);
+        ulong dframes = gpu.Rent(a.B * 4L), dlengths = gpu.Rent(a.B * 4L), doffsets = gpu.Rent(a.B * 4L), dlabels = gpu.Rent(Math.Max(1, a.Labels.Length) * 4L);
+        Gpu.Upload<byte>(logits, dx);
+        Gpu.Upload<int>(a.InputLengths, dframes);
+        Gpu.Upload<int>(a.LabelLengths, dlengths);
+        Gpu.Upload<int>(offsets, doffsets);
+        Gpu.Upload<int>(a.Labels, dlabels);
+        var f = gpu.Function(GenericPtx.Ctc<T>(out string entry), entry);
+        return new BenchRun(() =>
+        {
+            Gpu.Launch(f, (uint)a.B, 1, 256, 1, 0, dx, dloss, dgrad, dlse, dalpha, dbeta, dframes, dlengths, doffsets, dlabels,
+                Gpu.U(a.T), Gpu.U(a.B), Gpu.U(a.C), Gpu.U(a.Blank), Gpu.U(states), Gpu.U(grad is null ? 0 : 1));
+            Gpu.Synchronize();
+        }, () =>
+        {
+            Gpu.Download<byte>(dloss, loss);
+            if (grad is not null) Gpu.Download<byte>(dgrad, grad);
+        }, () =>
+        {
+            foreach (ulong b in new[] { dx, dloss, dgrad, dlse, dalpha, dbeta, dframes, dlengths, doffsets, dlabels }) if (b != 0) gpu.Return(b);
+        }, () => entry, () => new(0, lseBytes + alphaBytes * (grad is null ? 1 : 2)));
+    }
+
+    // The convolution on the device as the generic code writes it: im2col (GenericPtx.Im2col), then the product (Product);
+    // the backward: wᵀ (GenericPtx.Transpose) · dy, col2im (GenericPtx.Col2im) for dx; im2col, its transpose, then dy·colsᵀ
+    // for dw. The columns and the backward's transposes are the run's (Held).
+    private static IBenchRun ConvCuda<T>(ConvArgs a, byte[] x, byte[] w, byte[] y, byte[]? dx, byte[]? dw) where T : unmanaged, INumberBase<T>
+    {
+        int rows = a.Rows, cols = a.Cols, oc = a.OC;
+        var gpu = Devices.Gpu;
+        int size = Marshal.SizeOf<T>();
+        var (oh, ow) = a.Out;
+        ulong[] p = [Gpu.U(a.H), Gpu.U(a.W), Gpu.U(a.Kh), Gpu.U(a.Kw), Gpu.U(a.Sh), Gpu.U(a.Sw), Gpu.U(a.PadTop), Gpu.U(a.PadLeft), Gpu.U(a.Dh), Gpu.U(a.Dw), Gpu.U(oh), Gpu.U(ow)];
+        var im2col = gpu.Function(GenericPtx.Im2col<T>(out string ie), ie);
+        var rented = new List<ulong>();
+        ulong Rent(long bytes) { ulong d = gpu.Rent(Math.Max(16, bytes)); rented.Add(d); return d; }
+        ulong dX = Rent(x.Length), dW = Rent(w.Length), dCols = Rent((long)rows * cols * size);
+        Gpu.Upload<byte>(x, dX);
+        Gpu.Upload<byte>(w, dW);
+        void Columns() => Gpu.Launch(im2col, (uint)(((long)rows * cols + 255) / 256), 1, 256, 1, 0, [dX, dCols, Gpu.U(rows * cols), .. p]);
+        void Free() { foreach (var d in rented) gpu.Return(d); }
+        if (dx is null)
+        {
+            ulong dY = Rent(y.Length);
+            Columns();
+            var product = Product<T>(gpu, dW, dCols, dY, oc, cols, rows);
+            return new BenchRun(() => { Columns(); product.Launch(dW, dCols, dY, oc, cols, rows); Gpu.Synchronize(); },
+                () => Gpu.Download<byte>(dY, y), Free, () => $"{ie} + {product.Entry}", () => new(0, (long)rows * cols * size));
+        }
+
+        var col2im = gpu.Function(GenericPtx.Col2im<T>(out string ce), ce);
+        var transpose = gpu.Function(GenericPtx.Transpose<T>(out string te), te);
+        ulong dDy = Rent(y.Length), dWt = Rent((long)rows * oc * size), dDc = Rent((long)rows * cols * size), dCt = Rent((long)cols * rows * size);
+        ulong dDx = Rent(dx.Length), dDw = Rent(dw!.Length);
+        Gpu.Upload<byte>(y, dDy);
+        void Transpose(ulong from, ulong to, int r, int c) => Gpu.Launch(transpose, (uint)(((long)r * c + 255) / 256), 1, 256, 1, 0, from, to, Gpu.U(r), Gpu.U(c));
+        Transpose(dW, dWt, oc, rows);
+        Columns();
+        Transpose(dCols, dCt, rows, cols);
+        var dcols = Product<T>(gpu, dWt, dDy, dDc, rows, cols, oc);
+        var dweights = Product<T>(gpu, dDy, dCt, dDw, oc, rows, cols);
+        return new BenchRun(() =>
+        {
+            Transpose(dW, dWt, oc, rows);
+            dcols.Launch(dWt, dDy, dDc, rows, cols, oc);                                  // dcols = wᵀ·dy
+            Gpu.Launch(col2im, (uint)((a.XValues + 255) / 256), 1, 256, 1, 0, [dDc, dDx, Gpu.U((int)a.XValues), .. p]);
+            Columns();
+            Transpose(dCols, dCt, rows, cols);
+            dweights.Launch(dDy, dCt, dDw, oc, rows, cols);                               // dw = dy·colsᵀ
+            Gpu.Synchronize();
+        }, () => { Gpu.Download<byte>(dDx, dx); Gpu.Download<byte>(dDw, dw); }, Free, () => $"{ie}, {te}, {ce} + {dcols.Entry}",
+            () => new(0, ((long)rows * oc + 3L * rows * cols) * size));
     }
 
     private static T[] Of<T>(byte[] bytes) where T : unmanaged => MemoryMarshal.Cast<byte, T>(bytes.AsSpan()).ToArray();
@@ -285,27 +505,36 @@ public sealed class NumberSubject : IBenchSubject
         ulong da = gpu.Rent(x.Length), db = gpu.Rent(y.Length), dc = gpu.Rent(z.Length);
         Gpu.Upload<byte>(x, da);
         Gpu.Upload<byte>(y, db);
-        // The product's 64 and 128 tiles both measured once, the faster kept.
-        double best = double.MaxValue;
-        string chosen = "";
-        IntPtr function = IntPtr.Zero;
-        int tile = 64;
+        var product = Product<T>(gpu, da, db, dc, m, n, k);
+        return new BenchRun(() => { product.Launch(da, db, dc, m, n, k); Gpu.Synchronize(); },
+            () => Gpu.Download<byte>(dc, z), () => { gpu.Return(da); gpu.Return(db); gpu.Return(dc); }, () => product.Entry, () => new(0, 0));
+    }
+
+    // The generic product's kernel for an m × n × k shape: its 64 and 128 tiles both measured once on these operands, the
+    // faster kept.
+    private sealed record GenericProduct(IntPtr Function, int Tile, string Entry)
+    {
+        public void Launch(ulong a, ulong b, ulong c, int m, int n, int k) =>
+            Gpu.Launch(Function, (uint)((n + Tile - 1) / Tile), (uint)((m + Tile - 1) / Tile), 16, 16, 0, a, b, c, Gpu.U(m), Gpu.U(n), Gpu.U(k));
+    }
+
+    private static GenericProduct Product<T>(Gpu gpu, ulong da, ulong db, ulong dc, int m, int n, int k) where T : unmanaged, INumberBase<T>
+    {
+        GenericProduct? best = null;
+        double bestMs = double.MaxValue;
         foreach (int micro in new[] { 8, 4 })
         {
-            var f = gpu.Function(GenericPtx.MatMul<T>(micro, out string entry), entry);
-            int t = 16 * micro;
-            void Launch() => Gpu.Launch(f, (uint)((n + t - 1) / t), (uint)((m + t - 1) / t), 16, 16, 0, da, db, dc, Gpu.U(m), Gpu.U(n), Gpu.U(k));
-            Launch();
+            var p = new GenericProduct(gpu.Function(GenericPtx.MatMul<T>(micro, out string entry), entry), 16 * micro, entry);
+            p.Launch(da, db, dc, m, n, k);
             Gpu.Synchronize();
             long start = Stopwatch.GetTimestamp();
-            for (int i = 0; i < 3; i++) Launch();
+            for (int i = 0; i < 3; i++) p.Launch(da, db, dc, m, n, k);
             Gpu.Synchronize();
             double ms = Stopwatch.GetElapsedTime(start).TotalMilliseconds / 3;
-            if (ms < best) (best, chosen, function, tile) = (ms, entry, f, t);
+            if (ms < bestMs) (bestMs, best) = (ms, p);
         }
 
-        return new BenchRun(() => { Gpu.Launch(function, (uint)((n + tile - 1) / tile), (uint)((m + tile - 1) / tile), 16, 16, 0, da, db, dc, Gpu.U(m), Gpu.U(n), Gpu.U(k)); Gpu.Synchronize(); },
-            () => Gpu.Download<byte>(dc, z), () => { gpu.Return(da); gpu.Return(db); gpu.Return(dc); }, () => chosen, () => new(0, 0));
+        return best!;
     }
 
     private static IBenchRun Rows<T>(Device device, byte[] x, byte[] y, int rows, int cols, float? eps) where T : unmanaged, IFloatingPointIeee754<T>
