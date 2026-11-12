@@ -215,11 +215,14 @@ public static class LayoutCases
             case "adaptive_avgpool":
                 yield return Make(name, type, 3 * 7 * 9, null, [3, 7, 9, 5, 4], 3 * 5 * 4, 94);
                 yield return Make(name, type, 2 * 5 * 5, null, [2, 5, 5, 7, 3], 2 * 7 * 3, 95);
+                // Windows of 14 × 19 values, uneven and overlapping (a device's window a warp past 32 values).
+                yield return Make(name, type, 2 * 40 * 37, null, [2, 40, 37, 3, 2], 2 * 3 * 2, 96);
                 break;
             case "adaptive_maxpool_bwd":
             case "adaptive_avgpool_bwd":
                 yield return Make(name, type, 3 * 5 * 4, null, [3, 7, 9, 5, 4], 3 * 7 * 9, 97, 3 * 7 * 9);
                 yield return Make(name, type, 2 * 7 * 3, null, [2, 5, 5, 7, 3], 2 * 5 * 5, 98, 2 * 5 * 5);
+                yield return Make(name, type, 2 * 3 * 2, null, [2, 40, 37, 3, 2], 2 * 40 * 37, 99, 2 * 40 * 37);
                 break;
             case "depthwise_conv":
             {

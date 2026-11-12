@@ -285,6 +285,208 @@ internal static partial class Ptx
         return b.Finish(Header(gpu), entry, LayoutParams);
     }
 
+    /// <summary>Whether an adaptive pool's windows take a warp each (AdaptiveMaxWarp, LayoutWindowArgmaxWarp): windows of 32
+    /// values or more (a lane at least one of each), where a thread a window leaves the device with a few thousand threads
+    /// each walking a thousand values (64 × 256² to 7 × 7: 3136 threads). A stated choice: a warp's lanes are its width.</summary>
+    public static bool AdaptiveByWarp(int[] p) => p.Length >= 5 && p[3] > 0 && p[4] > 0 && (long)(p[1] / p[3]) * (p[2] / p[4]) >= 32;
+
+    // One adaptive window's first-ranked by a warp: (ch, oh, ow) from the window index w; each lane walks the window's
+    // values e = lane, lane + 32, … (row-major in the window: ih = h0 + e / kw, iw = w0 + e mod kw, advanced by 32 a step
+    // without a division); index: the first-ranked's input position too (the lowest on a tie), joined by shuffles.
+    // Returns (value, position) as every lane holds them after the butterflies (position 0xFFFFFFFF: none).
+    private static (string Value, string At) AdaptiveWindowWarp(PtxBuilder b, Fmt f, Lane lane, string x, string[] p, string w, string wl, bool index, string tag)
+    {
+        string H = p[1], W = p[2], OH = p[3], OW = p[4];
+        string ow = b.R(), oh = b.R(), ch = b.R(), t = b.R(), h0 = b.R(), h1 = b.R(), w0 = b.R(), w1 = b.R(), kh = b.R(), kw = b.R(), area = b.R();
+        RemU(b, ow, w, OW);
+        DivU(b, t, w, OW);
+        RemU(b, oh, t, OH);
+        DivU(b, ch, t, OH);
+        void Span(string o, string n, string outs, string start, string end)
+        {
+            b.L($"mul.lo.u32 {start}, {o}, {n};");
+            DivU(b, start, start, outs);
+            b.L($"add.u32 {end}, {o}, 1;");
+            b.L($"mul.lo.u32 {end}, {end}, {n};");
+            b.L($"add.u32 {end}, {end}, {outs};");
+            b.L($"sub.u32 {end}, {end}, 1;");
+            DivU(b, end, end, outs);
+        }
+
+        Span(oh, H, OH, h0, h1);
+        Span(ow, W, OW, w0, w1);
+        b.L($"sub.u32 {kh}, {h1}, {h0};");
+        b.L($"sub.u32 {kw}, {w1}, {w0};");
+        b.L($"mul.lo.u32 {area}, {kh}, {kw};");
+        string e = b.R(), ih = b.R(), iw = b.R(), stepH = b.R(), stepW = b.R(), pE = b.P(), src = b.R(), pWrap = b.P();
+        DivU(b, ih, wl, kw);
+        RemU(b, iw, wl, kw);
+        b.L($"add.u32 {ih}, {ih}, {h0};");
+        DivU(b, stepH, "32", kw);
+        RemU(b, stepW, "32", kw);
+        b.L($"mov.u32 {e}, {wl};");
+        string best = lane.NewReg(b), bestAt = b.R(), sel = lane.IsFloat ? lane.Op : lane.Reg;
+        b.L($"mov.{lane.Reg} {best}, {ReduceIdentity(lane, "max")};");
+        b.L($"mov.u32 {bestAt}, 0xFFFFFFFF;");
+        b.Label($"{tag}_WALK");
+        b.L($"setp.ge.u32 {pE}, {e}, {area};");
+        b.L($"@{pE} bra {tag}_WALKED;");
+        b.L($"mad.lo.u32 {src}, {ch}, {H}, {ih};");
+        b.L($"mad.lo.u32 {src}, {src}, {W}, {w0};");
+        b.L($"add.u32 {src}, {src}, {iw};");
+        string xv = Codec.UnpackAt(b, f, x, src, lane);
+        if (index)
+        {
+            // A lane's own values rise in position: a later one takes only when it ranks strictly above.
+            string pFirst = b.P();
+            b.L($"setp.eq.u32 {pFirst}, {bestAt}, 0xFFFFFFFF;");
+            string pGt = RankAbove(b, lane, xv, best);
+            b.L($"or.pred {pGt}, {pGt}, {pFirst};");
+            b.L($"selp.{sel} {best}, {xv}, {best}, {pGt};");
+            b.L($"selp.u32 {bestAt}, {src}, {bestAt}, {pGt};");
+        }
+        else
+        {
+            First(b, lane, best, best, xv);
+            b.L($"mov.u32 {bestAt}, 0;");
+        }
+
+        b.L($"add.u32 {e}, {e}, 32;");
+        b.L($"add.u32 {ih}, {ih}, {stepH};");
+        b.L($"add.u32 {iw}, {iw}, {stepW};");
+        b.L($"setp.ge.u32 {pWrap}, {iw}, {kw};");
+        b.L($"@{pWrap} sub.u32 {iw}, {iw}, {kw};");
+        b.L($"@{pWrap} add.u32 {ih}, {ih}, 1;");
+        b.L($"bra {tag}_WALK;");
+        b.Label($"{tag}_WALKED");
+        for (int off = 16; off >= 1; off /= 2)
+        {
+            string ov = lane.NewReg(b), oa = b.R();
+            if (lane.Wide)
+            {
+                string lo = b.R(), hi = b.R(), lo2 = b.R(), hi2 = b.R();
+                b.L($"mov.b64 {{{lo}, {hi}}}, {best};");
+                b.L($"shfl.sync.bfly.b32 {lo2}, {lo}, {off}, 0x1f, 0xffffffff;");
+                b.L($"shfl.sync.bfly.b32 {hi2}, {hi}, {off}, 0x1f, 0xffffffff;");
+                b.L($"mov.b64 {ov}, {{{lo2}, {hi2}}};");
+            }
+            else
+            {
+                string bits = b.R(), bits2 = b.R();
+                b.L($"mov.b32 {bits}, {best};");
+                b.L($"shfl.sync.bfly.b32 {bits2}, {bits}, {off}, 0x1f, 0xffffffff;");
+                b.L($"mov.b32 {ov}, {bits2};");
+            }
+
+            if (!index)
+            {
+                First(b, lane, best, best, ov);
+                continue;
+            }
+
+            // The other's (ov, oa) where it ranks above, or the same with a lower position; an empty one never.
+            b.L($"shfl.sync.bfly.b32 {oa}, {bestAt}, {off}, 0x1f, 0xffffffff;");
+            var (pGt2, pEq2) = Rank(b, lane, ov, best);
+            string pLt = b.P(), pTake = b.P(), pMine = b.P(), pOther = b.P();
+            b.L($"setp.lt.u32 {pLt}, {oa}, {bestAt};");
+            b.L($"and.pred {pEq2}, {pEq2}, {pLt};");
+            b.L($"or.pred {pTake}, {pGt2}, {pEq2};");
+            b.L($"setp.eq.u32 {pMine}, {bestAt}, 0xFFFFFFFF;");
+            b.L($"or.pred {pTake}, {pTake}, {pMine};");
+            b.L($"setp.ne.u32 {pOther}, {oa}, 0xFFFFFFFF;");
+            b.L($"and.pred {pTake}, {pTake}, {pOther};");
+            b.L($"selp.{sel} {best}, {ov}, {best}, {pTake};");
+            b.L($"selp.u32 {bestAt}, {oa}, {bestAt}, {pTake};");
+        }
+
+        return (best, bestAt);
+    }
+
+    /// <summary>adaptive_maxpool by a warp a window (AdaptiveByWarp): a warp per stored word of the output, its values' windows
+    /// one after another, each window's first-ranked in Adad's order (First: the order's max, a NaN where there is one) by
+    /// the warp's lanes and shuffles, the word stored by lane 0. The order's max is the same whichever way the window is
+    /// walked. Params as Layout's.</summary>
+    public static string AdaptiveMaxWarp(Gpu gpu, Fmt f, Lane lane, out string entry)
+    {
+        if (f.IsBlock) throw new NotSupportedException("a block format's output takes the block kernels");
+        entry = $"layout_adaptive_maxpool_warp_{f.Name}_{lane.Name}";
+        var b = new PtxBuilder(gpu);
+        string tid = b.R(), bid = b.R(), word = b.R(), wl = b.R();
+        b.L($"mov.u32 {tid}, %tid.x;");
+        b.L($"mov.u32 {bid}, %ctaid.x;");
+        b.L($"mul.lo.u32 {word}, {bid}, 8;");
+        string wib = b.R();
+        b.L($"shr.u32 {wib}, {tid}, 5;");
+        b.L($"add.u32 {word}, {word}, {wib};");
+        b.L($"and.b32 {wl}, {tid}, 31;");
+        string x = Param64(b, "p_x"), outp = Param64(b, "p_out"), count = Param32(b, "p_count");
+        var p = new string[LayoutParamCount];
+        for (int k = 0; k < LayoutParamCount; k++) p[k] = Param32(b, $"p_p{k}");
+        for (int k = 0; k < LayoutParamCount; k++) RegisterDivisor(b, p[k], $"p_m{k}", $"p_n{k}");
+        string words = b.R(), pw = b.P(), last = b.R();
+        if (f.WordBits == 64 || f.Per == 1) b.L($"mov.u32 {words}, {count};");
+        else { b.L($"add.u32 {words}, {count}, {f.Per - 1};"); b.L($"div.u32 {words}, {words}, {f.Per};"); }
+        b.L($"setp.ge.u32 {pw}, {word}, {words};");
+        b.L($"@{pw} bra DONE;");
+        b.L($"sub.u32 {last}, {count}, 1;");
+        var natural = f.Natural;
+        string code = f.WordBits == 64 ? b.RD() : b.R();
+        if (f.WordBits == 32) b.L($"mov.b32 {code}, 0;");
+        for (int i = 0; i < f.Per; i++)
+        {
+            string v = b.R(), pv = b.P();
+            b.L($"mad.lo.u32 {v}, {word}, {f.Per}, {i};");
+            b.L($"setp.lt.u32 {pv}, {v}, {count};");
+            b.L($"min.u32 {v}, {v}, {last};");
+            var (best, _) = AdaptiveWindowWarp(b, f, lane, x, p, v, wl, false, $"AW{i}");
+            string stored = lane == natural ? best : Codec.Convert(b, lane, best, natural, f);
+            string kept = natural.NewReg(b);
+            b.L($"selp.{natural.Reg} {kept}, {stored}, {natural.Zero}, {pv};");
+            Codec.Pack(b, f, kept, natural, i, code);
+        }
+
+        string p0 = b.P(), addr = b.RD();
+        b.L($"setp.ne.u32 {p0}, {wl}, 0;");
+        b.L($"@{p0} bra DONE;");
+        b.L($"mul.wide.u32 {addr}, {word}, {f.WordBits / 8};");
+        b.L($"add.u64 {addr}, {outp}, {addr};");
+        b.L($"st.global.{(f.WordBits == 64 ? "b64" : "b32")} [{addr}], {code};");
+        b.Label("DONE");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, LayoutParams);
+    }
+
+    /// <summary>LayoutWindowArgmax of adaptive_maxpool_bwd by a warp a window (AdaptiveByWarp): the window's first-ranked
+    /// position in Adad's order, the lowest on a tie (the scan's own answer, whichever way the window is walked), into
+    /// p_out (u32; 0xFFFFFFFF for none). Params as LayoutWindowArgmax's.</summary>
+    public static string LayoutWindowArgmaxWarp(Gpu gpu, Fmt f, Lane lane, out string entry)
+    {
+        entry = $"layout_argmax_adaptive_warp_{f.Name}_{lane.Name}";
+        var b = new PtxBuilder(gpu);
+        string tid = b.R(), bid = b.R(), w = b.R(), wl = b.R(), wib = b.R(), pd = b.P();
+        b.L($"mov.u32 {tid}, %tid.x;");
+        b.L($"mov.u32 {bid}, %ctaid.x;");
+        b.L($"shr.u32 {wib}, {tid}, 5;");
+        b.L($"mad.lo.u32 {w}, {bid}, 8, {wib};");
+        b.L($"and.b32 {wl}, {tid}, 31;");
+        string x2 = Param64(b, "p_x2"), outp = Param64(b, "p_out"), count = Param32(b, "p_count");
+        var p = new string[LayoutParamCount];
+        for (int k = 0; k < LayoutParamCount; k++) p[k] = Param32(b, $"p_p{k}");
+        for (int k = 0; k < LayoutParamCount; k++) RegisterDivisor(b, p[k], $"p_m{k}", $"p_n{k}");
+        b.L($"setp.ge.u32 {pd}, {w}, {count};");
+        b.L($"@{pd} bra DONE;");
+        var (_, at) = AdaptiveWindowWarp(b, f, lane, x2, p, w, wl, true, "AA");
+        string p0 = b.P(), addr = b.RD();
+        b.L($"setp.ne.u32 {p0}, {wl}, 0;");
+        b.L($"@{p0} bra DONE;");
+        b.L($"mul.wide.u32 {addr}, {w}, 4;");
+        b.L($"add.u64 {addr}, {outp}, {addr};");
+        b.L($"st.global.u32 [{addr}], {at};");
+        b.Label("DONE");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, LayoutParams);
+    }
+
     // The value of output (v; row r, column c) as a lane register.
     private static string LayoutValue(PtxBuilder b, Fmt f, Lane lane, string name, string x, string x2, string idx, string aux, string[] p, string cols, string v, string r, string c, int tag)
     {

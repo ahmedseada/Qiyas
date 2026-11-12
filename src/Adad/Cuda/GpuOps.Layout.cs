@@ -71,10 +71,14 @@ public sealed partial class GpuOps
                 var (OH, OW) = k.Name == "maxpool_bwd" ? LayoutArgs.PoolOut(k.P) : (k.P[3], k.P[4]);
                 int windows = k.P[0] * OH * OW;
                 aux = gpu.Rent(Math.Max(1, windows) * 4L);
-                var argmax = gpu.Cached($"layout_argmax:{k.Name}:{f.Name}:{lane.Name}", (out string e) => Ptx.LayoutWindowArgmax(gpu, f, lane, k.Name, out e));
+                // An adaptive pool's large windows a warp each (Ptx.AdaptiveByWarp), else a thread each.
+                bool byWarp = k.Name == "adaptive_maxpool_bwd" && Ptx.AdaptiveByWarp(k.P);
+                var argmax = byWarp
+                    ? gpu.Cached($"layout_argmax_warp:{f.Name}:{lane.Name}", (out string e) => Ptx.LayoutWindowArgmaxWarp(gpu, f, lane, out e))
+                    : gpu.Cached($"layout_argmax:{k.Name}:{f.Name}:{lane.Name}", (out string e) => Ptx.LayoutWindowArgmax(gpu, f, lane, k.Name, out e));
                 args[1] = x2; args[4] = aux; args[5] = Gpu.U(windows);
                 Ptx.LayoutDivisors(args);
-                if (windows > 0) Gpu.Launch(argmax, Grid(windows, 256), 1, 256, 1, 0, args);
+                if (windows > 0) Gpu.Launch(argmax, Grid(windows * (byWarp ? 32L : 1L), 256), 1, 256, 1, 0, args);
             }
 
             args[0] = x; args[1] = x2; args[2] = idx; args[3] = aux; args[4] = output; args[5] = Gpu.U(k.Count); args[6] = Gpu.U(rows); args[7] = Gpu.U(cols);
@@ -85,6 +89,14 @@ public sealed partial class GpuOps
                 if (k.Count > 0 && Ptx.BlockByCta(f)) Gpu.Launch(fb, (uint)((k.Count + f.BlockValues - 1) / f.BlockValues), 1, (uint)f.BlockValues, 1, 0, args);
                 else if (k.Count > 0) Gpu.Launch(fb, BlockGrid(f, k.Count), 1, 256, 1, 0, args);
                 return "f32 (blocks in place)";
+            }
+
+            if (k.Name == "adaptive_maxpool" && inFmt is null && Ptx.AdaptiveByWarp(k.P))
+            {
+                // Large windows: a warp each (the word's values' windows one after another), the order's max the same.
+                var fw = gpu.Cached($"layout_adaptive_max_warp:{f.Name}:{lane.Name}", (out string e) => Ptx.AdaptiveMaxWarp(gpu, f, lane, out e));
+                Gpu.Launch(fw, Grid(f.Words(k.Count) * 32L, 256), 1, 256, 1, 0, args);
+                return lane.Name;
             }
 
             bool perValue = inFmt is null && PerValueLayout(f, k.Count);
