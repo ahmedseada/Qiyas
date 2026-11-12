@@ -19,7 +19,7 @@ internal static partial class Checks
         new("uint8 groups of 32 with zeros, rank 4", "uint8", (0, 255), (0.002, 0.01), (120, 136), (n, k) => ScaledWeight.Grouped(n, k, 32), new ProductEpilogue { Rank = 4 }),
         new("int4 groups of 16 with zeros", "int4", (-8, 7), (0.05, 0.15), (-1, 1), (n, k) => ScaledWeight.Grouped(n, k, 16), new ProductEpilogue()),
         new("float8_e4m3 a scale for the tensor", "float8_e4m3", (-4, 4), (0.1, 0.3), null, ScaledWeight.PerTensor, new ProductEpilogue()),
-        new("float16 blocks of 2 rows x 24 with zeros", "float16", (-1, 1), (0.5, 1.5), (-0.25, 0.25), (n, k) => new ScaledWeight(n, k, 2, 24, (k + 23) / 24), new ProductEpilogue()),
+        new("float16 blocks of 2 rows x 24 with zeros", "float16", (-1, 1), (0.5, 1.5), (-0.25, 0.25), (n, k) => new ScaledWeight(n, k, 2, 24), new ProductEpilogue()),
         new("uint2 a scale a row with zeros, beta 0.5", "uint2", (0, 3), (0.2, 0.5), (1, 2), ScaledWeight.PerRow, new ProductEpilogue { Beta = 0.5 }),
     ];
 
