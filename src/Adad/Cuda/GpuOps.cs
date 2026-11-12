@@ -112,10 +112,11 @@ public sealed partial class GpuOps(Gpu gpu)
             return own.Name;
         }
 
-        // The bounds: the type's range for floats and 8-bit values (it decides the lane already) and for 16- and 32-bit
-        // integers (measuring costs a pass as long as the sum, and the lane the type's range gives is exact and runs at the
-        // same bandwidth); measured for 64-bit integers, where the type's range fits no lane.
-        var (lo, hi) = !f.IsFloat && f.Bits is 16 or 32 ? (TN.Min, TN.Max) : Range<TN>(x, total);
+        // The bounds: the type's range, never the measured values' (measuring costs a pass as long as the sum and a wait
+        // for it). For floats and 8-bit values it decides the lane already; for wider integers the lane it gives is exact
+        // wherever a measured one would be and runs at the same bandwidth. A 64-bit integer's range fits no lane: it takes
+        // s64 / u64, the lane a measured range past 32 bits gives too, its sums modular as there, so the sum is the same.
+        double lo = TN.Min, hi = TN.Max;
         long terms = axis switch { Axis.Whole => total, Axis.Rows => cols, _ => rows };
         var bounds = op == "sumsq" ? new Bounds(lo, hi, lo, hi, terms) : new Bounds(lo, hi, 1, 1, terms);
         var lane = SumLane(f, in bounds);
@@ -331,10 +332,11 @@ public sealed partial class GpuOps(Gpu gpu)
         }
 
         // Every type, block formats too: A and x read in place (decoded a value at a time), y's sums in the sum lane, then
-        // stored as the type (a block format's blocks encoded from them).
+        // stored as the type (a block format's blocks encoded from them). The lane is the one the type's range gives, not
+        // the measured values': A is read once, so a pass measuring it would cost as much as the product. Any lane the
+        // measured range could give is exact for these values, so the sums, and y, are the same (past 8 bits: s64 / u64).
         int xn = transposed ? rows : cols, yn = transposed ? cols : rows;
-        var ((aLo, aHi), (xLo, xHi)) = RangePair<TN>(a, rows * cols, x, xn);
-        var bounds = new Bounds(aLo, aHi, xLo, xHi, xn);
+        var bounds = new Bounds(TN.Min, TN.Max, TN.Min, TN.Max, xn);
         var lane = SumLane(f, in bounds);
         ulong yl = gpu.Rent((long)yn * lane.Size);
         try
