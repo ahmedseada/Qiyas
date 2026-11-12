@@ -9,10 +9,11 @@
 //   unsigned uint64 uint32 uint16 uint8 uint2
 //
 // Usage: Qiyas.dll [cpu|cuda|cuda,cpu] [--subjects a,b] [--types t1,t2] [--ops add,matmul,softmax,rms_norm] [--baseline name]
-//                  [--proven]
+//                  [--proven] [--repeat N] [--profile] [--settle PCT] [--settle-rounds N] [--warmup-round MS] [--warmup MS]
 //        Qiyas.dll profile | gpuprofile | team       (Qiyas's own diagnostics)
 //
-// Every proof in Checks must pass before anything is timed. Times are medians over an adaptive number of runs. A run
+// Every proof in Checks must pass before anything is timed. Times are medians over an adaptive number of runs after a
+// warm-up that settles (Timing; --profile adds what the runtime did meanwhile). A run
 // whose checks pass on a device records so beside its build (Proof.cs); --proven skips the checks where every device the
 // run benches has that record for these very assemblies, and runs them otherwise. Each run says which it did.
 //
@@ -32,6 +33,7 @@ Watched.Install();                                                     // a fail
 var options = Options.Parse(args);
 Bench.Odd = options.Shapes == "odd";
 Console.WriteLine($"bench: {Environment.ProcessorCount} logical processors, .NET {Environment.Version}");
+Console.WriteLine($"timing: {Timing.Describe()}");
 var proof = Proof.Of(AppContext.BaseDirectory);
 bool proven = false;
 if (options.Proven)
@@ -249,6 +251,11 @@ internal sealed class Options
                 case "--report": o.Report = true; break;
                 case "--proven": o.Proven = true; break;
                 case "--repeat": o.Repeat = int.Parse(args[++i]); Qiyas.Checks.Stress = Math.Max(Qiyas.Checks.Stress, o.Repeat); break;
+                case "--profile": Timing.Profile = true; break;
+                case "--settle": Timing.Settle = Timing.Settle with { Tolerance = Timing.Number(a, args[++i], 0) / 100 }; break;
+                case "--settle-rounds": Timing.Settle = Timing.Settle with { Rounds = (int)Timing.Number(a, args[++i], 1) }; break;
+                case "--warmup-round": Timing.Settle = Timing.Settle with { RoundMs = Timing.Number(a, args[++i], 0) }; break;
+                case "--warmup": Timing.Settle = Timing.Settle with { BudgetMs = Timing.Number(a, args[++i], 0) }; break;
                 case "profile" or "gpuprofile" or "team": o.Mode = a; break;
                 default:
                     o.Devices = [.. a.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -289,7 +296,7 @@ internal static class Subjects
 // buffers; device: the subject's count, null where it cannot tell). Spread: (slowest − fastest) / median over the --repeat
 // readings. Clock: on CUDA the GPU's performance state and memory clock at the end of the subject's timing (the lowest
 // memory clock over the --repeat readings; GpuClock), null where it cannot be read.
-internal sealed record Cell(string Subject, string Lane, double Ms, double Err, Held Held, double Spread, string? Clock = null);
+internal sealed record Cell(string Subject, string Lane, double Ms, double Err, Held Held, double Spread, string? Clock = null, TimeProfile? Profile = null);
 
 internal sealed record Row(Device Device, string Op, string Type, string Shape, Work Work, List<Cell?> Cells);
 
@@ -1322,6 +1329,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         var runs = new IBenchRun?[count];
         var times = new List<double>[count];
         var clocks = new string?[count];
+        var profiles = new List<TimeProfile>?[count];
         try
         {
             for (int i = 0; i < count; i++)
@@ -1334,8 +1342,9 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
                 for (int i = 0; i < count; i++)
                 {
                     if (runs[i] is not { } run || (rep > 0 && times[i].Count == 0)) continue;
-                    if (TimeOrRefused(device, subjects[i], run) is not { } ms) continue;
-                    times[i].Add(ms);
+                    if (TimeOrRefused(device, subjects[i], run) is not { } timed) continue;
+                    times[i].Add(timed.Ms);
+                    if (timed.Profile is { } p) (profiles[i] ??= []).Add(p);
                     if (device == Device.Cuda && GpuClock.Now() is { } now && (clocks[i] is null || GpuClock.Mhz(now) < GpuClock.Mhz(clocks[i]))) clocks[i] = now;
                 }
 
@@ -1349,7 +1358,8 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
                 var t = times[i];
                 t.Sort();
                 double median = t[t.Count / 2];
-                cells.Add(new Cell(subjects[i].Name, run.Lane, median, score(subjects[i], run), new Held(host + (own?.Host ?? 0), own?.Device), (t[^1] - t[0]) / median, clocks[i]));
+                cells.Add(new Cell(subjects[i].Name, run.Lane, median, score(subjects[i], run), new Held(host + (own?.Host ?? 0), own?.Device), (t[^1] - t[0]) / median, clocks[i],
+                    profiles[i] is { } ps ? TimeProfile.Sum(ps) : null));
             }
 
             var row = new Row(device, op, type, shape, work, cells);
@@ -1399,9 +1409,14 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
     // pool lookup; the buffers prepared outside the call stay the pool's.
     // The run's time, or null when its device refuses the operation (a family it has no kernels for, a lane it lacks):
     // a blank cell, the refusal said once.
-    private static double? TimeOrRefused(Device device, IBenchSubject subject, IBenchRun run)
+    private static Timed? TimeOrRefused(Device device, IBenchSubject subject, IBenchRun run)
     {
-        try { return Time(Scoped(device, subject, run), device == Device.Cpu ? 0 : GpuWarmMs); }
+        try
+        {
+            var timed = Time(Scoped(device, subject, run), device == Device.Cpu ? 0 : GpuWarmMs);
+            if (timed.Profile is { } p) Console.WriteLine($"  profile {subject.Name,-6} {p.Line()}");
+            return timed;
+        }
         catch (NotSupportedException e)
         {
             if (s_refused.Add(e.Message)) Console.WriteLine($"  {subject.Name} on {device.ToString().ToLowerInvariant()}: {e.Message}");
@@ -1420,41 +1435,112 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
     // the state back up before the settle test (the driver was seen taking 0.4 s).
     private const double GpuWarmMs = 500;
 
-    // Median wall time (ms) of the steady state: on a GPU first floorMs of continuous runs (GpuWarmMs), then warmed until
-    // settled (Measure.Faster's rule: on until the runtime has compiled nothing and the run has not got 2 % faster for
-    // three runs in a row; at most 24 warm runs and 2 s of them — a row timed first in a run otherwise measured code the
-    // runtime had not yet compiled to its final tier, 50 ms against 19), then at least 7 runs and 300 ms of them (at most
+    // Median wall time (ms) of the steady state (Timing): the first run apart, then the warm-up until the timing settles
+    // (Warm; on a GPU at least floorMs of continuous runs, GpuWarmMs), then at least 7 runs and 300 ms of them (at most
     // 201 runs; past 3 runs, at most 3 s), so a millisecond operation is timed over hundreds of runs and none by a handful.
-    public static double Time(Action run, double floorMs = 0)
+    // With --profile, what the runtime did meanwhile (TimeProfile); without it nothing of that is read. The harness's own
+    // loops are compiled optimized at their first call, so the first rows of a run are not timed by unoptimized loops.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
+    public static Timed Time(Action run, double floorMs = 0)
     {
+        bool profile = Timing.Profile;
+        var trace = profile ? new StringBuilder() : null;
+        long jit0 = 0, jit1 = 0, jit2 = 0, allocated = 0;
+        TimeSpan jitTime0 = default, jitTime1 = default, jitTime2 = default, cpu = default;
+        int gc0 = 0, gc1 = 0, gc2 = 0;
+        if (profile) (jit0, jitTime0) = (System.Runtime.JitInfo.GetCompiledMethodCount(), System.Runtime.JitInfo.GetCompilationTime());
+        long start = Stopwatch.GetTimestamp();
         run();
-        for (long t0 = Stopwatch.GetTimestamp(); Stopwatch.GetElapsedTime(t0).TotalMilliseconds < floorMs;) run();
-        double best = double.MaxValue, warm = 0;
-        for (int i = 0, still = 0; i < 24 && warm < 2000 && still < 3; i++)
+        double coldMs = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+        if (profile) (jit1, jitTime1) = (System.Runtime.JitInfo.GetCompiledMethodCount(), System.Runtime.JitInfo.GetCompilationTime());
+        start = Stopwatch.GetTimestamp();
+        var (warmCalls, settled) = Warm(run, floorMs, Timing.Settle, trace);
+        double warmMs = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+        Process? process = null;
+        if (profile)
         {
-            long compiled = System.Runtime.JitInfo.GetCompiledMethodCount();
+            process = Process.GetCurrentProcess();
+            cpu = process.TotalProcessorTime;
+            (gc0, gc1, gc2) = (GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2));
+            allocated = GC.GetTotalAllocatedBytes(precise: true);
+            (jit2, jitTime2) = (System.Runtime.JitInfo.GetCompiledMethodCount(), System.Runtime.JitInfo.GetCompilationTime());
+        }
+
+        var times = new List<double>(201);
+        double total = 0;
+        long seen = jit2;
+        long timedStart = Stopwatch.GetTimestamp();
+        while (times.Count < 201 && (times.Count < 7 || total < 300) && !(times.Count >= 3 && total > 3000))
+        {
             long t0 = Stopwatch.GetTimestamp();
             run();
             double ms = Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
-            warm += ms;
-            bool gained = ms < best * 0.98 || System.Runtime.JitInfo.GetCompiledMethodCount() != compiled;
-            best = Math.Min(best, ms);
-            still = gained ? 0 : still + 1;
-        }
-
-        var times = new List<double>();
-        double total = 0;
-        while (times.Count < 201 && (times.Count < 7 || total < 300) && !(times.Count >= 3 && total > 3000))
-        {
-            long start = Stopwatch.GetTimestamp();
-            run();
-            double ms = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
             times.Add(ms);
             total += ms;
+            if (trace is not null && System.Runtime.JitInfo.GetCompiledMethodCount() is var now && now != seen)
+            {
+                trace.Append(CultureInfo.InvariantCulture, $" @{times.Count}+{now - seen}");                     // methods compiled after this timed run
+                seen = now;
+            }
+        }
+
+        TimeProfile? said = null;
+        if (profile)
+        {
+            var (jit3, jitTime3) = (System.Runtime.JitInfo.GetCompiledMethodCount(), System.Runtime.JitInfo.GetCompilationTime());
+            double wall = Stopwatch.GetElapsedTime(timedStart).TotalMilliseconds;
+            allocated = GC.GetTotalAllocatedBytes(precise: true) - allocated;
+            (gc0, gc1, gc2) = (GC.CollectionCount(0) - gc0, GC.CollectionCount(1) - gc1, GC.CollectionCount(2) - gc2);
+            process!.Refresh();
+            cpu = process.TotalProcessorTime - cpu;
+            process.Dispose();
+            said = new TimeProfile(coldMs, jit1 - jit0, (jitTime1 - jitTime0).TotalMilliseconds, warmCalls, warmMs, settled, jit2 - jit1, (jitTime2 - jitTime1).TotalMilliseconds,
+                times.Count, wall, jit3 - jit2, (jitTime3 - jitTime2).TotalMilliseconds, (double)allocated / times.Count, gc0, gc1, gc2, cpu.TotalMilliseconds) { Trace = trace!.ToString() };
         }
 
         times.Sort();
-        return times[times.Count / 2];
+        return new Timed(times[times.Count / 2], said);
+    }
+
+    // The warm-up (Timing.Settle): rounds of at least RoundMs (each at least one run) until the medians of the last Rounds
+    // rounds lie within Tolerance of the smallest of them and the last round compiled no method on any thread, or BudgetMs
+    // is spent; on a GPU never before floorMs of continuous runs. Returns the runs and whether it settled. With a trace
+    // (--profile), each round as median ms/runs/methods compiled.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
+    private static (int Calls, bool Settled) Warm(Action run, double floorMs, Settle settle, StringBuilder? trace)
+    {
+        var medians = new List<double>();
+        var round = new List<double>();
+        int calls = 0;
+        bool settled = false;
+        double budget = Math.Max(settle.BudgetMs, floorMs);
+        long start = Stopwatch.GetTimestamp();
+        trace?.Append(" rounds");
+        while (true)
+        {
+            double elapsed = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+            if ((settled && elapsed >= floorMs) || elapsed >= budget) break;
+            round.Clear();
+            long compiled = System.Runtime.JitInfo.GetCompiledMethodCount();
+            long roundStart = Stopwatch.GetTimestamp();
+            do
+            {
+                long t0 = Stopwatch.GetTimestamp();
+                run();
+                round.Add(Stopwatch.GetElapsedTime(t0).TotalMilliseconds);
+                calls++;
+            }
+            while (Stopwatch.GetElapsedTime(roundStart).TotalMilliseconds < settle.RoundMs);
+
+            round.Sort();
+            medians.Add(round.Count % 2 == 1 ? round[round.Count / 2] : (round[round.Count / 2 - 1] + round[round.Count / 2]) / 2);
+            long fresh = System.Runtime.JitInfo.GetCompiledMethodCount() - compiled;
+            trace?.Append(CultureInfo.InvariantCulture, $" {medians[^1]:0.###}/{round.Count}/{fresh}");
+            settled = fresh == 0 && Timing.Agree(medians, settle.Rounds, settle.Tolerance);
+        }
+
+        trace?.Append(settled ? " settled;" : " not settled;");
+        return (calls, settled);
     }
 
     private double? BaselineMs(Row r) => r.Cells.FirstOrDefault(c => c?.Subject == _baseline)?.Ms;
@@ -1506,6 +1592,8 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         sb.AppendLine();
         sb.AppendLine($"Proof: {Proof}.");
         sb.AppendLine();
+        sb.AppendLine($"Timing: {Timing.Describe()}.{(Timing.Profile ? " Profile columns, per subject: `warm-up` the warm-up's runs and whether it settled; `jit` the methods the JIT compiled (every thread) and its ms, in the warm-up / in the timed runs; `B/run` the bytes allocated a timed run (every thread); `gc` the collections of generations 0/1/2 in the timed runs; `cpu` the process's processor time in the timed runs and the cores it kept busy (processor time over wall time)." : "")}");
+        sb.AppendLine();
         foreach (var l in Limits.Values) sb.AppendLine($"Limits measured: {l.Short()} (MA/s: multiply-adds a second).");
         sb.AppendLine();
         var names = subjects.Select(s => s.Name).ToList();
@@ -1513,11 +1601,13 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         foreach (var n in names) sb.Append($" {n} ms | {n} × | {n} lane | {n} err |");
         sb.Append(" bytes | ops | bound | by |");
         foreach (var n in names) sb.Append($" {n} rate | {n} of bound | {n} held |");
+        if (Timing.Profile) foreach (var n in names) sb.Append($" {n} warm-up | {n} jit | {n} B/run | {n} gc | {n} cpu |");
         sb.AppendLine();
         sb.Append("|---|---|---|---|");
         foreach (var _ in names) sb.Append("---:|---:|---|---:|");
         sb.Append("---:|---:|---:|---|");
         foreach (var _ in names) sb.Append("---:|---:|---:|");
+        if (Timing.Profile) foreach (var _ in names) sb.Append("---:|---:|---:|---:|---:|");
         sb.AppendLine();
         foreach (var r in _rows)
         {
@@ -1537,6 +1627,15 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
                 if (c is null || bound is not { } bb) { sb.Append(c is null ? " — | — | — |" : $" — | — | {HeldText(c.Held, r.Device)} |"); continue; }
                 var (rate, of) = Reached(r, c, bb);
                 sb.Append($" {rate} | {of} | {HeldText(c.Held, r.Device)} |");
+            }
+
+            if (Timing.Profile)
+            {
+                foreach (var c in r.Cells)
+                {
+                    sb.Append(c?.Profile is not { } p ? " — | — | — | — | — |" : string.Create(CultureInfo.InvariantCulture,
+                        $" {p.WarmCalls}{(p.Settled ? "" : " not settled")} | {p.WarmJit} ({p.WarmJitMs:0.#} ms) / {p.TimedJit} ({p.TimedJitMs:0.#} ms) | {p.BytesPerCall:0} | {p.Gc0}/{p.Gc1}/{p.Gc2} | {p.CpuMs:0} ms, {p.Cores:0.0} cores |"));
+                }
             }
 
             sb.AppendLine();
@@ -1661,6 +1760,100 @@ internal static class TeamBench
         Console.WriteLine(string.Create(CultureInfo.InvariantCulture,
             $"team dispatch {name,-20} min {times[0],8:0.0} median {times[times.Length / 2],8:0.0} p90 {times[times.Length * 9 / 10],8:0.0} p99 {times[times.Length * 99 / 100],8:0.0} max {times[^1],8:0.0} µs"));
     }
+}
+
+// ---------------------------------------------------------------------------------------------- timing
+
+/// <summary>A timed row cell: the median (ms) and, with --profile, what the runtime did around it.</summary>
+internal readonly record struct Timed(double Ms, TimeProfile? Profile);
+
+/// <summary>
+/// The warm-up's rule: rounds of at least <paramref name="RoundMs"/> (each at least one run) until the medians of the last
+/// <paramref name="Rounds"/> rounds lie within <paramref name="Tolerance"/> of the smallest of them and the last round
+/// compiled no method on any thread, or until <paramref name="BudgetMs"/> is spent.
+/// </summary>
+internal sealed record Settle(double Tolerance, int Rounds, double RoundMs, double BudgetMs);
+
+/// <summary>
+/// One timing's profile (--profile): the first call (cold) with what the JIT compiled during it; the warm-up's runs, time,
+/// whether it settled and what the JIT compiled during it; the timed runs' wall time and what the JIT compiled during them;
+/// and over the timed runs the bytes allocated a run (every thread), the collections of each generation, and the process's
+/// processor time (cores busy: processor time over wall time).
+/// </summary>
+internal sealed record TimeProfile(double ColdMs, long ColdJit, double ColdJitMs, int WarmCalls, double WarmMs, bool Settled, long WarmJit, double WarmJitMs,
+    int TimedCalls, double TimedMs, long TimedJit, double TimedJitMs, double BytesPerCall, int Gc0, int Gc1, int Gc2, double CpuMs)
+{
+    public double Cores => TimedMs > 0 ? CpuMs / TimedMs : 0;
+
+    /// <summary>The console's detail: each warm-up round as median ms/runs/methods compiled, and each timed run after which
+    /// methods were compiled (@run+methods).</summary>
+    public string? Trace { get; init; }
+
+    public string Line() => string.Create(CultureInfo.InvariantCulture,
+        $"cold {ColdMs:0.###} ms (jit {ColdJit} methods {ColdJitMs:0.#} ms); warm-up {WarmCalls} runs {WarmMs:0} ms {(Settled ? "settled" : "NOT settled")} (jit {WarmJit} methods {WarmJitMs:0.#} ms); timed {TimedCalls} runs {TimedMs:0} ms (jit {TimedJit} methods {TimedJitMs:0.#} ms); {BytesPerCall:0} B/run; gc {Gc0}/{Gc1}/{Gc2}; cpu {CpuMs:0} ms, {Cores:0.0} cores{(Trace is null ? "" : $" |{Trace}")}");
+
+    /// <summary>The --repeat readings of one cell together: counts and times summed, bytes over every timed run, settled when every one did.</summary>
+    public static TimeProfile Sum(List<TimeProfile> all)
+    {
+        if (all.Count == 1) return all[0];
+        int timed = all.Sum(p => p.TimedCalls);
+        return new TimeProfile(all.Sum(p => p.ColdMs), all.Sum(p => p.ColdJit), all.Sum(p => p.ColdJitMs), all.Sum(p => p.WarmCalls), all.Sum(p => p.WarmMs), all.All(p => p.Settled),
+            all.Sum(p => p.WarmJit), all.Sum(p => p.WarmJitMs), timed, all.Sum(p => p.TimedMs), all.Sum(p => p.TimedJit), all.Sum(p => p.TimedJitMs),
+            all.Sum(p => p.BytesPerCall * p.TimedCalls) / Math.Max(1, timed), all.Sum(p => p.Gc0), all.Sum(p => p.Gc1), all.Sum(p => p.Gc2), all.Sum(p => p.CpuMs));
+    }
+}
+
+/// <summary>
+/// How rows are timed. The warm-up settles by <see cref="Settle"/>, each setting by an option or a variable (the option
+/// wins): --settle PCT (QIYAS_SETTLE, default 5), --settle-rounds N (QIYAS_SETTLE_ROUNDS, 3), --warmup-round MS
+/// (QIYAS_WARMUP_ROUND, 30), --warmup MS (QIYAS_WARMUP, the budget, 2000). --profile (QIYAS_PROFILE=1) adds each cell's
+/// profile (TimeProfile); off, nothing of it is read.
+/// The bench runs with the runtime's call-counting delay at 0 (Qiyas.Bench.csproj): a method is promoted to its final tier
+/// after its first 30 calls, not first held back until 100 ms pass in which the process compiles no new method. Each row
+/// compiles its own new methods as it starts, so with the delay the promotions came 200-300 ms into the row, after the
+/// warm-up had ended, and a row was timed in its unoptimized code in one process and its final code in another (sum:rows
+/// int16 1.15 or 0.16 ms, col2im int16 29-32 or 1.9).
+/// </summary>
+internal static class Timing
+{
+    /// <summary>--profile, or QIYAS_PROFILE=1.</summary>
+    public static bool Profile = Environment.GetEnvironmentVariable("QIYAS_PROFILE") == "1";
+
+    public static Settle Settle = new(Variable("QIYAS_SETTLE", 5, 0) / 100, (int)Variable("QIYAS_SETTLE_ROUNDS", 3, 1), Variable("QIYAS_WARMUP_ROUND", 30, 0),
+        Variable("QIYAS_WARMUP", 2000, 0));
+
+    /// <summary>The runtime's call-counting delay this process runs with: DOTNET_TC_CallCountingDelayMs (hexadecimal) where
+    /// set, else the runtimeconfig's (the bench's sets 0), else the runtime's default.</summary>
+    public static string Delay =>
+        Environment.GetEnvironmentVariable("DOTNET_TC_CallCountingDelayMs") is { Length: > 0 } hex && int.TryParse(hex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out int ms)
+            ? $"{ms} ms (DOTNET_TC_CallCountingDelayMs)"
+            : AppContext.GetData("System.Runtime.TieredCompilation.CallCountingDelayMs") is { } d ? $"{d} ms" : "the runtime's default, 100 ms";
+
+    /// <summary>How rows are timed, for the console and the results' header.</summary>
+    public static string Describe() => string.Create(CultureInfo.InvariantCulture,
+        $"the first run apart; a warm-up in rounds of at least {Settle.RoundMs:0.##} ms until the last {Settle.Rounds} rounds' medians agree within {Settle.Tolerance * 100:0.##} % and the last round compiled no method (at most {Settle.BudgetMs:0} ms; a GPU row at least 500 ms of runs); then the median of at least 7 runs and 300 ms (at most 201 runs, 3 s); the runtime's call-counting delay {Delay}{(Profile ? "; profiled (--profile)" : "")}");
+
+    /// <summary>Whether the last <paramref name="rounds"/> values lie within <paramref name="tolerance"/> of the smallest of them.</summary>
+    public static bool Agree(List<double> values, int rounds, double tolerance)
+    {
+        if (values.Count < rounds) return false;
+        double low = double.MaxValue, high = double.MinValue;
+        for (int i = values.Count - rounds; i < values.Count; i++)
+        {
+            low = Math.Min(low, values[i]);
+            high = Math.Max(high, values[i]);
+        }
+
+        return high <= low * (1 + tolerance);
+    }
+
+    /// <summary>A setting's number from the command line, at least <paramref name="least"/>.</summary>
+    public static double Number(string option, string text, double least) =>
+        double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out double v) && v >= least ? v
+            : throw new ArgumentException($"{option} takes a number of at least {least.ToString(CultureInfo.InvariantCulture)}, not {text}");
+
+    private static double Variable(string name, double fallback, double least) =>
+        Environment.GetEnvironmentVariable(name) is { Length: > 0 } text ? Number(name, text, least) : fallback;
 }
 
 // The bench opts its whole process out of Windows' execution-speed throttling (EcoQoS) at start: a windowless process the

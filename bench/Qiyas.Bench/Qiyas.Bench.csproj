@@ -4,8 +4,15 @@
     <OutputType>Exe</OutputType>
     <RootNamespace>Qiyas</RootNamespace>
     <TieredPGO>true</TieredPGO>
-    <ServerGarbageCollector>false</ServerGarbageCollector>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- The runtime's call-counting delay at 0: a method reaches its final tier after its first 30 calls instead of first
+         waiting for 100 ms in which the process compiles no new method. Every row compiles new methods as it starts, so
+         with the delay a row's promotions landed 200-300 ms in, past the warm-up, and the row was timed in its earlier
+         code in one process and its final code in another (Timing in Program.cs). -->
+    <RuntimeHostConfigurationOption Include="System.Runtime.TieredCompilation.CallCountingDelayMs" Value="0" />
+  </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\Adad\Adad.csproj" />
     <ProjectReference Include="..\..\src\Qiyas.Checks\Qiyas.Checks.csproj" />

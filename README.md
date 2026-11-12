@@ -127,8 +127,9 @@ Every implementation in the loaded assemblies that implements `IBenchSubject` (`
 found by reflection and becomes a column: `adad` (`src/Qiyas.Checks/Bench/AdadSubject.cs`: every operation once, over the
 device contract), `number` (one implementation over .NET's `INumberBase<T>`, for the types .NET has a
 `T` for), and whatever you add. The harness makes the inputs (stored bytes of each type, from Adad's proven
-conversions, so every subject sees the same bits), times `Run` (warmed until the runtime compiles nothing more and the
-time stops falling, then medians over an adaptive number of runs), reads the
+conversions, so every subject sees the same bits), times `Run` (warmed in rounds until three agree within 5 % and the
+last compiled nothing, the runtime's call-counting delay at 0 so methods reach their final tier while it warms; then
+medians over an adaptive number of runs), reads the
 output after `Collect`, and scores it against float64 math on the same inputs. Results go to `results-qiyas-<devices>.md`.
 
 To add an implementation: one class with a parameterless constructor implementing the four methods (and `Map`, `Reduce`,
