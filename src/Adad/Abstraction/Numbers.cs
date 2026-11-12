@@ -147,6 +147,12 @@ public interface ILane<TSelf, T> where TSelf : struct, ILane<TSelf, T> where T :
     static virtual Vector<T> Equal(Vector<T> a, Vector<T> b) => Vector.Equals(a, b);
 
     static virtual Vector<T> Select(Vector<T> mask, Vector<T> a, Vector<T> b) => Vector.ConditionalSelect(mask, a, b);
+
+    /// <summary>Runs <paramref name="visitor"/> with the lane's own stored type TS (whose stored values are this lane's: s32's
+    /// Int32, f32's Float32; a dot lane's, its accumulator's) and its plain lane TP (the lane itself; a dot lane's, its
+    /// accumulator's element-wise lane, whose Fma and Mul are one product, not a group's dot product): sums a kernel keeps in
+    /// the lane are stored as TS, and arithmetic on them runs in TP.</summary>
+    static abstract void Kept<TV>(ref TV visitor) where TV : struct, IKeptVisitor<T>;
 }
 
 public interface IFloatLane<TSelf, T> : ILane<TSelf, T> where TSelf : struct, IFloatLane<TSelf, T> where T : unmanaged
@@ -219,6 +225,12 @@ public interface ISumVisitor : ILaneVisitor
         where TN : struct, IAdad<TN, TIn>, IAdad<TN, TAcc> where TIn : unmanaged where TAcc : unmanaged where TD : struct, IDotLane<TD, TIn, TAcc>;
 }
 
+/// <summary>What runs with a lane's own stored type and its plain lane (ILane.Kept).</summary>
+public interface IKeptVisitor<T> where T : unmanaged
+{
+    void Run<TS, TP>() where TS : struct, IAdad<TS, T> where TP : struct, ILane<TP, T>;
+}
+
 /// <summary>What runs with a float lane's own stored type (IFloatLane.Own).</summary>
 public interface IOwnVisitor<T> where T : unmanaged
 {
@@ -270,6 +282,7 @@ public readonly struct F32 : IFloatLane<F32, float>
     public static float Sqrt(float x) => MathF.Sqrt(x);
     public static float Div(float a, float b) => a / b;
     public static void Own<TV>(ref TV visitor) where TV : struct, IOwnVisitor<float> => visitor.Run<Float32>();
+    public static void Kept<TV>(ref TV visitor) where TV : struct, IKeptVisitor<float> => visitor.Run<Float32, F32>();
 }
 
 public readonly struct F64 : IFloatLane<F64, double>
@@ -304,6 +317,7 @@ public readonly struct F64 : IFloatLane<F64, double>
     public static double Sqrt(double x) => Math.Sqrt(x);
     public static double Div(double a, double b) => a / b;
     public static void Own<TV>(ref TV visitor) where TV : struct, IOwnVisitor<double> => visitor.Run<Float64>();
+    public static void Kept<TV>(ref TV visitor) where TV : struct, IKeptVisitor<double> => visitor.Run<Float64, F64>();
 }
 
 public readonly struct I64 : ILane<I64, long>
@@ -316,6 +330,7 @@ public readonly struct I64 : ILane<I64, long>
     public static long Add(long a, long b) => a + b;
     public static long Mul(long a, long b) => a * b;
     public static long Fma(long a, long b, long c) => a * b + c;
+    public static void Kept<TV>(ref TV visitor) where TV : struct, IKeptVisitor<long> => visitor.Run<Int64, I64>();
 }
 
 public readonly struct U64 : ILane<U64, ulong>
@@ -328,6 +343,7 @@ public readonly struct U64 : ILane<U64, ulong>
     public static ulong Add(ulong a, ulong b) => a + b;
     public static ulong Mul(ulong a, ulong b) => a * b;
     public static ulong Fma(ulong a, ulong b, ulong c) => a * b + c;
+    public static void Kept<TV>(ref TV visitor) where TV : struct, IKeptVisitor<ulong> => visitor.Run<UInt64, U64>();
 }
 
 public readonly struct I32 : ILane<I32, int>
@@ -340,6 +356,7 @@ public readonly struct I32 : ILane<I32, int>
     public static int Add(int a, int b) => a + b;
     public static int Mul(int a, int b) => a * b;
     public static int Fma(int a, int b, int c) => a * b + c;
+    public static void Kept<TV>(ref TV visitor) where TV : struct, IKeptVisitor<int> => visitor.Run<Int32, I32>();
 }
 
 public readonly struct U32 : ILane<U32, uint>
@@ -352,6 +369,7 @@ public readonly struct U32 : ILane<U32, uint>
     public static uint Add(uint a, uint b) => a + b;
     public static uint Mul(uint a, uint b) => a * b;
     public static uint Fma(uint a, uint b, uint c) => a * b + c;
+    public static void Kept<TV>(ref TV visitor) where TV : struct, IKeptVisitor<uint> => visitor.Run<UInt32, U32>();
 }
 
 public readonly struct I16 : ILane<I16, short>
@@ -364,6 +382,7 @@ public readonly struct I16 : ILane<I16, short>
     public static short Add(short a, short b) => (short)(a + b);
     public static short Mul(short a, short b) => (short)(a * b);
     public static short Fma(short a, short b, short c) => (short)(a * b + c);
+    public static void Kept<TV>(ref TV visitor) where TV : struct, IKeptVisitor<short> => visitor.Run<Int16, I16>();
 }
 
 public readonly struct U16 : ILane<U16, ushort>
@@ -376,6 +395,7 @@ public readonly struct U16 : ILane<U16, ushort>
     public static ushort Add(ushort a, ushort b) => (ushort)(a + b);
     public static ushort Mul(ushort a, ushort b) => (ushort)(a * b);
     public static ushort Fma(ushort a, ushort b, ushort c) => (ushort)(a * b + c);
+    public static void Kept<TV>(ref TV visitor) where TV : struct, IKeptVisitor<ushort> => visitor.Run<UInt16, U16>();
 }
 
 public readonly struct I8 : ILane<I8, sbyte>
@@ -388,6 +408,7 @@ public readonly struct I8 : ILane<I8, sbyte>
     public static sbyte Add(sbyte a, sbyte b) => (sbyte)(a + b);
     public static sbyte Mul(sbyte a, sbyte b) => (sbyte)(a * b);
     public static sbyte Fma(sbyte a, sbyte b, sbyte c) => (sbyte)(a * b + c);
+    public static void Kept<TV>(ref TV visitor) where TV : struct, IKeptVisitor<sbyte> => visitor.Run<Int8, I8>();
 }
 
 public readonly struct U8 : ILane<U8, byte>
@@ -400,6 +421,7 @@ public readonly struct U8 : ILane<U8, byte>
     public static byte Add(byte a, byte b) => (byte)(a + b);
     public static byte Mul(byte a, byte b) => (byte)(a * b);
     public static byte Fma(byte a, byte b, byte c) => (byte)(a * b + c);
+    public static void Kept<TV>(ref TV visitor) where TV : struct, IKeptVisitor<byte> => visitor.Run<UInt8, U8>();
 }
 
 // ---------------------------------------------------------------------------------------------- dot lanes
@@ -450,6 +472,7 @@ public readonly struct S8Dot : IDotLane<S8Dot, sbyte, int>
     public static int Add(int a, int b) => a + b;
     public static int Mul(int a, int b) => Dots.Dot8(a, b, 0);
     public static int Fma(int a, int b, int c) => Dots.Dot8(a, b, c);
+    public static void Kept<TV>(ref TV visitor) where TV : struct, IKeptVisitor<int> => visitor.Run<Int32, I32>();
 }
 
 /// <summary>Unsigned bytes, four a lane, into u32.</summary>
@@ -472,6 +495,7 @@ public readonly struct U8Dot : IDotLane<U8Dot, byte, uint>
     public static uint Add(uint a, uint b) => a + b;
     public static uint Mul(uint a, uint b) => Dots.Dot8(a, b, 0u);
     public static uint Fma(uint a, uint b, uint c) => Dots.Dot8(a, b, c);
+    public static void Kept<TV>(ref TV visitor) where TV : struct, IKeptVisitor<uint> => visitor.Run<UInt32, U32>();
 }
 
 /// <summary>Signed 16-bit values, two a lane, into s32.</summary>
@@ -493,6 +517,7 @@ public readonly struct S16Dot : IDotLane<S16Dot, short, int>
     public static int Add(int a, int b) => a + b;
     public static int Mul(int a, int b) => Dots.Dot16(a, b, 0);
     public static int Fma(int a, int b, int c) => Dots.Dot16(a, b, c);
+    public static void Kept<TV>(ref TV visitor) where TV : struct, IKeptVisitor<int> => visitor.Run<Int32, I32>();
 }
 
 /// <summary>Unsigned 16-bit values, two a lane, into u32.</summary>
@@ -514,6 +539,7 @@ public readonly struct U16Dot : IDotLane<U16Dot, ushort, uint>
     public static uint Add(uint a, uint b) => a + b;
     public static uint Mul(uint a, uint b) => Dots.Dot16(a, b, 0u);
     public static uint Fma(uint a, uint b, uint c) => Dots.Dot16(a, b, c);
+    public static void Kept<TV>(ref TV visitor) where TV : struct, IKeptVisitor<uint> => visitor.Run<UInt32, U32>();
 }
 
 // ---------------------------------------------------------------------------------------------- exp on vectors
