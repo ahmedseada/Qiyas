@@ -207,9 +207,13 @@ internal sealed partial class Kernels
                 // a tile).
                 int tile = Math.Max(16, 64 / System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>());
                 if (!TN.Direct) tile = Math.Max(tile, TN.Granularity);
+                // The output's columns a group covers: 256, whole storage units (a group's buffer of tile × span lanes stays
+                // in the nearest caches, and its reads keep to span lines of the input until the next group takes the lines
+                // after them).
+                int g = TN.Granularity, span = Math.Min((256 + g - 1) / g * g, cols);
                 var p = k.P;
-                long groups = (long)rows / p[dim] * ((p[dim] + tile - 1) / tile);
-                Team.For((int)groups, Math.Max(1, (int)(groups / (Threads * 4))), (long)k.Count, new StridedTileBody<TN, TLane>(k, cols, dim, tile));
+                long groups = (long)rows / p[dim] * ((p[dim] + tile - 1) / tile) * ((cols + span - 1) / span);
+                Team.For((int)groups, Math.Max(1, (int)(groups / (Threads * 4))), (long)k.Count, new StridedTileBody<TN, TLane>(k, cols, dim, tile, span));
             }
             else Move<TN, TLane, TL>(k, rows, cols, at);
         }
@@ -306,10 +310,12 @@ internal sealed partial class Kernels
     }
 
     /// <summary>The tiled strided copy: a group is `tile` output rows that differ only in dimension `dim` (whose input
-    /// stride is 1) at one index of the other outer dimensions; for each output column the group's values lie side by side
-    /// in the input (a cache line read once, not a line a value), gathered into the group's rows (a tile × cols block in
-    /// lane storage), each row then stored whole. Groups are disjoint sets of whole rows.</summary>
-    private struct StridedTileBody<TN, TLane>(LayoutArgs k, int cols, int dim, int tile) : Team.IBody
+    /// stride is 1) at one index of the other outer dimensions, over `span` of their columns; for each output column the
+    /// group's values lie side by side in the input (a cache line read once, not a line a value), gathered into the
+    /// group's rows (a tile × span block in lane storage), each row's span then stored. Groups are disjoint blocks of whole
+    /// storage units; consecutive groups take the next tile of rows over the same columns (the input lines after the last
+    /// group's).</summary>
+    private struct StridedTileBody<TN, TLane>(LayoutArgs k, int cols, int dim, int tile, int span) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -322,14 +328,16 @@ internal sealed partial class Kernels
             ReadOnlySpan<TLane> src = TN.Direct ? MemoryMarshal.Cast<byte, TLane>(k.X.AsSpan()) : default;
             var input = TN.Direct ? null : new Reader<TN, TLane>(k.X, k.InputCount);
             var lineBuffer = TN.Direct ? null : ArrayPool<TLane>.Shared.Rent(tile);
-            var buffer = ArrayPool<TLane>.Shared.Rent(tile * cols);
+            var buffer = ArrayPool<TLane>.Shared.Rent(tile * span);
+            int spans = (cols + span - 1) / span;
             try
             {
                 for (int g = first; g < last; g++)
                 {
-                    // g = rest · blocks + block; rest enumerates the other outer dimensions (in their order).
+                    // g = (rest · spans + s) · blocks + block; rest enumerates the other outer dimensions (in their order).
                     int block = g % blocks, lo = block * tile, count = Math.Min(tile, dj - lo);
-                    long rest = g / blocks, b0 = p[2 * rank] + lo, r0 = 0, step = 1;     // value lo of the group (stride 1 in t)
+                    int s = g / blocks % spans, c0 = s * span, cc = Math.Min(span, cols - c0);
+                    long rest = g / blocks / spans, b0 = p[2 * rank] + lo, r0 = 0, step = 1;     // value lo of the group (stride 1 in t)
                     for (int i = outer - 1; i >= 0; i--)
                     {
                         long index = i == dim ? lo : rest % p[i];
@@ -338,14 +346,15 @@ internal sealed partial class Kernels
                         step *= p[i];
                     }
 
-                    var t2 = buffer.AsSpan(0, tile * cols);
-                    for (int c = 0; c < cols; c++)
+                    var t2 = buffer.AsSpan(0, tile * cc);
+                    for (int c = 0; c < cc; c++)
                     {
-                        var line = input is null ? src.Slice((int)(b0 + c * sLast), count) : input.Span(b0 + c * sLast, count, lineBuffer!);
-                        for (int t = 0; t < count; t++) t2[t * cols + c] = line[t];
+                        long at = b0 + (c0 + c) * sLast;
+                        var line = input is null ? src.Slice((int)at, count) : input.Span(at, count, lineBuffer!);
+                        for (int t = 0; t < count; t++) t2[t * cc + c] = line[t];
                     }
 
-                    for (int t = 0; t < count; t++) TN.Store(t2.Slice(t * cols, cols), k.Output, (int)((r0 + t * rowStep) * cols));
+                    for (int t = 0; t < count; t++) TN.Store(t2.Slice(t * cc, cc), k.Output, (int)((r0 + t * rowStep) * cols + c0));
                 }
             }
             finally
