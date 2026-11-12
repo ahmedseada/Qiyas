@@ -13,7 +13,10 @@ using System.Runtime.InteropServices;
 namespace Adad.Abstraction;
 
 /// <summary>An optimizer step's scalars: the learning rate, the momentum / first-moment decay, the second-moment decay,
-/// eps, the weight decay, the step count (for Adam's bias correction).</summary>
+/// eps, the weight decay, the step count (for Adam's bias correction). The steps, each value's in the type's float lane:
+/// sgd p = p − lr·(g + wd·p); sgd_momentum m = b1·m + g + wd·p, p = p − lr·m; adam m = b1·m + (1 − b1)·g,
+/// v = b2·v + (1 − b2)·g², p = p − lr·m̂ / (√v̂ + eps), m̂ = m / (1 − b1ᵗ), v̂ = v / (1 − b2ᵗ); adamw adam with the decay
+/// decoupled from the moments and taken on the parameter the step starts from: p = (p − lr·wd·p) − lr·m̂ / (√v̂ + eps).</summary>
 public sealed record OptimizerArgs(string Name, double Lr, double B1, double B2, double Eps, double Wd, int Step)
 {
     public static readonly string[] Names = ["sgd", "sgd_momentum", "adam", "adamw"];
@@ -56,8 +59,8 @@ public sealed record OptimizerArgs(string Name, double Lr, double B1, double B2,
             m![i] = B1 * m[i] + (1 - B1) * gi;
             v![i] = B2 * v[i] + (1 - B2) * gi * gi;
             double update = Lr * (m[i] / c1) / (Math.Sqrt(v[i] / c2) + Eps);
+            if (Name == "adamw") p[i] -= Lr * Wd * p[i];                     // the decay of the parameter the step starts from
             p[i] -= update;
-            if (Name == "adamw") p[i] -= Lr * Wd * p[i];
         }
     }
 

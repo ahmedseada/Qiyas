@@ -8,7 +8,8 @@
 //   sgd            p = p − lr·(g + wd·p)
 //   sgd_momentum   m = mu·m + g + wd·p;  p = p − lr·m
 //   adam           m = b1·m + (1 − b1)·g;  v = b2·v + (1 − b2)·g²;  p = p − lr·(m / (1 − b1ᵗ)) / (√(v / (1 − b2ᵗ)) + eps)
-//   adamw          adam, then p = p − lr·wd·p (decoupled)
+//   adamw          adam with the decay decoupled from the moments: p = (p − lr·wd·p) − lr·m̂ / (√v̂ + eps), the decay
+//                  of the parameter the step starts from
 //
 // A step across several tensors under one clipping (OptimizerMany): the squares of every tensor's gradients as the
 // whole sum's parts (Reduce.cs WholeParts, in the sum's own lane), all of them joined in one chain — one sum across the
@@ -229,8 +230,8 @@ internal sealed partial class Kernels
                             mv = TL.Fma(b1, mv, ob1 * gv);
                             vv = TL.Fma(b2, vv, ob2 * gv * gv);
                             var update = lr * (mv * ic1) / (TL.Sqrt(vv * ic2) + eps);
-                            pv -= update;
                             if (adamw) pv -= lrwd * pv;
+                            pv -= update;
                             vv.CopyTo(vs[i..]);
                         }
 
@@ -256,8 +257,8 @@ internal sealed partial class Kernels
                             vs[i] = TL.Fma(TL.From(a.B2), vs[i], TL.Mul(TL.From(1 - a.B2), TL.Mul(gi, gi)));
                             var root = TL.Sqrt(new Vector<TLane>(TL.Mul(vs[i], TL.From(1 / c2))))[0];
                             TLane update = TL.Div(TL.Mul(TL.From(a.Lr), TL.Mul(ms[i], TL.From(1 / c1))), TL.Add(root, TL.From(a.Eps)));
-                            ps[i] = TL.Sub(ps[i], update);
                             if (adamw) ps[i] = TL.Sub(ps[i], TL.Mul(TL.From(a.Lr * a.Wd), ps[i]));
+                            ps[i] = TL.Sub(ps[i], update);
                         }
                     }
 

@@ -102,7 +102,8 @@ internal static partial class VkKernels
     // One value's step: the new parameter and moments.
     //   sgd:          p = p − lr·(g + wd·p)
     //   sgd_momentum: m = b1·m + g + wd·p;  p = p − lr·m
-    //   adam / adamw: m = b1·m + (1 − b1)·g; v = b2·v + (1 − b2)·g²; p = p − lr·m̂ / (√v̂ + eps) (adamw: then p − lr·wd·p)
+    //   adam / adamw: m = b1·m + (1 − b1)·g; v = b2·v + (1 − b2)·g²; p = p − lr·m̂ / (√v̂ + eps) (adamw: p − lr·wd·p first,
+    //                 the decay of the parameter the step starts from)
     private static (V P, V M, V V) Step(Spv b, string name, V p, V g, V m, V v, StepScalars k)
     {
         if (name == "sgd") return (p - k.Lr * b.Fma(k.Wd, p, g), m, v);
@@ -117,8 +118,7 @@ internal static partial class VkKernels
         var mh = m1 * k.Ic1;
         var vh = v1 * k.Ic2;
         var den = b.Sqrt(vh) + k.Eps;
-        var pNew = p - k.Lr * mh / den;
-        if (name == "adamw") pNew = pNew - k.LrWd * pNew;
-        return (pNew, m1, v1);
+        var p0 = name == "adamw" ? p - k.LrWd * p : p;
+        return (p0 - k.Lr * mh / den, m1, v1);
     }
 }

@@ -195,7 +195,8 @@ internal static partial class Ptx
     // One value's step: m (and v) updated in their registers, the new parameter returned.
     //   sgd:          p = p − lr·(g + wd·p)
     //   sgd_momentum: m = b1·m + g + wd·p;  p = p − lr·m
-    //   adam / adamw: m = b1·m + (1 − b1)·g; v = b2·v + (1 − b2)·g²; p = p − lr·m̂ / (√v̂ + eps) (adamw: then p − lr·wd·p)
+    //   adam / adamw: m = b1·m + (1 − b1)·g; v = b2·v + (1 − b2)·g²; p = p − lr·m̂ / (√v̂ + eps) (adamw: p − lr·wd·p first,
+    //                 the decay of the parameter the step starts from)
     private static string Step(PtxBuilder b, Lane lane, string name, string p, string g, string mv, string vv, StepScalars k)
     {
         string pNew = lane.NewReg(b), t = lane.NewReg(b);
@@ -228,14 +229,16 @@ internal static partial class Ptx
         b.L(lane.Add(den, root, k.Eps));
         b.L(lane.Mul(upd, k.Lr, mh));
         b.L($"div.rn.{lane.Op} {upd}, {upd}, {den};");
-        b.L($"sub.rn.{lane.Op} {pNew}, {p}, {upd};");
+        string p0 = p;
         if (name == "adamw")
         {
             string decay = lane.NewReg(b);
-            b.L(lane.Mul(decay, k.LrWd, pNew));
-            b.L($"sub.rn.{lane.Op} {pNew}, {pNew}, {decay};");
+            p0 = lane.NewReg(b);
+            b.L(lane.Mul(decay, k.LrWd, p));
+            b.L($"sub.rn.{lane.Op} {p0}, {p}, {decay};");
         }
 
+        b.L($"sub.rn.{lane.Op} {pNew}, {p0}, {upd};");
         return pNew;
     }
 }
