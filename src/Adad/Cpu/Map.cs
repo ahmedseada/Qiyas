@@ -524,6 +524,49 @@ internal sealed partial class Kernels
         }
     }
 
+    // keep[i] all ones where draw first + i keeps its value (Draws.Keep: its bits reach the threshold), all zeros where not:
+    // the draws a vector of counters at a time (Draws.Bits's steps over Vector<uint>, exact in every lane), each mask then
+    // widened to the lane's width.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void Keeps<TLane>(DrawKey key, uint first, uint threshold, Span<TLane> keep) where TLane : unmanaged
+    {
+        int n = keep.Length, u = Vector<uint>.Count, i = 0, size = Unsafe.SizeOf<TLane>();
+        if (size is 4 or 8)
+        {
+            Vector<uint> a = new(key.A), b = new(key.B), t = new(threshold), step = new((uint)u), counter = Vector<uint>.Indices + new Vector<uint>(first);
+            ref TLane r = ref MemoryMarshal.GetReference(keep);
+            for (; i + u <= n; i += u, counter += step)
+            {
+                var mask = Vector.GreaterThanOrEqual(Mix(Mix(counter ^ a) + b), t);
+                if (size == 4)
+                {
+                    Vector.AsVectorUInt32(mask).StoreUnsafe(ref Unsafe.As<TLane, uint>(ref r), (nuint)i);
+                }
+                else
+                {
+                    Vector.Widen(Vector.AsVectorInt32(mask), out var lo, out var hi);    // −1 stays −1: all ones at 64 bits
+                    ref long rl = ref Unsafe.As<TLane, long>(ref r);
+                    lo.StoreUnsafe(ref rl, (nuint)i);
+                    hi.StoreUnsafe(ref rl, (nuint)(i + u / 2));
+                }
+            }
+        }
+
+        var bytes = MemoryMarshal.AsBytes(keep);
+        for (; i < n; i++) bytes.Slice(i * size, size).Fill(Draws.Keep(key, first + (uint)i, threshold) ? (byte)0xFF : (byte)0);
+    }
+
+    // Draws.Mix over a vector of 32-bit words: the same xor-shifts and odd products, modulo 2^32 in every lane.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector<uint> Mix(Vector<uint> h)
+    {
+        h ^= Vector.ShiftRightLogical(h, 16);
+        h *= new Vector<uint>(Draws.M1);
+        h ^= Vector.ShiftRightLogical(h, Draws.S);
+        h *= new Vector<uint>(Draws.M2);
+        return h ^ Vector.ShiftRightLogical(h, 16);
+    }
+
     private readonly struct DropoutBody<TN, TE, TLane, TL>(byte[] x, byte[]? residual, byte[] output, DrawKey key, uint threshold, TLane scale) : Team.IBody
         where TN : struct, IAdad<TN, TE> where TE : unmanaged where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
@@ -564,15 +607,14 @@ internal sealed partial class Kernels
                     }
                 }
 
-                TLane one = TL.From(1), zero = TL.From(0);
-                for (int i = 0; i < len; i++) keep[i] = Draws.Keep(key, (uint)(at + i), threshold) ? one : zero;
+                Keeps(key, (uint)at, threshold, keep[..len]);
                 int l = 0;
                 for (; l + w <= len; l += w)
                 {
                     var vx = new Vector<TLane>(tx[l..]);
                     var vr = new Vector<TLane>(tr[l..]);
                     var kept = residual is null ? TL.Mul(vx, s) : TL.Fma(vx, s, vr);
-                    TL.Select(TL.Equal(new Vector<TLane>(keep[l..]), Vector<TLane>.Zero), vr, kept).CopyTo(tx[l..]);
+                    TL.Select(new Vector<TLane>(keep[l..]), kept, vr).CopyTo(tx[l..]);
                 }
 
                 if (l < len)
@@ -582,7 +624,7 @@ internal sealed partial class Kernels
                     var vx = new Vector<TLane>(px);
                     var vr = new Vector<TLane>(pr);
                     var kept = residual is null ? TL.Mul(vx, s) : TL.Fma(vx, s, vr);
-                    var res = TL.Select(TL.Equal(new Vector<TLane>(pk), Vector<TLane>.Zero), vr, kept);
+                    var res = TL.Select(new Vector<TLane>(pk), kept, vr);
                     for (int i = l; i < len; i++) tx[i] = res[i - l];
                 }
 
@@ -591,7 +633,9 @@ internal sealed partial class Kernels
                 {
                     // A kept value by the type's conversion, a dropped one the residual as it is stored.
                     Widths.Store<TLane, TE>(tx[..len], nx[..len]);
-                    for (int i = 0; i < len; i++) if (EqualityComparer<TLane>.Default.Equals(keep[i], zero)) nx[i] = nr[i];
+                    var masks = MemoryMarshal.AsBytes(keep[..len]);
+                    int size = Unsafe.SizeOf<TLane>();
+                    for (int i = 0; i < len; i++) if (masks[i * size] == 0) nx[i] = nr[i];
                     TN.Store(nx[..len], output, at);
                 }
             }
