@@ -180,7 +180,7 @@ internal static partial class Ptx
         for (int k = 0; k < LayoutParamCount; k++) p[k] = Param32(b, $"p_p{k}");
         b.L($"setp.ge.u32 {pd}, {i}, {count};");
         b.L($"@{pd} bra DONE;");
-        string H = p[1], W = p[2], OH = adaptive ? p[3] : PoolHeight(b, p, false), OW = adaptive ? p[4] : PoolWidth(b, p, false);
+        string H = p[1], W = p[2], OH = adaptive ? p[3] : p[11], OW = adaptive ? p[4] : p[12];      // a pool's OH OW: LayoutArgs.KernelP
         string ow = b.R(), oh = b.R(), ch = b.R(), t = b.R(), h0 = b.R(), kh = b.R(), w0 = b.R(), kw = b.R();
         b.L($"rem.u32 {ow}, {i}, {OW};");
         b.L($"div.u32 {t}, {i}, {OW};");
@@ -337,9 +337,10 @@ internal static partial class Ptx
 
             case "im2col":
             {
-                // r = (ch·kh + a)·kw + bb; c = oh·OW + ow; source (ch, oh·sh − ph + a·dh, ow·sw − pw + bb·dw) or 0.
+                // r = (ch·kh + a)·kw + bb; c = oh·OW + ow; source (ch, oh·sh − top + a·dh, ow·sw − left + bb·dw) or 0 (p: C H W kh kw
+                // sh sw top left bottom right dh dw OH OW, LayoutArgs.KernelP).
                 string kw = p[4], kh = p[3], H = p[1], W = p[2], ow = b.R(), oh = b.R(), bb = b.R(), a = b.R(), ch = b.R(), t = b.R(), ih = b.R(), iw = b.R(), pin = b.P(), p2 = b.P(), src = b.R(), ow2 = b.R();
-                string OW = OutWidth(b, p, false);
+                string OW = p[14];
                 b.L($"rem.u32 {ow}, {c}, {OW};");
                 b.L($"div.u32 {oh}, {c}, {OW};");
                 b.L($"rem.u32 {bb}, {r}, {kw};");
@@ -348,10 +349,10 @@ internal static partial class Ptx
                 b.L($"div.u32 {ch}, {t}, {kh};");
                 b.L($"mul.lo.u32 {ih}, {oh}, {p[5]};");
                 b.L($"sub.u32 {ih}, {ih}, {p[7]};");
-                b.L($"mad.lo.u32 {ih}, {a}, {p[9]}, {ih};");
+                b.L($"mad.lo.u32 {ih}, {a}, {p[11]}, {ih};");
                 b.L($"mul.lo.u32 {iw}, {ow}, {p[6]};");
                 b.L($"sub.u32 {iw}, {iw}, {p[8]};");
-                b.L($"mad.lo.u32 {iw}, {bb}, {p[10]}, {iw};");
+                b.L($"mad.lo.u32 {iw}, {bb}, {p[12]}, {iw};");
                 b.L($"setp.lt.u32 {pin}, {ih}, {H};");
                 b.L($"setp.lt.u32 {p2}, {iw}, {W};");
                 b.L($"and.pred {pin}, {pin}, {p2};");
@@ -364,9 +365,9 @@ internal static partial class Ptx
 
             case "col2im":
             {
-                // Output (ch, ih, iw = c), r = ch·H + ih: Σ over (a, bb) with (ih + ph − a·dh) = oh·sh, (iw + pw − bb·dw) = ow·sw in range.
-                string H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8], dh = p[9], dw = p[10];
-                string OW = OutWidth(b, p, false), OH = OutWidth(b, p, true);
+                // Output (ch, ih, iw = c), r = ch·H + ih: Σ over (a, bb) with (ih + top − a·dh) = oh·sh, (iw + left − bb·dw) = ow·sw in range.
+                string H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], top = p[7], left = p[8], dh = p[11], dw = p[12];
+                string OW = p[14], OH = p[13];
                 string ih = b.R(), ch = b.R(), acc = Zero(), a = b.R(), bb = b.R(), th = b.R(), tw = b.R(), oh = b.R(), ow = b.R(), rem = b.R(), pa = b.P(), pb = b.P(), pc = b.P(), src = b.R(), plane = b.R(), rowIdx = b.R();
                 b.L($"rem.u32 {ih}, {r}, {H};");
                 b.L($"div.u32 {ch}, {r}, {H};");
@@ -375,7 +376,7 @@ internal static partial class Ptx
                 b.Label($"CA{tag}");
                 b.L($"setp.ge.u32 {pa}, {a}, {kh};");
                 b.L($"@{pa} bra CA{tag}_END;");
-                b.L($"add.u32 {th}, {ih}, {ph};");
+                b.L($"add.u32 {th}, {ih}, {top};");
                 b.L($"mul.lo.u32 {rem}, {a}, {dh};");
                 b.L($"sub.s32 {th}, {th}, {rem};");                      // may go negative: a signed test
                 b.L($"setp.lt.s32 {pb}, {th}, 0;");
@@ -390,7 +391,7 @@ internal static partial class Ptx
                 b.Label($"CB{tag}");
                 b.L($"setp.ge.u32 {pc}, {bb}, {kw};");
                 b.L($"@{pc} bra CB{tag}_END;");
-                b.L($"add.u32 {tw}, {c}, {pw};");
+                b.L($"add.u32 {tw}, {c}, {left};");
                 b.L($"mul.lo.u32 {rem}, {bb}, {dw};");
                 b.L($"sub.s32 {tw}, {tw}, {rem};");
                 b.L($"setp.lt.s32 {pc}, {tw}, 0;");
@@ -514,11 +515,12 @@ internal static partial class Ptx
             case "avgpool":
             case "depthwise_conv":
             {
-                // r = ch·OH + oh, c = ow; the window over (a, bb) with the pads and dilations (1 for the pools).
+                // r = ch·OH + oh, c = ow; the window over (a, bb) from (oh·sh − top, ow·sw − left) with the dilations (1 for the
+                // pools); OH from LayoutArgs.KernelP. A pool's window holds an input value (LayoutArgs.Validate): no empty case.
                 bool max = name == "maxpool", conv = name == "depthwise_conv";
-                string H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8];
-                string dh = conv ? p[9] : "1", dw = conv ? p[10] : "1";
-                string OH = PoolHeight(b, p, conv), oh = b.R(), ch = b.R(), a = b.R(), bb = b.R(), ih = b.R(), iw = b.R(), pa = b.P(), pb = b.P(), src = b.R(), n = b.R();
+                string H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], top = p[7], left = p[8];
+                string dh = conv ? p[11] : "1", dw = conv ? p[12] : "1";
+                string OH = conv ? p[13] : p[11], oh = b.R(), ch = b.R(), a = b.R(), bb = b.R(), ih = b.R(), iw = b.R(), pa = b.P(), pb = b.P(), src = b.R(), n = b.R();
                 string acc = lane.NewReg(b);
                 b.L($"rem.u32 {oh}, {r}, {OH};");
                 b.L($"div.u32 {ch}, {r}, {OH};");
@@ -529,7 +531,7 @@ internal static partial class Ptx
                 b.L($"setp.ge.u32 {pa}, {a}, {kh};");
                 b.L($"@{pa} bra PA{tag}_END;");
                 b.L($"mul.lo.u32 {ih}, {oh}, {sh};");
-                b.L($"sub.u32 {ih}, {ih}, {ph};");
+                b.L($"sub.u32 {ih}, {ih}, {top};");
                 b.L($"mad.lo.u32 {ih}, {a}, {dh}, {ih};");
                 b.L($"setp.ge.u32 {pa}, {ih}, {H};");                      // unsigned: negative rows are out of range
                 b.L($"@{pa} bra PA{tag}_NEXT;");
@@ -538,7 +540,7 @@ internal static partial class Ptx
                 b.L($"setp.ge.u32 {pb}, {bb}, {kw};");
                 b.L($"@{pb} bra PB{tag}_END;");
                 b.L($"mul.lo.u32 {iw}, {c}, {sw};");
-                b.L($"sub.u32 {iw}, {iw}, {pw};");
+                b.L($"sub.u32 {iw}, {iw}, {left};");
                 b.L($"mad.lo.u32 {iw}, {bb}, {dw}, {iw};");
                 b.L($"setp.ge.u32 {pb}, {iw}, {W};");
                 b.L($"@{pb} bra PB{tag}_NEXT;");
@@ -564,14 +566,11 @@ internal static partial class Ptx
                 b.L($"add.u32 {a}, {a}, 1;");
                 b.L($"bra PA{tag};");
                 b.Label($"PA{tag}_END");
-                if (conv) return acc;
-                string pNone = b.P();
-                b.L($"setp.eq.u32 {pNone}, {n}, 0;");
-                if (max) return Sel(pNone, Zero(), acc);
+                if (conv || max) return acc;
                 string nf = lane.NewReg(b), mean = lane.NewReg(b);
-                b.L($"cvt.rn.{lane.Op}.u32 {nf}, {PoolDivisor(b, p, oh, c, n)};");
+                b.L($"cvt.rn.{lane.Op}.u32 {nf}, {n};");
                 b.L($"div.rn.{lane.Op} {mean}, {acc}, {nf};");
-                return Sel(pNone, Zero(), mean);
+                return mean;
             }
 
             case "maxpool_bwd":
@@ -579,8 +578,8 @@ internal static partial class Ptx
             {
                 // Output (ch, ih, iw = c), r = ch·H + ih; x = dy (C × OH × OW), x2 = the forward input (maxpool).
                 bool max = name == "maxpool_bwd";
-                string H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8];
-                string OH = PoolHeight(b, p, false), OW = PoolWidth(b, p, false);
+                string H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], top = p[7], left = p[8];
+                string OH = p[11], OW = p[12];
                 string ih = b.R(), ch = b.R(), acc = lane.NewReg(b), a = b.R(), bb = b.R(), th = b.R(), tw = b.R(), oh = b.R(), ow = b.R(), rem = b.R(), pa = b.P(), pb = b.P(), dyIdx = b.R(), me = b.R();
                 b.L($"rem.u32 {ih}, {r}, {H};");
                 b.L($"div.u32 {ch}, {r}, {H};");
@@ -591,7 +590,7 @@ internal static partial class Ptx
                 b.Label($"BA{tag}");
                 b.L($"setp.ge.u32 {pa}, {a}, {kh};");
                 b.L($"@{pa} bra BA{tag}_END;");
-                b.L($"add.u32 {th}, {ih}, {ph};");
+                b.L($"add.u32 {th}, {ih}, {top};");
                 b.L($"sub.s32 {th}, {th}, {a};");
                 b.L($"setp.lt.s32 {pa}, {th}, 0;");
                 b.L($"@{pa} bra BA{tag}_NEXT;");
@@ -605,7 +604,7 @@ internal static partial class Ptx
                 b.Label($"BB{tag}");
                 b.L($"setp.ge.u32 {pb}, {bb}, {kw};");
                 b.L($"@{pb} bra BB{tag}_END;");
-                b.L($"add.u32 {tw}, {c}, {pw};");
+                b.L($"add.u32 {tw}, {c}, {left};");
                 b.L($"sub.s32 {tw}, {tw}, {bb};");
                 b.L($"setp.lt.s32 {pb}, {tw}, 0;");
                 b.L($"@{pb} bra BB{tag}_NEXT;");
@@ -627,38 +626,10 @@ internal static partial class Ptx
                 }
                 else
                 {
-                    // The window (oh, ow): its valid count (avg).
-                    string aa = b.R(), bbb = b.R(), hh = b.R(), ww = b.R(), pc = b.P(), pd = b.P(), cnt = b.R();
-                    b.L($"mov.u32 {cnt}, 0;");
-                    b.L($"mov.u32 {aa}, 0;");
-                    b.Label($"WA{tag}");
-                    b.L($"setp.ge.u32 {pc}, {aa}, {kh};");
-                    b.L($"@{pc} bra WA{tag}_END;");
-                    b.L($"mul.lo.u32 {hh}, {oh}, {sh};");
-                    b.L($"sub.u32 {hh}, {hh}, {ph};");
-                    b.L($"add.u32 {hh}, {hh}, {aa};");
-                    b.L($"setp.ge.u32 {pc}, {hh}, {H};");
-                    b.L($"@{pc} bra WA{tag}_NEXT;");
-                    b.L($"mov.u32 {bbb}, 0;");
-                    b.Label($"WB{tag}");
-                    b.L($"setp.ge.u32 {pd}, {bbb}, {kw};");
-                    b.L($"@{pd} bra WB{tag}_END;");
-                    b.L($"mul.lo.u32 {ww}, {ow}, {sw};");
-                    b.L($"sub.u32 {ww}, {ww}, {pw};");
-                    b.L($"add.u32 {ww}, {ww}, {bbb};");
-                    b.L($"setp.ge.u32 {pd}, {ww}, {W};");
-                    b.L($"@{pd} bra WB{tag}_NEXT;");
-                    b.L($"add.u32 {cnt}, {cnt}, 1;");
-                    b.Label($"WB{tag}_NEXT");
-                    b.L($"add.u32 {bbb}, {bbb}, 1;");
-                    b.L($"bra WB{tag};");
-                    b.Label($"WB{tag}_END");
-                    b.Label($"WA{tag}_NEXT");
-                    b.L($"add.u32 {aa}, {aa}, 1;");
-                    b.L($"bra WA{tag};");
-                    b.Label($"WA{tag}_END");
-                    string nf = lane.NewReg(b), share = lane.NewReg(b);
-                    b.L($"cvt.rn.{lane.Op}.u32 {nf}, {PoolDivisor(b, p, oh, ow, cnt)};");
+                    // The window (oh, ow): its n values (avg), dy / n each.
+                    string cnt = b.R(), nf = lane.NewReg(b), share = lane.NewReg(b);
+                    b.L($"mul.lo.u32 {cnt}, {WindowSpan(b, oh, sh, top, kh, H)}, {WindowSpan(b, ow, sw, left, kw, W)};");
+                    b.L($"cvt.rn.{lane.Op}.u32 {nf}, {cnt};");
                     b.L($"div.rn.{lane.Op} {share}, {dy}, {nf};");
                     b.L(lane.Add(acc, acc, share));
                 }
@@ -911,74 +882,17 @@ internal static partial class Ptx
         return (has, w);
     }
 
-    // A pool's (dilation 1) or a depthwise convolution's output height / width: C H W kh kw sh sw ph pw [dh dw].
-    private static string PoolHeight(PtxBuilder b, string[] p, bool dilated) => PoolSize(b, p[1], p[3], p[5], p[7], dilated ? p[9] : null, p[11]);
-    private static string PoolWidth(PtxBuilder b, string[] p, bool dilated) => PoolSize(b, p[2], p[4], p[6], p[8], dilated ? p[10] : null, p[11]);
-
-    // LayoutArgs.PoolSize: (size + 2·pad − d·(k − 1) − 1) / s + 1, or with ceil (p[11] ≠ 0) rounded up and the last window
-    // dropped when it starts past the input and its leading pad.
-    private static string PoolSize(PtxBuilder b, string size, string k, string s, string pad, string? d, string ceil)
+    // The input positions window o covers along an axis of n (LayoutArgs.Window): min(o·s − before + k, n) − max(o·s − before, 0).
+    private static string WindowSpan(PtxBuilder b, string o, string s, string before, string k, string n)
     {
-        string t = b.R(), u = b.R(), up = b.R(), sm1 = b.R(), start = b.R(), end = b.R(), past = b.P(), pc = b.P();
-        b.L($"shl.b32 {t}, {pad}, 1;");
-        b.L($"add.u32 {t}, {t}, {size};");
-        b.L($"sub.u32 {u}, {k}, 1;");
-        if (d is not null) b.L($"mul.lo.u32 {u}, {u}, {d};");
-        b.L($"sub.u32 {t}, {t}, {u};");
-        b.L($"sub.u32 {t}, {t}, 1;");
-        b.L($"sub.u32 {sm1}, {s}, 1;");
-        b.L($"add.u32 {up}, {t}, {sm1};");
-        b.L($"div.u32 {up}, {up}, {s};");
-        b.L($"mul.lo.u32 {start}, {up}, {s};");
-        b.L($"add.u32 {end}, {size}, {pad};");
-        b.L($"setp.ge.u32 {past}, {start}, {end};");
-        b.L($"add.u32 {up}, {up}, 1;");
-        b.L($"@{past} sub.u32 {up}, {up}, 1;");
-        b.L($"div.u32 {t}, {t}, {s};");
-        b.L($"add.u32 {t}, {t}, 1;");
-        b.L($"setp.ne.u32 {pc}, {ceil}, 0;");
-        b.L($"selp.u32 {t}, {up}, {t}, {pc};");
-        return t;
-    }
-
-    // LayoutArgs.PoolDivisor: window (oh, ow)'s divisor, its `inside` count or, counting the pads (p[12] ≠ 0), its positions up
-    // to H + ph, W + pw.
-    private static string PoolDivisor(PtxBuilder b, string[] p, string oh, string ow, string inside)
-    {
-        string Extent(string o, string size, string k, string s, string pad)
-        {
-            string hs = b.R(), he = b.R(), lim = b.R();
-            b.L($"mul.lo.s32 {hs}, {o}, {s};");
-            b.L($"sub.s32 {hs}, {hs}, {pad};");
-            b.L($"add.s32 {he}, {hs}, {k};");
-            b.L($"add.s32 {lim}, {size}, {pad};");
-            b.L($"min.s32 {he}, {he}, {lim};");
-            b.L($"sub.s32 {he}, {he}, {hs};");
-            return he;
-        }
-
-        string eh = Extent(oh, p[1], p[3], p[5], p[7]), ew = Extent(ow, p[2], p[4], p[6], p[8]), d = b.R(), pc = b.P();
-        b.L($"mul.lo.u32 {d}, {eh}, {ew};");
-        b.L($"setp.ne.u32 {pc}, {p[12]}, 0;");
-        b.L($"selp.u32 {d}, {d}, {inside}, {pc};");
-        return d;
-    }
-
-    // OH or OW of a convolution's output from its parameters (C H W kh kw sh sw ph pw dh dw 0 pb pr).
-    private static string OutWidth(PtxBuilder b, string[] p, bool height)
-    {
-        // The bottom or right pad at p[12], p[13] (LayoutArgs.KernelP gives them).
-        string size = height ? p[1] : p[2], k = height ? p[3] : p[4], s = height ? p[5] : p[6], pad = height ? p[7] : p[8], d = height ? p[9] : p[10], end = height ? p[12] : p[13];
-        string t = b.R(), u = b.R();
-        b.L($"add.u32 {t}, {pad}, {end};");
-        b.L($"add.u32 {t}, {t}, {size};");
-        b.L($"sub.u32 {u}, {k}, 1;");
-        b.L($"mul.lo.u32 {u}, {u}, {d};");
-        b.L($"sub.u32 {t}, {t}, {u};");
-        b.L($"sub.u32 {t}, {t}, 1;");
-        b.L($"div.u32 {t}, {t}, {s};");
-        b.L($"add.u32 {t}, {t}, 1;");
-        return t;
+        string from = b.R(), to = b.R();
+        b.L($"mul.lo.s32 {from}, {o}, {s};");
+        b.L($"sub.s32 {from}, {from}, {before};");
+        b.L($"add.s32 {to}, {from}, {k};");
+        b.L($"min.s32 {to}, {to}, {n};");
+        b.L($"max.s32 {from}, {from}, 0;");
+        b.L($"sub.s32 {to}, {to}, {from};");
+        return to;
     }
 
     /// <summary>The bits of count values of src (format f, from value 0) placed at value offset `offset` of dst, which starts

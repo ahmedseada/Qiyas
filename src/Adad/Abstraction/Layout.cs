@@ -87,12 +87,19 @@ public sealed class LayoutArgs
     // gather_rows: rows cols n                             output n·cols
     // gather_cols: rows cols m                             output rows·m
     // scatter_add_rows: n cols rows                        output rows·cols
-    // im2col / col2im: C H W kh kw sh sw ph pw dh dw       cols (C·kh·kw) × (OH·OW)
+    // im2col / col2im: C H W kh kw sh sw top left bottom right dh dw    cols (C·kh·kw) × (OH·OW): window (oh, ow) tap (a, b)
+    //              reads x[c][oh·sh − top + a·dh][ow·sw − left + b·dw], 0 off the image; OH, OW the windows that fit
+    //              (WindowCount: the bottom and right pads only add windows)
     // interpolate: C H W OH OW αh βh δh αw βw δw           output C·OH·OW; along each axis one affine map: output o's source
     //              is the input coordinate s = (o·α + β) / δ (α ≥ 0, δ ≥ 1; input position i at coordinate i), held to the
     //              input; nearest takes the position nearest s, bilinear the two around it (CentreMap: the usual map)
     // interpolate_*_bwd: the forward's parameters            dx (C·H·W) from dy (C·OH·OW)
-    // pools: C H W kh kw sh sw ph pw [dh dw [ceil [countIncludePad]]]   (dilation 1 for the pools; ceil: PyTorch's ceil_mode)
+    // pools: C H W kh kw sh sw top left bottom right      output C·OH·OW: window (oh, ow) the input positions of rows
+    //              oh·sh − top … + kh − 1 and columns ow·sw − left … + kw − 1; max its first-ranked value, avg the mean of
+    //              its values (a pad is no value: each pad shorter than the window, so every window holds one)
+    // depthwise_conv: C H W kh kw sh sw top left bottom right dh dw   y[c][oh][ow] = Σ w[c][a][b]·x[c][oh·sh − top + a·dh]
+    //              [ow·sw − left + b·dw] (the weights C × kh × kw the second input; x 0 off the image)
+    // adaptive pools: C H W OH OW                          window (oh, ow) rows [⌊oh·H/OH⌋, ⌈(oh + 1)·H/OH⌉), columns likewise
     // shift: rows cols k                                   output rows·cols
     // pad2d: rows cols newCols                             output rows·newCols
 
@@ -115,7 +122,8 @@ public sealed class LayoutArgs
             "interpolate_nearest" or "interpolate_bilinear" => (p[0] * p[3], p[4]),
             "shift" => (p[0], p[1]),
             "pad2d" => (p[0], p[2]),
-            "maxpool" or "avgpool" or "depthwise_conv" => (p[0] * PoolOut(p).OH, PoolOut(p).OW),
+            "maxpool" or "avgpool" => (p[0] * PoolOut(p).OH, PoolOut(p).OW),
+            "depthwise_conv" => (p[0] * ConvOut(p).OH, ConvOut(p).OW),
             "maxpool_bwd" or "avgpool_bwd" => (p[0] * p[1], p[2]),
             "adaptive_maxpool" or "adaptive_avgpool" => (p[0] * p[3], p[4]),
             "adaptive_maxpool_bwd" or "adaptive_avgpool_bwd" => (p[0] * p[1], p[2]),
@@ -124,33 +132,26 @@ public sealed class LayoutArgs
         };
     }
 
-    /// <summary>A pool's output size: C H W kh kw sh sw ph pw [dh dw [ceil]] (ceil: PyTorch's ceil_mode).</summary>
-    public static (int OH, int OW) PoolOut(int[] p)
+    /// <summary>A pool's output size from C H W kh kw sh sw top left bottom right: the windows that fit an axis
+    /// (WindowCount).</summary>
+    public static (int OH, int OW) PoolOut(int[] p) => (WindowCount(p[1], p[3], p[5], p[7], p[9], 1), WindowCount(p[2], p[4], p[6], p[8], p[10], 1));
+
+    /// <summary>A convolution window's (im2col's, col2im's, depthwise_conv's) output size from C H W kh kw sh sw top left
+    /// bottom right dh dw: the windows that fit an axis (WindowCount).</summary>
+    public static (int OH, int OW) ConvOut(int[] p) => (WindowCount(p[1], p[3], p[5], p[7], p[9], p[11]), WindowCount(p[2], p[4], p[6], p[8], p[10], p[12]));
+
+    /// <summary>The windows of k taps d apart at stride s that fit an axis of n values with `before` and `after` pads:
+    /// ⌊(before + n + after − d·(k − 1) − 1) / s⌋ + 1, or none where one window is longer than the padded axis.</summary>
+    public static int WindowCount(int n, int k, int s, int before, int after, int d)
     {
-        int H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8];
-        int dh = p.Length > 9 ? p[9] : 1, dw = p.Length > 10 ? p[10] : 1;
-        bool ceil = p.Length > 11 && p[11] != 0;
-        return (PoolSize(H, kh, sh, ph, dh, ceil), PoolSize(W, kw, sw, pw, dw, ceil));
+        long span = (long)before + n + after - (long)d * (k - 1) - 1;
+        return span < 0 ? 0 : (int)(span / s + 1);
     }
 
-    /// <summary>The windows along an axis of n values: floor, or with ceil the windows that start inside the input or its
-    /// leading pad (PyTorch's rule: the last one may run past the trailing pad).</summary>
-    public static int PoolSize(int n, int k, int s, int pad, int d, bool ceil)
-    {
-        int span = n + 2 * pad - d * (k - 1) - 1;
-        if (!ceil) return span / s + 1;
-        int o = (span + s - 1) / s + 1;
-        return (o - 1) * s >= n + pad ? o - 1 : o;
-    }
-
-    /// <summary>An average pool's divisor for window (oh, ow) of `inside` input values: those, or counting the pads (p[12]) the
-    /// window's positions up to the padded end H + ph, W + pw (PyTorch's count_include_pad).</summary>
-    public static int PoolDivisor(int[] p, int oh, int ow, int inside)
-    {
-        if (p.Length <= 12 || p[12] == 0) return inside;
-        int hs = oh * p[5] - p[7], ws = ow * p[6] - p[8];
-        return (Math.Min(hs + p[3], p[1] + p[7]) - hs) * (Math.Min(ws + p[4], p[2] + p[8]) - ws);
-    }
+    /// <summary>The input positions [from, to) window o covers along an axis of n (k taps at stride s from o·s − before),
+    /// held to the input.</summary>
+    public static (int From, int To) Window(int o, int n, int k, int s, int before) =>
+        (Math.Max(o * s - before, 0), Math.Min(o * s - before + k, n));
 
     // ---- the parameters as the kernels take them
 
@@ -194,6 +195,32 @@ public sealed class LayoutArgs
             long forward = (long)P[0] * P[3] * P[4], image = (long)P[0] * P[1] * P[2];
             if (Count != (Name.EndsWith("_bwd", StringComparison.Ordinal) ? image : forward)) throw new ArgumentException($"{Name}: an output of {Count} values");
         }
+        else if (Name is "im2col" or "col2im" or "depthwise_conv" or "maxpool" or "avgpool" or "maxpool_bwd" or "avgpool_bwd")
+        {
+            // C H W kh kw sh sw top left bottom right (dh dw for the convolution windows): sizes ≥ 0, windows, strides and
+            // dilations ≥ 1, pads ≥ 0; a pool's pad shorter than its window (a window of pads alone holds no value) over an
+            // image of positions; the output's count.
+            bool pool = Name.Contains("pool", StringComparison.Ordinal);
+            if (P.Length != (pool ? 11 : 13)) throw new ArgumentException($"{Name}: {P.Length} parameters (C H W kh kw sh sw top left bottom right{(pool ? "" : " dh dw")})");
+            if (P[0] < 0 || P[1] < 0 || P[2] < 0) throw new ArgumentException($"{Name}: a negative size");
+            if (P[3] < 1 || P[4] < 1 || P[5] < 1 || P[6] < 1 || (!pool && (P[11] < 1 || P[12] < 1))) throw new ArgumentException($"{Name}: a window, a stride or a dilation below 1");
+            if (P[7] < 0 || P[8] < 0 || P[9] < 0 || P[10] < 0) throw new ArgumentException($"{Name}: a negative pad");
+            if (pool && (P[7] >= P[3] || P[9] >= P[3] || P[8] >= P[4] || P[10] >= P[4])) throw new ArgumentException($"{Name}: pads ({P[7]}, {P[8]}, {P[9]}, {P[10]}) as long as a {P[3]} × {P[4]} window: a window of pads alone has no value");
+            if (pool && P[0] > 0 && (P[1] == 0 || P[2] == 0)) throw new ArgumentException($"{Name}: a pool over an image of no positions");
+            var (oh, ow) = pool ? PoolOut(P) : ConvOut(P);
+            long image = (long)P[0] * P[1] * P[2], windows = (long)P[0] * oh * ow;
+            long count = Name switch { "im2col" => windows * P[3] * P[4], "col2im" or "maxpool_bwd" or "avgpool_bwd" => image, _ => windows };
+            if (Count != count) throw new ArgumentException($"{Name}: an output of {Count} values ({count} by its shape)");
+        }
+        else if (Name.StartsWith("adaptive_", StringComparison.Ordinal))
+        {
+            // C H W OH OW: an image of positions where there are windows.
+            if (P.Length != 5) throw new ArgumentException($"{Name}: {P.Length} parameters (C H W OH OW)");
+            if (P[0] < 0 || P[1] < 0 || P[2] < 0 || P[3] < 0 || P[4] < 0) throw new ArgumentException($"{Name}: a negative size");
+            if ((long)P[0] * P[3] * P[4] > 0 && (P[1] == 0 || P[2] == 0)) throw new ArgumentException($"{Name}: windows over an image of no positions");
+            long count = Name.EndsWith("_bwd", StringComparison.Ordinal) ? (long)P[0] * P[1] * P[2] : (long)P[0] * P[3] * P[4];
+            if (Count != count) throw new ArgumentException($"{Name}: an output of {Count} values ({count} by its shape)");
+        }
     }
 
     /// <summary>The integers a device's layout kernel takes (its parameters past the buffers and counts).</summary>
@@ -234,14 +261,14 @@ public sealed class LayoutArgs
         return ((int)rows, p[rank - 1]);
     }
 
-    /// <summary>The parameters the device kernels read: a strided view canonical (StridedKernel); the others as given.</summary>
+    /// <summary>The parameters the device kernels read: a strided view canonical (StridedKernel), a window's with its output's
+    /// size; the others as given.</summary>
     public static int[] KernelP(string name, int[] p) => name switch
     {
         "strided" => StridedKernel(p),
-        "im2col" or "col2im" => ConvKernel(p),
-        // The pools take positions 9 and 10 (depthwise_conv's dilations) only so ceil and the pad count keep one order: 1.
-        "maxpool" or "avgpool" or "maxpool_bwd" or "avgpool_bwd" when p.Length > 9 && (p[9] != 1 || p[10] != 1)
-            => throw new ArgumentException($"{name}: the pools' dilations (P[9], P[10]) are 1"),
+        // A window's parameters and the output's size (WindowCount, once): OH OW at 13 and 14, a pool's at 11 and 12.
+        "im2col" or "col2im" or "depthwise_conv" => [.. p, ConvOut(p).OH, ConvOut(p).OW],
+        "maxpool" or "avgpool" or "maxpool_bwd" or "avgpool_bwd" => [.. p, PoolOut(p).OH, PoolOut(p).OW],
         _ => p,
     };
 
@@ -316,18 +343,6 @@ public sealed class LayoutArgs
     /// <summary>An adaptive window along one axis: [⌊i·n/o⌋, ⌈(i + 1)·n/o⌉).</summary>
     public static (int From, int To) Adaptive(int i, int n, int o) => (i * n / o, ((i + 1) * n + o - 1) / o);
 
-    /// <summary>A convolution's (im2col's) output size from C H W kh kw sh sw ph pw dh dw [0 pb pr]: the bottom and right pads
-    /// (ONNX's four pads; ph and pw where not given) only add windows, never move them: (H + ph + pb − dh·(kh − 1) − 1) / sh + 1.</summary>
-    public static (int OH, int OW) ConvOut(int[] p)
-    {
-        int H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8], dh = p[9], dw = p[10];
-        int pb = p.Length > 13 ? p[12] : ph, pr = p.Length > 13 ? p[13] : pw;
-        return ((H + ph + pb - dh * (kh - 1) - 1) / sh + 1, (W + pw + pr - dw * (kw - 1) - 1) / sw + 1);
-    }
-
-    // im2col's and col2im's parameters as the kernels take them: fourteen, the bottom and right pads given.
-    private static int[] ConvKernel(int[] p) =>
-        p.Length > 13 ? p : [.. p.Take(11), 0, p[7], p[8]];
 
     /// <summary>The float64 reference of the operation on the input's values (x2: the second input's).</summary>
     public static double[] Reference(string name, double[] x, int[]? index, int[] p, int count, double[]? x2 = null)
@@ -338,22 +353,23 @@ public sealed class LayoutArgs
             case "maxpool":
             case "avgpool":
             {
+                // Every window holds an input value (Validate): max its first-ranked, avg the mean of its values.
                 var (OH, OW) = PoolOut(p);
-                int C = p[0], H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8];
+                int C = p[0], H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], top = p[7], left = p[8];
                 for (int c = 0; c < C; c++) for (int oh = 0; oh < OH; oh++) for (int ow = 0; ow < OW; ow++)
                 {
                     double best = double.NegativeInfinity, sum = 0;
                     int n = 0;
                     for (int a = 0; a < kh; a++) for (int b = 0; b < kw; b++)
                     {
-                        int ih = oh * sh - ph + a, iw = ow * sw - pw + b;
+                        int ih = oh * sh - top + a, iw = ow * sw - left + b;
                         if ((uint)ih >= (uint)H || (uint)iw >= (uint)W) continue;
                         double v = x[(c * H + ih) * W + iw];
                         if (n == 0 || Routing.Order(v, best) > 0) best = v;
                         sum += v; n++;
                     }
 
-                    y[(c * OH + oh) * OW + ow] = name == "maxpool" ? (n == 0 ? 0 : best) : (n == 0 ? 0 : sum / PoolDivisor(p, oh, ow, n));
+                    y[(c * OH + oh) * OW + ow] = name == "maxpool" ? best : sum / n;
                 }
 
                 return y;
@@ -362,28 +378,28 @@ public sealed class LayoutArgs
             case "maxpool_bwd":
             case "avgpool_bwd":
             {
-                // x = dy (C × OH × OW), x2 = the forward input (maxpool: the window's first largest takes the gradient).
+                // x = dy (C × OH × OW), x2 = the forward input: maxpool's gradient to the window's first-ranked value, avgpool's
+                // spread over the window's values, dy / n each.
                 var (OH, OW) = PoolOut(p);
-                int C = p[0], H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8];
+                int C = p[0], H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], top = p[7], left = p[8];
                 for (int c = 0; c < C; c++) for (int oh = 0; oh < OH; oh++) for (int ow = 0; ow < OW; ow++)
                 {
                     double dy = x[(c * OH + oh) * OW + ow], best = double.NegativeInfinity;
                     int n = 0, bestAt = -1;
                     for (int a = 0; a < kh; a++) for (int b = 0; b < kw; b++)
                     {
-                        int ih = oh * sh - ph + a, iw = ow * sw - pw + b;
+                        int ih = oh * sh - top + a, iw = ow * sw - left + b;
                         if ((uint)ih >= (uint)H || (uint)iw >= (uint)W) continue;
                         n++;
                         if (name == "maxpool_bwd") { double v = x2![(c * H + ih) * W + iw]; if (bestAt < 0 || Routing.Order(v, best) > 0) { best = v; bestAt = (c * H + ih) * W + iw; } }
-                        else y[(c * H + ih) * W + iw] += 0;    // counted below
                     }
 
-                    if (name == "maxpool_bwd") { if (bestAt >= 0) y[bestAt] += dy; continue; }
+                    if (name == "maxpool_bwd") { y[bestAt] += dy; continue; }
                     for (int a = 0; a < kh; a++) for (int b = 0; b < kw; b++)
                     {
-                        int ih = oh * sh - ph + a, iw = ow * sw - pw + b;
+                        int ih = oh * sh - top + a, iw = ow * sw - left + b;
                         if ((uint)ih >= (uint)H || (uint)iw >= (uint)W) continue;
-                        y[(c * H + ih) * W + iw] += dy / PoolDivisor(p, oh, ow, n);
+                        y[(c * H + ih) * W + iw] += dy / n;
                     }
                 }
 
@@ -434,14 +450,14 @@ public sealed class LayoutArgs
 
             case "depthwise_conv":
             {
-                var (OH, OW) = PoolOut(p);
-                int C = p[0], H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8], dh = p[9], dw = p[10];
+                var (OH, OW) = ConvOut(p);
+                int C = p[0], H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], top = p[7], left = p[8], dh = p[11], dw = p[12];
                 for (int c = 0; c < C; c++) for (int oh = 0; oh < OH; oh++) for (int ow = 0; ow < OW; ow++)
                 {
                     double acc = 0;
                     for (int a = 0; a < kh; a++) for (int b = 0; b < kw; b++)
                     {
-                        int ih = oh * sh - ph + a * dh, iw = ow * sw - pw + b * dw;
+                        int ih = oh * sh - top + a * dh, iw = ow * sw - left + b * dw;
                         if ((uint)ih >= (uint)H || (uint)iw >= (uint)W) continue;
                         acc += x2![(c * kh + a) * kw + b] * x[(c * H + ih) * W + iw];
                     }
@@ -485,7 +501,7 @@ public sealed class LayoutArgs
                 for (int c = 0; c < C; c++) for (int a = 0; a < kh; a++) for (int b = 0; b < kw; b++)
                     for (int oh = 0; oh < OH; oh++) for (int ow = 0; ow < OW; ow++)
                     {
-                        int ih = oh * p[5] - p[7] + a * p[9], iw = ow * p[6] - p[8] + b * p[10];
+                        int ih = oh * p[5] - p[7] + a * p[11], iw = ow * p[6] - p[8] + b * p[12];
                         y[((c * kh + a) * kw + b) * (OH * OW) + oh * OW + ow] = (uint)ih < (uint)H && (uint)iw < (uint)W ? x[(c * H + ih) * W + iw] : 0;
                     }
                 return y;
@@ -498,7 +514,7 @@ public sealed class LayoutArgs
                 for (int c = 0; c < C; c++) for (int a = 0; a < kh; a++) for (int b = 0; b < kw; b++)
                     for (int oh = 0; oh < OH; oh++) for (int ow = 0; ow < OW; ow++)
                     {
-                        int ih = oh * p[5] - p[7] + a * p[9], iw = ow * p[6] - p[8] + b * p[10];
+                        int ih = oh * p[5] - p[7] + a * p[11], iw = ow * p[6] - p[8] + b * p[12];
                         if ((uint)ih < (uint)H && (uint)iw < (uint)W) y[(c * H + ih) * W + iw] += x[((c * kh + a) * kw + b) * (OH * OW) + oh * OW + ow];
                     }
                 return y;

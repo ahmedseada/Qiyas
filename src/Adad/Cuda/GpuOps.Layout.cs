@@ -43,6 +43,7 @@ public sealed partial class GpuOps
         }
         else lane = LayoutArgs.FloatLane(k.Name) ? RowLane(f) : f.Natural;
 
+        if (k.Count == 0) return lane.Name;                                         // no outputs (a window longer than its image)
         ulong aux = 0;
         try
         {

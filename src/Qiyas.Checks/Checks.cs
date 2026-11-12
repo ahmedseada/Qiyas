@@ -2246,7 +2246,7 @@ internal static partial class Checks
         var imgv = Bench.Registry.Values(type, x2, img.Length);
         bool ok = true;
         static bool Same(double x, double y) => x == y || (double.IsNaN(x) && double.IsNaN(y));
-        foreach (var (name, p) in new (string, int[])[] { ("maxpool", [C, H, W, 3, 3, 2, 2, 1, 1]), ("maxpool", [C, H, W, 2, 3, 1, 2, 0, 1]), ("adaptive_maxpool", [C, H, W, 5, 4]) })
+        foreach (var (name, p) in new (string, int[])[] { ("maxpool", [C, H, W, 3, 3, 2, 2, 1, 1, 1, 1]), ("maxpool", [C, H, W, 2, 3, 1, 2, 0, 1, 0, 1]), ("adaptive_maxpool", [C, H, W, 5, 4]) })
         {
             var (oh, ow) = name == "maxpool" ? LayoutArgs.PoolOut(p) : (p[3], p[4]);
             int count = C * oh * ow;

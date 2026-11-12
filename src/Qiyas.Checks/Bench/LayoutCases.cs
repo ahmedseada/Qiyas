@@ -45,18 +45,25 @@ public static class LayoutCases
         "gather_rows" => $"{k.P[2]} of {k.P[0]}x{k.P[1]}",
         "gather_cols" => $"{k.P[2]} of {k.P[0]}x{k.P[1]}",
         "scatter_add_rows" => $"{k.P[0]} into {k.P[2]}x{k.P[1]}",
-        "im2col" or "col2im" => $"{k.P[0]}x{k.P[1]}x{k.P[2]} k{k.P[3]}x{k.P[4]}",
+        "im2col" or "col2im" => $"{k.P[0]}x{k.P[1]}x{k.P[2]} k{k.P[3]}x{k.P[4]}{(Even(k.P) ? "" : $" p{Pads(k.P)}")}",
         "interpolate_nearest" or "interpolate_bilinear" or "interpolate_nearest_bwd" or "interpolate_bilinear_bwd" =>
             $"{k.P[0]}x{k.P[1]}x{k.P[2]} to {k.P[3]}x{k.P[4]}{(IsCentres(k.P) ? "" : $" maps ({k.P[5]}, {k.P[6]}, {k.P[7]}), ({k.P[8]}, {k.P[9]}, {k.P[10]})")}",
         "shift" => $"{k.P[0]}x{k.P[1]} by {k.P[2]}",
         "pad2d" => $"{k.P[0]}x{k.P[1]} to {k.P[2]}",
         "maxpool" or "avgpool" or "maxpool_bwd" or "avgpool_bwd" or "depthwise_conv" =>
-            $"{k.P[0]}x{k.P[1]}x{k.P[2]} k{k.P[3]}x{k.P[4]} s{k.P[5]} p{k.P[7]}{(k.P.Length > 11 && k.P[11] != 0 ? " ceil" : "")}{(k.P.Length > 12 && k.P[12] != 0 ? " counting pads" : "")}",
+            $"{k.P[0]}x{k.P[1]}x{k.P[2]} k{k.P[3]}x{k.P[4]} s{k.P[5]} p{(Even(k.P) ? k.P[7].ToString() : Pads(k.P))}",
         "adaptive_maxpool" or "adaptive_avgpool" or "adaptive_maxpool_bwd" or "adaptive_avgpool_bwd" => $"{k.P[0]}x{k.P[1]}x{k.P[2]} to {k.P[3]}x{k.P[4]}",
         _ => "",
     };
 
     private static int ConvCols(int[] p) { var (oh, ow) = LayoutArgs.ConvOut(p); return p[0] * p[3] * p[4] * oh * ow; }
+
+    private static int ConvCount(int[] p) { var (oh, ow) = LayoutArgs.ConvOut(p); return p[0] * oh * ow; }
+
+    // A window's four pads (top, left, bottom, right): all one, or each.
+    private static bool Even(int[] p) => p[7] == p[8] && p[8] == p[9] && p[9] == p[10];
+
+    private static string Pads(int[] p) => $"{p[7]},{p[8]},{p[9]},{p[10]}";
 
     // An interpolation C H W OH OW with a map an axis.
     private static int[] Resize(int c, int h, int w, int oh, int ow, (int A, int B, int D) mh, (int A, int B, int D) mw) => [c, h, w, oh, ow, mh.A, mh.B, mh.D, mw.A, mw.B, mw.D];
@@ -66,12 +73,13 @@ public static class LayoutCases
 
     private static bool IsCentres(int[] p) => p.AsSpan().SequenceEqual(Centres(p[0], p[1], p[2], p[3], p[4]));
 
-    // The pools' gate shapes: C H W kh kw sh sw ph pw [dh dw ceil countIncludePad] — ceil mode (a last window past the input
-    // and its pad), the pads counted by the divisor, both.
+    // The pools' gate shapes: C H W kh kw sh sw top left bottom right — even pads; a bottom and right pad that add a window
+    // (a last window past the input); uneven pads each side; a window longer than its image (no windows: the backward's dx 0).
     private static readonly int[][] PoolShapes =
     [
-        [3, 7, 9, 3, 3, 2, 2, 1, 1], [2, 11, 5, 2, 3, 1, 2, 0, 1], [1, 6, 6, 4, 4, 4, 4, 2, 2],
-        [3, 7, 9, 3, 3, 2, 2, 1, 1, 1, 1, 1, 1], [2, 11, 5, 2, 3, 1, 2, 0, 1, 1, 1, 0, 1], [1, 6, 7, 3, 3, 2, 2, 0, 0, 1, 1, 1, 0], [2, 8, 8, 3, 2, 3, 3, 0, 1, 1, 1, 1, 0],
+        [3, 7, 9, 3, 3, 2, 2, 1, 1, 1, 1], [2, 11, 5, 2, 3, 1, 2, 0, 1, 0, 1], [1, 6, 6, 4, 4, 4, 4, 2, 2, 2, 2],
+        [3, 7, 9, 3, 3, 2, 2, 1, 1, 2, 2], [2, 11, 5, 2, 3, 1, 2, 0, 1, 1, 2], [1, 6, 7, 3, 3, 2, 2, 0, 0, 1, 1], [2, 8, 8, 3, 2, 3, 3, 0, 1, 2, 1],
+        [1, 2, 5, 3, 3, 1, 1, 0, 1, 0, 1],
     ];
 
     /// <summary>The gate's cases for an operation: odd dimensions, transposed and broadcast views, pads and strides, duplicates.</summary>
@@ -123,7 +131,10 @@ public static class LayoutCases
             case "im2col":
             case "col2im":
             {
-                int[][] shapes = [[3, 7, 9, 3, 2, 2, 1, 1, 1, 1, 1, 0], [2, 5, 5, 3, 3, 1, 1, 1, 1, 2, 2, 0], [1, 11, 7, 1, 1, 1, 1, 0, 0, 1, 1, 0]];
+                // C H W kh kw sh sw top left bottom right dh dw: even pads, dilations, a 1 × 1 kernel, uneven pads with a column
+                // dilation, and a window longer than its image (no columns: col2im's dx 0).
+                int[][] shapes = [[3, 7, 9, 3, 2, 2, 1, 1, 1, 1, 1, 1, 1], [2, 5, 5, 3, 3, 1, 1, 1, 1, 1, 1, 2, 2], [1, 11, 7, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1],
+                    [2, 6, 7, 3, 3, 2, 1, 0, 2, 1, 0, 1, 2], [1, 2, 5, 3, 3, 1, 1, 0, 0, 0, 0, 1, 1]];
                 foreach (var p in shapes)
                 {
                     int image = p[0] * p[1] * p[2], cols = ConvCols(p);
@@ -193,10 +204,12 @@ public static class LayoutCases
                 break;
             case "depthwise_conv":
             {
-                // The last two (6j): a column stride of 2 (the value-at-a-time loop), and rows of 37 with a column dilation of 3
-                // (the stride-1 vector passes over several vectors and a tail, taps reaching past both edges).
-                int[][] shapes = [[3, 7, 9, 3, 3, 1, 1, 1, 1, 1, 1], [2, 11, 5, 3, 2, 2, 1, 1, 0, 2, 1], [2, 9, 11, 3, 3, 1, 2, 1, 1, 1, 2], [1, 5, 37, 2, 3, 1, 1, 0, 2, 1, 3]];
-                foreach (var p in shapes) yield return Make(name, type, p[0] * p[1] * p[2], null, p, PoolCount(p), 96, p[0] * p[3] * p[4]);
+                // C H W kh kw sh sw top left bottom right dh dw. A column stride of 2 (the value-at-a-time loop); rows of 37 with a
+                // column dilation of 3 (the stride-1 vector passes over several vectors and a tail, taps reaching past both
+                // edges); uneven pads; pads longer than the window (windows of zeros alone).
+                int[][] shapes = [[3, 7, 9, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1], [2, 11, 5, 3, 2, 2, 1, 1, 0, 1, 0, 2, 1], [2, 9, 11, 3, 3, 1, 2, 1, 1, 1, 1, 1, 2],
+                    [1, 5, 37, 2, 3, 1, 1, 0, 2, 0, 2, 1, 3], [2, 6, 8, 3, 3, 1, 1, 2, 0, 0, 1, 1, 1], [1, 4, 4, 2, 2, 1, 1, 3, 0, 0, 3, 1, 1]];
+                foreach (var p in shapes) yield return Make(name, type, p[0] * p[1] * p[2], null, p, ConvCount(p), 96, p[0] * p[3] * p[4]);
                 break;
             }
         }
@@ -211,8 +224,8 @@ public static class LayoutCases
         "gather_rows" => Make(name, type, 4096 * 4096, Indices(4096, 4096, 83), [4096, 4096, 4096], 4096 * 4096, 83),
         "gather_cols" => Make(name, type, 4096 * 4096, Indices(4096, 4096, 84), [4096, 4096, 4096], 4096 * 4096, 84),
         "scatter_add_rows" => Make(name, type, 4096 * 4096, Indices(4096, 4096, 85), [4096, 4096, 4096], 4096 * 4096, 85),
-        "im2col" => Make(name, type, 64 * 128 * 128, null, [64, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 0], ConvCols([64, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 0]), 86),
-        "col2im" => Make(name, type, ConvCols([64, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 0]), null, [64, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 0], 64 * 128 * 128, 87),
+        "im2col" => Make(name, type, 64 * 128 * 128, null, [64, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1], ConvCols([64, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1]), 86),
+        "col2im" => Make(name, type, ConvCols([64, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1]), null, [64, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1], 64 * 128 * 128, 87),
         "interpolate_nearest" => Make(name, type, 16 * 512 * 512, null, Centres(16, 512, 512, 1024, 1024), 16 * 1024 * 1024, 88),
         "interpolate_bilinear" => Make(name, type, 16 * 512 * 512, null, Centres(16, 512, 512, 1024, 1024), 16 * 1024 * 1024, 89),
         "interpolate_nearest_bwd" => Make(name, type, 16 * 1024 * 1024, null, Centres(16, 512, 512, 1024, 1024), 16 * 512 * 512, 88),
@@ -220,11 +233,11 @@ public static class LayoutCases
         "shift" => Make(name, type, 4096 * 4096, null, [4096, 4096, 3], 4096 * 4096, 90),
         "pad2d" => Make(name, type, 4096 * 4093, null, [4096, 4093, 4096], 4096 * 4096, 91),
         // 64 channels of 256 × 256: 2 × 2 windows at stride 2 (the common pool), 3 × 3 depthwise at stride 1
-        "maxpool" or "avgpool" => Make(name, type, 64 * 256 * 256, null, [64, 256, 256, 2, 2, 2, 2, 0, 0], PoolCount([64, 256, 256, 2, 2, 2, 2, 0, 0]), 92),
-        "maxpool_bwd" or "avgpool_bwd" => Make(name, type, PoolCount([64, 256, 256, 2, 2, 2, 2, 0, 0]), null, [64, 256, 256, 2, 2, 2, 2, 0, 0], 64 * 256 * 256, 93, 64 * 256 * 256),
+        "maxpool" or "avgpool" => Make(name, type, 64 * 256 * 256, null, [64, 256, 256, 2, 2, 2, 2, 0, 0, 0, 0], PoolCount([64, 256, 256, 2, 2, 2, 2, 0, 0, 0, 0]), 92),
+        "maxpool_bwd" or "avgpool_bwd" => Make(name, type, PoolCount([64, 256, 256, 2, 2, 2, 2, 0, 0, 0, 0]), null, [64, 256, 256, 2, 2, 2, 2, 0, 0, 0, 0], 64 * 256 * 256, 93, 64 * 256 * 256),
         "adaptive_maxpool" or "adaptive_avgpool" => Make(name, type, 64 * 256 * 256, null, [64, 256, 256, 7, 7], 64 * 7 * 7, 94),
         "adaptive_maxpool_bwd" or "adaptive_avgpool_bwd" => Make(name, type, 64 * 7 * 7, null, [64, 256, 256, 7, 7], 64 * 256 * 256, 97, 64 * 256 * 256),
-        "depthwise_conv" => Make(name, type, 64 * 256 * 256, null, [64, 256, 256, 3, 3, 1, 1, 1, 1, 1, 1], PoolCount([64, 256, 256, 3, 3, 1, 1, 1, 1, 1, 1]), 96, 64 * 9),
+        "depthwise_conv" => Make(name, type, 64 * 256 * 256, null, [64, 256, 256, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1], ConvCount([64, 256, 256, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1]), 96, 64 * 9),
         _ => throw new ArgumentException(name),
     };
 }

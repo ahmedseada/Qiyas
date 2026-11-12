@@ -99,8 +99,8 @@ internal static partial class VkKernels
         b.If(i < a.Count, () =>
         {
             V H = p[1], W = p[2];
-            var OH = adaptive ? p[3] : PoolSize(p[1], p[3], p[5], p[7], null, p[11]);
-            var OW = adaptive ? p[4] : PoolSize(p[2], p[4], p[6], p[8], null, p[11]);
+            var OH = adaptive ? p[3] : p[11];                                                // a pool's OH OW: LayoutArgs.KernelP
+            var OW = adaptive ? p[4] : p[12];
             var ow = i % OW;
             var t = i / OW;
             var oh = t % OH;
@@ -145,22 +145,22 @@ internal static partial class VkKernels
         return b.Build();
     }
 
-    /// <summary>im2col's value at column row r = (ch·kh + a)·kw + bb, column c = oh·OW + ow (p: its parameters,
-    /// ConvArgs.P): the image's index (ch, oh·sh − ph + a·dh, ow·sw − pw + bb·dw), and whether it is inside the image (else
-    /// the value is 0, the index 0: a safe address). The layout's im2col and the convolution's product share it.</summary>
+    /// <summary>im2col's value at column row r = (ch·kh + a)·kw + bb, column c = oh·OW + ow (p: im2col's parameters as the
+    /// kernels take them, LayoutArgs.KernelP: C H W kh kw sh sw top left bottom right dh dw OH OW): the image's index
+    /// (ch, oh·sh − top + a·dh, ow·sw − left + bb·dw), and whether it is inside the image (else the value is 0, the index 0:
+    /// a safe address). The layout's im2col and the convolution's product share it.</summary>
     internal static (V Src, V Inside) Im2colAt(Spv b, V[] p, V r, V c)
     {
         V kw = p[4], kh = p[3], H = p[1], W = p[2];
-        // The layout's parameters give the right pad (LayoutArgs.KernelP); the product's (ConvArgs.P's twelve) are symmetric.
-        var OW = p.Length > 13 ? ConvSize(p[2], p[4], p[6], p[8], p[13], p[10]) : PoolSize(p[2], p[4], p[6], p[8], p[10]);
+        var OW = p[14];
         var ow = c % OW;
         var oh = c / OW;
         var bb = r % kw;
         var t = r / kw;
         var ka = t % kh;
         var ch = t / kh;
-        var ih = oh * p[5] - p[7] + ka * p[9];                                          // above or left: unsigned past H or W
-        var iw = ow * p[6] - p[8] + bb * p[10];
+        var ih = oh * p[5] - p[7] + ka * p[11];                                         // above or left: unsigned past H or W
+        var iw = ow * p[6] - p[8] + bb * p[12];
         var inside = (ih < H) & (iw < W);
         return (b.Select(inside, (ch * H + ih) * W + iw, b.U(0)), inside);
     }
@@ -173,37 +173,13 @@ internal static partial class VkKernels
         return (start, end - start);
     }
 
-    // A pool's (dilation 1) or a convolution's output size (LayoutArgs.PoolSize): (size + 2·pad − (k − 1)·d − 1) / s + 1, or
-    // with ceil (≠ 0) rounded up and the last window dropped when it starts past the input and its leading pad.
-    private static V PoolSize(V size, V k, V s, V pad, V? d, V? ceil = null)
+    // The input positions window o covers along an axis of n (LayoutArgs.Window): min(o·s − before + k, n) − max(o·s − before,
+    // 0), signed (a window may start in the leading pad).
+    private static V WindowSpan(Spv b, V o, V s, V before, V k, V n)
     {
-        var u = k - 1;
-        if (d is V dd) u = u * dd;
-        var span = (pad << 1) + size - u - 1;
-        var floor = span / s + 1;
-        if (ceil is not V cm) return floor;
-        var b = size.B;
-        var up = (span + s - 1) / s;
-        up = b.Select(up * s >= size + pad, up, up + 1);
-        return b.Select(cm != 0, up, floor);
-    }
-
-    // A convolution's output size with its leading and trailing pads (LayoutArgs.ConvOut): (pad + end + size − (k − 1)·d − 1) / s + 1.
-    private static V ConvSize(V size, V k, V s, V pad, V end, V d) => (pad + end + size - (k - 1) * d - 1) / s + 1;
-
-    // LayoutArgs.PoolDivisor: window (oh, ow)'s divisor, its `inside` count or, counting the pads (p[12] ≠ 0), its positions up
-    // to H + ph, W + pw (signed: a window may start in the leading pad).
-    private static V PoolDivisor(Spv b, V[] p, V oh, V ow, V inside)
-    {
-        V Extent(V o, V size, V k, V s, V pad)
-        {
-            var hs = b.Bitcast(o * s - pad, K.S32);
-            var he = b.Min(hs + b.Bitcast(k, K.S32), b.Bitcast(size + pad, K.S32));
-            return b.Bitcast(he - hs, K.U32);
-        }
-
-        var d = Extent(oh, p[1], p[3], p[5], p[7]) * Extent(ow, p[2], p[4], p[6], p[8]);
-        return b.Select(p[12] != 0, d, inside);
+        var from = b.Bitcast(o * s - before, K.S32);
+        var to = b.Min(from + b.Bitcast(k, K.S32), b.Bitcast(n, K.S32));
+        return b.Bitcast(to - b.Max(from, b.S(0)), K.U32);
     }
 
     // A bilinear axis as integers (LayoutArgs.BilinearAt): t = max(o·α + β, 0) (β may be negative), i0 = t / δ;
@@ -314,21 +290,21 @@ internal static partial class VkKernels
 
             case "col2im":
             {
-                // Output (ch, ih, iw = c), r = ch·H + ih: Σ over (a, bb) with (ih + ph − a·dh) = oh·sh, (iw + pw − bb·dw) = ow·sw in range.
-                V H = p[1], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8], dh = p[9], dw = p[10];
-                var OW = ConvSize(p[2], p[4], p[6], p[8], p[13], p[10]);
-                var OH = ConvSize(p[1], p[3], p[5], p[7], p[12], p[9]);
+                // Output (ch, ih, iw = c), r = ch·H + ih: Σ over (a, bb) with (ih + top − a·dh) = oh·sh, (iw + left − bb·dw) = ow·sw in range.
+                V H = p[1], kh = p[3], kw = p[4], sh = p[5], sw = p[6], top = p[7], left = p[8], dh = p[11], dw = p[12];
+                var OH = p[13];
+                var OW = p[14];
                 var ih = r % H;
                 var ch = r / H;
                 var plane = OH * OW;
                 var acc = b.Local(Zero());
                 b.For(b.U(0), kh, ka =>
                 {
-                    var th = ih + ph - ka * dh;                                         // may go negative: a signed test
+                    var th = ih + top - ka * dh;                                        // may go negative: a signed test
                     var okH = (b.Bitcast(th, K.S32) >= b.S(0)) & (th % sh == 0) & (th / sh < OH);
                     b.If(okH, () => b.For(b.U(0), kw, bb =>
                     {
-                        var tw = c + pw - bb * dw;
+                        var tw = c + left - bb * dw;
                         var okW = (b.Bitcast(tw, K.S32) >= b.S(0)) & (tw % sw == 0) & (tw / sw < OW);
                         b.If(okW, () =>
                         {
@@ -409,21 +385,22 @@ internal static partial class VkKernels
             case "avgpool":
             case "depthwise_conv":
             {
-                // r = ch·OH + oh, c = ow; the window over (a, bb) with the pads and dilations (1 for the pools).
+                // r = ch·OH + oh, c = ow; the window over (a, bb) from (oh·sh − top, ow·sw − left) with the dilations (1 for the
+                // pools); OH from LayoutArgs.KernelP. A pool's window holds an input value (LayoutArgs.Validate): no empty case.
                 bool max = name == "maxpool", conv = name == "depthwise_conv";
-                V H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8];
-                V dh = conv ? p[9] : b.U(1), dw = conv ? p[10] : b.U(1);
-                var OH = PoolSize(p[1], p[3], p[5], p[7], conv ? p[9] : null, p[11]);
+                V H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], top = p[7], left = p[8];
+                V dh = conv ? p[11] : b.U(1), dw = conv ? p[12] : b.U(1);
+                var OH = conv ? p[13] : p[11];
                 var oh = r % OH;
                 var ch = r / OH;
                 var acc = b.Local(max ? Identity(b, k, "max") : Zero());
                 var n = b.Local(b.U(0));
                 b.For(b.U(0), kh, ka =>
                 {
-                    var ih = oh * sh - ph + ka * dh;
+                    var ih = oh * sh - top + ka * dh;
                     b.If(ih < H, () => b.For(b.U(0), kw, bb =>                             // unsigned: negative rows are out of range
                     {
-                        var iw = c * sw - pw + bb * dw;
+                        var iw = c * sw - left + bb * dw;
                         b.If(iw < W, () =>
                         {
                             var xv = Load((ch * H + ih) * W + iw);
@@ -434,10 +411,8 @@ internal static partial class VkKernels
                         });
                     }));
                 });
-                if (conv) return acc.V;
-                var empty = n.V == 0;
-                if (max) return b.Select(empty, Zero(), acc.V);
-                return b.Select(empty, Zero(), acc.V / b.Convert(PoolDivisor(b, p, oh, c, n.V), k));
+                if (conv || max) return acc.V;
+                return acc.V / b.Convert(n.V, k);
             }
 
             case "maxpool_bwd":
@@ -445,20 +420,20 @@ internal static partial class VkKernels
             {
                 // Output (ch, ih, iw = c), r = ch·H + ih; x = dy (C × OH × OW), aux = each window's first-ranked (maxpool).
                 bool max = name == "maxpool_bwd";
-                V H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8];
-                var OH = PoolSize(p[1], p[3], p[5], p[7], null, p[11]);
-                var OW = PoolSize(p[2], p[4], p[6], p[8], null, p[11]);
+                V H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], top = p[7], left = p[8];
+                var OH = p[11];
+                var OW = p[12];
                 var ih = r % H;
                 var ch = r / H;
                 var me = (ch * H + ih) * W + c;
                 var acc = b.Local(Zero());
                 b.For(b.U(0), kh, ka =>
                 {
-                    var th = ih + ph - ka;
+                    var th = ih + top - ka;
                     var okH = (b.Bitcast(th, K.S32) >= b.S(0)) & (th % sh == 0) & (th / sh < OH);
                     b.If(okH, () => b.For(b.U(0), kw, bb =>
                     {
-                        var tw = c + pw - bb;
+                        var tw = c + left - bb;
                         var okW = (b.Bitcast(tw, K.S32) >= b.S(0)) & (tw % sw == 0) & (tw / sw < OW);
                         b.If(okW, () =>
                         {
@@ -473,18 +448,9 @@ internal static partial class VkKernels
                                 return;
                             }
 
-                            // The window (oh, ow): its valid count.
-                            var cnt = b.Local(b.U(0));
-                            b.For(b.U(0), kh, aa =>
-                            {
-                                var hh = oh * sh - ph + aa;
-                                b.If(hh < H, () => b.For(b.U(0), kw, bbb =>
-                                {
-                                    var ww = ow * sw - pw + bbb;
-                                    b.If(ww < W, () => cnt.V = cnt.V + 1);
-                                }));
-                            });
-                            acc.V = acc.V + dy / b.Convert(PoolDivisor(b, p, oh, ow, cnt.V), k);
+                            // The window (oh, ow): its n values, dy / n each.
+                            var cnt = WindowSpan(b, oh, sh, top, kh, H) * WindowSpan(b, ow, sw, left, kw, W);
+                            acc.V = acc.V + dy / b.Convert(cnt, k);
                         });
                     }));
                 });

@@ -10,7 +10,7 @@
 //   gather_rows   output[i] = x[index[i]] (a row each); gather_cols output[r][j] = x[r][index[j]]
 //   scatter_add_rows   output[index[i]] += x[i] (the embedding gradient): every output row sums its sources in source
 //              order (deterministic on both devices)
-//   im2col     x (C × H × W) to columns ((C·kh·kw) × (OH·OW)) for a kernel kh × kw, strides, pads, dilations;
+//   im2col     x (C × H × W) to columns ((C·kh·kw) × (OH·OW)) for a kernel kh × kw, strides, a pad a side, dilations;
 //   col2im     the reverse sum (each input pixel gathers its column entries in kernel order: exact order)
 //   interpolate   x (C × H × W) resized to (C × OH × OW), nearest or bilinear, along each axis the source coordinate
 //              s = (o·α + β) / δ exact in integers (LayoutArgs.NearestAt, BilinearAt); its backward gathers each input
@@ -18,12 +18,13 @@
 //   shift      output[r][c] = x[r][c − k] inside the row, 0 outside (k may be negative)
 //   pad2d      rows × cols into rows × newCols: the row's values then zeros (the operands of a product whose shape the
 //              product kernels' vector loads cannot take as stored)
-//   maxpool / avgpool   x (C × H × W) over kh × kw windows at strides and pads (pads excluded from a window's count unless
-//              counted: LayoutArgs.PoolDivisor; ceil mode by LayoutArgs.PoolOut)
+//   maxpool / avgpool   x (C × H × W) over kh × kw windows at strides with a pad a side (LayoutArgs.PoolOut): max the
+//              window's first-ranked value, avg the mean of its values (a pad is no value)
 //   maxpool_bwd / avgpool_bwd   dx from dy: each input pixel gathers the windows it lies in (the first largest wins a
 //              maxpool tie, recomputed: deterministic)
 //   adaptive_maxpool / adaptive_avgpool   x (C × H × W) to C × OH × OW with windows [⌊i·H/OH⌋, ⌈(i + 1)·H/OH⌉)
-//   depthwise_conv   y[c][oh][ow] = Σ w[c][a][b] · x[c][oh·sh − ph + a·dh][ow·sw − pw + b·dw] (the weights as a second input)
+//   depthwise_conv   y[c][oh][ow] = Σ w[c][a][b] · x[c][oh·sh − top + a·dh][ow·sw − left + b·dw] (the weights as a second
+//              input; x 0 off the image)
 
 using System.Buffers;
 using System.Numerics;
@@ -172,6 +173,7 @@ internal sealed partial class Kernels
     private static void Move<TN, TLane, TL>(LayoutArgs k, int rows, int cols, long[]? at, bool inLanes = false)
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
     {
+        if ((long)rows * cols == 0) return;                                        // no outputs (a window longer than its image)
         int wanted = Math.Max(1, rows / (Threads * 4)), chunk = RowChunk<TN>(rows, cols, wanted), g = TN.Granularity;
         if (g <= 1 || chunk <= 2 * wanted)
         {
@@ -258,6 +260,15 @@ internal sealed partial class Kernels
     }
 
     private static (int Rows, int Cols) OutputRows(LayoutArgs k) => LayoutArgs.OutputRows(k);
+
+    // A mean in the lane: sum / n, one rounding (the devices' division); the float lanes' scalar division where the lane is
+    // one (the JIT keeps only the branch of the lane).
+    private static TLane Mean<TLane, TL>(TLane sum, int n) where TLane : unmanaged where TL : struct, ILane<TL, TLane>
+    {
+        if (typeof(TLane) == typeof(float)) { float m = Unsafe.As<TLane, float>(ref sum) / n; return Unsafe.As<float, TLane>(ref m); }
+        if (typeof(TLane) == typeof(double)) { double m = Unsafe.As<TLane, double>(ref sum) / n; return Unsafe.As<double, TLane>(ref m); }
+        return TL.Div(new Vector<TLane>(sum), new Vector<TLane>(TL.From(n)))[0];
+    }
 
     // A bilinear axis's weights in the lane: f = rem / δ (one rounding), g = 1 − f.
     private static (TLane F, TLane G) Weights<TLane, TL>(int rem, int delta) where TLane : unmanaged where TL : struct, ILane<TL, TLane>
@@ -496,10 +507,10 @@ internal sealed partial class Kernels
                             int b = r % kw, a = r / kw % kh, c = r / (kw * kh);
                             for (int oh = 0; oh < OH; oh++)
                             {
-                                int ih = oh * p[5] - p[7] + a * p[9];
+                                int ih = oh * p[5] - p[7] + a * p[11];
                                 for (int ow = 0; ow < OW; ow++)
                                 {
-                                    int iw = ow * p[6] - p[8] + b * p[10];
+                                    int iw = ow * p[6] - p[8] + b * p[12];
                                     o[oh * OW + ow] = (uint)ih < (uint)H && (uint)iw < (uint)W ? input[((long)c * H + ih) * W + iw] : TL.Zero;
                                 }
                             }
@@ -511,18 +522,18 @@ internal sealed partial class Kernels
                         {
                             // Input pixel (c, ih, iw = col): every (a, b, oh, ow) that maps onto it, in kernel order.
                             var (OH, OW) = LayoutArgs.ConvOut(p);
-                            int H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8], dh = p[9], dw = p[10];
+                            int H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], top = p[7], left = p[8], dh = p[11], dw = p[12];
                             int ih = r % H, c = r / H;
                             for (int iw = 0; iw < W; iw++)
                             {
                                 TLane acc = TL.Zero;
                                 for (int a = 0; a < kh; a++)
                                 {
-                                    int th = ih + ph - a * dh;
+                                    int th = ih + top - a * dh;
                                     if (th < 0 || th % sh != 0 || th / sh >= OH) continue;
                                     for (int b = 0; b < kw; b++)
                                     {
-                                        int tw = iw + pw - b * dw;
+                                        int tw = iw + left - b * dw;
                                         if (tw < 0 || tw % sw != 0 || tw / sw >= OW) continue;
                                         acc = TL.Add(acc, input[((long)((c * kh + a) * kw + b) * (OH * OW)) + (th / sh) * OW + tw / sw]);
                                     }
@@ -608,8 +619,9 @@ internal sealed partial class Kernels
                         case "maxpool":
                         case "avgpool":
                         {
+                            // Every window holds an input value (LayoutArgs.Validate): the mean is the sum over its n values / n.
                             var (OH, OW) = LayoutArgs.PoolOut(p);
-                            int H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8];
+                            int H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], top = p[7], left = p[8];
                             int oh = r % OH, c = r / OH;
                             bool max = k.Name == "maxpool";
                             for (int ow = 0; ow < OW; ow++)
@@ -618,11 +630,11 @@ internal sealed partial class Kernels
                                 int n = 0;
                                 for (int a = 0; a < kh; a++)
                                 {
-                                    int ih = oh * sh - ph + a;
+                                    int ih = oh * sh - top + a;
                                     if ((uint)ih >= (uint)H) continue;
                                     for (int b = 0; b < kw; b++)
                                     {
-                                        int iw = ow * sw - pw + b;
+                                        int iw = ow * sw - left + b;
                                         if ((uint)iw >= (uint)W) continue;
                                         TLane v = input[((long)c * H + ih) * W + iw];
                                         acc = max ? (n == 0 || Widths.Compare(v, acc) > 0 ? v : acc) : TL.Add(acc, v);
@@ -630,7 +642,7 @@ internal sealed partial class Kernels
                                     }
                                 }
 
-                                o[ow] = n == 0 ? TL.Zero : max ? acc : TL.Mul(acc, TL.From(1.0 / LayoutArgs.PoolDivisor(p, oh, ow, n)));
+                                o[ow] = max ? acc : Mean<TLane, TL>(acc, n);
                             }
 
                             break;
@@ -641,7 +653,7 @@ internal sealed partial class Kernels
                         {
                             // Input pixel (c, ih, iw = col): the windows it lies in; maxpool: those whose first largest it is.
                             var (OH, OW) = LayoutArgs.PoolOut(p);
-                            int H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8];
+                            int H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], top = p[7], left = p[8];
                             int ih = r % H, c = r / H;
                             bool max = k.Name == "maxpool_bwd";
                             if (max && at is not null)
@@ -652,7 +664,7 @@ internal sealed partial class Kernels
                                 long rowAt = (long)c * H + ih;
                                 for (int a = 0; a < kh; a++)
                                 {
-                                    int th = ih + ph - a;
+                                    int th = ih + top - a;
                                     if (th < 0 || th % sh != 0 || th / sh >= OH) continue;
                                     int oh = th / sh;
                                     for (int ow = OW - 1; ow >= 0; ow--)
@@ -670,20 +682,21 @@ internal sealed partial class Kernels
                                 TLane acc = TL.Zero;
                                 for (int a = 0; a < kh; a++)
                                 {
-                                    int th = ih + ph - a;
+                                    int th = ih + top - a;
                                     if (th < 0 || th % sh != 0 || th / sh >= OH) continue;
                                     int oh = th / sh;
                                     for (int b = 0; b < kw; b++)
                                     {
-                                        int tw = iw + pw - b;
+                                        int tw = iw + left - b;
                                         if (tw < 0 || tw % sw != 0 || tw / sw >= OW) continue;
                                         int ow = tw / sw;
                                         TLane dy = input[((long)c * OH + oh) * OW + ow];
                                         if (!max)
                                         {
-                                            int n = 0;
-                                            for (int aa = 0; aa < kh; aa++) { int hh = oh * sh - ph + aa; if ((uint)hh >= (uint)H) continue; for (int bb = 0; bb < kw; bb++) { int ww = ow * sw - pw + bb; if ((uint)ww < (uint)W) n++; } }
-                                            acc = TL.Add(acc, TL.Mul(dy, TL.From(1.0 / LayoutArgs.PoolDivisor(p, oh, ow, n))));
+                                            // The window's share: dy over its n values.
+                                            var (h0, h1) = LayoutArgs.Window(oh, H, kh, sh, top);
+                                            var (w0, w1) = LayoutArgs.Window(ow, W, kw, sw, left);
+                                            acc = TL.Add(acc, Mean<TLane, TL>(dy, (h1 - h0) * (w1 - w0)));
                                             continue;
                                         }
 
@@ -692,11 +705,11 @@ internal sealed partial class Kernels
                                         TLane best = TL.From(double.NegativeInfinity);
                                         for (int aa = 0; aa < kh; aa++)
                                         {
-                                            int hh = oh * sh - ph + aa;
+                                            int hh = oh * sh - top + aa;
                                             if ((uint)hh >= (uint)H) continue;
                                             for (int bb = 0; bb < kw; bb++)
                                             {
-                                                int ww = ow * sw - pw + bb;
+                                                int ww = ow * sw - left + bb;
                                                 if ((uint)ww >= (uint)W) continue;
                                                 TLane v = second![((long)c * H + hh) * W + ww];
                                                 if (bestAt < 0 || Widths.Compare(v, best) > 0) { best = v; bestAt = ((long)c * H + hh) * W + ww; }
@@ -732,7 +745,7 @@ internal sealed partial class Kernels
                                     unset = false;
                                 }
 
-                                o[ow] = max ? acc : TL.Mul(acc, TL.From(1.0 / ((h1 - h0) * (w1 - w0))));
+                                o[ow] = max ? acc : Mean<TLane, TL>(acc, (h1 - h0) * (w1 - w0));
                             }
 
                             break;
@@ -757,7 +770,7 @@ internal sealed partial class Kernels
                                     for (int ow = 0; ow < OW; ow++)
                                     {
                                         var (w0, w1) = LayoutArgs.Adaptive(ow, W, OW);
-                                        TLane share = TL.Mul(input[((long)c * OH + oh) * OW + ow], TL.From(1.0 / ((h1 - h0) * (w1 - w0))));
+                                        TLane share = Mean<TLane, TL>(input[((long)c * OH + oh) * OW + ow], (h1 - h0) * (w1 - w0));
                                         for (int iw = w0; iw < w1; iw++) o[iw] = TL.Add(o[iw], share);
                                     }
                                 }
@@ -796,7 +809,7 @@ internal sealed partial class Kernels
                                         var (w0, w1) = LayoutArgs.Adaptive(ow, W, OW);
                                         if (iw < w0 || iw >= w1) continue;
                                         TLane dy = input[((long)c * OH + oh) * OW + ow];
-                                        if (!max) { acc = TL.Add(acc, TL.Mul(dy, TL.From(1.0 / ((h1 - h0) * (w1 - w0))))); continue; }
+                                        if (!max) { acc = TL.Add(acc, Mean<TLane, TL>(dy, (h1 - h0) * (w1 - w0))); continue; }
                                         long bestAt = -1;
                                         TLane best = TL.Zero;
                                         for (int hh = h0; hh < h1; hh++) for (int ww = w0; ww < w1; ww++)
@@ -817,8 +830,8 @@ internal sealed partial class Kernels
 
                         case "depthwise_conv":
                         {
-                            var (OH, OW) = LayoutArgs.PoolOut(p);
-                            int H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8], dh = p[9], dw = p[10];
+                            var (OH, OW) = LayoutArgs.ConvOut(p);
+                            int H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], top = p[7], left = p[8], dh = p[11], dw = p[12];
                             int oh = r % OH, c = r / OH;
                             if (sw == 1)
                             {
@@ -831,13 +844,13 @@ internal sealed partial class Kernels
                                 int vl = Vector<TLane>.Count;
                                 for (int a = 0; a < kh; a++)
                                 {
-                                    int ih = oh * sh - ph + a * dh;
+                                    int ih = oh * sh - top + a * dh;
                                     if ((uint)ih >= (uint)H) continue;
                                     long rowAt = ((long)c * H + ih) * W;
                                     var line = input.Span(rowAt, W, source);
                                     for (int b = 0; b < kw; b++)
                                     {
-                                        int off = b * dw - pw, lo = Math.Max(0, -off), hi = Math.Min(OW, W - off);
+                                        int off = b * dw - left, lo = Math.Max(0, -off), hi = Math.Min(OW, W - off);
                                         if (lo >= hi) continue;
                                         TLane wv = second![(long)(c * kh + a) * kw + b];
                                         var wvec = new Vector<TLane>(wv);
@@ -858,11 +871,11 @@ internal sealed partial class Kernels
                                 TLane acc = TL.Zero;
                                 for (int a = 0; a < kh; a++)
                                 {
-                                    int ih = oh * sh - ph + a * dh;
+                                    int ih = oh * sh - top + a * dh;
                                     if ((uint)ih >= (uint)H) continue;
                                     for (int b = 0; b < kw; b++)
                                     {
-                                        int iw = ow * sw - pw + b * dw;
+                                        int iw = ow * sw - left + b * dw;
                                         if ((uint)iw >= (uint)W) continue;
                                         acc = TL.Fma(second![(long)(c * kh + a) * kw + b], input[((long)c * H + ih) * W + iw], acc);
                                     }
