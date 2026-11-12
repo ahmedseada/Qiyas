@@ -406,10 +406,12 @@ internal static partial class Ptx
     /// one after another, each window's first-ranked in Adad's order (First: the order's max, a NaN where there is one) by
     /// the warp's lanes and shuffles, the word stored by lane 0. The order's max is the same whichever way the window is
     /// walked. Params as Layout's.</summary>
-    public static string AdaptiveMaxWarp(Gpu gpu, Fmt f, Lane lane, out string entry)
+    /// <summary>inFmt: the input's format where it is not f's (a block format's input read where it is stored, f the f32
+    /// lane storage its blocks are encoded from after).</summary>
+    public static string AdaptiveMaxWarp(Gpu gpu, Fmt f, Lane lane, out string entry, Fmt? inFmt = null)
     {
         if (f.IsBlock) throw new NotSupportedException("a block format's output takes the block kernels");
-        entry = $"layout_adaptive_maxpool_warp_{f.Name}_{lane.Name}";
+        entry = $"layout_adaptive_maxpool_warp_{f.Name}_{lane.Name}{(inFmt is null ? "" : "_i" + inFmt.Name)}";
         var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R(), word = b.R(), wl = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
@@ -438,7 +440,7 @@ internal static partial class Ptx
             b.L($"mad.lo.u32 {v}, {word}, {f.Per}, {i};");
             b.L($"setp.lt.u32 {pv}, {v}, {count};");
             b.L($"min.u32 {v}, {v}, {last};");
-            var (best, _) = AdaptiveWindowWarp(b, f, lane, x, p, v, wl, false, $"AW{i}");
+            var (best, _) = AdaptiveWindowWarp(b, inFmt ?? f, lane, x, p, v, wl, false, $"AW{i}");
             string stored = lane == natural ? best : Codec.Convert(b, lane, best, natural, f);
             string kept = natural.NewReg(b);
             b.L($"selp.{natural.Reg} {kept}, {stored}, {natural.Zero}, {pv};");

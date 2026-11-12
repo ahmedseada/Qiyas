@@ -122,6 +122,27 @@ public sealed partial class GpuOps
 
             args[0] = x; args[1] = x2; args[2] = idx; args[3] = aux; args[4] = output; args[5] = Gpu.U(k.Count); args[6] = Gpu.U(rows); args[7] = Gpu.U(cols);
             Ptx.LayoutDivisors(args);
+            if (f.IsBlock && k.Name == "adaptive_maxpool" && inFmt is null && Ptx.AdaptiveByWarp(k.P))
+            {
+                // A block format's large windows: a warp each over the blocks where they are stored, the values into f32 lane
+                // storage, then encoded by blocks (a warp or a CTA a block took every window of its block's values alone).
+                var f32 = Fmt.Of<Float32>();
+                ulong lanes = gpu.Rent(Math.Max(16, (long)k.Count * 4));
+                try
+                {
+                    var fw = gpu.Cached($"layout_adaptive_max_warp:{f32.Name}:{Lane.F32.Name}:{f.Name}", (out string e) => Ptx.AdaptiveMaxWarp(gpu, f32, Lane.F32, out e, f));
+                    args[4] = lanes;
+                    Gpu.Launch(fw, Grid(k.Count * 32L, 256), 1, 256, 1, 0, args);
+                    Back(f, Lane.F32, lanes, output, k.Count);
+                }
+                finally
+                {
+                    gpu.Return(lanes);
+                }
+
+                return "f32 (blocks in place)";
+            }
+
             if (f.IsBlock)
             {
                 var fb = gpu.Cached($"layout_blocks:{kn}:{f.Name}:{inFmt?.Name}", (out string e) => Ptx.LayoutBlocks(gpu, f, kn, out e, inFmt));
