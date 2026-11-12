@@ -76,7 +76,7 @@ public static class Ops
         return Math.Round(a) != a ? double.NaN : Math.Abs(a % 2) == 1 ? -m : m;
     }
 
-    private static readonly (double, double) Unit = (-1, 1), Positive = (0.5, 4), Any = (-4, 4), Wide = (-20, 20);
+    private static readonly (double, double) Positive = (0.5, 4), Any = (-4, 4), Wide = (-20, 20);
     private const string Cond = " (ill-conditioned past |x| ≈ 3: the result follows σ or sech² of a rounded argument that grows as |x|³, so its error in ulps grows with |x|)";
 
     /// <summary>The catalogue, in Adad's own terms. Integer types run every formula that is not FloatOnly in their own lane

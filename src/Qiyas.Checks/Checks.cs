@@ -293,12 +293,12 @@ internal static partial class Checks
             Half(0.5f, block, 0);
             for (int i = 0; i < 32; i++) block[2 + i] = (byte)(sbyte)(i - 16);
             Blocks.DecodeQ8_0(block, v);
-            for (int i = 0; i < 32; i++) if (v[i] != 0.5f * (i - 16)) { ok = false; Console.WriteLine($"check block q8_0 spec: value {i} = {v[i]}, expected {0.5f * (i - 16)}"); break; }
+            for (int i = 0; i < 32; i++) if (v[i] != 0.5f * (i - 16)) { ok = false; Console.WriteLine($"check block q8_0 spec DIFFERS: value {i} = {v[i]}, expected {0.5f * (i - 16)}"); break; }
             var back = new byte[34];
             Blocks.EncodeQ8_0(v.AsSpan(0, 32), back);
             float dEnc = (float)BitConverter.ToHalf(back.AsSpan(0, 2));
             Blocks.DecodeQ8_0(back, v);
-            for (int i = 0; i < 32; i++) if (Off(Gap(v[i], 0.5f * (i - 16)), 0.5f * dEnc + 1e-6f)) { ok = false; Console.WriteLine($"check block q8_0 spec: round trip value {i} = {v[i]} (scale {dEnc})"); break; }
+            for (int i = 0; i < 32; i++) if (Off(Gap(v[i], 0.5f * (i - 16)), 0.5f * dEnc + 1e-6f)) { ok = false; Console.WriteLine($"check block q8_0 spec DIFFERS: round trip value {i} = {v[i]} (scale {dEnc})"); break; }
         }
 
         // Q4_0: d = 0.25; byte 2 + j holds value j in its low nibble and value j + 16 in its high nibble; value = d·(q − 8).
@@ -309,7 +309,7 @@ internal static partial class Checks
             Blocks.DecodeQ4_0(block, v);
             for (int j = 0; j < 16; j++)
             {
-                if (v[j] != 0.25f * (j - 8) || v[j + 16] != 0.25f * (15 - j - 8)) { ok = false; Console.WriteLine($"check block q4_0 spec: values {j}, {j + 16} = {v[j]}, {v[j + 16]}"); break; }
+                if (v[j] != 0.25f * (j - 8) || v[j + 16] != 0.25f * (15 - j - 8)) { ok = false; Console.WriteLine($"check block q4_0 spec DIFFERS: values {j}, {j + 16} = {v[j]}, {v[j + 16]}"); break; }
             }
         }
 
@@ -337,7 +337,7 @@ internal static partial class Checks
             for (int j = 0; j < 8 && ok; j++) for (int i = 0; i < 32; i++)
             {
                 float want = 1f * ls[j] * ((i + j) & 15) - 0.5f * lm[j];
-                if (v[j * 32 + i] != want) { ok = false; Console.WriteLine($"check block q4_k spec: sub-block {j} value {i} = {v[j * 32 + i]}, expected {want}"); break; }
+                if (v[j * 32 + i] != want) { ok = false; Console.WriteLine($"check block q4_k spec DIFFERS: sub-block {j} value {i} = {v[j * 32 + i]}, expected {want}"); break; }
             }
         }
 
@@ -367,7 +367,7 @@ internal static partial class Checks
             for (int j = 0; j < 16 && ok; j++) for (int i = 0; i < 16; i++)
             {
                 float want = 0.125f * (j - 8) * (((i * 3 + j) & 63) - 32);
-                if (v[j * 16 + i] != want) { ok = false; Console.WriteLine($"check block q6_k spec: sub-block {j} value {i} = {v[j * 16 + i]}, expected {want}"); break; }
+                if (v[j * 16 + i] != want) { ok = false; Console.WriteLine($"check block q6_k spec DIFFERS: sub-block {j} value {i} = {v[j * 16 + i]}, expected {want}"); break; }
             }
         }
 
@@ -450,7 +450,7 @@ internal static partial class Checks
             var (wantV, wantI) = Routing.TopKReference(xv, rows, cols, k);
             var values = new byte[Bench.Registry.Bytes(type, rows * k)];
             var indices = new int[rows * k];
-            Bench.Registry.With(type, new TopKRun(ops, x, rows, cols, k, values, indices, null, null, null, null));
+            Bench.Registry.With(type, new TopKRun(ops, x, rows, cols, k, values, indices, null, null));
             // Ties (the narrow types have many): the values and the columns exactly, an equal value by the lower column.
             ok &= Close(type, "topk values", where, values, wantV, rows * k);
             int bad = 0;
@@ -458,7 +458,7 @@ internal static partial class Checks
             if (bad > 0) { Console.WriteLine($"check topk indices  {where,-6} {type,-12} DIFFERS at {bad} places"); ok = false; }
             var index = Enumerable.Range(0, rows).Select(_ => random.Next(cols)).ToArray();
             var picked = new byte[Bench.Registry.Bytes(type, rows)];
-            Bench.Registry.With(type, new TopKRun(ops, x, rows, cols, 0, null, null, index, picked, null, null));
+            Bench.Registry.With(type, new TopKRun(ops, x, rows, cols, 0, null, null, index, picked));
             ok &= Close(type, "pick", where, picked, Routing.PickReference(xv, rows, cols, index), rows);
             // k = cols (3 of 3 columns, the first row among them): the whole row in order; k past the row refused (the k
             // largest of fewer values are not defined); and pick at a column outside the row (-1, cols): 0, nothing read.
@@ -469,19 +469,19 @@ internal static partial class Checks
                 var (pv, pi) = Routing.TopKReference(pxv, pr, pc, pk);
                 var pvalues = new byte[Bench.Registry.Bytes(type, pr * pk)];
                 var pindices = new int[pr * pk];
-                Bench.Registry.With(type, new TopKRun(ops, px, pr, pc, pk, pvalues, pindices, null, null, null, null));
+                Bench.Registry.With(type, new TopKRun(ops, px, pr, pc, pk, pvalues, pindices, null, null));
                 ok &= Close(type, "topk values of the whole row", where, pvalues, pv, pr * pk);
                 int pbad = 0;
                 for (int i = 0; i < pr * pk; i++) if (pindices[i] != pi[i]) pbad++;
 
                 if (pbad > 0) { Console.WriteLine($"check topk indices of the whole row {where,-6} {type,-12} DIFFERS at {pbad} places"); ok = false; }
                 bool refused = false;
-                try { Bench.Registry.With(type, new TopKRun(ops, px, pr, pc, pc + 2, new byte[Bench.Registry.Bytes(type, pr * (pc + 2))], new int[pr * (pc + 2)], null, null, null, null)); }
+                try { Bench.Registry.With(type, new TopKRun(ops, px, pr, pc, pc + 2, new byte[Bench.Registry.Bytes(type, pr * (pc + 2))], new int[pr * (pc + 2)], null, null)); }
                 catch (ArgumentException) { refused = true; }
                 if (!refused) { Console.WriteLine($"check topk past the row {where,-6} {type,-12} FAILS: k = {pc + 2} of {pc} columns was not refused"); ok = false; }
                 var outside = Enumerable.Range(0, pr).Select(r => r % 3 == 0 ? -1 : r % 3 == 1 ? pc : r % pc).ToArray();
                 var ppicked = new byte[Bench.Registry.Bytes(type, pr)];
-                Bench.Registry.With(type, new TopKRun(ops, px, pr, pc, 0, null, null, outside, ppicked, null, null));
+                Bench.Registry.With(type, new TopKRun(ops, px, pr, pc, 0, null, null, outside, ppicked));
                 ok &= Close(type, "pick outside the row", where, ppicked, Routing.PickReference(pxv, pr, pc, outside), pr);
             }
 
@@ -592,7 +592,7 @@ internal static partial class Checks
         var (wantV, wantI) = Routing.TopKReference(xv, rows, cols, k);
         var values = new byte[Bench.Registry.Bytes(type, rows * k)];
         var indices = new int[rows * k];
-        Bench.Registry.With(type, new TopKRun(ops, x, rows, cols, k, values, indices, null, null, null, null));
+        Bench.Registry.With(type, new TopKRun(ops, x, rows, cols, k, values, indices, null, null));
         var got = Bench.Registry.Values(type, values, rows * k);
         int badI = 0, badV = 0;
         for (int i = 0; i < rows * k; i++)
@@ -619,7 +619,7 @@ internal static partial class Checks
         return ok;
     }
 
-    private sealed class TopKRun(IDevice<ulong, ulong>? ops, byte[] x, int rows, int cols, int k, byte[]? values, int[]? indices, int[]? index, byte[]? picked, object? u1, object? u2) : Bench.ITypeVisitor<bool>
+    private sealed class TopKRun(IDevice<ulong, ulong>? ops, byte[] x, int rows, int cols, int k, byte[]? values, int[]? indices, int[]? index, byte[]? picked) : Bench.ITypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IAdad<TN, float>
         {
@@ -1792,7 +1792,7 @@ internal static partial class Checks
                 exact += c;
                 double value = values[r];
                 double step = Math.Pow(2, Math.Floor(Math.Log2(Math.Abs(exact))) - 23);
-                if (Off(Gap(value, exact), step)) { Console.WriteLine($"check {axis} {op} {type} device row {r}: {value:R} against {exact:R} ({Steps(Gap(value, exact), step):0.##} f32 steps, lane {lane})"); ok = false; }
+                if (Off(Gap(value, exact), step)) { Console.WriteLine($"check {axis} {op} {type} device row {r} DIFFERS: {value:R} against {exact:R} ({Steps(Gap(value, exact), step):0.##} f32 steps, lane {lane})"); ok = false; }
                 }
             }
         }
@@ -2447,7 +2447,7 @@ internal static partial class Checks
             }
         }
 
-        Console.WriteLine($"check {name + " (ulps)",-36} {x.Length,9} values: worst {worst:0.00} ulp at x = {x[worstAt]:R}{(worst <= maxUlp ? "" : "  TOO FAR")}");
+        Console.WriteLine($"check {name + " (ulps)",-36} {x.Length,9} values: worst {worst:0.00} ulp at x = {x[worstAt]:R}{(worst <= maxUlp ? "" : "  DIFFERS: too far")}");
         return worst <= maxUlp;
     }
 
@@ -2469,7 +2469,7 @@ internal static partial class Checks
             }
         }
 
-        Console.WriteLine($"check {name + " (ulps)",-36} {x.Length,9} values: worst {worst:0.00} ulp at x = {x[worstAt]:R}{(worst <= maxUlp ? "" : "  TOO FAR")}");
+        Console.WriteLine($"check {name + " (ulps)",-36} {x.Length,9} values: worst {worst:0.00} ulp at x = {x[worstAt]:R}{(worst <= maxUlp ? "" : "  DIFFERS: too far")}");
         return worst <= maxUlp;
     }
 
@@ -2757,7 +2757,7 @@ internal static partial class Checks
             }
 
             string name = scaled ? "sliced float64 (rows, columns scaled)" : "sliced float64 product";
-            Console.WriteLine($"check {name,-36} {M * N,9} values: worst {worst:0.000} ulp at {worstAt}{(worst <= 1 ? "" : "  TOO FAR")}");
+            Console.WriteLine($"check {name,-36} {M * N,9} values: worst {worst:0.000} ulp at {worstAt}{(worst <= 1 ? "" : "  DIFFERS: too far")}");
             ok &= worst <= 1;
         }
 
@@ -2948,7 +2948,7 @@ internal static partial class Checks
             }
         }
 
-        Console.WriteLine($"check {"exp f32 (ulps)",-36} {x.Length,9} values: worst {worst:0.00} ulp at x = {x[worstAt]:R}{(worst <= 1.5 ? "" : "  TOO FAR")}");
+        Console.WriteLine($"check {"exp f32 (ulps)",-36} {x.Length,9} values: worst {worst:0.00} ulp at x = {x[worstAt]:R}{(worst <= 1.5 ? "" : "  DIFFERS: too far")}");
         return worst <= 1.5;
     }
 
@@ -2970,7 +2970,7 @@ internal static partial class Checks
             }
         }
 
-        Console.WriteLine($"check {"exp f64 (ulps)",-36} {x.Length,9} values: worst {worst:0.00} ulp at x = {x[worstAt]:R}{(worst <= 2 ? "" : "  TOO FAR")}");
+        Console.WriteLine($"check {"exp f64 (ulps)",-36} {x.Length,9} values: worst {worst:0.00} ulp at x = {x[worstAt]:R}{(worst <= 2 ? "" : "  DIFFERS: too far")}");
         return worst <= 2;
     }
 

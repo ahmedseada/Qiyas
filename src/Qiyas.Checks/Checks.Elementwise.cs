@@ -388,7 +388,7 @@ internal static partial class Checks
                         : from == "uint64" ? MemoryMarshal.Cast<byte, ulong>(x.AsSpan()).ToArray().Select(l => (double)(float)l).ToArray()
                         : Bench.Registry.Values(from, x, N).Select(d => (double)(float)d).ToArray();
                     var want = Bench.Registry.Encode(to, f32);
-                    if (!cpu.AsSpan().SequenceEqual(want.AsSpan(0, cpu.Length))) { Console.WriteLine($"check convert {from}->{to,-14} cpu    the blocks differ from the encoder's of the values as float32"); ok = false; }
+                    if (!cpu.AsSpan().SequenceEqual(want.AsSpan(0, cpu.Length))) { Console.WriteLine($"check convert {from}->{to,-14} cpu    DIFFERS: the blocks are not the encoder's of the values as float32"); ok = false; }
                     continue;
                 }
 

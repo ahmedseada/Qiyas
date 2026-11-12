@@ -43,12 +43,12 @@ internal sealed partial class Kernels
             // would re-encode their block row by row).
             bool lanes = TN.Granularity > 8;
             var output = lanes ? new byte[(long)rows * k * System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>()] : values;
-            Team.For(rows, Kernels.RowChunk<TN>(rows, k, rows / (Threads * 4)), (long)rows * cols * 4, new TopKBody<TN, TLane, TL>(x, rows, cols, k, output, indices, lanes));
+            Team.For(rows, Kernels.RowChunk<TN>(rows, k, rows / (Threads * 4)), (long)rows * cols * 4, new TopKBody<TN, TLane, TL>(x, cols, k, output, indices, lanes));
             if (lanes) StoreLanes<TN, TLane>(output, values, 0, (long)rows * k);
         }
     }
 
-    private struct TopKBody<TN, TLane, TL>(byte[] x, int rows, int cols, int k, byte[] values, int[] indices, bool lanes) : Team.IBody
+    private struct TopKBody<TN, TLane, TL>(byte[] x, int cols, int k, byte[] values, int[] indices, bool lanes) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
     {
         public readonly void Run(int first, int last)

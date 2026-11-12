@@ -504,7 +504,7 @@ internal static partial class Ptx
 
         /// <summary>x·σ(t + lo) as x / (1 + e^(−t)·(1 − lo)), the denominator's sum split exactly and its low part
         /// folded into the quotient: one rounding fewer than x times the rounded σ(t).</summary>
-        public string XSigmoid(string x, string t, string lo = null)
+        public string XSigmoid(string x, string t, string? lo = null)
         {
             if (lane.Wide) return Mul(x, Sigmoid(t));
             string e = Exp(Neg(t));
