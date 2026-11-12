@@ -32,9 +32,16 @@ internal sealed partial class Kernels
     {
         if (format is not ("q8_0" or "q4_0") || k % 32 != 0) throw new NotSupportedException($"{format}: the block product takes Q8_0 or Q4_0 with k in whole blocks");
         if (!S8Dot.IsSupported) throw new NotSupportedException("the block product needs the s8 dot lane");
+        if (k == 0)
+        {
+            // A sum of no terms: C = 0 (the panels below would divide by k).
+            cLanes.AsSpan(0, (int)((long)m * n * 4)).Clear();
+            return "s8dp blocks";
+        }
+
         // B's panel: as many of its rows as fit BlockPanelBytes of int8 values and scales (2·k bytes a row), all of them
         // when they do.
-        int panel = (int)Math.Clamp(BlockPanelBytes / (2L * k), 2, n);
+        int panel = (int)Math.Max(1, Math.Min(n, Math.Max(2, BlockPanelBytes / (2L * k))));        // n below 2: Clamp's bounds would cross
         var qb = new sbyte[(long)panel * k];
         var sb = new float[(long)panel * k / 4];
         for (int j0 = 0; j0 < n; j0 += panel)
@@ -56,7 +63,7 @@ internal sealed partial class Kernels
     private static readonly Dictionary<string, bool> s_blocksFaster = [];
 
     private static bool BlockView<TN>(ProductView v) where TN : struct, IAdad<TN> =>
-        TN.Name is "q8_0" or "q4_0" && v.Batch == 1 && !v.TransA && v.TransB && v.K % 32 == 0 && BlockProductAvailable;
+        TN.Name is "q8_0" or "q4_0" && v.Batch == 1 && !v.TransA && v.TransB && v.K > 0 && v.K % 32 == 0 && BlockProductAvailable;
 
     /// <summary>The block product for the view (A·Bᵀ), C encoded to the type by blocks.</summary>
     public static string MatMulViewBlocks<TN>(ProductView v, byte[] a, byte[] b, byte[] c) where TN : struct, IAdad<TN>
