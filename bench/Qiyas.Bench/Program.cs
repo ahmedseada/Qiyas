@@ -27,6 +27,7 @@ using Qiyas;
 using Qiyas.Bench;
 
 CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;
+FullSpeed.Process();                                                   // every subject timed on the hardware, not Windows' policy
 Watched.Install();                                                     // a failing line keeps the run's proofs unwritten (Proof.cs)
 var options = Options.Parse(args);
 Bench.Odd = options.Shapes == "odd";
@@ -1499,7 +1500,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         sb.AppendLine("# Qiyas bench");
         sb.AppendLine();
         sb.AppendLine(string.Create(CultureInfo.InvariantCulture,
-            $"{DateTime.Now:yyyy-MM-dd HH:mm}. Median wall time (ms){(options.Repeat > 1 ? $" of {options.Repeat} readings, the subjects in turn" : "")}; `×` = {_baseline} ÷ subject (above 1: faster than {_baseline}). `err` = largest |result − float64 math on the same stored inputs| as the type defines the result (a type that is not float: rounded as it rounds and held to its range; a float type: held where it saturates). `lane` = what the subject computed in.{(CoolDownSeconds > 0 ? $" Timed after {CoolDownSeconds} s idle following the gates (the processor's boost budget recovered)." : "")}"));
+            $"{DateTime.Now:yyyy-MM-dd HH:mm}. {FullSpeed.Said} Median wall time (ms){(options.Repeat > 1 ? $" of {options.Repeat} readings, the subjects in turn" : "")}; `×` = {_baseline} ÷ subject (above 1: faster than {_baseline}). `err` = largest |result − float64 math on the same stored inputs| as the type defines the result (a type that is not float: rounded as it rounds and held to its range; a float type: held where it saturates). `lane` = what the subject computed in.{(CoolDownSeconds > 0 ? $" Timed after {CoolDownSeconds} s idle following the gates (the processor's boost budget recovered)." : "")}"));
         sb.AppendLine();
         sb.AppendLine("The readout: `bytes` and `ops` are what the row's operation moves and computes by its own definition (every operand read once and every result written once at its stored width; each arithmetic operation or elementary function one, a multiply-add two); `bound` is the time those take at this device's limits, measured at the start of this run (the larger of the bytes at the memory's measured rates, reads at the read rate and writes at the write rate or a copy's mix at the copy rate, whichever model is fastest, and the operations at the lane's peak; `by` names which: memory, copy where the row does not say which bytes it writes, or the lane); each subject's `rate` is what it reached in the bound's unit and `of bound` the bound ÷ its time; `held` a bound on the working memory its run held beyond its operands (host: the pooled buffers out at once at their peak, every other allocation as if all were live together, and the subject's kept buffers, each thread's peak summed; + device on a GPU, the subject's buffers at their peak; ? where the subject cannot tell).");
         sb.AppendLine();
@@ -1659,5 +1660,34 @@ internal static class TeamBench
         Array.Sort(times);
         Console.WriteLine(string.Create(CultureInfo.InvariantCulture,
             $"team dispatch {name,-20} min {times[0],8:0.0} median {times[times.Length / 2],8:0.0} p90 {times[times.Length * 9 / 10],8:0.0} p99 {times[times.Length * 99 / 100],8:0.0} max {times[^1],8:0.0} µs"));
+    }
+}
+
+// The bench opts its whole process out of Windows' execution-speed throttling (EcoQoS) at start: a windowless process the
+// scheduler starts may be judged a background one and run on efficiency cores at low clocks, which moved CPU rows 3-13x
+// between processes. Every subject's threads then run as the hardware lets them, however the bench is launched.
+internal static class FullSpeed
+{
+    public static string Said { get; private set; } = "";
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern bool SetProcessInformation(nint process, int infoClass, ref State info, int size);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern nint GetCurrentProcess();
+
+    private struct State { public uint Version, ControlMask, StateMask; }
+
+    public static void Process()
+    {
+        // QIYAS_KEEP_THROTTLING=1 leaves the process as Windows runs it: a probe of Team's own handling of a throttled caller.
+        if (!OperatingSystem.IsWindows() || Environment.GetEnvironmentVariable("QIYAS_KEEP_THROTTLING") == "1") return;
+        try
+        {
+            var state = new State { Version = 1, ControlMask = 1, StateMask = 0 };          // EXECUTION_SPEED, not throttled
+            if (SetProcessInformation(GetCurrentProcess(), 4, ref state, 12))              // ProcessPowerThrottling
+                Said = "The bench's process opted out of Windows' power throttling (every subject at the speed the hardware gives).";
+        }
+        catch (Exception e) when (e is EntryPointNotFoundException or DllNotFoundException) { }
     }
 }
