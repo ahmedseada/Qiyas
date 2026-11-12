@@ -227,7 +227,7 @@ internal sealed partial class Kernels
                 int g = TN.Granularity, span = Math.Min((256 + g - 1) / g * g, cols);
                 var p = k.P;
                 long groups = (long)rows / p[dim] * ((p[dim] + tile - 1) / tile) * ((cols + span - 1) / span);
-                Team.For((int)groups, Math.Max(1, (int)(groups / (Threads * 4))), (long)k.Count, new StridedTileBody<TN, TLane>(k, cols, dim, tile, span));
+                Team.For((int)groups, Math.Max(1, (int)(groups / (Threads * 4))), (long)k.Count, new StridedTileBody<TN, TLane>(k, cols, dim, tile, span, TN.Direct && Streams.Past(TN.Bytes(k.InputCount) + TN.Bytes(k.Count))));
             }
             else Move<TN, TLane, TL>(k, rows, cols, at);
         }
@@ -384,7 +384,8 @@ internal sealed partial class Kernels
     /// group's rows (a tile × span block in lane storage), each row's span then stored. Groups are disjoint blocks of whole
     /// storage units; consecutive groups take the next tile of rows over the same columns (the input lines after the last
     /// group's).</summary>
-    private struct StridedTileBody<TN, TLane>(LayoutArgs k, int cols, int dim, int tile, int span) : Team.IBody
+    // stream: each row's span streamed into the output past the caches (Streams), the copy well past them.
+    private struct StridedTileBody<TN, TLane>(LayoutArgs k, int cols, int dim, int tile, int span, bool stream) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -423,8 +424,15 @@ internal sealed partial class Kernels
                         for (int t = 0; t < count; t++) t2[t * cc + c] = line[t];
                     }
 
-                    for (int t = 0; t < count; t++) TN.Store(t2.Slice(t * cc, cc), k.Output, (int)((r0 + t * rowStep) * cols + c0));
+                    for (int t = 0; t < count; t++)
+                    {
+                        int at = (int)((r0 + t * rowStep) * cols + c0);
+                        if (stream) Streams.Copy(MemoryMarshal.AsBytes(t2.Slice(t * cc, cc)), k.Output.AsSpan(at * Unsafe.SizeOf<TLane>(), cc * Unsafe.SizeOf<TLane>()));
+                        else TN.Store(t2.Slice(t * cc, cc), k.Output, at);
+                    }
                 }
+
+                if (stream) Streams.Fence();
             }
             finally
             {
