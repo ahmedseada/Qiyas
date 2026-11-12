@@ -813,8 +813,9 @@ internal static class Widths
         _ => typeof(T) == typeof(long) ? Unsafe.As<T, long>(ref v) : (long)Math.Min(Unsafe.As<T, ulong>(ref v), long.MaxValue),
     };
 
-    /// <summary>Orders two lane values by Adad's order (Routing.Precedes without the columns): floats by value, a NaN above
-    /// every number and two NaNs equal, −0 equal to +0; unsigned 64-bit values as unsigned. Negative, zero or positive.</summary>
+    /// <summary>Orders two lane values by Adad's order (Routing.Order, written here in the lane's width): floats by value, a
+    /// NaN above every number and two NaNs equal, −0 equal to +0; unsigned 64-bit values as unsigned. Negative, zero or
+    /// positive.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int Compare<T>(T a, T b) where T : unmanaged
     {

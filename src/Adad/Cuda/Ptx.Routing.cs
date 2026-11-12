@@ -56,7 +56,7 @@ internal static partial class Ptx
         string idx = b.R();
         b.L($"add.u32 {idx}, {start}, {c};");
         string v = Codec.UnpackAt(b, f, x, idx, lane);
-        var (pAbove, _) = Rank(b, lane, v, best);
+        string pAbove = RankAbove(b, lane, v, best);
         string pFirst = b.P();
         b.L($"setp.eq.u32 {pFirst}, {bestAt}, 0xFFFFFFFF;");
         b.L($"or.pred {pAbove}, {pAbove}, {pFirst};");
@@ -90,7 +90,7 @@ internal static partial class Ptx
         return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_indices, .param .u32 p_cols, .param .u32 p_k", ReduceBytes + 256 * 4 + 256 * 16);
     }
 
-    /// <summary>Adad's order on two lane values (Routing.Precedes without the columns): whether a ranks above c (larger, or a
+    /// <summary>Adad's order on two lane values (Routing.Order): whether a ranks above c (larger, or a
     /// NaN against a number) and whether they rank the same (equal, −0 and +0 among them, or two NaNs).</summary>
     internal static (string Above, string Same) Rank(PtxBuilder b, Lane lane, string a, string c)
     {
@@ -110,6 +110,34 @@ internal static partial class Ptx
         }
 
         return (above, same);
+    }
+
+    /// <summary>Whether a ranks above c in Adad's order (Rank's Above alone, for a scan that keeps the earlier of equals):
+    /// greater or either a NaN (setp.gtu), but not when c is the NaN: two instructions a value, of which one float
+    /// compare, where Rank takes four (a float64 scan runs at the device's float64 rate).</summary>
+    internal static string RankAbove(PtxBuilder b, Lane lane, string a, string c)
+    {
+        string above = b.P();
+        if (!lane.IsFloat) { b.L($"setp.gt.{lane.Op} {above}, {a}, {c};"); return above; }
+        string nc = b.P();
+        b.L($"setp.gtu.{lane.Op} {above}, {a}, {c};");
+        b.L($"testp.notanumber.{lane.Op} {nc}, {c};");
+        b.L($"and.pred {above}, {above}, !{nc};");
+        return above;
+    }
+
+    /// <summary>d = the first-ranked of a and c in Adad's order (Rank): the larger, a NaN when either is one (the lane's max
+    /// gives the number); of −0 and +0, which rank the same, the one max gives. An integer lane's max. d may be a.</summary>
+    internal static void First(PtxBuilder b, Lane lane, string d, string a, string c)
+    {
+        if (!lane.IsFloat) { b.L($"max.{lane.Op} {d}, {a}, {c};"); return; }
+        string t = lane.NewReg(b), pa = b.P(), pc = b.P();
+        b.L($"testp.notanumber.{lane.Op} {pa}, {a};");
+        b.L($"testp.notanumber.{lane.Op} {pc}, {c};");
+        b.L($"max.{lane.Op} {t}, {a}, {c};");
+        b.L($"@{pc} mov.{lane.Reg} {t}, {c};");
+        b.L($"@{pa} mov.{lane.Reg} {t}, {a};");
+        b.L($"mov.{lane.Reg} {d}, {t};");
     }
 
     /// <summary>out[r·k + j] = x[r][index[r·k + j]] (s32 columns) over n = rows·k values of f, each stored word written by one

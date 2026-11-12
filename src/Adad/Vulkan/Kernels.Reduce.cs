@@ -24,17 +24,20 @@ internal static partial class VkKernels
         _ => new Fmt("uint64", 64, false, false),
     };
 
-    /// <summary>The value a reduction starts from: −∞ / the smallest value for max, +∞ / the largest for min, zero for sums.</summary>
+    /// <summary>The value a reduction starts from: −∞ / the smallest value for max; for min a NaN (the top of Adad's order:
+    /// NMin of it and x is x, of NaNs alone a NaN) / the largest value; zero for sums.</summary>
     private static V Identity(Spv b, K k, string op) => op switch
     {
         "max" => k.IsFloat() ? b.C(k, double.NegativeInfinity) : k is K.U32 or K.U64 ? b.CBits(k, 0) : b.CBits(k, k.Wide() ? 0x8000000000000000UL : 0x80000000UL),
-        "min" => k.IsFloat() ? b.C(k, double.PositiveInfinity) : k is K.U32 or K.U64 ? b.CBits(k, ulong.MaxValue) : b.CBits(k, k.Wide() ? 0x7FFFFFFFFFFFFFFFUL : 0x7FFFFFFFUL),
+        "min" => k.IsFloat() ? b.C(k, double.NaN) : k is K.U32 or K.U64 ? b.CBits(k, ulong.MaxValue) : b.CBits(k, k.Wide() ? 0x7FFFFFFFFFFFFFFFUL : 0x7FFFFFFFUL),
         _ => b.C(k, 0),
     };
 
+    // a op v in Adad's order (Routing.Order): max the first-ranked (First: a NaN when either is one), min the last-ranked
+    // (NMin: the number when one is a NaN, a NaN only when both are), else the sum.
     private static V Combine(Spv b, string op, V a, V v) => op switch
     {
-        "max" => b.Max(a, v),
+        "max" => First(b, a, v),
         "min" => b.Min(a, v),
         _ => a + v,
     };
@@ -195,7 +198,8 @@ internal static partial class VkKernels
         return b.Build();
     }
 
-    /// <summary>out[row] = the index of the row's first largest value (s32), a workgroup per row.</summary>
+    /// <summary>out[row] = the column of the row's first-ranked value in Adad's order (Rank; the lowest column among those
+    /// that rank the same), s32, a workgroup per row.</summary>
     public static SpvKernel ArgmaxRows(Vulkan vk, Fmt f, Lane lane)
     {
         var k = Kinds.Of(lane);
@@ -211,12 +215,12 @@ internal static partial class VkKernels
         b.For(tid, cols, b.U(ReduceThreads), i =>
         {
             var v = Codec.UnpackAt(b, f, src, row * cols + i, lane);
-            var take = (v > best.V) | (bestAt.V == none);
+            var take = Rank(b, lane, v, best.V).Above | (bestAt.V == none);
             best.V = b.Select(take, v, best.V);
             bestAt.V = b.Select(take, i, bestAt.V);
         });
 
-        // The workgroup's best: a tree over (value, index) pairs; ties keep the lower index.
+        // The workgroup's first-ranked: a tree over (value, index) pairs in Adad's order; ties keep the lower index.
         var sv = b.Shared(k, ReduceThreads);
         var si = b.Shared(K.U32, ReduceThreads);
         sv[tid] = best.V;
@@ -231,7 +235,8 @@ internal static partial class VkKernels
                 var mi = si[tid];
                 var ov = sv[tid + step];
                 var oi = si[tid + step];
-                var take = ((ov > mv) | ((ov == mv) & (oi < mi)) | (mi == none)) & (oi != none);
+                var (above, same) = Rank(b, lane, ov, mv);
+                var take = (above | (same & (oi < mi)) | (mi == none)) & (oi != none);
                 sv[tid] = b.Select(take, ov, mv);
                 si[tid] = b.Select(take, oi, mi);
             });
@@ -242,7 +247,8 @@ internal static partial class VkKernels
         return b.Build();
     }
 
-    /// <summary>out[col] = the row index of the column's first largest value (s32), a thread per column.</summary>
+    /// <summary>out[col] = the row of the column's first-ranked value in Adad's order (Rank; the first row among those that
+    /// rank the same), s32, a thread per column.</summary>
     public static SpvKernel ArgmaxCols(Vulkan vk, Fmt f, Lane lane)
     {
         var k = Kinds.Of(lane);
@@ -260,7 +266,7 @@ internal static partial class VkKernels
             b.For(b.U(0), rows, r =>
             {
                 var v = Codec.UnpackAt(b, f, src, r * cols + col, lane);
-                var take = (v > best.V) | (bestAt.V == none);
+                var take = Rank(b, lane, v, best.V).Above | (bestAt.V == none);
                 best.V = b.Select(take, v, best.V);
                 bestAt.V = b.Select(take, r, bestAt.V);
             });

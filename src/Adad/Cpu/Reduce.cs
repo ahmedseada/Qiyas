@@ -6,7 +6,9 @@
 //   Reduce   sum, sumsq, max, min, argmax over a whole array, each row, or each column. Sums take the number's sum
 //            lane for the bounds measured on the data (a dot lane sums packed groups against ones: the processor's
 //            widening multiply-add is its fastest adder for 8- and 16-bit values); max/min/argmax take the type's own
-//            lane. The result is lane values (the lane is reported): exact by the rule, the caller converts as it likes.
+//            lane and Adad's order (Routing.Order: a NaN above every number, −0 equal to +0): max the first-ranked value,
+//            min the last-ranked, argmax the first position of the first-ranked. The result is lane values (the lane is
+//            reported): exact by the rule, the caller converts as it likes.
 //   MapRow   output[r][c] = op(x[r][c], v[c]) for the two-input formulas (a row vector broadcast down the rows).
 //   Transpose
 //   Gemv     y = A·x and y = Aᵀ·x in the sum lane, the result stored as the type.
@@ -28,6 +30,7 @@ internal sealed partial class Kernels
     {
         if (op is "max" or "min" or "argmax")
         {
+            Reductions.ValidateExtreme(op, axis, rows, cols);
             var cmp = new CompareVisitor(op, axis, x, rows, cols);
             TN.Elementwise(ref cmp);
             return (cmp.Result!, op == "argmax" ? "s32 index" : cmp.Lane);
@@ -335,7 +338,7 @@ internal sealed partial class Kernels
                 for (int b = 1; b < blocks; b++)
                 {
                     var u = Vector.LoadUnsafe(ref rp, (nuint)((long)b * cols + i));
-                    v = op == JoinOp.Add ? TL.Add(v, u) : op == JoinOp.Max ? TL.Max(v, u) : TL.Min(v, u);
+                    v = op == JoinOp.Add ? TL.Add(v, u) : op == JoinOp.Max ? First(v, u) : Last(v, u);
                 }
 
                 v.StoreUnsafe(ref ro, (nuint)i);
@@ -405,6 +408,15 @@ internal sealed partial class Kernels
     }
 
     // ---------------------------------------------------------------- max, min, argmax in the type's own lane
+
+    // Adad's order on lane vectors, lane by lane (Widths.Compare's on values): the first-ranked of each pair, a NaN when
+    // either is one (IEEE maximum, which propagates NaN), and the last-ranked, the number when one is a NaN (IEEE
+    // minimumNumber); an integer lane's max and min. Of −0 and +0, which rank the same, either may be the result.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector<T> First<T>(Vector<T> a, Vector<T> b) => Vector.Max(a, b);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector<T> Last<T>(Vector<T> a, Vector<T> b) => Vector.MinNumber(a, b);
 
     private struct CompareVisitor(string op, Axis axis, byte[] x, int rows, int cols) : ILaneVisitor
     {
@@ -503,7 +515,7 @@ internal sealed partial class Kernels
             if (len >= w)
             {
                 // Four chains of vectors (item 6j), joined lane by lane: each lane still the extreme of the same positions
-                // (the lane's Max / Min associative and commutative: IEEE maximum / minimum, integers exact).
+                // (First / Last associative and commutative in the order; integers exact).
                 ref TLane rs = ref MemoryMarshal.GetReference(s);
                 var acc = Vector.LoadUnsafe(ref rs);
                 i = w;
@@ -515,14 +527,14 @@ internal sealed partial class Kernels
                         nuint at2 = (nuint)i;
                         var v0 = Vector.LoadUnsafe(ref rs, at2); var v1 = Vector.LoadUnsafe(ref rs, at2 + (nuint)w);
                         var v2 = Vector.LoadUnsafe(ref rs, at2 + (nuint)(2 * w)); var v3 = Vector.LoadUnsafe(ref rs, at2 + (nuint)(3 * w));
-                        if (max) { acc = TL.Max(acc, v0); a1 = TL.Max(a1, v1); a2 = TL.Max(a2, v2); a3 = TL.Max(a3, v3); }
-                        else { acc = TL.Min(acc, v0); a1 = TL.Min(a1, v1); a2 = TL.Min(a2, v2); a3 = TL.Min(a3, v3); }
+                        if (max) { acc = First(acc, v0); a1 = First(a1, v1); a2 = First(a2, v2); a3 = First(a3, v3); }
+                        else { acc = Last(acc, v0); a1 = Last(a1, v1); a2 = Last(a2, v2); a3 = Last(a3, v3); }
                     }
 
-                    acc = max ? TL.Max(TL.Max(acc, a1), TL.Max(a2, a3)) : TL.Min(TL.Min(acc, a1), TL.Min(a2, a3));
+                    acc = max ? First(First(acc, a1), First(a2, a3)) : Last(Last(acc, a1), Last(a2, a3));
                 }
 
-                for (; i + w <= len; i += w) { var v = Vector.LoadUnsafe(ref rs, (nuint)i); acc = max ? TL.Max(acc, v) : TL.Min(acc, v); }
+                for (; i + w <= len; i += w) { var v = Vector.LoadUnsafe(ref rs, (nuint)i); acc = max ? First(acc, v) : Last(acc, v); }
                 TLane e = acc[0];
                 for (int l = 1; l < w; l++) e = max ? (Widths.Compare(acc[l], e) > 0 ? acc[l] : e) : (Widths.Compare(acc[l], e) < 0 ? acc[l] : e);
                 if (!have || (max ? Widths.Compare(e, best) > 0 : Widths.Compare(e, best) < 0)) { best = e; have = true; }
@@ -598,11 +610,11 @@ internal sealed partial class Kernels
         }
     }
 
-    /// <summary>A tile's first largest value of each column and its row, the rows read in order: a row's value taken
-    /// only when the type's order puts it strictly above the column's best so far (float: CompareTo, NaN below every
-    /// number, ±0 equal). A vector compare a row gives exactly those lanes (above by the lane's compare, or the best a
-    /// NaN and the value not): 4-byte lanes take value and row by it; other lanes take the vectors it marks by the type's
-    /// order, value by value. In place where the stored values are the lane's.</summary>
+    /// <summary>A tile's first-ranked value of each column and its row, the rows read in order: a row's value taken only
+    /// when Adad's order (Widths.Compare: a NaN above every number, ±0 equal) puts it strictly above the column's best so
+    /// far. A vector compare a row gives exactly those lanes (above by the lane's compare, or the value a NaN and the best
+    /// not): 4-byte lanes take value and row by it; other lanes take the vectors it marks by the order, value by value. In
+    /// place where the stored values are the lane's.</summary>
     private readonly struct ColumnArgmaxTile<TN, TLane, TL>(byte[] x, byte[] values, byte[] rowsAt, int cols) : IColumnTile
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
     {
@@ -633,7 +645,7 @@ internal sealed partial class Kernels
                     {
                         var v = Vector.LoadUnsafe(ref rs, (nuint)i);
                         var b = Vector.LoadUnsafe(ref rb, (nuint)i);
-                        var above = TL.Greater(v, b) | Vector.AndNot(TL.Equal(v, v), TL.Equal(b, b));
+                        var above = TL.Greater(v, b) | Vector.AndNot(TL.Equal(b, b), TL.Equal(v, v));
                         Vector.ConditionalSelect(above, v, b).StoreUnsafe(ref rb, (nuint)i);
                         Vector.ConditionalSelect(Vector.As<TLane, int>(above), rv, Vector.LoadUnsafe(ref ra, (nuint)i)).StoreUnsafe(ref ra, (nuint)i);
                     }
@@ -643,9 +655,9 @@ internal sealed partial class Kernels
                 {
                     var v = Vector.LoadUnsafe(ref rs, (nuint)i);
                     var b = Vector.LoadUnsafe(ref rb, (nuint)i);
-                    // Above, or the best not equal to itself (a NaN) where the value is: exactly the lanes CompareTo puts
+                    // Above, or the value not equal to itself (a NaN) where the best is: exactly the lanes the order puts
                     // above (an integer lane equals itself: only the first term).
-                    var above = TL.Greater(v, b) | Vector.AndNot(TL.Equal(v, v), TL.Equal(b, b));
+                    var above = TL.Greater(v, b) | Vector.AndNot(TL.Equal(b, b), TL.Equal(v, v));
                     if (above == Vector<TLane>.Zero) continue;
                     for (int l = i; l < i + w; l++) if (Widths.Compare(s[l], best[l]) > 0) { best[l] = s[l]; at[l] = r; }
                 }
@@ -657,7 +669,7 @@ internal sealed partial class Kernels
         }
     }
 
-    // The blocks' first largest joined in block order: a later block's only when strictly larger.
+    // The blocks' first-ranked joined in block order: a later block's only when it ranks strictly above.
     private struct ArgmaxJoinBody<TLane>(byte[] values, byte[] rowsAt, int blocks, int cols, byte[] result) : Team.IBody where TLane : unmanaged
     {
         public readonly void Run(int first, int last)
@@ -679,8 +691,8 @@ internal sealed partial class Kernels
         }
     }
 
-    // A tile's column extremes: TL.Max / TL.Min on whole vectors, the type's order on the rest (as the rows' pass), in
-    // place where the stored values are the lane's.
+    // A tile's column extremes in Adad's order: First / Last on whole vectors, Widths.Compare on the rest (as the rows'
+    // pass), in place where the stored values are the lane's.
     private readonly struct ColumnCompareTile<TN, TLane, TL>(byte[] x, byte[] dst, int cols, bool max) : IColumnTile
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
     {
@@ -700,8 +712,8 @@ internal sealed partial class Kernels
                 else { TN.Load(x, r * cols + c0, row.AsSpan(0, n)); s = row.AsSpan(0, n); }
                 ref TLane rs = ref MemoryMarshal.GetReference(s);
                 int i = 0;
-                if (max) for (; i + w <= n; i += w) TL.Max(Vector.LoadUnsafe(ref ro, (nuint)i), Vector.LoadUnsafe(ref rs, (nuint)i)).StoreUnsafe(ref ro, (nuint)i);
-                else for (; i + w <= n; i += w) TL.Min(Vector.LoadUnsafe(ref ro, (nuint)i), Vector.LoadUnsafe(ref rs, (nuint)i)).StoreUnsafe(ref ro, (nuint)i);
+                if (max) for (; i + w <= n; i += w) First(Vector.LoadUnsafe(ref ro, (nuint)i), Vector.LoadUnsafe(ref rs, (nuint)i)).StoreUnsafe(ref ro, (nuint)i);
+                else for (; i + w <= n; i += w) Last(Vector.LoadUnsafe(ref ro, (nuint)i), Vector.LoadUnsafe(ref rs, (nuint)i)).StoreUnsafe(ref ro, (nuint)i);
                 for (; i < n; i++) if (max ? Widths.Compare(s[i], o[i]) > 0 : Widths.Compare(s[i], o[i]) < 0) o[i] = s[i];
             }
 

@@ -83,12 +83,12 @@ internal static partial class VkKernels
         return b.Build();
     }
 
-    /// <summary>The max-pool backward's first largest of every window of the forward input (x2), a thread per window (count
+    /// <summary>The max-pool backward's first-ranked of every window of the forward input (x2) in Adad's order, a thread per window (count
     /// windows, in the output's order): its index into the input, 0xFFFFFFFF for a window with no pixel, into out (u32);
     /// compared in the backward's lane, as a scan of the window would.</summary>
     public static SpvKernel LayoutWindowArgmax(Vulkan vk, Fmt f, Lane lane, string name)
     {
-        if (name is not ("maxpool_bwd" or "adaptive_maxpool_bwd")) throw new NotSupportedException($"window first largest of {name}");
+        if (name is not ("maxpool_bwd" or "adaptive_maxpool_bwd")) throw new NotSupportedException($"window first-ranked of {name}");
         bool adaptive = name == "adaptive_maxpool_bwd";
         var k = Kinds.Of(lane);
         var b = new Spv($"layout_argmax_{name}_{f.Name}_{lane.Name}", Threads, vk.Controls);
@@ -130,10 +130,11 @@ internal static partial class VkKernels
                     var ww = w0 + bb;
                     b.If(ww < W, () =>
                     {
-                        // The first largest in row-major order: a later value takes it only when strictly larger.
+                        // The first-ranked in row-major order (Adad's order, Rank): a later value takes it only when it
+                        // ranks strictly above.
                         var cand = (ch * H + hh) * W + ww;
                         var xv = Codec.UnpackAt(b, f, a.X2, cand, lane);
-                        var take = (xv > best.V) | (bestAt.V == none);
+                        var take = Rank(b, lane, xv, best.V).Above | (bestAt.V == none);
                         best.V = b.Select(take, xv, best.V);
                         bestAt.V = b.Select(take, cand, bestAt.V);
                     });
@@ -433,7 +434,7 @@ internal static partial class VkKernels
                         b.If(iw < W, () =>
                         {
                             var xv = Load((ch * H + ih) * W + iw);
-                            if (max) acc.V = b.Max(acc.V, xv);
+                            if (max) acc.V = First(b, acc.V, xv);
                             else if (conv) acc.V = b.Fma(Load2((ch * kh + ka) * kw + bb), xv, acc.V);
                             else acc.V = acc.V + xv;
                             n.V = n.V + 1;
@@ -449,7 +450,7 @@ internal static partial class VkKernels
             case "maxpool_bwd":
             case "avgpool_bwd":
             {
-                // Output (ch, ih, iw = c), r = ch·H + ih; x = dy (C × OH × OW), aux = each window's first largest (maxpool).
+                // Output (ch, ih, iw = c), r = ch·H + ih; x = dy (C × OH × OW), aux = each window's first-ranked (maxpool).
                 bool max = name == "maxpool_bwd";
                 V H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], ph = p[7], pw = p[8];
                 var OH = PoolSize(p[1], p[3], p[5], p[7], null, p[11]);
@@ -474,7 +475,7 @@ internal static partial class VkKernels
                             var dy = Load(dyIdx);
                             if (max)
                             {
-                                // The window's first largest, found once for all its pixels (LayoutWindowArgmax, in aux).
+                                // The window's first-ranked, found once for all its pixels (LayoutWindowArgmax, in aux).
                                 acc.V = b.Select(Index(a.Aux, dyIdx) == me, acc.V + dy, acc.V);
                                 return;
                             }
@@ -538,7 +539,7 @@ internal static partial class VkKernels
                 b.For(h0, h0 + hl, ih => b.For(w0, w0 + wl, iw =>
                 {
                     var xv = Load((ch * H + ih) * W + iw);
-                    acc.V = max ? b.Max(acc.V, xv) : acc.V + xv;
+                    acc.V = max ? First(b, acc.V, xv) : acc.V + xv;
                 }));
                 if (max) return acc.V;
                 return acc.V / b.Convert(hl * wl, k);

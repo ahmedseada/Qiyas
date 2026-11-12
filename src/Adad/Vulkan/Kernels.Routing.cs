@@ -83,13 +83,22 @@ internal static partial class VkKernels
         return b.Build();
     }
 
-    /// <summary>Adad's order on two lane values (Routing.Precedes without the columns): whether a ranks above c (larger, or a
+    /// <summary>Adad's order on two lane values (Routing.Order): whether a ranks above c (larger, or a
     /// NaN against a number) and whether they rank the same (equal, −0 and +0 among them, or two NaNs).</summary>
     internal static (V Above, V Same) Rank(Spv b, Lane lane, V a, V c)
     {
         if (!lane.IsFloat) return (a > c, a == c);
         V na = b.IsNan(a), nc = b.IsNan(c);
         return ((a > c) | (na & !nc), (a == c) | (na & nc));
+    }
+
+    /// <summary>The first-ranked of a and c in Adad's order (Rank): the larger, a NaN when either is one (NMax gives the
+    /// number); of −0 and +0, which rank the same, the one NMax gives. An integer kind's max.</summary>
+    internal static V First(Spv b, V a, V c)
+    {
+        var m = b.Max(a, c);
+        if (!a.Kind.IsFloat()) return m;
+        return b.Select(b.IsNan(a), a, b.Select(b.IsNan(c), c, m));
     }
 
     /// <summary>out[r·k + j] = x[r][index[r·k + j]] (s32 columns) over rows · k values, a thread per stored word: top-k's

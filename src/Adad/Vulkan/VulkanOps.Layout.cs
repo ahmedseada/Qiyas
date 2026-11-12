@@ -49,7 +49,7 @@ public sealed partial class VulkanOps
 
             if (k.Name is "maxpool_bwd" or "adaptive_maxpool_bwd")
             {
-                // Each window's first largest of the forward input, once, into aux.
+                // Each window's first-ranked of the forward input in Adad's order, once, into aux.
                 var (OH, OW) = k.Name == "maxpool_bwd" ? LayoutArgs.PoolOut(k.P) : (k.P[3], k.P[4]);
                 int windows = k.P[0] * OH * OW;
                 aux = vk.Rent(Math.Max(1, windows) * 4L);

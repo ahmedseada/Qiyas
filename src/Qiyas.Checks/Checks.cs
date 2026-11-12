@@ -1702,10 +1702,12 @@ internal static partial class Checks
                     ok &= Close(type, $"layout {name}{(perValue == false ? " (word kernel)" : "")}", where, k.Output, reference, k.Count, terms);
                 }
             }
+
+            if (Bench.Registry.IsFloat(type) && !Bench.Registry.IsBlock(type)) ok &= PoolOrder(ops, where, type);
         }
 
         if (cuda is not null) cuda.LayoutPerValue = null;
-        if (ok) Console.WriteLine($"check layouts                {where,-6} every type{(blocks ? "" : " but the block formats")}: moves exact, sums and resizes within the lane's rounding");
+        if (ok) Console.WriteLine($"check layouts                {where,-6} every type{(blocks ? "" : " but the block formats")}: moves exact, sums and resizes within the lane's rounding; max pooling in Adad's order (NaN, ±0, −inf, ties: exactly)");
         return ok;
     }
 
@@ -2094,6 +2096,8 @@ internal static partial class Checks
                 }
             }
 
+            if (!integer) ok &= ReduceOrder(ops, where, type);
+
             // Broadcasts (two formulas), transpose, gemv both ways.
             foreach (var opName in new[] { "add", "mul" })
             {
@@ -2123,7 +2127,120 @@ internal static partial class Checks
             }
         }
 
-        if (ok) Console.WriteLine($"check reductions, broadcasts, transposes, gemv {where,-6} every type{(blocks ? "" : " but the block formats")} at 37 × 1001: as the references");
+        if (ok) Console.WriteLine($"check reductions, broadcasts, transposes, gemv {where,-6} every type{(blocks ? "" : " but the block formats")} at 37 × 1001: as the references; max, min and argmax in Adad's order (NaN, ±0, ±inf, ties: exactly)");
+        return ok;
+    }
+
+    // Adad's order in max, min and argmax (a float type, the values as the type stores them; a block format's as its
+    // blocks hold them): rows, columns and wholes of rows holding NaN, every value NaN, every value −∞, zeros of both
+    // signs, ±∞ and ties, and a long array with one NaN far in (many parts, many row blocks): max and min exactly the
+    // reference's (Routing.Order: a NaN where it has one, −0 equal to +0), argmax's positions exactly.
+    private static bool ReduceOrder(IDevice<ulong, ulong>? ops, string where, string type)
+    {
+        const int rows = 12, cols = 67, LR = 97, LC = 4099;
+        var r = new Random(43);
+        var a = new double[rows * cols];
+        for (int i = 0; i < a.Length; i++)
+        {
+            int row = i / cols, pick = r.Next(12);
+            // Row 6 every value NaN, row 4 every value −∞, row 5 zeros of both signs; rows 3j hold NaN, rows 3j + 1 ±∞.
+            a[i] = row == 6 ? double.NaN : row == 4 ? double.NegativeInfinity : row == 5 ? (pick % 2 == 0 ? 0.0 : -0.0) : pick switch
+            {
+                0 => row % 3 == 0 ? double.NaN : 0.0,
+                1 => row % 3 == 1 ? double.PositiveInfinity : 1.5,
+                2 => row % 3 == 1 ? double.NegativeInfinity : -1.5,
+                3 => 0.0,
+                4 => -0.0,
+                5 or 6 => 1.5,
+                7 => -2.0,
+                _ => Math.Round(r.NextDouble() * 6 - 3, 1),
+            };
+        }
+
+        // The columns' case: a's rows as columns, three times side by side (67 rows of 36: whole vectors and a tail).
+        var t = new double[cols * 36];
+        for (int i = 0; i < cols; i++) for (int c = 0; c < 36; c++) t[i * 36 + c] = a[c % 12 * cols + i];
+        var l = new double[LR * LC];
+        for (int i = 0; i < l.Length; i++) l[i] = Math.Round(r.NextDouble() * 6 - 3, 2);
+        l[300001] = double.NaN;
+        bool ok = true;
+        static bool Same(double x, double y) => x == y || (double.IsNaN(x) && double.IsNaN(y));
+        foreach (var (axis, rr, cc, v) in new[] { (Axis.Rows, rows, cols, a), (Axis.Whole, rows, cols, a), (Axis.Cols, cols, 36, t), (Axis.Whole, LR, LC, l), (Axis.Cols, LR, LC, l) })
+        {
+            var x = Bench.Registry.Encode(type, v);
+            var xv = Bench.Registry.Values(type, x, rr * cc);
+            int count = axis == Axis.Whole ? 1 : axis == Axis.Rows ? rr : cc;
+            foreach (var op in new[] { "max", "min", "argmax" })
+            {
+                var want = References.Reduce(op, axis, xv, rr, cc);
+                var (got, lane) = Bench.Registry.With(type, new ReduceRun(ops, op, axis, x, rr, cc));
+                var g = Bench.LaneValues.Decode(lane, got, count);
+                int bad = 0;
+                for (int i = 0; i < count; i++) if (!Same(g[i], want[i])) bad++;
+                if (bad > 0) { Console.WriteLine($"check {op}:{axis.ToString().ToLowerInvariant()} order (NaN, ±0, ±inf, ties) {where,-6} {type,-12} DIFFERS at {bad} of {count} ({rr} x {cc}, lane {lane})"); ok = false; }
+            }
+        }
+
+        // An extreme of no values is refused (Reductions.ValidateExtreme): rows of no columns, columns of no rows.
+        foreach (var (op, axis, rr, cc) in new[] { ("max", Axis.Rows, 3, 0), ("min", Axis.Cols, 0, 3), ("argmax", Axis.Whole, 0, 5) })
+        {
+            bool refused = false;
+            try { Bench.Registry.With(type, new ReduceRun(ops, op, axis, [], rr, cc)); }
+            catch (ArgumentException) { refused = true; }
+            if (!refused) { Console.WriteLine($"check {op}:{axis.ToString().ToLowerInvariant()} of no values {where,-6} {type,-12} FAILS: {rr} x {cc} was not refused"); ok = false; }
+        }
+
+        return ok;
+    }
+
+    // Max pooling in Adad's order (a float type of whole values; a block format's NaN is its block's): windows holding NaN,
+    // windows of −∞, of zeros of both signs and of ties, with pads, and the adaptive windows: the pools' values exactly
+    // the reference's (Routing.Order: a NaN where it has one), the backward's gradient at each window's first-ranked
+    // position (within the sums' rounding).
+    private static bool PoolOrder(IDevice<ulong, ulong>? ops, string where, string type)
+    {
+        const int C = 2, H = 7, W = 9;
+        var r = new Random(47);
+        var img = new double[C * H * W];
+        for (int i = 0; i < img.Length; i++)
+        {
+            int c = i / (H * W), hh = i / W % H, pick = r.Next(10);
+            // Channel 1: rows 0 to 2 every value −∞, rows 3 and 4 zeros of both signs; the rest NaN, ±∞, ties and numbers.
+            img[i] = c == 1 && hh < 3 ? double.NegativeInfinity : c == 1 && hh < 5 ? (pick % 2 == 0 ? 0.0 : -0.0) : pick switch
+            {
+                0 => double.NaN,
+                1 => double.PositiveInfinity,
+                2 => double.NegativeInfinity,
+                3 or 4 => 1.5,
+                5 => -0.0,
+                _ => Math.Round(r.NextDouble() * 4 - 2, 1),
+            };
+        }
+
+        var x2 = Bench.Registry.Encode(type, img);
+        var imgv = Bench.Registry.Values(type, x2, img.Length);
+        bool ok = true;
+        static bool Same(double x, double y) => x == y || (double.IsNaN(x) && double.IsNaN(y));
+        foreach (var (name, p) in new (string, int[])[] { ("maxpool", [C, H, W, 3, 3, 2, 2, 1, 1]), ("maxpool", [C, H, W, 2, 3, 1, 2, 0, 1]), ("adaptive_maxpool", [C, H, W, 5, 4]) })
+        {
+            var (oh, ow) = name == "maxpool" ? LayoutArgs.PoolOut(p) : (p[3], p[4]);
+            int count = C * oh * ow;
+            var k = new LayoutArgs { Name = name, X = x2, P = p, Count = count, InputCount = img.Length, Output = new byte[Bench.Registry.Bytes(type, count)] };
+            Bench.Registry.With(type, new LayoutRun(ops, k));
+            var want = Bench.Registry.Values(type, Bench.Registry.Encode(type, LayoutArgs.Reference(name, imgv, null, p, count, null)), count);
+            var got = Bench.Registry.Values(type, k.Output, count);
+            int bad = 0;
+            for (int i = 0; i < count; i++) if (!Same(got[i], want[i])) bad++;
+            if (bad > 0) { Console.WriteLine($"check layout {name} order (NaN, ±0, −inf, ties) {where,-6} {type,-12} DIFFERS at {bad} of {count}"); ok = false; }
+
+            // The backward: dy at each window's first-ranked position of the same input.
+            string back = name + "_bwd";
+            var dy = Bench.Registry.Make(type, count, 48, -1, 1);
+            var kb = new LayoutArgs { Name = back, X = dy, X2 = x2, P = p, Count = img.Length, InputCount = count, Output = new byte[Bench.Registry.Bytes(type, img.Length)] };
+            Bench.Registry.With(type, new LayoutRun(ops, kb));
+            ok &= Close(type, $"layout {back} order (NaN, ±0, −inf, ties)", where, kb.Output, LayoutArgs.Reference(back, Bench.Registry.Values(type, dy, count), null, p, img.Length, imgv), img.Length, LayoutArgs.Terms(back, p));
+        }
+
         return ok;
     }
 

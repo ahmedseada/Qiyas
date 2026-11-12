@@ -70,6 +70,7 @@ public sealed partial class GpuOps(Gpu gpu)
         int total = rows * cols;
         if (op is "max" or "min" or "argmax")
         {
+            Reductions.ValidateExtreme(op, axis, rows, cols);
             var own = f.Natural;
             if (op == "argmax")
             {

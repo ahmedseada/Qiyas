@@ -6,6 +6,8 @@ using Qiyas.Bench;
 
 internal static class References
 {
+    /// <summary>sum and sumsq in float64; max the first value in Adad's order (Routing.Order: a NaN when there is one), min
+    /// the last (the least number, a NaN only when every value is one), argmax the first position of the first-ranked.</summary>
     public static double[] Reduce(string op, Axis axis, double[] x, int rows, int cols)
     {
         int r = axis == Axis.Whole ? 1 : rows, c = axis == Axis.Whole ? rows * cols : cols;
@@ -23,9 +25,8 @@ internal static class References
                 {
                     case "sum": acc += v; break;
                     case "sumsq": acc += v * v; break;
-                    case "max": acc = Math.Max(acc, v); break;
-                    case "min": acc = Math.Min(acc, v); break;
-                    case "argmax": if (v > acc) { acc = v; at = j; } break;
+                    case "max" or "argmax": if (at < 0 || Routing.Order(v, acc) > 0) { acc = v; at = j; } break;
+                    case "min": if (at < 0 || Routing.Order(v, acc) < 0) { acc = v; at = j; } break;
                 }
             }
 

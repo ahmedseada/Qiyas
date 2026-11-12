@@ -6,7 +6,10 @@ namespace Adad.Abstraction;
 /// <summary>Reductions, transposes and matrix-vector products (Reduce.cs).</summary>
 public interface IReductions<TBuffer>
 {
-    /// <summary>op (sum, max, min, argmax, ...) along the axis of x (rows × cols) into output, as the lane's values.</summary>
+    /// <summary>op (sum, sumsq, max, min, argmax) along the axis of x (rows × cols) into output, as the lane's values (argmax:
+    /// s32 positions). max, min and argmax in Adad's order (Routing.Order: a NaN above every number, −0 equal to +0): max
+    /// the first-ranked value (a NaN when there is one), min the last-ranked (a NaN only when every value is one), argmax
+    /// the first position of the first-ranked.</summary>
     string Reduce<TN>(string op, Axis axis, TBuffer x, int rows, int cols, TBuffer output) where TN : struct, IAdad<TN>;
 
     /// <summary>output (cols × rows) = xᵀ.</summary>

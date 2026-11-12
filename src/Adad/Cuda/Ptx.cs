@@ -3330,8 +3330,9 @@ internal static partial class Ptx
     /// <summary>Shared bytes a reduction uses: a slot per warp and one for the result.</summary>
     private const int ReduceBytes = 33 * 8;
 
-    // The block's reduction of a lane value: butterflies within each warp, the warps' results through shared memory,
-    // the first warp's butterfly over those, the result read by all. Two barriers.
+    // The block's reduction of a lane value (op: "add", "max", "min", or "first": the first-ranked in Adad's order, a NaN
+    // when there is one): butterflies within each warp, the warps' results through shared memory, the first warp's
+    // butterfly over those, the result read by all. Two barriers.
     private static string BlockReduce(PtxBuilder b, Lane lane, string tid, string v, string op, int threads)
     {
         int warps = threads / 32;
@@ -3347,7 +3348,7 @@ internal static partial class Ptx
         b.L($"setp.ne.u32 {p0}, {laneId}, 0;");
         b.L($"@!{p0} st.shared.{lane.Mem} [{slot}], {acc};");
         b.L("bar.sync 0;");
-        string pw = b.P(), pl = b.P(), mine = b.R(), identity = op == "max" ? ReduceIdentity(lane, "max") : op == "min" ? ReduceIdentity(lane, "min") : lane.Zero;
+        string pw = b.P(), pl = b.P(), mine = b.R(), identity = op is "max" or "first" ? ReduceIdentity(lane, "max") : op == "min" ? ReduceIdentity(lane, "min") : lane.Zero;
         b.L($"setp.ne.u32 {pw}, {warp}, 0;");
         b.L($"@{pw} bra {tag}_SKIP;");
         b.L($"setp.lt.u32 {pl}, {laneId}, {warps};");
@@ -3426,11 +3427,12 @@ internal static partial class Ptx
         return (rh, rl);
     }
 
-    /// <summary>The value a reduction starts from: −∞ / the smallest value for max, +∞ / the largest for min, zero for sums.</summary>
+    /// <summary>The value a reduction starts from: −∞ / the smallest value for max; for min a NaN (the top of Adad's order:
+    /// the lane's min of it and x is x, of NaNs alone a NaN) / the largest value; zero for sums.</summary>
     private static string ReduceIdentity(Lane lane, string op) => op switch
     {
         "max" => lane.IsFloat ? lane.Literal(double.NegativeInfinity) : lane.Name[0] == 'u' ? "0" : lane.Wide ? "0x8000000000000000" : "0x80000000",
-        "min" => lane.IsFloat ? lane.Literal(double.PositiveInfinity) : lane.Name[0] == 'u' ? (lane.Wide ? "0xFFFFFFFFFFFFFFFF" : "0xFFFFFFFF") : lane.Wide ? "0x7FFFFFFFFFFFFFFF" : "0x7FFFFFFF",
+        "min" => lane.IsFloat ? lane.Literal(double.NaN) : lane.Name[0] == 'u' ? (lane.Wide ? "0xFFFFFFFFFFFFFFFF" : "0xFFFFFFFF") : lane.Wide ? "0x7FFFFFFFFFFFFFFF" : "0x7FFFFFFF",
         _ => lane.Zero,
     };
 
@@ -3455,7 +3457,8 @@ internal static partial class Ptx
                 b.L($"mov.b32 {other}, {bits2};");
             }
 
-            b.L(op == "max" ? $"max.{lane.Op} {acc}, {acc}, {other};" : op == "min" ? $"min.{lane.Op} {acc}, {acc}, {other};" : lane.Add(acc, acc, other));
+            if (op == "first") First(b, lane, acc, acc, other);
+            else b.L(op == "max" ? $"max.{lane.Op} {acc}, {acc}, {other};" : op == "min" ? $"min.{lane.Op} {acc}, {acc}, {other};" : lane.Add(acc, acc, other));
         }
     }
 }

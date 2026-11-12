@@ -161,13 +161,13 @@ internal static partial class Ptx
         return b.Finish(Header(gpu), entry, LayoutParams);
     }
 
-    /// <summary>The max-pool backward's first largest of every window of the forward input (p_x2), a thread per window
+    /// <summary>The max-pool backward's first-ranked of every window of the forward input (p_x2) in Adad's order, a thread per window
     /// (p_count windows, in the output's order): its index into the input, 0xFFFFFFFF for a window with no pixel, into
     /// p_out (u32). The backward then reads each window's choice (LayoutValue) instead of scanning every window a pixel
     /// lies in; compared in the backward's lane, as the scan was.</summary>
     public static string LayoutWindowArgmax(Gpu gpu, Fmt f, Lane lane, string name, out string entry)
     {
-        if (name is not ("maxpool_bwd" or "adaptive_maxpool_bwd")) throw new NotSupportedException($"window first largest of {name}");
+        if (name is not ("maxpool_bwd" or "adaptive_maxpool_bwd")) throw new NotSupportedException($"window first-ranked of {name}");
         bool adaptive = name == "adaptive_maxpool_bwd";
         entry = $"layout_argmax_{name}_{f.Name}_{lane.Name}";
         var b = new PtxBuilder();
@@ -235,10 +235,10 @@ internal static partial class Ptx
         b.L($"@{pb} bra WB_NEXT;");
         b.L($"mad.lo.u32 {cand}, {ch}, {H}, {hh};");
         b.L($"mad.lo.u32 {cand}, {cand}, {W}, {ww};");
-        // The first largest in row-major order: a later value takes it only when strictly larger.
-        string xv = Codec.UnpackAt(b, f, x2, cand, lane), pFirst = b.P(), pGt = b.P();
+        // The first-ranked in row-major order (Adad's order, Rank): a later value takes it only when it ranks strictly above.
+        string xv = Codec.UnpackAt(b, f, x2, cand, lane), pFirst = b.P();
         b.L($"setp.eq.u32 {pFirst}, {bestAt}, 0xFFFFFFFF;");
-        b.L($"setp.gt.{lane.Op} {pGt}, {xv}, {best};");
+        string pGt = RankAbove(b, lane, xv, best);
         b.L($"or.pred {pGt}, {pGt}, {pFirst};");
         b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {best}, {xv}, {best}, {pGt};");
         b.L($"selp.u32 {bestAt}, {cand}, {bestAt}, {pGt};");
@@ -263,7 +263,6 @@ internal static partial class Ptx
     {
         string Load(string index) => Codec.UnpackAt(b, f, x, index, lane);
         string Load2(string index) => Codec.UnpackAt(b, f, x2, index, lane);
-        string Gt(string a, string z) { string pr = b.P(); b.L($"setp.gt.{(lane.IsFloat ? lane.Op : lane.Op)} {pr}, {a}, {z};"); return pr; }
         string Index(string ptr, string i) { string a = b.RD(), o = b.R(); b.L($"mul.wide.u32 {a}, {i}, 4;"); b.L($"add.u64 {a}, {ptr}, {a};"); b.L($"ld.global.s32 {o}, [{a}];"); return o; }
         string Zero() { string z = lane.NewReg(b); b.L($"mov.{lane.Reg} {z}, {lane.Zero};"); return z; }
         string Sel(string pred, string a, string z) { string d = lane.NewReg(b); b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {d}, {a}, {z}, {pred};"); return d; }
@@ -561,7 +560,7 @@ internal static partial class Ptx
                 b.L($"mad.lo.u32 {src}, {ch}, {H}, {ih};");
                 b.L($"mad.lo.u32 {src}, {src}, {W}, {iw};");
                 string xv = Load(src);
-                if (max) b.L($"max.{lane.Op} {acc}, {acc}, {xv};");
+                if (max) First(b, lane, acc, acc, xv);
                 else if (conv)
                 {
                     string wIdx = b.R();
@@ -636,7 +635,7 @@ internal static partial class Ptx
                 string dy = Load(dyIdx);
                 if (max)
                 {
-                    // The window's first largest, found once for all its pixels (LayoutWindowArgmax, in aux).
+                    // The window's first-ranked, found once for all its pixels (LayoutWindowArgmax, in aux).
                     string chosen = Index(aux, dyIdx), pChosen = b.P();
                     b.L($"setp.eq.u32 {pChosen}, {chosen}, {me};");
                     b.L($"@{pChosen} {lane.Add(acc, acc, dy)}");
@@ -735,7 +734,7 @@ internal static partial class Ptx
                 }
                 else
                 {
-                    // The window's first largest of the forward input, found once for all its pixels (LayoutWindowArgmax, in aux).
+                    // The window's first-ranked of the forward input, found once for all its pixels (LayoutWindowArgmax, in aux).
                     string chosen = Index(aux, dyIdx), pChosen = b.P();
                     b.L($"setp.eq.u32 {pChosen}, {chosen}, {me};");
                     b.L($"@{pChosen} {lane.Add(acc, acc, dy)}");
@@ -787,7 +786,7 @@ internal static partial class Ptx
                 b.L($"mad.lo.u32 {src}, {ch}, {H}, {ih};");
                 b.L($"mad.lo.u32 {src}, {src}, {W}, {iw};");
                 string xv = Load(src);
-                if (max) b.L($"max.{lane.Op} {acc}, {acc}, {xv};"); else b.L(lane.Add(acc, acc, xv));
+                if (max) First(b, lane, acc, acc, xv); else b.L(lane.Add(acc, acc, xv));
                 b.L($"add.u32 {iw}, {iw}, 1;");
                 b.L($"bra AW{tag};");
                 b.Label($"AW{tag}_END");

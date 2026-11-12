@@ -376,7 +376,8 @@ internal sealed partial class Kernels
                 if (adaptive) { (h0, h1) = LayoutArgs.Adaptive(oh, H, OH); (w0, w1) = LayoutArgs.Adaptive(ow, W, OW); }
                 else { h0 = oh * p[5] - p[7]; h1 = h0 + p[3]; w0 = ow * p[6] - p[8]; w1 = w0 + p[4]; }
                 h0 = Math.Max(h0, 0); h1 = Math.Min(h1, H); w0 = Math.Max(w0, 0); w1 = Math.Min(w1, W);
-                // The first largest in row-major order: a later value takes it only when strictly larger.
+                // The first-ranked in row-major order (Adad's order, Widths.Compare): a later value takes it only when it
+                // ranks strictly above.
                 long bestAt = -1;
                 TLane best = default;
                 for (int hh = h0; hh < h1; hh++) for (int ww = w0; ww < w1; ww++)

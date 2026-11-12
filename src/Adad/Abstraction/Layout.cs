@@ -286,7 +286,8 @@ public sealed class LayoutArgs
                         int ih = oh * sh - ph + a, iw = ow * sw - pw + b;
                         if ((uint)ih >= (uint)H || (uint)iw >= (uint)W) continue;
                         double v = x[(c * H + ih) * W + iw];
-                        best = Math.Max(best, v); sum += v; n++;
+                        if (n == 0 || Routing.Order(v, best) > 0) best = v;
+                        sum += v; n++;
                     }
 
                     y[(c * OH + oh) * OW + ow] = name == "maxpool" ? (n == 0 ? 0 : best) : (n == 0 ? 0 : sum / PoolDivisor(p, oh, ow, n));
@@ -310,7 +311,7 @@ public sealed class LayoutArgs
                         int ih = oh * sh - ph + a, iw = ow * sw - pw + b;
                         if ((uint)ih >= (uint)H || (uint)iw >= (uint)W) continue;
                         n++;
-                        if (name == "maxpool_bwd") { double v = x2![(c * H + ih) * W + iw]; if (v > best) { best = v; bestAt = (c * H + ih) * W + iw; } }
+                        if (name == "maxpool_bwd") { double v = x2![(c * H + ih) * W + iw]; if (bestAt < 0 || Routing.Order(v, best) > 0) { best = v; bestAt = (c * H + ih) * W + iw; } }
                         else y[(c * H + ih) * W + iw] += 0;    // counted below
                     }
 
@@ -335,7 +336,7 @@ public sealed class LayoutArgs
                     var (h0, h1) = Adaptive(oh, H, OH);
                     var (w0, w1) = Adaptive(ow, W, OW);
                     double best = double.NegativeInfinity, sum = 0;
-                    for (int ih = h0; ih < h1; ih++) for (int iw = w0; iw < w1; iw++) { double v = x[(c * H + ih) * W + iw]; best = Math.Max(best, v); sum += v; }
+                    for (int ih = h0; ih < h1; ih++) for (int iw = w0; iw < w1; iw++) { double v = x[(c * H + ih) * W + iw]; if ((ih == h0 && iw == w0) || Routing.Order(v, best) > 0) best = v; sum += v; }
                     y[(c * OH + oh) * OW + ow] = name == "adaptive_maxpool" ? best : sum / ((h1 - h0) * (w1 - w0));
                 }
 
@@ -361,7 +362,7 @@ public sealed class LayoutArgs
 
                     double best = double.NegativeInfinity;
                     int bestAt = -1;
-                    for (int ih = h0; ih < h1; ih++) for (int iw = w0; iw < w1; iw++) { double v = x2![(c * H + ih) * W + iw]; if (bestAt < 0 || v > best) { best = v; bestAt = (c * H + ih) * W + iw; } }
+                    for (int ih = h0; ih < h1; ih++) for (int iw = w0; iw < w1; iw++) { double v = x2![(c * H + ih) * W + iw]; if (bestAt < 0 || Routing.Order(v, best) > 0) { best = v; bestAt = (c * H + ih) * W + iw; } }
                     y[bestAt] += dy;
                 }
 

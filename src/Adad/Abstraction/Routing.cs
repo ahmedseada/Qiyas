@@ -18,15 +18,18 @@ public static class Routing
         if (rows < 0 || cols < 0 || k < 0 || k > cols) throw new ArgumentException($"top-k: the {k} largest of rows of {cols} values (k is at most the row's columns)");
     }
 
-    /// <summary>Adad's order of a row's values, the one top-k takes on every device: a at column ia ranks before b at column
-    /// ib when it is larger, a NaN ranking above every number; equal values (−0 and +0 among them, and two NaNs) by the lower
-    /// column. A total order: each column of a row has one rank.</summary>
+    /// <summary>Adad's order on values, the one every comparison takes on every device (top-k, max, min, argmax, max
+    /// pooling): positive when a ranks above b (larger, or a NaN against a number), zero when they rank the same (equal,
+    /// −0 and +0 among them, or two NaNs), negative when b ranks above a.</summary>
+    public static int Order(double a, double b) => a > b ? 1 : a < b ? -1 : a == b ? 0 : double.IsNaN(a) ? (double.IsNaN(b) ? 0 : 1) : -1;
+
+    /// <summary>Adad's order of a row's values with their columns: a at column ia ranks before b at column ib when Order puts
+    /// it above, and of two that rank the same the lower column first. A total order: each column of a row has one rank.
+    /// Top-k takes the first k; max is the first's value and argmax its column; min the last's value.</summary>
     public static bool Precedes(double a, int ia, double b, int ib)
     {
-        bool na = double.IsNaN(a), nb = double.IsNaN(b);
-        if (na != nb) return na;
-        if (!na && a != b) return a > b;
-        return ia < ib;
+        int o = Order(a, b);
+        return o != 0 ? o > 0 : ia < ib;
     }
 
     // Row r's columns in Adad's order, the first k.

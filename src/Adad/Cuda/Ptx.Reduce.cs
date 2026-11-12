@@ -22,12 +22,13 @@ internal static partial class Ptx
         _ => new Fmt("uint64", 64, false, false),
     };
 
-    private static string Combine(Lane lane, string op, string d, string a, string b) => op switch
+    // d = a op c in Adad's order (Routing.Order): max the first-ranked (First: a NaN when either is one), min the last-ranked
+    // (the lane's min: the number when one is a NaN, a NaN only when both are), else the sum.
+    private static void Combine(PtxBuilder b, Lane lane, string op, string d, string a, string c)
     {
-        "max" => $"max.{lane.Op} {d}, {a}, {b};",
-        "min" => $"min.{lane.Op} {d}, {a}, {b};",
-        _ => lane.Add(d, a, b),
-    };
+        if (op == "max") First(b, lane, d, a, c);
+        else b.L(op == "min" ? $"min.{lane.Op} {d}, {a}, {c};" : lane.Add(d, a, c));
+    }
 
     private static string Identity(Lane lane, string op) => ReduceIdentity(lane, op);
 
@@ -105,7 +106,7 @@ internal static partial class Ptx
             b.L($"mov.f32 {acc}, {kt};");
         }
         else if (squares) b.L(lane.Fma(acc, v, v, acc));
-        else b.L(Combine(lane, op, acc, acc, v));
+        else Combine(b, lane, op, acc, acc, v);
         b.L($"add.u32 {i}, {i}, {ReduceThreads};");
         b.L("bra LOOP;");
         b.Label("DONE");
@@ -139,7 +140,7 @@ internal static partial class Ptx
             lane = Lane.F64;
         }
 
-        string total = BlockReduce(b, lane, tid, acc, op == "max" ? "max" : op == "min" ? "min" : "add", ReduceThreads);
+        string total = BlockReduce(b, lane, tid, acc, op == "max" ? "first" : op == "min" ? "min" : "add", ReduceThreads);
         string p0 = b.P(), oAddr = b.RD();
         b.L($"setp.ne.u32 {p0}, {tid}, 0;");
         b.L($"@{p0} bra OUT;");
@@ -211,7 +212,8 @@ internal static partial class Ptx
         return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_out, .param .u32 p_cols, .param .u32 p_chunk", ReduceBytes);
     }
 
-    /// <summary>out[col] = the row index of the column's first largest value (s32), a thread per column.</summary>
+    /// <summary>out[col] = the row of the column's first-ranked value in Adad's order (Rank; the first row among those that
+    /// rank the same), s32, a thread per column.</summary>
     public static string ArgmaxCols(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"argmax_cols_{f.Name}_{lane.Name}";
@@ -222,7 +224,7 @@ internal static partial class Ptx
         b.L($"mad.lo.u32 {col}, {bid}, 256, {tid};");
         b.L($"setp.ge.u32 {pEnd}, {col}, {cols};");
         b.L($"@{pEnd} bra DONE;");
-        string r = b.R(), best = lane.NewReg(b), bestAt = b.R(), idx = b.R(), pR = b.P(), pGt = b.P(), pFirst = b.P();
+        string r = b.R(), best = lane.NewReg(b), bestAt = b.R(), idx = b.R(), pR = b.P(), pFirst = b.P();
         b.L($"mov.{lane.Reg} {best}, {Identity(lane, "max")};");
         b.L($"mov.u32 {bestAt}, 0xFFFFFFFF;");
         b.L($"mov.u32 {r}, 0;");
@@ -231,7 +233,7 @@ internal static partial class Ptx
         b.L($"@{pR} bra END;");
         b.L($"mad.lo.u32 {idx}, {r}, {cols}, {col};");
         string v = Codec.UnpackAt(b, f, src, idx, lane);
-        b.L($"setp.gt.{lane.Op} {pGt}, {v}, {best};");
+        string pGt = RankAbove(b, lane, v, best);                                   // ranks above (Adad's order)
         b.L($"setp.eq.u32 {pFirst}, {bestAt}, 0xFFFFFFFF;");
         b.L($"or.pred {pGt}, {pGt}, {pFirst};");
         b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {best}, {v}, {best}, {pGt};");
@@ -248,7 +250,8 @@ internal static partial class Ptx
         return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_out, .param .u32 p_rows, .param .u32 p_cols");
     }
 
-    /// <summary>out[row] = the index of the first largest value of the row (s32), a block per row.</summary>
+    /// <summary>out[row] = the column of the row's first-ranked value in Adad's order (Rank; the lowest column among those
+    /// that rank the same), s32, a block per row.</summary>
     public static string ArgmaxRows(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"argmax_rows_{f.Name}_{lane.Name}";
@@ -265,10 +268,10 @@ internal static partial class Ptx
         b.Label("LOOP");
         b.L($"setp.ge.u32 {pEnd}, {i}, {cols};");
         b.L($"@{pEnd} bra DONE;");
-        string idx = b.R(), pGt = b.P(), pFirst = b.P();
+        string idx = b.R(), pFirst = b.P();
         b.L($"add.u32 {idx}, {start}, {i};");
         string v = Codec.UnpackAt(b, f, src, idx, lane);
-        b.L($"setp.gt.{lane.Op} {pGt}, {v}, {best};");
+        string pGt = RankAbove(b, lane, v, best);                                   // ranks above (Adad's order)
         b.L($"setp.eq.u32 {pFirst}, {bestAt}, 0xFFFFFFFF;");
         b.L($"or.pred {pGt}, {pGt}, {pFirst};");
         b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {best}, {v}, {best}, {pGt};");
@@ -276,7 +279,7 @@ internal static partial class Ptx
         b.L($"add.u32 {i}, {i}, {ReduceThreads};");
         b.L("bra LOOP;");
         b.Label("DONE");
-        // The block's best: a shared tree over (value, index) pairs; ties keep the lower index.
+        // The block's first-ranked: a shared tree over (value, index) pairs in Adad's order; ties keep the lower index.
         string smem = b.R(), mine = b.R();
         b.L($"mov.u32 {smem}, smem;");
         b.L($"mad.lo.u32 {mine}, {tid}, 16, {smem};");
@@ -293,8 +296,9 @@ internal static partial class Ptx
             b.L($"ld.shared.u32 {oi}, [{other}+8];");
             b.L($"setp.ne.u32 {pNone}, {oi}, 0xFFFFFFFF;");
             b.L($"setp.eq.u32 {pMineNone}, {bestAt}, 0xFFFFFFFF;");
-            b.L($"setp.gt.{lane.Op} {pTake}, {ov}, {best};");
-            b.L($"setp.eq.{lane.Op} {pEq}, {ov}, {best};");
+            var (pAbove, pSame) = Rank(b, lane, ov, best);
+            b.L($"mov.pred {pTake}, {pAbove};");
+            b.L($"mov.pred {pEq}, {pSame};");
             b.L($"setp.lt.u32 {pLess}, {oi}, {bestAt};");
             b.L($"and.pred {pEq}, {pEq}, {pLess};");
             b.L($"or.pred {pTake}, {pTake}, {pEq};");
@@ -341,7 +345,7 @@ internal static partial class Ptx
         b.L($"@{pLoop} bra DONE;");
         string v = Codec.UnpackAt(b, f, src, idx, lane);
         if (squares) b.L(lane.Fma(acc, v, v, acc));
-        else b.L(Combine(lane, op, acc, acc, v));
+        else Combine(b, lane, op, acc, acc, v);
         b.L($"add.u32 {idx}, {idx}, {cols};");
         b.L($"add.u32 {r}, {r}, 1;");
         b.L("bra LOOP;");
