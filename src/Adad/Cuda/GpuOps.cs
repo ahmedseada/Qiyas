@@ -37,7 +37,7 @@ public sealed partial class GpuOps(Gpu gpu)
         {
             // A block format: a thread per output block, the inputs decoded in place, the sum in f32 registers, the block encoded.
             var fb = gpu.Cached($"add_blocks:{f.Name}", (out string e) => Ptx.AddBlocks(gpu, f, out e));
-            Gpu.Launch(fb, BlockGrid(f, n), 1, 256, 1, 0, a, b, c, Gpu.U(n));
+            Gpu.Launch(fb, Grid(Ptx.BlockKernelThreads(f, n, Ptx.BlockByThread(f)), 256), 1, 256, 1, 0, a, b, c, Gpu.U(n));
             return;
         }
 
@@ -245,7 +245,7 @@ public sealed partial class GpuOps(Gpu gpu)
         if (f.IsBlock)
         {
             var fb = gpu.Cached($"maprow_blocks:{op.Name}:{f.Name}", (out string e) => Ptx.MapRowBlocks(gpu, f, op, out e));
-            Gpu.Launch(fb, BlockGrid(f, (long)rows * cols), 1, 256, 1, 0, x, v, output, Gpu.U(rows * cols), Gpu.U(cols));
+            Gpu.Launch(fb, Grid(Ptx.BlockKernelThreads(f, (long)rows * cols, Ptx.MapByThread(gpu, f, op)), 256), 1, 256, 1, 0, x, v, output, Gpu.U(rows * cols), Gpu.U(cols));
             return "f32 (blocks in place)";
         }
 
@@ -390,7 +390,7 @@ public sealed partial class GpuOps(Gpu gpu)
             // A thread per output block: the inputs decoded in place, the formula in f32 registers, the block encoded.
             (a, b) = Stored.Held<Float32>(a, b);
             var fb = gpu.Cached($"map_blocks:{op.Name}:{f.Name}", (out string e) => Ptx.MapBlocks(gpu, f, op, out e));
-            Gpu.Launch(fb, BlockGrid(f, n), 1, 256, 1, 0, x, y, z, output, Gpu.U(n), Gpu.F((float)a), Gpu.F((float)b));
+            Gpu.Launch(fb, Grid(Ptx.BlockKernelThreads(f, n, Ptx.MapByThread(gpu, f, op)), 256), 1, 256, 1, 0, x, y, z, output, Gpu.U(n), Gpu.F((float)a), Gpu.F((float)b));
             return "f32 (blocks in place)";
         }
 

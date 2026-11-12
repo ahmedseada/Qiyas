@@ -16,13 +16,18 @@ internal static partial class Ptx
         entry = $"add_{f.Name}_blocks";
         var b = new PtxBuilder(gpu);
         string pa = Param64(b, "p_a"), pb = Param64(b, "p_b"), pc = Param64(b, "p_c"), n = Param32(b, "p_n");
-        var w = BlockWarp(b, f, n);
-        EncodeBlock(b, f, pc, w, n, at =>
+        if (BlockByThread(f)) AddBlocksThread(b, f, pa, pb, pc, n);
+        else
         {
-            string x = Codec.UnpackAt(b, f, pa, at, Lane.F32), y = Codec.UnpackAt(b, f, pb, at, Lane.F32), z = b.F();
-            b.L(Lane.F32.Add(z, x, y));
-            return z;
-        });
+            var w = BlockWarp(b, f, n);
+            EncodeBlock(b, f, pc, w, n, at =>
+            {
+                string x = Codec.UnpackAt(b, f, pa, at, Lane.F32), y = Codec.UnpackAt(b, f, pb, at, Lane.F32), z = b.F();
+                b.L(Lane.F32.Add(z, x, y));
+                return z;
+            });
+        }
+
         b.Label("DONE");
         b.L("ret;");
         return b.Finish(Header(gpu), entry, ".param .u64 p_a, .param .u64 p_b, .param .u64 p_c, .param .u32 p_n");
@@ -37,16 +42,21 @@ internal static partial class Ptx
         string a = b.F(), pb = b.F();
         b.L($"ld.param.f32 {a}, [p_a];");
         b.L($"ld.param.f32 {pb}, [p_b];");
-        var w = BlockWarp(b, f, n);
-        EncodeBlock(b, f, po, w, n, at =>
+        if (MapByThread(gpu, f, op)) MapBlocksThread(b, f, op, px, py, pz, po, n, a, pb);
+        else
         {
-            string x;
-            if (op.Inputs >= 1) x = Codec.UnpackAt(b, f, px, at, Lane.F32);
-            else { x = b.F(); b.L($"mov.f32 {x}, 0f00000000;"); }
-            string y = op.Inputs >= 2 ? Codec.UnpackAt(b, f, py, at, Lane.F32) : x;
-            string z = op.Inputs >= 3 ? Codec.UnpackAt(b, f, pz, at, Lane.F32) : x;
-            return Formula(b, Lane.F32, op.Name, x, y, z, a, pb);
-        });
+            var w = BlockWarp(b, f, n);
+            EncodeBlock(b, f, po, w, n, at =>
+            {
+                string x;
+                if (op.Inputs >= 1) x = Codec.UnpackAt(b, f, px, at, Lane.F32);
+                else { x = b.F(); b.L($"mov.f32 {x}, 0f00000000;"); }
+                string y = op.Inputs >= 2 ? Codec.UnpackAt(b, f, py, at, Lane.F32) : x;
+                string z = op.Inputs >= 3 ? Codec.UnpackAt(b, f, pz, at, Lane.F32) : x;
+                return Formula(b, Lane.F32, op.Name, x, y, z, a, pb);
+            });
+        }
+
         b.Label("DONE");
         b.L("ret;");
         return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_y, .param .u64 p_z, .param .u64 p_o, .param .u32 p_n, .param .f32 p_a, .param .f32 p_b");
@@ -58,16 +68,21 @@ internal static partial class Ptx
         entry = $"maprow_{op.Name}_{f.Name}_blocks";
         var b = new PtxBuilder(gpu);
         string px = Param64(b, "p_x"), pv = Param64(b, "p_v"), po = Param64(b, "p_o"), n = Param32(b, "p_n"), cols = Param32(b, "p_cols");
-        string zero = b.F();
-        b.L($"mov.f32 {zero}, 0f00000000;");
-        var w = BlockWarp(b, f, n);
-        EncodeBlock(b, f, po, w, n, at =>
+        if (MapByThread(gpu, f, op)) MapRowBlocksThread(b, f, op, px, pv, po, n, cols);
+        else
         {
-            string col = b.R();
-            b.L($"rem.u32 {col}, {at}, {cols};");
-            string x = Codec.UnpackAt(b, f, px, at, Lane.F32), y = Codec.UnpackAt(b, f, pv, col, Lane.F32);
-            return Formula(b, Lane.F32, op.Name, x, y, zero, zero, zero);
-        });
+            string zero = b.F();
+            b.L($"mov.f32 {zero}, 0f00000000;");
+            var w = BlockWarp(b, f, n);
+            EncodeBlock(b, f, po, w, n, at =>
+            {
+                string col = b.R();
+                b.L($"rem.u32 {col}, {at}, {cols};");
+                string x = Codec.UnpackAt(b, f, px, at, Lane.F32), y = Codec.UnpackAt(b, f, pv, col, Lane.F32);
+                return Formula(b, Lane.F32, op.Name, x, y, zero, zero, zero);
+            });
+        }
+
         b.Label("DONE");
         b.L("ret;");
         return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_v, .param .u64 p_o, .param .u32 p_n, .param .u32 p_cols");
