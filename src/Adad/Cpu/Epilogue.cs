@@ -5,7 +5,8 @@
 // stored, transposed or at their offsets) into the lane's sums, the second product's into sums of its own (the same
 // way), then the store (ProductStore): each value's sums, bias, β·y (y read where it is stored, a tile before it is
 // written), the activation or the gradient through one (the formula's, Map.cs, in the lane) and the residual, all in the
-// lane, y rounded to the type once; the sums kept by a pass of their own first. A float type sums in its float lane; a
+// lane, y rounded to the type once; the sums kept by a pass of their own first. The sums are the calling thread's scratch
+// (Recurrent.cs Scratch: kept from call to call, every value written by the product before the store reads it). A float type sums in its float lane; a
 // type that is not float in the lane its products take by the bounds of every value the store makes
 // (ProductEpilogue.IntegerSums: exact), the sums kept as the lane's own type and the terms added in its plain lane
 // (ILane.Kept: a dot lane's accumulator's), its formulas Map's any-type ones. The convolution's general path (Conv.cs)
@@ -69,12 +70,12 @@ internal sealed partial class Kernels
         {
             if (v.M == 0 || v.N == 0 || v.Batch == 0) return;
             int size = System.Runtime.CompilerServices.Unsafe.SizeOf<TAcc>();
-            var sums = new byte[v.ValuesC * size];
+            var sums = Scratch.Get(Scratch.Sums, v.ValuesC * size);
             ViewSums<TN, TS, TIn, TAcc, TL>(v, a, b, sums);
             byte[]? second = null;
             if (terms.Second)
             {
-                second = new byte[v.ValuesC * size];
+                second = Scratch.Get(Scratch.SecondSums, v.ValuesC * size);
                 ViewSums<TN, TS, TIn, TAcc, TL>(e.Second!, t.SecondA!, t.SecondB!, second);
             }
 
@@ -89,7 +90,7 @@ internal sealed partial class Kernels
         public string Run<TN, TS, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
         {
             if (v.M == 0 || v.N == 0 || v.Batch == 0) return TL.Name;
-            var sums = new byte[v.ValuesC * System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>()];
+            var sums = Scratch.Get(Scratch.Sums, v.ValuesC * System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>());
             ViewSums<TN, TS, TLane, TLane, TL>(v, a, b, sums);
             EpilogueStore<TN, TS, TLane, TL>(v, e, terms, t, sums, c, 1, v.N);
             return TL.Name;
@@ -115,7 +116,7 @@ internal sealed partial class Kernels
         byte[]? second = null;
         if (terms.Second)
         {
-            second = new byte[v.ValuesC * System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>()];
+            second = Scratch.Get(Scratch.SecondSums, v.ValuesC * System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>());
             ViewSums<TN, TS, TLane, TLane, TL>(e.Second!, t.SecondA!, t.SecondB!, second);
         }
 

@@ -174,8 +174,8 @@ internal sealed partial class Kernels
     {
         var v = a.V;
         if (a.Offsets.Length < v.Experts + 1) throw new ArgumentException($"experts: {a.Offsets.Length} offsets for {v.Experts} experts");
-        var gs = ExpertSums<TN, TS, TIn, TAcc, TL>(v, a.X, a.Offsets, a.Gw);
-        var us = a.Uw is null ? null : ExpertSums<TN, TS, TIn, TAcc, TL>(v, a.X, a.Offsets, a.Uw);
+        var gs = ExpertSums<TN, TS, TIn, TAcc, TL>(v, a.X, a.Offsets, a.Gw, Scratch.Sums);
+        var us = a.Uw is null ? null : ExpertSums<TN, TS, TIn, TAcc, TL>(v, a.X, a.Offsets, a.Uw, Scratch.SecondSums);
         var rowExpert = new int[v.Rows];
         Array.Fill(rowExpert, v.Experts);
         for (int e = 0; e < v.Experts; e++) for (int r = Math.Max(0, a.Offsets[e]); r < Math.Min(v.Rows, a.Offsets[e + 1]); r++) rowExpert[r] = e;
@@ -190,11 +190,12 @@ internal sealed partial class Kernels
         return new ExpertStoreUse<TN, TAcc, TP>(v, gs, Bias(a.Gb, v.BiasValues), us, Bias(a.Ub, v.BiasValues), rowExpert, a.Y);
     }
 
-    // Each expert's rows of x times its weights into the lane's sums stored as TS (Rows × N; rows outside every expert's 0).
-    private static byte[] ExpertSums<TN, TS, TIn, TAcc, TL>(ExpertView v, byte[] x, int[] offsets, byte[] w)
+    // Each expert's rows of x times its weights into the lane's sums stored as TS (Rows × N; rows outside every expert's
+    // not written: the store reads none of them), in the calling thread's scratch slot (kept from call to call).
+    private static byte[] ExpertSums<TN, TS, TIn, TAcc, TL>(ExpertView v, byte[] x, int[] offsets, byte[] w, int slot)
         where TN : struct, IAdad<TN, TIn>, IAdad<TN, TAcc> where TS : struct, IAdad<TS, TAcc> where TIn : unmanaged where TAcc : unmanaged where TL : struct, ILane<TL, TAcc>
     {
-        var sums = new byte[v.YValues * Unsafe.SizeOf<TAcc>()];
+        var sums = Scratch.Get(slot, v.YValues * Unsafe.SizeOf<TAcc>());
         for (int e = 0; e < v.Experts; e++)
         {
             int r0 = offsets[e], r1 = offsets[e + 1];
