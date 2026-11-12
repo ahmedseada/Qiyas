@@ -77,7 +77,7 @@ public sealed partial class VulkanOps
         {
             ulong sums = Rent(v.ValuesC * lane.Size);
             ViewSums(v, lane, f, a, b, sums);
-            EpilogueStore(f, lane, v, e, terms, t, sums, c, Rent);
+            EpilogueStore(f, lane, v, e, terms, t, sums, c, 1, v.N, Rent);
         }
         finally { foreach (var p in rented) vk.Return(p); }
 
@@ -104,7 +104,7 @@ public sealed partial class VulkanOps
             var fn = vk.Cached($"matmul_scaled:{f.Name}:{fw.Name}:{lane.Name}:{z}", () => VkKernels.MatMulScaled(vk, f, fw, lane, z));
             vk.Launch(fn, Groups(v.N, VkKernels.TileN), Groups(v.M, VkKernels.TileM), x, codes, sums, Vulkan.U(v.M), Vulkan.U(v.N), Vulkan.U(v.K),
                 scales, zeros, Vulkan.U(w.BlockRows), Vulkan.U(w.BlockColumns), Vulkan.U(w.ScaleColumns));
-            EpilogueStore(f, lane, v, e, terms, t, sums, y, Rent);
+            EpilogueStore(f, lane, v, e, terms, t, sums, y, 1, v.N, Rent);
         }
         finally { foreach (var p in rented) vk.Return(p); }
 
@@ -180,7 +180,7 @@ public sealed partial class VulkanOps
 
     // After a product's sums (lane storage, the view's C contiguous): the second product's into sums of its own, then the
     // store (the sums kept first where they are).
-    private void EpilogueStore(Fmt f, Lane lane, ProductView v, ProductEpilogue e, StoreTerms terms, ProductTerms<ulong> t, ulong sums, ulong c, Func<long, ulong> rent)
+    private void EpilogueStore(Fmt f, Lane lane, ProductView v, ProductEpilogue e, StoreTerms terms, ProductTerms<ulong> t, ulong sums, ulong c, int cols, int oc, Func<long, ulong> rent)
     {
         ulong second = 0;
         if (terms.Second)
@@ -189,8 +189,8 @@ public sealed partial class VulkanOps
             ViewSums(e.Second!, lane, f, t.SecondA, t.SecondB, second);
         }
 
-        if (terms.Keep) ProductStore(f, lane, terms.KeepPass, sums, second, t.Bias, 0, 0, t.Sums, v.ValuesC, 1, v.N, e.ActA, e.Beta);
-        ProductStore(f, lane, terms, sums, second, t.Bias, t.Residual, t.ActInputs, c, v.ValuesC, 1, v.N, e.ActA, e.Beta);
+        if (terms.Keep) ProductStore(f, lane, terms.KeepPass, sums, second, t.Bias, 0, 0, t.Sums, v.ValuesC, cols, oc, e.ActA, e.Beta);
+        ProductStore(f, lane, terms, sums, second, t.Bias, t.Residual, t.ActInputs, c, v.ValuesC, cols, oc, e.ActA, e.Beta);
     }
 
     /// <summary>y (count values of f) = the store terms' value of the lane sums (Kernels.ProductStore.cs): the bias the

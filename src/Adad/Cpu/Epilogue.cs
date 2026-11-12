@@ -30,7 +30,7 @@ internal sealed partial class Kernels
             if (v.M == 0 || v.N == 0 || v.Batch == 0) return TL.Name;
             var sums = new byte[v.ValuesC * System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>()];
             ViewSums<TN, TS, TLane, TL>(v, a, b, sums);
-            EpilogueStore<TN, TS, TLane, TL>(v, e, terms, t, sums, c);
+            EpilogueStore<TN, TS, TLane, TL>(v, e, terms, t, sums, c, 1, v.N);
             return TL.Name;
         }
     }
@@ -47,8 +47,8 @@ internal sealed partial class Kernels
     }
 
     // After a product's sums (lane storage, the view's C contiguous): the second product's into sums of its own, then the
-    // store (the sums kept first where they are).
-    private static void EpilogueStore<TN, TS, TLane, TL>(ProductView v, ProductEpilogue e, StoreTerms terms, ProductTerms<byte[]> t, byte[] sums, byte[] c)
+    // store (the sums kept first where they are), value i's bias the channel (i / cols) mod oc's (a view's: 1, n).
+    private static void EpilogueStore<TN, TS, TLane, TL>(ProductView v, ProductEpilogue e, StoreTerms terms, ProductTerms<byte[]> t, byte[] sums, byte[] c, int cols, int oc)
         where TN : struct, IAdad<TN, TLane> where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         byte[]? second = null;
@@ -58,7 +58,7 @@ internal sealed partial class Kernels
             ViewSums<TN, TS, TLane, TL>(e.Second!, t.SecondA!, t.SecondB!, second);
         }
 
-        var src = new StoreSources(sums, second, t.Bias, t.Residual, t.ActInputs, 1, v.N, e.ActA, e.Beta);
+        var src = new StoreSources(sums, second, t.Bias, t.Residual, t.ActInputs, cols, oc, e.ActA, e.Beta);
         if (terms.Keep) ProductStore<TN, TLane, TL>(terms.KeepPass, src, t.Sums!, (int)v.ValuesC);
         ProductStore<TN, TLane, TL>(terms, src, c, (int)v.ValuesC);
     }

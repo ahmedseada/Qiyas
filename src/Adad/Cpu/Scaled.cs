@@ -200,7 +200,7 @@ internal sealed partial class Kernels
             var sums = new byte[v.ValuesC * Unsafe.SizeOf<TLane>()];
             var product = new ScaledProduct<TN, TS, TLane, TL>(w, v.M, x, codes, sl, zl, sums);
             TW.Elementwise(ref product);
-            EpilogueStore<TN, TS, TLane, TL>(v, e, terms, t, sums, y);
+            EpilogueStore<TN, TS, TLane, TL>(v, e, terms, t, sums, y, 1, v.N);
             return TL.Name;
         }
     }

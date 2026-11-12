@@ -100,7 +100,7 @@ public sealed partial class GpuOps
         try
         {
             ProductStored(v, lane, a, f, 0, b, f, 0, sums, null);
-            EpilogueStore(f, lane, v, e, terms, t, sums, c);
+            EpilogueStore(f, lane, v, e, terms, t, sums, c, 1, v.N);
         }
         finally { gpu.Return(sums); }
 
@@ -122,7 +122,7 @@ public sealed partial class GpuOps
         try
         {
             ProductStored(v, lane, x, f, 0, codes, Fmt.Of<TW>(), 0, sums, null, new GemmScale(scales, zeros, f, w.BlockRows, w.BlockColumns, w.ScaleColumns));
-            EpilogueStore(f, lane, v, e, terms, t, sums, y);
+            EpilogueStore(f, lane, v, e, terms, t, sums, y, 1, v.N);
         }
         finally { gpu.Return(sums); }
 
@@ -179,7 +179,7 @@ public sealed partial class GpuOps
 
     // After a product's sums (lane storage, the view's C contiguous): the second product's into sums of its own (every
     // batch's operands read where they are stored), then the store (the sums kept first where they are).
-    private void EpilogueStore(Fmt f, Lane lane, ProductView v, ProductEpilogue e, StoreTerms terms, ProductTerms<ulong> t, ulong sums, ulong c)
+    private void EpilogueStore(Fmt f, Lane lane, ProductView v, ProductEpilogue e, StoreTerms terms, ProductTerms<ulong> t, ulong sums, ulong c, int cols, int oc)
     {
         ulong second = 0;
         try
@@ -190,8 +190,8 @@ public sealed partial class GpuOps
                 ProductStored(e.Second!, lane, t.SecondA, f, 0, t.SecondB, f, 0, second, null);
             }
 
-            if (terms.Keep) ProductStore(f, lane, terms.KeepPass, sums, second, t.Bias, 0, 0, t.Sums, v.ValuesC, 1, v.N, e.ActA, e.Beta);
-            ProductStore(f, lane, terms, sums, second, t.Bias, t.Residual, t.ActInputs, c, v.ValuesC, 1, v.N, e.ActA, e.Beta);
+            if (terms.Keep) ProductStore(f, lane, terms.KeepPass, sums, second, t.Bias, 0, 0, t.Sums, v.ValuesC, cols, oc, e.ActA, e.Beta);
+            ProductStore(f, lane, terms, sums, second, t.Bias, t.Residual, t.ActInputs, c, v.ValuesC, cols, oc, e.ActA, e.Beta);
         }
         finally
         {

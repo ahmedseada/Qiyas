@@ -124,16 +124,21 @@ public sealed record ProductEpilogue
 
     /// <summary>The float64 reference: y and the sums s it was made from (y0 y's values before; bias n values; residual and
     /// actInputs y's layout; a2 and b2 the second product's operands as its view stores them).</summary>
-    public (double[] Y, double[] S) Reference(ProductView v, double[] a, double[] b, double[] y0, double[]? bias, double[]? residual, double[]? actInputs, double[]? a2, double[]? b2)
+    public (double[] Y, double[] S) Reference(ProductView v, double[] a, double[] b, double[] y0, double[]? bias, double[]? residual, double[]? actInputs, double[]? a2, double[]? b2) =>
+        Apply(v.Reference(a, b), 1, v.N, y0, bias, residual, actInputs, Second?.Reference(a2!, b2!));
+
+    /// <summary>The store's float64 reference over a product's sums p (y's layout, every batch): y and the sums s, value i's
+    /// bias the channel (i / cols) mod oc's (a view's product: cols 1, oc its n columns; a product whose bias is a value a
+    /// row of n columns: cols n, oc the rows), second the second product's sums (or none).</summary>
+    public (double[] Y, double[] S) Apply(double[] p, int cols, int oc, double[] y0, double[]? bias, double[]? residual, double[]? actInputs, double[]? second)
     {
-        var s = v.Reference(a, b);
-        var second = Second?.Reference(a2!, b2!);
         var act = Act is null ? null : Ops.Find(Act);
         var grad = Grad is null ? null : Ops.Find(Grad);
-        var y = new double[s.Length];
-        for (int i = 0; i < s.Length; i++)
+        var s = new double[p.Length];
+        var y = new double[p.Length];
+        for (int i = 0; i < p.Length; i++)
         {
-            double t = s[i] + (second is null ? 0 : second[i]) + (bias is null ? 0 : bias[i % v.N]) + (Beta == 0 ? 0 : Beta * y0[i]);
+            double t = p[i] + (second is null ? 0 : second[i]) + (bias is null ? 0 : bias[i / cols % oc]) + (Beta == 0 ? 0 : Beta * y0[i]);
             s[i] = t;
             double o = act is not null ? act.Reference(t, 0, 0, ActA, 0) : grad is not null ? grad.Reference(actInputs![i], t, 0, ActA, 0) : t;
             y[i] = o + (residual is null ? 0 : residual[i]);
