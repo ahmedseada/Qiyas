@@ -19,6 +19,45 @@ public sealed partial class GpuOps
     private bool PerValueLayout(Fmt f, int count) =>
         Ptx.PerValueFits(f) && (LayoutPerValue ?? (long)f.Words(count) < (long)gpu.Multiprocessors * gpu.ThreadsPerMultiprocessor);
 
+    /// <summary>A canonical strided view (LayoutArgs.StridedKernel: d0 … d(n−1) | s0 … s(n−1) | base) whose input runs along
+    /// a dimension j (stride 1) other than the last, the last not (stride ≠ 1): its output rows read across the input's runs
+    /// a value each, every warp's reads 32 apart. Taken as a batch of tiled transposes (Ptx.Transpose, strided): A[r][c]
+    /// with r the last dimension (input stride s(n−1)) and c dimension j, B[c][r] at the output's stride of j; the other
+    /// dimensions the batch. Whole output words only (the last dimension a multiple of the values a word holds), at most
+    /// TransposeBatchDims others and 65535 batches; false (nothing launched) otherwise.</summary>
+    private bool StridedTransposed(Fmt f, Lane lane, int[] p, ulong x, ulong output)
+    {
+        int n = p.Length / 2;
+        if (f.IsBlock || n < 2 || p[2 * n - 1] == 1 || p[n - 1] % f.Per != 0 || p[n - 1] < 2) return false;
+        int j = -1;
+        for (int i = 0; i < n - 1; i++) if (p[n + i] == 1 && p[i] >= 2) { j = i; break; }
+        if (j < 0 || n - 2 > Ptx.TransposeBatchDims) return false;
+        var outStride = new long[n];
+        long acc = 1;
+        for (int i = n - 1; i >= 0; i--) { outStride[i] = acc; acc *= p[i]; }
+        long batches = 1;
+        var others = new List<int>();
+        for (int i = 0; i < n - 1; i++) if (i != j) { others.Add(i); batches *= p[i]; }
+        if (batches == 0 || batches > 65535 || acc > uint.MaxValue) return false;
+        var z = new ulong[3 * Ptx.TransposeBatchDims];
+        int slot0 = Ptx.TransposeBatchDims - others.Count;
+        for (int s = 0; s < Ptx.TransposeBatchDims; s++) z[3 * s] = 1;
+        for (int o = 0; o < others.Count; o++)
+        {
+            int dim = others[o], s = slot0 + o;
+            z[3 * s] = Gpu.U(p[dim]);
+            z[3 * s + 1] = Gpu.U(p[n + dim]);
+            z[3 * s + 2] = (ulong)(uint)outStride[dim];
+        }
+
+        bool valueWise = false;
+        var fn = gpu.Cached($"transpose:{f.Name}:{valueWise}:s", (out string e) => Ptx.Transpose(gpu, f, lane, valueWise, out e, strided: true));
+        int rows = p[n - 1], cols = p[j];
+        Gpu.LaunchZ(fn, Grid(cols, Ptx.TransposeTile), Grid(rows, Ptx.TransposeTile), (uint)batches, 256, 1, 0,
+            [x, output, Gpu.U(rows), Gpu.U(cols), Gpu.U(p[2 * n - 1]), (ulong)(uint)outStride[j], Gpu.U(p[2 * n]), .. z]);
+        return true;
+    }
+
     /// <summary>A layout operation (LayoutArgs.Names) from x (and the index array) into output, all on the device. Returns the lane's name.</summary>
     public string Layout<TN>(LayoutArgs k, ulong x, ulong idx, ulong output, ulong x2 = 0) where TN : struct, IAdad<TN> => Layout<TN>(k, x, idx, output, x2, null);
 
@@ -91,6 +130,7 @@ public sealed partial class GpuOps
                 return "f32 (blocks in place)";
             }
 
+            if (kn.StartsWith("strided", StringComparison.Ordinal) && inFmt is null && StridedTransposed(f, lane, k.P, x, output)) return lane.Name;
             if (k.Name == "adaptive_maxpool" && inFmt is null && Ptx.AdaptiveByWarp(k.P))
             {
                 // Large windows: a warp each (the word's values' windows one after another), the order's max the same.

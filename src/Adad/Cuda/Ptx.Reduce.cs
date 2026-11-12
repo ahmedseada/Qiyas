@@ -497,9 +497,17 @@ internal static partial class Ptx
 
     /// <summary>output (cols × rows) = xᵀ: a block per 32 × 32 tile (256 threads), the tile read along the rows into shared
     /// memory as lane values, then each thread writes whole words of the output rows.</summary>
-    public static string Transpose(Gpu gpu, Fmt f, Lane lane, bool valueWise, out string entry)
+    /// <summary>The batched strided transpose's other dimensions at most (a canonical view's rank less its two).</summary>
+    public const int TransposeBatchDims = 5;
+
+    /// <summary>strided (whole output words only, not valueWise): a batch of transposes on grid z, each A[r][c] read at
+    /// p_base + Σ i_k·p_zi_k + r·p_srow + c and B[c][r] written at Σ i_k·p_zo_k + c·p_orow + r, batch z's indices i_k
+    /// (k &lt; p_nz) from z by the sizes p_z_k (the last fastest): a strided view whose input runs along one dimension and
+    /// whose output runs along another, its values through the tile (both sides' accesses along their own runs).</summary>
+    public static string Transpose(Gpu gpu, Fmt f, Lane lane, bool valueWise, out string entry, bool strided = false)
     {
-        entry = $"transpose_{f.Name}{(valueWise ? "_v" : "")}";
+        if (strided && valueWise) throw new NotSupportedException("the strided transpose writes whole words");
+        entry = $"transpose_{f.Name}{(valueWise ? "_v" : "")}{(strided ? "_s" : "")}";
         const int T = TransposeTile;
         var b = new PtxBuilder(gpu);
         string tid = b.R(), bx = b.R(), by = b.R(), tx = b.R(), ty = b.R();
@@ -509,6 +517,23 @@ internal static partial class Ptx
         b.L($"and.b32 {tx}, {tid}, 31;");
         b.L($"shr.u32 {ty}, {tid}, 5;");
         string src = Param64(b, "p_x"), dst = Param64(b, "p_o"), rows = Param32(b, "p_rows"), cols = Param32(b, "p_cols");
+        string srow = cols, orow = rows, inBase = "0", outBase = "0";
+        if (strided)
+        {
+            srow = Param32(b, "p_srow"); orow = Param32(b, "p_orow");
+            inBase = Param32(b, "p_base"); outBase = b.R();
+            string z = b.R();
+            b.L($"mov.u32 {outBase}, 0;");
+            b.L($"mov.u32 {z}, %ctaid.z;");
+            for (int k = TransposeBatchDims - 1; k >= 0; k--)
+            {
+                string size = Param32(b, $"p_z{k}"), si = Param32(b, $"p_zi{k}"), so = Param32(b, $"p_zo{k}"), ik = b.R();
+                b.L($"rem.u32 {ik}, {z}, {size};");
+                b.L($"div.u32 {z}, {z}, {size};");
+                b.L($"mad.lo.u32 {inBase}, {ik}, {si}, {inBase};");
+                b.L($"mad.lo.u32 {outBase}, {ik}, {so}, {outBase};");
+            }
+        }
         string r0 = b.R(), c0 = b.R(), smem = b.R();
         b.L($"mul.lo.u32 {r0}, {by}, {T};");
         b.L($"mul.lo.u32 {c0}, {bx}, {T};");
@@ -524,7 +549,8 @@ internal static partial class Ptx
             b.L($"setp.lt.u32 {pc}, {c}, {cols};");
             b.L($"and.pred {pr}, {pr}, {pc};");
             b.L($"@!{pr} bra NEXT{k};");
-            b.L($"mad.lo.u32 {idx}, {r}, {cols}, {c};");
+            b.L($"mad.lo.u32 {idx}, {r}, {srow}, {c};");
+            if (strided) b.L($"add.u32 {idx}, {idx}, {inBase};");
             string v = Codec.UnpackAt(b, f, src, idx, lane);
             b.L($"mad.lo.u32 {sAddr}, {ty}, {(T + 1) * lane.Size}, {smem};");
             b.L($"add.u32 {sAddr}, {sAddr}, {k * 8 * (T + 1) * lane.Size};");
@@ -625,9 +651,10 @@ internal static partial class Ptx
 
             // The output word index: outRow · rows + r0 + rStart values, a whole word since r0 and rStart are multiples of Per.
             string vIdx = b.RD(), wAddr = b.RD(), rows64 = b.RD(), add64 = b.RD();
-            b.L($"cvt.u64.u32 {rows64}, {rows};");
+            b.L($"cvt.u64.u32 {rows64}, {orow};");
             b.L($"cvt.u64.u32 {vIdx}, {outRow};");
             b.L($"mul.lo.u64 {vIdx}, {vIdx}, {rows64};");
+            if (strided) { b.L($"cvt.u64.u32 {add64}, {outBase};"); b.L($"add.u64 {vIdx}, {vIdx}, {add64};"); }
             b.L($"cvt.u64.u32 {add64}, {r0};");
             b.L($"add.u64 {vIdx}, {vIdx}, {add64};");
             b.L($"cvt.u64.u32 {add64}, {rStart};");
@@ -649,7 +676,9 @@ internal static partial class Ptx
         }
 
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_o, .param .u32 p_rows, .param .u32 p_cols", T * (T + 1) * lane.Size);
+        string batch = strided ? ", .param .u32 p_srow, .param .u32 p_orow, .param .u32 p_base"
+            + string.Concat(Enumerable.Range(0, TransposeBatchDims).Select(k => $", .param .u32 p_z{k}, .param .u32 p_zi{k}, .param .u32 p_zo{k}")) : "";
+        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_o, .param .u32 p_rows, .param .u32 p_cols" + batch, T * (T + 1) * lane.Size);
     }
 
     // ---------------------------------------------------------------- y = A·x (a warp per row), y = Aᵀ·x (a thread per column)
