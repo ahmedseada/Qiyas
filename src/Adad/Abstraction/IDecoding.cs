@@ -9,15 +9,17 @@ namespace Adad.Abstraction;
 /// ICache.PositionAdvance: no value crosses to the host between steps).</summary>
 public interface IDecoding<TBuffer, TIndex>
 {
-    /// <summary>history[r·capacity + length[0] mod capacity] = ids[r] for each of rows rows (the ring's next slot; the
-    /// length not advanced: PositionAdvance does, once the step's rows are pushed).</summary>
+    /// <summary>Each row's token into its ring: history[r·capacity + length[0] mod capacity] = ids[r] for each of rows rows,
+    /// the ring's slot after its last token (the length not advanced: PositionAdvance does, once the step's rows are
+    /// pushed).</summary>
     void HistoryPush(TIndex ids, TIndex history, TIndex length, int rows, int capacity);
 
     /// <summary>output (a.Rows × a.Cols, TN) = each row of scores x (row r at r·a.Stride + a.RowOffset, read where it is) with
-    /// the tokens of the row's window penalized (PenaltyArgs: the last min(length[0], LastN, Capacity) tokens of its ring;
-    /// a token outside [0, Cols) penalizes nothing): a token that occurs n times there once, y = (x above 0 ? x / Repeat :
-    /// x · Repeat) − (Presence + Frequency · n) in the float lane, rounded to TN once; every other value x's as it is.</summary>
-    string Penalize<TN>(PenaltyArgs a, TBuffer x, TIndex history, TIndex length, TBuffer output) where TN : struct, IFloatAdad<TN>;
+    /// the tokens of the row's window penalized (PenaltyArgs: the last min(length[0], Window) tokens of its ring; a token
+    /// outside [0, Cols) penalizes nothing): a token that occurs n times there once, y = (x above 0 ? x / Repeat : x · Repeat)
+    /// − (Presence + Frequency · n) in TN's float lane (Fmt.FloatLane), rounded to TN once by its own conversion; every other
+    /// value x's as it is stored. Every type but bool.</summary>
+    string Penalize<TN>(PenaltyArgs a, TBuffer x, TIndex history, TIndex length, TBuffer output) where TN : struct, IAdad<TN>;
 
     /// <summary>picks[r] = a column of row r of the scores x (row r at r·a.Stride + a.RowOffset, read where it is) drawn from
     /// softmax(x / a.Temperature) held in turn to its a.TopK most probable columns, to the nucleus of a.TopP of their

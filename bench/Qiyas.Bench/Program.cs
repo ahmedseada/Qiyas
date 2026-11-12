@@ -763,10 +763,10 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         }, n);
     }
 
-    // A decoder's steps (float types).
+    // A decoder's steps (penalize: every type but bool; the draws: float types).
     private void DecodingRow(Device device, string type, string name)
     {
-        if (!Registry.IsFloat(type)) return;
+        if (Registry.Bits(type) == 1) return;
         if (name == "penalize")
         {
             // As many scores as a map row (512 rows of 32768: map's 16M values), each row's window the last 64 tokens of a ring
@@ -782,6 +782,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             return;
         }
 
+        if (!Registry.IsFloat(type)) return;
         // The draw (sample_rows's shape, 4096 rows of 32768 scores): every column kept (sample_plain: the weights and the
         // draw alone, sample_rows's nearest equivalent with cross_entropy's pass before it), and held to the top 40, the
         // nucleus of 0.95 and min-p 0.02 at a temperature of 0.8 (sample_filtered). The error is not a distance between

@@ -103,15 +103,17 @@ internal static partial class VkKernels
         return PenalizedAt(b, f, lane, slots, r, at - r * cols, px, win, stride, off, rep, pres, freq);
     }
 
-    // The value of column col of row r.
+    // The value of column col of row r, in f's natural lane: x's as it is stored, or penalized in the float lane and taken
+    // back by f's conversion (rounded to nearest even, held to the range).
     private static V PenalizedAt(Spv b, Fmt f, Lane lane, int slots, V r, V col, V px, V win, V stride, V off, V rep, V pres, V freq)
     {
+        var natural = f.Natural;
         var c = b.Bitcast(col, K.S32);
-        var x = Codec.UnpackAt(b, f, px, r * stride + off + col, lane);
+        var xn = Codec.UnpackAt(b, f, px, r * stride + off + col, natural);
         var table = r * (double)(4 * slots);
         var hb = col & (ulong)(16 * slots - 1);
         var bits = b.Load(K.U32, b.At(win, table + (double)(2 * slots) + (hb >> 5), 4));
-        var y = b.Local(x);
+        var y = b.Local(xn);
         b.If((bits.Shr(hb & 31UL) & 1UL) != b.U(0), () =>
         {
             var pos = b.U(0);
@@ -124,8 +126,10 @@ internal static partial class VkKernels
             var entry = table + b.Max(pos, b.U(1)) - 1.0;
             var hit = (pos > 0.0) & (b.Load(K.S32, b.At(win, entry, 4)) == c);
             var times = b.Convert(b.Load(K.S32, b.At(win, entry + (double)slots, 4)), Kinds.Of(lane));
+            var x = Codec.Convert(b, natural, xn, lane);
             var scaled = b.Select(x > 0.0, x / rep, x * rep);
-            y.V = b.Select(hit, scaled - b.Fma(freq, times, pres), x);
+            var penalized = scaled - b.Fma(freq, times, pres);
+            y.V = b.Select(hit, lane == natural ? penalized : Codec.Saturate(b, penalized, Kinds.Of(natural)), xn);
         });
         return y.V;
     }
@@ -138,7 +142,7 @@ internal static partial class VkKernels
         var b = new Spv($"penalize_rows_{f.Name}_{lane.Name}_{slots}", Threads, vk.Controls);
         V px = b.Arg(0), win = b.Arg(1), py = b.Arg(2);
         V n = b.Arg(3, K.U32), cols = b.Arg(4, K.U32), stride = b.Arg(5, K.U32), off = b.Arg(6, K.U32), rep = b.Arg(7, k), pres = b.Arg(8, k), freq = b.Arg(9, k);
-        StoreEach(b, f, lane, py, n, at => PenalizedValue(b, f, lane, slots, at, px, win, cols, stride, off, rep, pres, freq));
+        StoreEach(b, f, f.Natural, py, n, at => PenalizedValue(b, f, lane, slots, at, px, win, cols, stride, off, rep, pres, freq));
         return b.Build();
     }
 
@@ -172,7 +176,7 @@ internal static partial class VkKernels
             for (int i = 0; i < f.Per; i++)
             {
                 var v = PenalizedAt(b, f, lane, slots, r, wx * (double)f.Per + i, px, win, stride, off, rep, pres, freq);
-                word = Codec.Pack(b, f, lane.Name == natural.Name ? v : Codec.Convert(b, lane, v, natural), natural, i, word);
+                word = Codec.Pack(b, f, v, natural, i, word);
             }
 
             b.Store(b.At(py, r * words + wx, f.WordBits / 8), word);

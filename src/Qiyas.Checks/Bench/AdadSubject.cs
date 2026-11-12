@@ -664,13 +664,13 @@ public sealed class AdadSubject : IBenchSubject
     }
 
     public IBenchRun? Penalize(Device device, string type, PenaltyArgs a, byte[] x, int[] history, int length, byte[] output) =>
-        Registry.IsFloat(type) ? Registry.WithFloat(type, new PenalizeVisitor(device, a, x, history, length, output)) : null;
+        Registry.Bits(type) == 1 ? null : Registry.With(type, new PenalizeVisitor(device, a, x, history, length, output));
 
-    private sealed class PenalizeVisitor(Device device, PenaltyArgs a, byte[] x, int[] history, int length, byte[] output) : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+    private sealed class PenalizeVisitor(Device device, PenaltyArgs a, byte[] x, int[] history, int length, byte[] output) : ITypeVisitor<IBenchRun?>, INumberRun
     {
-        public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, PenalizeVisitor>(device, this);
+        public IBenchRun? Visit<TN>() where TN : struct, IAdad<TN, float> => On<TN, PenalizeVisitor>(device, this);
 
-        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IAdad<TN, float>
         {
             TB dx = s.In(x, s.Slack), dy = s.Out(output, s.Slack);
             TI dh = s.Index(history), dl = s.Index([length]);

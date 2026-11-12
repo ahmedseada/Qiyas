@@ -6,7 +6,7 @@
 //                      (Adad's order: larger first, an equal value by the lower index), each value within the type's step plus the
 //                      lane's rounding of the row's log-sum-exp of the float64 reference; rows wider than a block of
 //                      threads; k the whole row; and k past the row refused.
-//   history, penalize  the ring and the penalties of its window (Checks.Penalties.cs).
+//   history, penalize  the ring and the penalties of its window, every type but bool (Checks.Penalties.cs).
 //   sample             the draw from the kept columns (Checks.Sampling.cs).
 namespace Qiyas;
 
@@ -19,13 +19,14 @@ internal static partial class Checks
         ok &= HistoryRings(ops, where);
         foreach (var type in Bench.Registry.Names)
         {
-            if (!Bench.Registry.IsFloat(type) || (!blocks && Bench.Registry.IsBlock(type))) continue;
-            ok &= LogSoftmaxTopKs(ops, where, type);
+            if ((!blocks && Bench.Registry.IsBlock(type)) || Bench.Registry.Bits(type) == 1) continue;
             ok &= Penalties(ops, where, type);
+            if (!Bench.Registry.IsFloat(type)) continue;
+            ok &= LogSoftmaxTopKs(ops, where, type);
             ok &= Samplings(ops, where, type);
         }
 
-        if (ok) Console.WriteLine($"check decoding               {where,-6} every float type{(blocks ? "" : " but the block formats")}: the top-k of each row as log-probabilities (TopK's indices exactly, the values within the lane's rounding of the row's log-sum-exp, k the whole row, k past it refused); each row's ring of tokens pushed and advanced on the device, and the penalties of its window (repeat, presence, frequency: the last tokens, a wrapped ring, tokens outside the row, rows a stride apart) within the lane's rounding, every other score x's own; a column of each row drawn from its scores at a temperature, held to top-k, the nucleus and min-p (rows of +inf, with a NaN and of -inf, scores a step of the type apart at a threshold; the seed's draw at the device's step), each within the lane's rounding of the float64 rule");
+        if (ok) Console.WriteLine($"check decoding               {where,-6} every float type{(blocks ? "" : " but the block formats")}: the top-k of each row as log-probabilities (TopK's indices exactly, the values within the lane's rounding of the row's log-sum-exp, k the whole row, k past it refused); each row's ring of tokens pushed and advanced on the device, and the penalties of its window over every type but bool (repeat, presence, frequency: the last tokens, a wrapped ring, tokens outside the row, rows a stride apart; a window past the ring refused) within the float lane's rounding, every other score x's own; a column of each row drawn from its scores at a temperature, held to top-k, the nucleus and min-p (rows of +inf, with a NaN and of -inf, scores a step of the type apart at a threshold; the seed's draw at the device's step), each within the lane's rounding of the float64 rule");
         return ok;
     }
 

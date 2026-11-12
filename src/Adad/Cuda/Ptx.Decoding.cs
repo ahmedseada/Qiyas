@@ -158,7 +158,7 @@ internal static partial class Ptx
 
     /// <summary>y (n = rows · cols values of f) = the rows' scores (row r of x at r·stride + off) with the tokens of each row's
     /// table (PenaltyWindow's, `slots` a row) penalized: (x above 0 ? x / rep : x · rep) − (pres + freq · occurrences) in the
-    /// lane, the others x's value. Params: x, win, y, n, cols, stride, off, rep, pres, freq (lane). sparse (contiguous rows
+    /// float lane, taken back to f's natural lane by its conversion; the others x's value, moved in the natural lane exactly. Params: x, win, y, n, cols, stride, off, rep, pres, freq (lane). sparse (contiguous rows
     /// of whole stored words, not a block format, y already x's copy): a thread a slot of a row's table (n the rows) stores
     /// the word of y that holds its token, the first slot of the ascending table with that word alone (one writer a word);
     /// every other word is left as the copy made it.</summary>
@@ -173,15 +173,16 @@ internal static partial class Ptx
         b.L($"ld.param.{lane.Op} {rep}, [p_rep];");
         b.L($"ld.param.{lane.Op} {pres}, [p_pres];");
         b.L($"ld.param.{lane.Op} {freq}, [p_freq];");
-        // The value of column c of row r.
+        var natural = f.Natural;
+        // The value of column c of row r, in f's natural lane.
         string Value(string r, string c)
         {
-            string src = b.R(), table = b.R(), pos = b.R(), y = lane.NewReg(b);
+            string src = b.R(), table = b.R(), pos = b.R(), y = natural.NewReg(b);
             string skip = $"PEN{b.P().TrimStart('%')}";
             b.L($"mad.lo.u32 {src}, {r}, {stride}, {off};");
             b.L($"add.u32 {src}, {src}, {c};");
-            string x = Codec.UnpackAt(b, f, px, src, lane);
-            b.L($"mov.{lane.Reg} {y}, {x};");
+            string xn = Codec.UnpackAt(b, f, px, src, natural);
+            b.L($"mov.{natural.Reg} {y}, {xn};");
             b.L($"shl.b32 {table}, {r}, {shift + 2};");
             // The column's bit of the row's mask: clear, the column is not in the window (the score is x's).
             {
@@ -226,15 +227,15 @@ internal static partial class Ptx
             b.L($"ld.global.s32 {count}, [{ea}+{slots * 4}];");
             b.L($"setp.eq.s32 {hit}, {token}, {c};");
             b.L($"and.pred {hit}, {hit}, {any};");
-            string times = lane.NewReg(b), positive = b.P(), scaled = lane.NewReg(b);
+            string times = lane.NewReg(b), positive = b.P(), scaled = lane.NewReg(b), x = Codec.Convert(b, natural, xn, lane, f);
             b.L($"cvt.rn.{lane.Op}.s32 {times}, {count};");
             b.L($"setp.gt.{lane.Op} {positive}, {x}, {lane.Zero};");
             string down = LaneOp(b, lane, "div", x, rep), up = LaneOp(b, lane, "mul", x, rep);
             b.L($"selp.{lane.Op} {scaled}, {down}, {up}, {positive};");
             string less = lane.NewReg(b);
             b.L(lane.Fma(less, freq, times, pres));
-            string penalized = LaneOp(b, lane, "sub", scaled, less);
-            b.L($"selp.{lane.Op} {y}, {penalized}, {x}, {hit};");
+            string penalized = Codec.Convert(b, lane, LaneOp(b, lane, "sub", scaled, less), natural, f);
+            b.L($"selp.{natural.Op} {y}, {penalized}, {xn}, {hit};");
             b.Label(skip);
             return y;
         }
@@ -247,7 +248,6 @@ internal static partial class Ptx
             string gid = GlobalIndex(b), row = b.R(), slot = b.R(), pEnd = b.P(), table = b.R(), token = b.R(), before = b.R(), ta = b.RD(), ba = b.RD(), at0 = b.R(), bi = b.R();
             string wx = b.R(), wb = b.R(), pOut = b.P(), pFirst = b.P(), pBeforeIn = b.P(), pSame = b.P(), words = b.R();
             string code = f.WordBits == 64 ? b.RD() : b.R(), at = b.R(), addr = b.RD();
-            var natural = f.Natural;
             b.L($"shr.u32 {row}, {gid}, {shift};");
             b.L($"and.b32 {slot}, {gid}, {slots - 1};");
             b.L($"setp.ge.u32 {pEnd}, {row}, {n};");
@@ -279,8 +279,7 @@ internal static partial class Ptx
             {
                 string c = b.R();
                 b.L($"mad.lo.u32 {c}, {wx}, {f.Per}, {i};");
-                string v = Value(row, c);
-                Codec.Pack(b, f, lane == natural ? v : Codec.Convert(b, lane, v, natural, f), natural, i, code);
+                Codec.Pack(b, f, Value(row, c), natural, i, code);
             }
 
             b.L($"shr.u32 {words}, {cols}, {perShift};");                      // the words a row (cols a multiple of Per)
@@ -291,7 +290,7 @@ internal static partial class Ptx
         }
         else
         {
-            StoreEach(b, f, lane, py, n, at =>
+            StoreEach(b, f, natural, py, n, at =>
             {
                 string r = b.R(), c = b.R();
                 b.L($"div.u32 {r}, {at}, {cols};");

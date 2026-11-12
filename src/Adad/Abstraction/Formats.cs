@@ -29,6 +29,12 @@ public sealed record Fmt(string Name, int Bits, bool IsFloat, bool Signed)
     /// <summary>The lane this format's values are read into before any other (floats f32/f64, integers s32/u32/s64/u64).</summary>
     public Lane Natural => IsFloat ? (Bits == 64 ? Lane.F64 : Lane.F32) : Bits == 64 ? (Signed ? Lane.S64 : Lane.U64) : Signed ? Lane.S32 : Lane.U32;
 
+    /// <summary>The float lane a float formula takes for this type: a float type's f64 for 64 bits, else f32 (a block format's
+    /// f32); an integer's f32 to 16 bits, where it holds each value exactly, else f64, which holds a 32-bit integer exactly and
+    /// a 64-bit one to 53 bits (past them, the nearest f64). Values move in the natural lane, exactly; a formula's result is
+    /// stored through the type's own conversion (rounded once, held to the range).</summary>
+    public Lane FloatLane => IsFloat ? (Bits == 64 ? Lane.F64 : Lane.F32) : Bits <= 16 ? Lane.F32 : Lane.F64;
+
     /// <summary>How Convert takes a value of <paramref name="from"/> into <paramref name="to"/> with one rounding: the lane it is
     /// read into (exact: the natural lane; between integers a 64-bit one, so the range is held once, in it), and whether it is
     /// first rounded to odd at float32 — a value read wider than float32 going to a float narrower than it, whose odd last

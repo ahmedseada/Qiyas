@@ -21,18 +21,19 @@ public sealed partial class GpuOps
     /// <summary>The rows' scores with their windows' tokens penalized (IDecoding.Penalize): each row's window ordered into
     /// a table with its mask (Ptx.PenaltyWindow), then the store (Ptx.PenalizeRows): every stored word, or — contiguous
     /// rows of whole stored words — the rows copied and the words that hold a window's token alone. Returns the lane's name.</summary>
-    public string Penalize<TN>(PenaltyArgs a, ulong x, ulong history, ulong length, ulong output) where TN : struct, IFloatAdad<TN>
+    public string Penalize<TN>(PenaltyArgs a, ulong x, ulong history, ulong length, ulong output) where TN : struct, IAdad<TN>
     {
         a.Validate();
+        if (TN.Bits == 1) throw new NotSupportedException($"penalties: {TN.Name} holds truth values, not scores");
         var f = Fmt.Of<TN>();
-        var lane = RowLane(f);
+        var lane = f.FloatLane;
         if (a.Values == 0) return lane.Name;
-        int slots = Ptx.PenaltySlots(a.MaxWindow);
+        int slots = Ptx.PenaltySlots(a.Window);
         ulong win = gpu.Rent(Math.Max(16, (long)a.Rows * Ptx.PenaltyRowWords(slots) * 4));
         try
         {
             var window = gpu.Cached($"penalty_window:{slots}", (out string e) => Ptx.PenaltyWindow(gpu, slots, out e));
-            Gpu.Launch(window, Grid((long)a.Rows * slots, 256), 1, 256, 1, 0, history, length, win, Gpu.U(a.Rows), Gpu.U(a.Capacity), Gpu.U(a.MaxWindow));
+            Gpu.Launch(window, Grid((long)a.Rows * slots, 256), 1, 256, 1, 0, history, length, win, Gpu.U(a.Rows), Gpu.U(a.Capacity), Gpu.U(a.Window));
             ulong Slot(double v) => lane.Wide ? Gpu.D(v) : Gpu.F((float)v);
             // Contiguous rows of whole stored words: the rows copied as they are stored, then only the words that hold a
             // window's token stored (a thread a slot of the tables).

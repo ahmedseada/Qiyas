@@ -21,18 +21,19 @@ public sealed partial class VulkanOps
     /// a table with its mask (VkKernels.PenaltyWindow), then the store (VkKernels.PenalizeRows; a block format's by its
     /// encoder), or — contiguous rows of whole stored words — the rows copied and the words that hold a window's token
     /// alone (VkKernels.PenalizeSparse). Returns the lane's name.</summary>
-    public string Penalize<TN>(PenaltyArgs a, ulong x, ulong history, ulong length, ulong output) where TN : struct, IFloatAdad<TN>
+    public string Penalize<TN>(PenaltyArgs a, ulong x, ulong history, ulong length, ulong output) where TN : struct, IAdad<TN>
     {
         a.Validate();
+        if (TN.Bits == 1) throw new NotSupportedException($"penalties: {TN.Name} holds truth values, not scores");
         var f = Fmt.Of<TN>();
-        var lane = RowLane(f);
+        var lane = f.FloatLane;
         if (a.Values == 0) return lane.Name;
-        int slots = VkKernels.PenaltySlots(a.MaxWindow);
+        int slots = VkKernels.PenaltySlots(a.Window);
         ulong win = vk.Rent(Math.Max(16, (long)a.Rows * VkKernels.PenaltyRowWords(slots) * 4));
         try
         {
             vk.Launch(vk.Cached($"penalty_window:{slots}", () => VkKernels.PenaltyWindow(vk, slots)), Groups((long)a.Rows * slots, VkKernels.Threads), 1,
-                history, length, win, Vulkan.U(a.Rows), Vulkan.U(a.Capacity), Vulkan.U(a.MaxWindow));
+                history, length, win, Vulkan.U(a.Rows), Vulkan.U(a.Capacity), Vulkan.U(a.Window));
             if (f.IsBlock)
             {
                 Encode(f, a.Values, vk.Cached($"block_penalize_rows:{f.Name}:{slots}", () => VkKernels.BlockPenalizeRows(vk, f, slots)), output,
