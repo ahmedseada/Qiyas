@@ -143,7 +143,7 @@ public interface IBenchSubject
     IBenchRun? Penalize(Device device, string type, PenaltyArgs a, byte[] x, int[] history, int length, byte[] output) => null;
 
     /// <summary>A column of each row drawn from its kept weights (IDecoding.SampleFiltered) at a step: picks (s32) and each
-    /// pick's probability (rows, as the type).</summary>
+    /// pick's probability (rows of the type's float lane, as stored).</summary>
     IBenchRun? SampleFiltered(Device device, string type, SamplingArgs a, byte[] x, int step, int[] picks, byte[] probability) => null;
 
     /// <summary>A memory operation by a range (IMemory) over the bytes from <paramref name="offset"/> to as many before the

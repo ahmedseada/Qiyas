@@ -101,6 +101,25 @@ internal static partial class VkKernels
         return b.Select(b.IsNan(a), a, b.Select(b.IsNan(c), c, m));
     }
 
+    /// <summary>v's order key (Routing.OrderKey): an unsigned value of v's width that orders as Routing.Order does: a NaN
+    /// above every number and every NaN one key, −0 and +0 one key. A float's bits with the sign brought to the order (a
+    /// positive one's top bit set, a negative one's inverted), a signed integer's with its top bit flipped, an unsigned
+    /// one's as they are.</summary>
+    internal static V OrderKey(Spv b, V v)
+    {
+        var kk = v.Kind.BitsKind();
+        ulong sign = kk == K.U64 ? 0x8000000000000000UL : 0x80000000UL, ones = kk == K.U64 ? ulong.MaxValue : uint.MaxValue;
+        if (v.Kind.IsFloat())
+        {
+            var raw = b.Bitcast(v, kk);
+            var bits = b.Select((raw & (sign - 1)) == b.CBits(kk, 0), b.CBits(kk, 0), raw);   // −0 as +0, by the bits (a compare may flush a subnormal to 0)
+            var key = b.Select(bits >= b.CBits(kk, sign), ~bits, bits | sign);
+            return b.Select(b.IsNan(v), b.CBits(kk, ones), key);
+        }
+
+        return v.Kind.IsSigned() ? b.Bitcast(v, kk) ^ sign : v;
+    }
+
     /// <summary>out[r·k + j] = x[r][index[r·k + j]] (s32 columns) over rows · k values, a thread per stored word: top-k's
     /// values, pick's with k = 1. A column outside the row (below 0 or past it; below 0 is past it unsigned) reads the
     /// row's first value, dropped: 0. Arguments: x, index, out, rows, cols, k.</summary>

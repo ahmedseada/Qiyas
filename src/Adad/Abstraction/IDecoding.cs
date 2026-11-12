@@ -22,11 +22,12 @@ public interface IDecoding<TBuffer, TIndex>
     string Penalize<TN>(PenaltyArgs a, TBuffer x, TIndex history, TIndex length, TBuffer output) where TN : struct, IAdad<TN>;
 
     /// <summary>picks[r] = a column of row r of the scores x (row r at r·a.Stride + a.RowOffset, read where it is) drawn from
-    /// softmax(x / a.Temperature) held in turn to its a.TopK most probable columns, to the nucleus of a.TopP of their
-    /// probability and to the columns at least a.MinP times as probable as the most probable (SamplingArgs; Sampling.cs has
-    /// the rule: weights exp(s − largest) in the float lane, each rule a threshold on them, equal weights kept together),
-    /// by the seed's uniform draw at (step[0], r): the first kept column, in column order, at which the running sum of the
-    /// kept weights reaches the draw times their sum; −1 for a row with no score (all NaN or −∞). probability (rows, TN;
-    /// absent: not stored): the column's weight over the kept weights' sum (0 with no column), rounded to TN once.</summary>
-    string SampleFiltered<TN>(SamplingArgs a, TBuffer x, TIndex step, TIndex picks, TBuffer? probability) where TN : struct, IFloatAdad<TN>;
+    /// softmax(x / a.Temperature) held in turn to the a.TopK first columns of the row's order (its scores as stored, in
+    /// Adad's order), to the shortest prefix of those holding a.TopP of their probability and to the columns at least a.MinP
+    /// times as probable as the first (SamplingArgs; Sampling.cs has the rule: weights exp((x − first) / temperature) in
+    /// TN's float lane, each rule a prefix of the order), by the seed's uniform draw at (step[0], r): the kept column whose
+    /// interval of the kept weights' running sum, in column order, holds the draw times their sum; −1 for a row whose
+    /// first-ranked score is not finite. probability (rows of TN's float lane, Fmt.FloatLane, as stored; absent: not
+    /// stored): the column's weight over the kept weights' sum (NaN with no column). Every type but bool.</summary>
+    string SampleFiltered<TN>(SamplingArgs a, TBuffer x, TIndex step, TIndex picks, TBuffer? probability) where TN : struct, IAdad<TN>;
 }

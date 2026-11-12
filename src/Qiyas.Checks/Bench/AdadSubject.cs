@@ -695,13 +695,13 @@ public sealed class AdadSubject : IBenchSubject
     }
 
     public IBenchRun? SampleFiltered(Device device, string type, SamplingArgs a, byte[] x, int step, int[] picks, byte[] probability) =>
-        Registry.IsFloat(type) ? Registry.WithFloat(type, new SampleFilteredVisitor(device, a, x, step, picks, probability)) : null;
+        Registry.Bits(type) == 1 ? null : Registry.With(type, new SampleFilteredVisitor(device, a, x, step, picks, probability));
 
-    private sealed class SampleFilteredVisitor(Device device, SamplingArgs a, byte[] x, int step, int[] picks, byte[] probability) : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+    private sealed class SampleFilteredVisitor(Device device, SamplingArgs a, byte[] x, int step, int[] picks, byte[] probability) : ITypeVisitor<IBenchRun?>, INumberRun
     {
-        public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, SampleFilteredVisitor>(device, this);
+        public IBenchRun? Visit<TN>() where TN : struct, IAdad<TN, float> => On<TN, SampleFilteredVisitor>(device, this);
 
-        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IAdad<TN, float>
         {
             TB dx = s.In(x, s.Slack), dp = s.Out(probability, s.Slack);
             TI ds = s.Index([step]), di = s.IndexOut(picks);

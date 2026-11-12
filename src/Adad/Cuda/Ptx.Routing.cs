@@ -140,6 +140,34 @@ internal static partial class Ptx
         b.L($"mov.{lane.Reg} {d}, {t};");
     }
 
+    /// <summary>v's order key (Routing.OrderKey): an unsigned register (b32 for a 32-bit lane, b64 for a 64-bit one) that
+    /// orders as Routing.Order does: a NaN above every number and every NaN one key, −0 and +0 one key. A float's bits with
+    /// the sign brought to the order (a positive one's top bit set, a negative one's inverted), a signed integer's with
+    /// its top bit flipped, an unsigned one's as they are.</summary>
+    internal static string OrderKey(PtxBuilder b, Lane lane, string v)
+    {
+        bool wide = lane.Wide;
+        string kt = wide ? "u64" : "u32", kbits = wide ? "b64" : "b32", sign = wide ? "0x8000000000000000" : "0x80000000";
+        string key = wide ? b.RD() : b.R();
+        if (lane.IsFloat)
+        {
+            string bits = wide ? b.RD() : b.R(), mag = wide ? b.RD() : b.R(), flipped = wide ? b.RD() : b.R(), pn = b.P(), pz = b.P(), ps = b.P();
+            b.L($"mov.{kbits} {bits}, {v};");
+            b.L($"testp.notanumber.{lane.Op} {pn}, {v};");
+            b.L($"and.{kbits} {mag}, {bits}, {(wide ? "0x7FFFFFFFFFFFFFFF" : "0x7FFFFFFF")};");
+            b.L($"setp.eq.{kt} {pz}, {mag}, 0;");
+            b.L($"selp.{kt} {bits}, 0, {bits}, {pz};");                         // −0 as +0, by the bits
+            b.L($"setp.ge.{kt} {ps}, {bits}, {sign};");
+            b.L($"not.{kbits} {flipped}, {bits};");
+            b.L($"or.{kbits} {key}, {bits}, {sign};");
+            b.L($"selp.{kt} {key}, {flipped}, {key}, {ps};");
+            b.L($"selp.{kt} {key}, {(wide ? "0xFFFFFFFFFFFFFFFF" : "0xFFFFFFFF")}, {key}, {pn};");
+        }
+        else if (lane.Name[0] == 's') b.L($"xor.{kbits} {key}, {v}, {sign};");
+        else b.L($"mov.{kbits} {key}, {v};");
+        return key;
+    }
+
     /// <summary>out[r·k + j] = x[r][index[r·k + j]] (s32 columns) over n = rows·k values of f, each stored word written by one
     /// thread (a block format's block by its encoder) from the values read where they are stored: top-k's values, pick's
     /// with k = 1. A column outside the row (below 0 is past it unsigned) reads nothing: 0. Params: x, index, out, n, cols, k.</summary>

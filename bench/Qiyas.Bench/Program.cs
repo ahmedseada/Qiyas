@@ -763,7 +763,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         }, n);
     }
 
-    // A decoder's steps (penalize: every type but bool; the draws: float types).
+    // A decoder's steps, every type but bool (bool holds truth values, not scores).
     private void DecodingRow(Device device, string type, string name)
     {
         if (Registry.Bits(type) == 1) return;
@@ -782,23 +782,32 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             return;
         }
 
-        if (!Registry.IsFloat(type)) return;
-        // The draw (sample_rows's shape, 4096 rows of 32768 scores): every column kept (sample_plain: the weights and the
-        // draw alone, sample_rows's nearest equivalent with cross_entropy's pass before it), and held to the top 40, the
-        // nucleus of 0.95 and min-p 0.02 at a temperature of 0.8 (sample_filtered). The error is not a distance between
-        // columns: it is the probability the worst row's pick is off the float64 rule by (SamplingArgs.PickErrors: 0 where
-        // the draw lies in the pick's interval of the kept weights' running sum, the lane's rounding where a sum's rounding
-        // moved the pick to the next kept column, the probability in between where the column is wrong).
+        // The draw (sample_rows's shape, 4096 rows of 32768 scores), every type but bool: every column kept (sample_plain:
+        // the weights and the draw alone, sample_rows's nearest equivalent with cross_entropy's pass before it), and held to
+        // the top 40, the nucleus of 0.95 and min-p 0.02 at a temperature of 0.8 (sample_filtered). The error is not a
+        // distance between columns: it is the probability the worst row's pick is off the float64 rule by
+        // (SamplingArgs.PickErrors: 0 where the draw lies in the pick's interval of the kept weights' running sum, the lane's
+        // rounding where a sum's rounding moved the pick to the next kept column, the probability in between where the
+        // column is wrong).
         {
             int rows = Prime(4096), cols = Prime(32768), step = 3;
-            var a = name == "sample_plain" ? new SamplingArgs(rows, cols, 1, 0, 0, 0, 17) : new SamplingArgs(rows, cols, 0.8, 40, 0.95, 0.02, 17);
+            var a = name == "sample_plain" ? new SamplingArgs(rows, cols, 1, cols, 1, 0, 17) : new SamplingArgs(rows, cols, 0.8, 40, 0.95, 0.02, 17);
             var x = Registry.Make(type, rows * cols, 95, -4, 4);
             var xv = Registry.Values(type, x, rows * cols);
             var (want, _) = a.Reference(xv, step);
-            var probability = new byte[Registry.Bytes(type, rows)];
+            var probability = new byte[rows * 8];                                // the float lane's storage, at most 8 bytes a row
             MeasureIndices(device, name, type, $"{rows}x{cols}", want, (s, picks) => s.SampleFiltered(device, type, a, x, step, picks, probability),
-                score: (s, picks) => PickScore(device, name, type, s.Name, a, xv, step, want, picks, Registry.Values(type, probability, rows)));
+                score: (s, picks) => PickScore(device, name, type, s.Name, a, xv, step, want, picks, ProbabilityValues(type, probability, rows)));
         }
+    }
+
+    // A probability per row in the type's float lane as stored (Fmt.FloatLane: float64 for float64 and the integers wider
+    // than 16 bits, else float32).
+    private static double[] ProbabilityValues(string type, byte[] stored, int rows)
+    {
+        int bits = Registry.Bits(type);
+        bool wide = Registry.IsFloat(type) ? bits == 64 : bits > 16;
+        return Enumerable.Range(0, rows).Select(r => wide ? BitConverter.ToDouble(stored, r * 8) : BitConverter.ToSingle(stored, r * 4)).ToArray();
     }
 
     // The largest of the picks' errors; with QIYAS_MAP_DEBUG=1, each row whose pick is not the reference's column, with the
@@ -814,29 +823,27 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             {
                 if (picks[r] == want[r]) continue;
                 shown++;
-                var e = a.Weights(x.AsSpan(r * a.Stride + a.RowOffset, a.Cols));
-                double t = a.Threshold(e), total = 0, u = Draws.Uniform(key, (uint)step, (uint)r);
+                var row = x.AsSpan(r * a.Stride + a.RowOffset, a.Cols).ToArray();
+                var order = SamplingArgs.Order(row);
+                var (e, keep) = a.Rule(row, order);
+                double total = 0, u = Draws.Uniform(key, (uint)step, (uint)r);
                 int kept = 0;
-                for (int c = 0; c < a.Cols; c++) if (e[c] > 0 && e[c] >= t) { total += e[c]; kept++; }
+                for (int c = 0; c < a.Cols; c++) if (keep[c]) { total += e[c]; kept++; }
                 string At(int col)
                 {
                     if (col < 0 || col >= a.Cols) return $"column {col}: no column of the row";
                     double before = 0;
-                    for (int c = 0; c < col; c++) if (e[c] > 0 && e[c] >= t) before += e[c];
-                    bool isKept = e[col] > 0 && e[col] >= t;
-                    return $"column {col} (weight {e[col]:R}, {(isKept ? "kept" : "not kept")}): running sum {before / total:R} .. {(before + (isKept ? e[col] : 0)) / total:R}";
+                    for (int c = 0; c < col; c++) if (keep[c]) before += e[c];
+                    return $"column {col} (weight {e[col]:R}, {(keep[col] ? "kept" : "not kept")}): running sum {before / total:R} .. {(before + (keep[col] ? e[col] : 0)) / total:R}";
                 }
 
-                Console.WriteLine($"  {name} {device} {type} {subject} row {r}: draw {u:R} of {kept} kept (threshold {t:R}, sum {total:R}); off by {errors[r]:E3}");
+                Console.WriteLine($"  {name} {device} {type} {subject} row {r}: draw {u:R} of {kept} kept (sum {total:R}); off by {errors[r]:E3}");
                 Console.WriteLine($"    the rule's {At(want[r])}");
                 Console.WriteLine($"    the pick's {At(picks[r])}");
                 if (picks[r] >= 0 && picks[r] < a.Cols && probability[r] > 0)
                     Console.WriteLine($"    the subject's probability of its pick {probability[r]:R}: a kept sum of {e[picks[r]] / probability[r]:R}");
                 if (kept <= 64)
-                {
-                    var order = Enumerable.Range(0, a.Cols).OrderByDescending(c => e[c]).Take(kept + 6).ToArray();
-                    Console.WriteLine("    the largest weights: " + string.Join(" ", order.Select((c, i) => $"{i + 1}:{e[c]:R}@{c}(x {x[r * a.Stride + a.RowOffset + c]:R})")));
-                }
+                    Console.WriteLine("    the first of the order: " + string.Join(" ", order.Take(kept + 6).Select((c, i) => $"{i + 1}:{e[c]:R}@{c}(x {row[c]:R})")));
             }
         }
 

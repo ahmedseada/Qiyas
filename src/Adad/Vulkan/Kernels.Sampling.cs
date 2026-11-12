@@ -1,26 +1,31 @@
 // Copyright (c) 2026 Ahmed Seada
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
-// A decoder's sampling on Vulkan (Sampling.cs), CUDA's (Cuda/Ptx.Sampling.cs), a workgroup a row in two kernels:
-//   SampleWeights  the row's scores read where they are stored into its weights in lane storage: s = x / temperature in
-//                  the lane, the largest by the workgroup's tree (a NaN is no score), then exp(s − largest) (1 at each +∞
-//                  of a row whose largest is +∞; 0 for a row with no score).
-//   SampleDraw     over the weights (lane storage: one kernel a lane, whatever the type): each rule's threshold by
-//                  narrowing the lane's bit patterns between 0 and 1 — a pass of the row a step, an invocation its
-//                  columns against the step's values, the workgroup's trees of the counts (top-k: sixteen ways a pass,
-//                  the weights' bits compared as integers) or of the sums (the nucleus: sixteen ways in the f32 lane, two
-//                  in the f64 lane, a sum a value being an add a weight; where 256 weights or fewer are at least top-k's
-//                  threshold they are gathered into workgroup memory instead, an invocation a gathered weight summing
-//                  those at least its own) — then, the weights below the threshold taken as 0 where they are read, the kept
+// A decoder's sampling on Vulkan (Abstraction/Sampling.cs has the rule; CUDA's in Cuda/Ptx.Sampling.cs), a workgroup a
+// row in two kernels:
+//   SampleWeights  the row's scores read where they are stored, in the type's float lane: m the first-ranked in Adad's
+//                  order (First: a NaN where the row holds one, else the largest) by the workgroup's tree, then the
+//                  weights exp((x − m) / t) in lane storage (NaN throughout a row whose m is not finite).
+//   SampleDraw     each rule's prefix of the row's order, by the scores' order keys (Routing.Order's integer form: a
+//                  stored value as an unsigned integer that orders as Adad's order does, made where it is read): top-k's
+//                  k-th column by narrowing the keys' range sixteen ways a pass (an invocation its columns tid, tid +
+//                  256, …; the workgroup's trees of the counts), its key's columns cut by column order (an invocation a
+//                  chunk of consecutive columns, the chunks' counts' prefix); the nucleus over top-k's columns gathered
+//                  into workgroup memory where k fits a workgroup's invocations (each ranks itself among them, the first
+//                  sums them in order), else by narrowing the keys' range sixteen ways with the weights' sums and its
+//                  key's columns cut where the running sum reaches the target; min-p a weight at least q. Then the kept
 //                  weights' chunk sums and their prefix, the seed's uniform at (step, row) with the step read where it
-//                  is, and the first kept column at which the running sum reaches it (the last kept one when rounding
-//                  leaves none; −1 for a row that keeps none).
+//                  is, and the column at which the running sum passes it (the last kept column of positive weight when
+//                  rounding leaves none; −1 and a NaN probability for a row whose sum is not positive).
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
 
 internal static partial class VkKernels
 {
+    /// <summary>The most columns top-k may keep for the nucleus to take them gathered (an invocation a column).</summary>
+    public const int SampleGathered = ReduceThreads;
+
     /// <summary>w (lane storage, rows × cols) = each row's weights. Slots: x (f; row r at r·stride + off), w, cols, stride,
     /// off, temperature (lane); a workgroup a row.</summary>
     public static SpvKernel SampleWeights(Vulkan vk, Fmt f, Lane lane)
@@ -32,241 +37,338 @@ internal static partial class VkKernels
         var row = b.GroupX;
         var start = row * stride + off;
         var wbase = row * cols;
-        V lowest = b.C(k, double.NegativeInfinity), highest = b.C(k, double.PositiveInfinity), zero = b.C(k, 0);
-        V Score(V c) => Codec.UnpackAt(b, f, px, start + c, lane) / temp;
+        V lowest = b.C(k, double.NegativeInfinity), highest = b.C(k, double.PositiveInfinity);
+        V Value(V c) => Codec.UnpackAt(b, f, px, start + c, lane);
+        // The first-ranked value in Adad's order (First: a NaN where the row holds one, else the largest).
         var best = b.Local(lowest);
+        b.For(tid, cols, b.U(ReduceThreads), c => best.V = First(b, best.V, Value(c)));
+        var m = GroupReduce(b, b.Shared(k, ReduceThreads), tid, best.V, (x, y) => First(b, x, y), ReduceThreads);
+        var finite = (m > lowest) & (m < highest);
         b.For(tid, cols, b.U(ReduceThreads), c =>
         {
-            var s = Score(c);
-            best.V = b.Max(best.V, b.Select(b.IsNan(s), lowest, s));
-        });
-        var m = GroupReduce(b, b.Shared(k, ReduceThreads), tid, best.V, b.Max, ReduceThreads);
-        V none = m <= lowest, top = m >= highest;
-        b.For(tid, cols, b.U(ReduceThreads), c =>
-        {
-            var s = Score(c);
-            var e = b.Select(b.IsNan(s), zero, Fn.Exp(b, s - m));
-            e = b.Select(top, b.Select(s >= highest, b.C(k, 1), zero), e);
-            b.Store(b.At(pw, wbase + c, lane.Size), b.Select(none, zero, e));
+            var e = b.Select(finite, Fn.Exp(b, (Value(c) - m) / temp), b.C(k, double.NaN));   // x − m is NaN at m's own column
+            b.Store(b.At(pw, wbase + c, lane.Size), e);
         });
         return b.Build();
     }
 
-    /// <summary>picks[row] and (prob not 0) prob[row] (lane storage) from the row's weights w (lane storage, rows × cols,
-    /// read only). Slots: w, picks, prob, step (the device's, read where it is), cols, k (0:
-    /// no top-k), the seed's key A, p (0: no nucleus), q (0: no min-p) (lane), the key's B; a workgroup a row.</summary>
-    public static SpvKernel SampleDraw(Vulkan vk, Lane lane)
+    /// <summary>picks[row] and (prob not 0) prob[row] (lane storage) from the row's scores x (f, where they are stored) and
+    /// weights w (lane storage, rows × cols). Slots: x, w, picks, prob, step (the device's, read where it is), cols, stride,
+    /// off, k (cols: no top-k), the seed's key A, p (1: no nucleus), q (0: no min-p) (lane), the key's B; a workgroup a
+    /// row.</summary>
+    public static SpvKernel SampleDraw(Vulkan vk, Fmt f, Lane lane)
     {
         var k = Kinds.Of(lane);
-        var bk = k.BitsKind();
-        ulong oneBits = lane.Wide ? 0x3FF0000000000000UL : 0x3F800000UL;
-        var b = new Spv($"sample_draw_{lane.Name}", ReduceThreads, vk.Controls);
-        V pw = b.Arg(0), picks = b.Arg(1), prob = b.Arg(2), pstep = b.Arg(3);
-        V cols = b.Arg(4, K.U32), kk = b.Arg(5, K.U32), key = b.Arg(6, K.U32), p = b.Arg(7, k), q = b.Arg(8, k), kb = b.Arg(9, K.U32);
+        var natural = f.Natural;
+        var nk = Kinds.Of(natural);
+        var kk = nk.BitsKind();
+        ulong ones = kk == K.U64 ? ulong.MaxValue : uint.MaxValue;
+        var b = new Spv($"sample_draw_{f.Name}_{lane.Name}", ReduceThreads, vk.Controls);
+        V px = b.Arg(0), pw = b.Arg(1), picks = b.Arg(2), prob = b.Arg(3), pstep = b.Arg(4);
+        V cols = b.Arg(5, K.U32), stride = b.Arg(6, K.U32), off = b.Arg(7, K.U32), topK = b.Arg(8, K.U32), ka = b.Arg(9, K.U32);
+        V p = b.Arg(10, k), q = b.Arg(11, k), kb = b.Arg(12, K.U32);
         var tid = b.LocalIdX;
         var row = b.GroupX;
         var wbase = row * cols;
+        var start = row * stride + off;
         var zero = b.C(k, 0);
-        var stride = b.U(ReduceThreads);
+        var none = b.U(uint.MaxValue);
+        var strided = b.U(ReduceThreads);
         var counts = b.Shared(K.U32, ReduceThreads);
         var sums = b.Shared(k, ReduceThreads);
-        var whole = b.Shared(k, 1);
-        var gathered = b.Shared(k, ReduceThreads);
+        var keyTree = b.Shared(kk, ReduceThreads);
+        var total = b.Shared(k, 1);
+        var bound = b.Shared(kk, 1);
+        var boundCol = b.Shared(K.U32, 1);
+        var gKey = b.Shared(kk, SampleGathered);
+        var gWeight = b.Shared(k, SampleGathered);
+        var gCol = b.Shared(K.U32, SampleGathered);
+        var rKey = b.Shared(kk, SampleGathered);
+        var rWeight = b.Shared(k, SampleGathered);
+        var rCol = b.Shared(K.U32, SampleGathered);
+        V hasTopK = topK < cols, hasNucleus = p < 1.0, ranked = hasTopK | hasNucleus;
+        V gather = hasTopK & hasNucleus & (topK <= (double)SampleGathered);
+
+        // Column c's order key (OrderKey), read where it is stored in the natural lane.
+        V KeyOf(V c) => OrderKey(b, Codec.UnpackAt(b, f, px, start + c, natural));
+
         V Stored(V c) => b.Load(k, b.At(pw, wbase + c, lane.Size));
-        var lo = b.Local(b.CBits(bk, 0));
-        var hi = b.Local(b.CBits(bk, oneBits));
-        var t = b.Local(zero);                                                  // the threshold: 0 keeps every weight
-        // A step's values between lo and hi: lo + j · max(1, (hi − lo + 1) / ways) held to hi, j = 1 .. ways − 1 (the rule
-        // holds up to some value and fails past it: the step keeps the last value at which it holds as lo and the bits below
-        // the first at which it fails as hi).
-        const int CountWays = 16;
-        int sumWays = lane.Wide ? 2 : 16;
-        V[] Step(int ways)
+
+        // The prefix's last column (key, column): a column is within it when its key is larger, or equal at or before it.
+        var bKey = b.Local(b.CBits(kk, 0));
+        var bCol = b.Local(none);                                             // every column until a rule cuts
+        V Holds(V key, V c) => (key > bKey.V) | ((key == bKey.V) & (c <= bCol.V));
+
+        // This invocation's chunk of consecutive columns.
+        var chunk = (cols + (double)(ReduceThreads - 1)) / (double)ReduceThreads;
+        var c0 = b.Min(tid * chunk, cols);
+        var c1 = b.Min(c0 + chunk, cols);
+
+        // The exclusive prefix of the invocations' values in `arr` by the first invocation (each then holds what comes before
+        // its chunk), the total into `whole` where given.
+        void Prefix(Arr arr, Arr? whole)
         {
-            var step = b.Max((hi.V - lo.V + 1.0) >> int.Log2(ways), b.CBits(bk, 1));
-            var at = new V[ways];
-            for (int j = 1; j < ways; j++) at[j] = b.Min(lo.V + step * (double)j, hi.V);
+            b.Barrier();
+            b.If(tid == 0, () =>
+            {
+                var acc = b.Local(arr.Kind.IsFloat() ? b.C(arr.Kind, 0) : b.CBits(arr.Kind, 0));
+                b.For(b.U(0), b.U(ReduceThreads), i =>
+                {
+                    var v = arr[i];
+                    arr[i] = acc.V;
+                    acc.V = acc.V + v;
+                });
+                if (whole is { } w) w[b.U(0)] = acc.V;
+            });
+            b.Barrier();
+        }
+
+        // A step's values between lo and hi (keys): lo + j·step held to hi, step = (hi − lo) / ways + 1, j = 1 .. ways − 1 (the
+        // rule holds up to some key and fails past it: lo becomes the last at which it holds, hi the key below the first at
+        // which it fails).
+        const int Ways = 16;
+        V[] Step(V lo, V hi)
+        {
+            var span = hi - lo;
+            var step = (span >> int.Log2(Ways)) + 1.0;
+            var at = new V[Ways];
+            for (int j = 1; j < Ways; j++) at[j] = lo + b.Min(step * (double)j, span);
             return at;
         }
 
-        void Narrow(V[] at, V[] holds)
+        void Narrow(Var lo, Var hi, V[] at, V[] holds)
         {
             V low = lo.V, high = hi.V;
-            for (int j = 1; j < at.Length; j++) low = b.Select(holds[j], at[j], low);
-            for (int j = at.Length - 1; j >= 1; j--) high = b.Select(holds[j], high, at[j] - 1.0);
+            for (int j = 1; j < Ways; j++) low = b.Select(holds[j], at[j], low);
+            for (int j = Ways - 1; j >= 1; j--) high = b.Select(holds[j], high, at[j] - 1.0);
             lo.V = low;
             hi.V = high;
         }
 
-        // Top-k: the largest value at which k weights or more are at least it (a count of exactly k ends the search).
-        b.If(kk != b.U(0), () =>
+        // The cut of key `key`'s columns (within the prefix so far) by column order: the first at which the count (n) or the
+        // weights (target) of the columns of a larger key and of its columns before reaches the goal. The new prefix ends
+        // there (none reaches it: at the key's last).
+        void CutByColumn(V key, V? target, V? n)
         {
-            b.While(() => lo.V < hi.V, () =>
+            bool weighed = target is not null;
+            var of = weighed ? k : K.U32;
+            var arr = weighed ? sums : counts;
+            V nothing = weighed ? zero : b.U(0);
+            V Value(V c) => weighed ? Stored(c) : b.U(1);
+            var aboveMine = b.Local(nothing);
+            var tieMine = b.Local(nothing);
+            b.For(c0, c1, c =>
             {
-                var at = Step(CountWays);
-                var count = new Var[CountWays];
-                for (int j = 1; j < CountWays; j++) count[j] = b.Local(b.U(0));
-                b.For(tid, cols, stride, c =>
-                {
-                    // A weight is 0 or above: its bits order as it does (integer compares, whatever the lane).
-                    var bits = b.Load(bk, b.At(pw, wbase + c, lane.Size));
-                    for (int j = 1; j < CountWays; j++) count[j].V = count[j].V + b.Select(bits >= at[j], b.U(1), b.U(0));
-                });
-                var holds = new V[CountWays];
-                var exact = new V[CountWays];
-                for (int j = 1; j < CountWays; j++)
-                {
-                    var total = GroupReduce(b, counts, tid, count[j].V, static (x, y) => x + y, ReduceThreads);
-                    holds[j] = total >= kk;
-                    exact[j] = total == kk;
-                }
-
-                Narrow(at, holds);
-                for (int j = 1; j < CountWays; j++)
-                {
-                    lo.V = b.Select(exact[j], at[j], lo.V);
-                    hi.V = b.Select(exact[j], at[j], hi.V);
-                }
+                var kc = KeyOf(c);
+                var within = Holds(kc, c);
+                var v = Value(c);
+                aboveMine.V = aboveMine.V + b.Select((kc > key) & within, v, nothing);
+                tieMine.V = tieMine.V + b.Select((kc == key) & within, v, nothing);
             });
-            t.V = b.Bitcast(lo.V, k);
-        });
-
-        // The nucleus: the largest value at which the weights at least it sum to p of the weights at least t.
-        // The weights at least t: where they fit a workgroup's invocations (top-k has left few), gathered into workgroup
-        // memory — an invocation's count, the counts' exclusive prefix by the first, each invocation's weights at its place —
-        // and the nucleus read from them: invocation i's weight v, the gathered weights at least v summed in their order, v
-        // kept where that reaches p of them all; the largest such v is the threshold (no pass of the row a step).
-        var few = b.Local(b.Bool(false));
-        b.If(p > 0.0, () =>
-        {
-            var from = t.V;
-            var mineCount = b.Local(b.U(0));
-            b.For(tid, cols, stride, c => mineCount.V = mineCount.V + b.Select(Stored(c) >= from, b.U(1), b.U(0)));
-            var n = GroupReduce(b, counts, tid, mineCount.V, static (x, y) => x + y, ReduceThreads);
-            few.V = n <= (double)ReduceThreads;
-            b.If(few.V, () =>
+            var above = GroupReduce(b, arr, tid, aboveMine.V, static (x, y) => x + y, ReduceThreads);
+            arr[tid] = tieMine.V;
+            Prefix(arr, null);
+            var before = arr[tid];
+            var goal = weighed ? target!.Value - above : n!.Value - above;
+            var found = b.Local(none);
+            b.If(before + tieMine.V >= goal, () =>
             {
-                counts[tid] = mineCount.V;
-                b.Barrier();
-                b.If(tid == 0, () =>
+                var run = b.Local(before);
+                b.For(c0, c1, c =>
                 {
-                    var acc = b.Local(b.U(0));
-                    b.For(b.U(0), b.U(ReduceThreads), i =>
-                    {
-                        var v = counts[i];
-                        counts[i] = acc.V;
-                        acc.V = acc.V + v;
-                    });
+                    var kc = KeyOf(c);
+                    var tie = (kc == key) & Holds(kc, c);
+                    run.V = run.V + b.Select(tie, Value(c), nothing);
+                    found.V = b.Select(tie & (run.V >= goal) & (found.V == none), c, found.V);
                 });
-                b.Barrier();
-                var place = b.Local(counts[tid]);
-                b.For(tid, cols, stride, c =>
-                {
-                    var e = Stored(c);
-                    b.If(e >= from, () =>
-                    {
-                        gathered[place.V] = e;
-                        place.V = place.V + 1.0;
-                    });
-                });
-                b.Barrier();
-                var own = gathered[b.Min(tid, b.U(ReduceThreads - 1))];
-                var all = b.Local(zero);
-                var above = b.Local(zero);
-                b.For(b.U(0), n, i =>
-                {
-                    var w = gathered[i];
-                    all.V = all.V + w;
-                    above.V = above.V + b.Select(w >= own, w, zero);
-                });
-                var candidate = b.Select((tid < n) & (above.V >= p * all.V), own, zero);
-                t.V = b.Max(from, GroupReduce(b, sums, tid, candidate, b.Max, ReduceThreads));
             });
-        });
-        b.If((p > 0.0) & !few.V, () =>
-        {
-            var from = t.V;
-            var part = b.Local(zero);
-            b.For(tid, cols, stride, c =>
-            {
-                var e = Stored(c);
-                part.V = part.V + b.Select(e >= from, e, zero);
-            });
-            var target = p * GroupReduce(b, sums, tid, part.V, static (x, y) => x + y, ReduceThreads);
-            lo.V = b.Bitcast(from, bk);
-            hi.V = b.CBits(bk, oneBits);
-            b.While(() => lo.V < hi.V, () =>
-            {
-                var at = Step(sumWays);
-                var sum = new Var[sumWays];
-                for (int j = 1; j < sumWays; j++) sum[j] = b.Local(zero);
-                b.For(tid, cols, stride, c =>
-                {
-                    var e = Stored(c);
-                    for (int j = 1; j < sumWays; j++) sum[j].V = sum[j].V + b.Select(e >= b.Bitcast(at[j], k), e, zero);
-                });
-                var holds = new V[sumWays];
-                for (int j = 1; j < sumWays; j++) holds[j] = GroupReduce(b, sums, tid, sum[j].V, static (x, y) => x + y, ReduceThreads) >= target;
-                Narrow(at, holds);
-            });
-            t.V = b.Bitcast(lo.V, k);
-        });
-
-        var threshold = b.Max(t.V, q);                                          // min-p
-        // The kept weight of column c: its weight where that is at least the threshold, else 0.
-        V Weight(V c)
-        {
-            var e = Stored(c);
-            return b.Select(e >= threshold, e, zero);
+            var least = GroupReduce(b, counts, tid, found.V, b.Min, ReduceThreads);
+            bKey.V = key;
+            bCol.V = least;
         }
 
-        // The kept weights' sums over this invocation's chunk of consecutive columns, their exclusive prefix and the total by
-        // the first invocation.
-        var chunk = (cols + (double)(ReduceThreads - 1)) / (double)ReduceThreads;
-        var c0 = b.Min(tid * chunk, cols);
-        var c1 = b.Min(c0 + chunk, cols);
-        var mine = b.Local(zero);
-        b.For(c0, c1, c => mine.V = mine.V + Weight(c));
-        sums[tid] = mine.V;
-        b.Barrier();
-        b.If(tid == 0, () =>
+        // The row's keys' range (where a rule ranks).
+        var kmin = b.Local(b.CBits(kk, ones));
+        var kmax = b.Local(b.CBits(kk, 0));
+        b.If(ranked, () =>
         {
-            var acc = b.Local(zero);
-            b.For(b.U(0), b.U(ReduceThreads), i =>
+            var lo = b.Local(b.CBits(kk, ones));
+            var hi = b.Local(b.CBits(kk, 0));
+            b.For(tid, cols, strided, c =>
             {
-                var v = sums[i];
-                sums[i] = acc.V;
-                acc.V = acc.V + v;
+                var key = KeyOf(c);
+                lo.V = b.Min(lo.V, key);
+                hi.V = b.Max(hi.V, key);
             });
-            whole[b.U(0)] = acc.V;
+            kmin.V = GroupReduce(b, keyTree, tid, lo.V, b.Min, ReduceThreads);
+            kmax.V = GroupReduce(b, keyTree, tid, hi.V, b.Max, ReduceThreads);
         });
-        b.Barrier();
-        var total2 = whole[b.U(0)];
+
+        // Top-k: the largest key at least k columns reach (sixteen ways a pass), then its columns cut by column order.
+        b.If(hasTopK, () =>
+        {
+            var lo = b.Local(kmin.V);
+            var hi = b.Local(kmax.V);
+            b.While(() => lo.V < hi.V, () =>
+            {
+                var at = Step(lo.V, hi.V);
+                var count = new Var[Ways];
+                for (int j = 1; j < Ways; j++) count[j] = b.Local(b.U(0));
+                b.For(tid, cols, strided, c =>
+                {
+                    var key = KeyOf(c);
+                    for (int j = 1; j < Ways; j++) count[j].V = count[j].V + b.Select(key >= at[j], b.U(1), b.U(0));
+                });
+                var holds = new V[Ways];
+                for (int j = 1; j < Ways; j++) holds[j] = GroupReduce(b, counts, tid, count[j].V, static (x, y) => x + y, ReduceThreads) >= topK;
+                Narrow(lo, hi, at, holds);
+            });
+            CutByColumn(lo.V, null, topK);
+        });
+
+        // The nucleus within the prefix: the shortest prefix of the order whose weights reach p of the prefix's.
+        b.If(gather, () =>
+        {
+            // Top-k's k columns gathered (an invocation's chunk's columns at the place its count's prefix gives), each ranked
+            // by the gathered columns before it in the order, then summed in rank order by the first invocation.
+            var mineCount = b.Local(b.U(0));
+            b.For(c0, c1, c => mineCount.V = mineCount.V + b.Select(Holds(KeyOf(c), c), b.U(1), b.U(0)));
+            counts[tid] = mineCount.V;
+            Prefix(counts, null);
+            var place = b.Local(counts[tid]);
+            b.For(c0, c1, c =>
+            {
+                var key = KeyOf(c);
+                b.If(Holds(key, c), () =>
+                {
+                    gKey[place.V] = key;
+                    gWeight[place.V] = Stored(c);
+                    gCol[place.V] = c;
+                    place.V = place.V + 1.0;
+                });
+            });
+            b.Barrier();
+            b.If(tid < topK, () =>
+            {
+                var own = gKey[tid];
+                var ownCol = gCol[tid];
+                var rank = b.Local(b.U(0));
+                b.For(b.U(0), topK, i =>
+                {
+                    var ki = gKey[i];
+                    rank.V = rank.V + b.Select((ki > own) | ((ki == own) & (gCol[i] < ownCol)), b.U(1), b.U(0));
+                });
+                rKey[rank.V] = own;
+                rWeight[rank.V] = gWeight[tid];
+                rCol[rank.V] = ownCol;
+            });
+            b.Barrier();
+            b.If(tid == 0, () =>
+            {
+                var mass = b.Local(zero);
+                b.For(b.U(0), topK, j => mass.V = mass.V + rWeight[j]);
+                var target = p * mass.V;
+                var run = b.Local(zero);
+                var end = b.Local(none);
+                b.For(b.U(0), topK, j =>
+                {
+                    run.V = run.V + rWeight[j];
+                    end.V = b.Select((run.V >= target) & (end.V == none), j, end.V);
+                });
+                var at = b.Select(end.V == none, topK - 1.0, end.V);
+                bound[b.U(0)] = rKey[at];
+                boundCol[b.U(0)] = rCol[at];
+            });
+            b.Barrier();
+            bKey.V = bound[b.U(0)];
+            bCol.V = boundCol[b.U(0)];
+            b.Barrier();
+        });
+
+        b.If(hasNucleus & !gather, () =>
+        {
+            // The weights within the prefix, their sum's p, then the largest key at which the weights at or above it within
+            // the prefix reach it, and its columns cut by column order where the running sum reaches it.
+            var part = b.Local(zero);
+            b.For(tid, cols, strided, c => part.V = part.V + b.Select(Holds(KeyOf(c), c), Stored(c), zero));
+            var target = p * GroupReduce(b, sums, tid, part.V, static (x, y) => x + y, ReduceThreads);
+            var lo = b.Local(kmin.V);
+            var hi = b.Local(kmax.V);
+            b.While(() => lo.V < hi.V, () =>
+            {
+                var at = Step(lo.V, hi.V);
+                var sum = new Var[Ways];
+                for (int j = 1; j < Ways; j++) sum[j] = b.Local(zero);
+                b.For(tid, cols, strided, c =>
+                {
+                    var key = KeyOf(c);
+                    var within = Holds(key, c);
+                    var w = Stored(c);
+                    for (int j = 1; j < Ways; j++) sum[j].V = sum[j].V + b.Select((key >= at[j]) & within, w, zero);
+                });
+                var holds = new V[Ways];
+                for (int j = 1; j < Ways; j++) holds[j] = GroupReduce(b, sums, tid, sum[j].V, static (x, y) => x + y, ReduceThreads) >= target;
+                Narrow(lo, hi, at, holds);
+            });
+            CutByColumn(lo.V, target, null);
+        });
+
+        // A column's kept weight: its weight where it is within the prefix and at least q (0 without min-p: every weight).
+        V KeptWeight(V c)
+        {
+            var e = Stored(c);
+            var within = b.Local(b.Bool(true));
+            b.If(ranked, () => within.V = Holds(KeyOf(c), c));
+            return b.Select(within.V & (e >= q), e, zero);
+        }
+
+        // The kept weights' sums over this invocation's chunk, their exclusive prefix and the total.
+        var mine = b.Local(zero);
+        b.For(c0, c1, c => mine.V = mine.V + KeptWeight(c));
+        sums[tid] = mine.V;
+        Prefix(sums, total);
+        var sum2 = total[b.U(0)];
         // The draw: Draws.Uniform(key, step, row) = Bits(Stream(key, step), row) · 2^−32 in the lane, times the total.
-        var u = b.Convert(Draw(Draw(key, kb, b.Load(K.U32, pstep)), kb, row), k) * (1.0 / 4294967296);
-        var target2 = u * total2;
-        var run = b.Local(sums[tid]);
-        var found = b.Local(cols);
+        var u = b.Convert(Draw(Draw(ka, kb, b.Load(K.U32, pstep)), kb, row), k) * (1.0 / 4294967296);
+        var target2 = u * sum2;
+        var run2 = b.Local(sums[tid]);
+        var found2 = b.Local(cols);
         var lastMine = b.Local(b.U(0));
         b.For(c0, c1, c =>
         {
-            var w = Weight(c);
-            run.V = run.V + w;
-            found.V = b.Select((w > 0.0) & (run.V >= target2) & (found.V == cols), c, found.V);
+            var w = KeptWeight(c);
+            run2.V = run2.V + w;
+            found2.V = b.Select((w > 0.0) & (run2.V > target2) & (found2.V == cols), c, found2.V);
             lastMine.V = b.Select(w > 0.0, c + 1.0, lastMine.V);                   // the chunk's columns ascend
         });
-        var least = GroupReduce(b, counts, tid, found.V, b.Min, ReduceThreads);
-        var lastKept = GroupReduce(b, counts, tid, lastMine.V, b.Max, ReduceThreads);      // the last kept column (+ 1; 0: none)
+        var least2 = GroupReduce(b, counts, tid, found2.V, b.Min, ReduceThreads);
+        var lastKept = GroupReduce(b, counts, tid, lastMine.V, b.Max, ReduceThreads);  // the last kept column (+ 1; 0: none)
         b.If(tid == 0, () =>
         {
-            var pick = b.Select(least >= cols, lastKept - 1.0, least);              // the last kept column; −1 when none
+            var pick = b.Select(least2 >= cols, lastKept - 1.0, least2);              // the last kept column; −1 when none
+            pick = b.Select(sum2 > 0.0, pick, none);                                  // a sum not positive (NaN): no column
             b.Store(b.At(picks, row, 4), pick);
             b.If(prob != b.UL(0), () =>
             {
-                var valid = b.Bitcast(pick, K.S32) >= b.S(0);
-                var w = Weight(b.Select(valid, pick, b.U(0)));
-                b.Store(b.At(prob, row, lane.Size), b.Select(valid, w / total2, zero));
+                var valid = pick != none;
+                var w = Stored(b.Select(valid, pick, b.U(0)));
+                b.Store(b.At(prob, row, lane.Size), b.Select(valid, w / sum2, b.C(k, double.NaN)));
             });
+        });
+        return b.Build();
+    }
+
+    /// <summary>keys[i] (u64) = the order key (OrderKey) of x's value i in f's natural lane, i below n: the key proven on
+    /// the device against Routing.Order (Checks.Sampling.cs). Slots: x, keys, n; an invocation a value.</summary>
+    public static SpvKernel OrderKeys(Vulkan vk, Fmt f)
+    {
+        var b = new Spv($"order_keys_{f.Name}", Threads, vk.Controls);
+        V px = b.Arg(0), pk = b.Arg(1), n = b.Arg(2, K.U32);
+        var gid = b.GlobalX;
+        b.If(gid < n, () =>
+        {
+            var key = OrderKey(b, Codec.UnpackAt(b, f, px, gid, f.Natural));
+            b.Store(b.At(pk, gid, 8), key.Kind == K.U64 ? key : b.Convert(key, K.U64));
         });
         return b.Build();
     }
