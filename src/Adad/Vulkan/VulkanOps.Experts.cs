@@ -21,13 +21,13 @@ public sealed partial class VulkanOps
         ulong Rent(long bytes) { ulong q = vk.Rent(Math.Max(16, bytes)); rented.Add(q); return q; }
         try
         {
-            ulong flags = Rent((long)tokens * experts * 4), chosen = Rent(slots * 4L), lanes = Rent(slots * (long)lane.Size), counts = Rent(experts * 4L), order = Rent(slots * 4L);
+            ulong ranked = Rent((long)tokens * experts * 4), chosen = Rent(slots * 4L), lanes = Rent(slots * (long)lane.Size), counts = Rent(experts * 4L), order = Rent(slots * 4L);
             if (tokens > 0)
             {
                 var ranks = vk.Cached($"expert_ranks:{f.Name}:{lane.Name}", () => VkKernels.ExpertRanks(vk, f, lane));
-                vk.Launch(ranks, Groups((long)tokens * experts, VkKernels.Threads), 1, p, flags, Vulkan.U(tokens * experts), Vulkan.U(experts), Vulkan.U(k));
+                vk.Launch(ranks, Groups((long)tokens * experts, VkKernels.Threads), 1, p, ranked, Vulkan.U(tokens * experts), Vulkan.U(experts), Vulkan.U(k));
                 var picks = vk.Cached($"expert_picks:{f.Name}:{lane.Name}", () => VkKernels.ExpertPicks(vk, f, lane));
-                vk.Launch(picks, Groups(tokens, VkKernels.Threads), 1, p, flags, chosen, lanes, Vulkan.U(tokens), Vulkan.U(experts), Vulkan.U(k), Vulkan.U(normalize ? 1 : 0));
+                vk.Launch(picks, Groups(tokens, VkKernels.Threads), 1, p, ranked, chosen, lanes, Vulkan.U(tokens), Vulkan.U(experts), Vulkan.U(k), Vulkan.U(normalize ? 1 : 0));
                 Back(f, lane, lanes, weights, slots);
             }
 

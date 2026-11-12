@@ -47,9 +47,9 @@ public sealed record ExpertView(int Experts, int Rows, int K, int N, bool TransW
 
 public static class Experts
 {
-    /// <summary>The routing's float64 reference (RouteTopK): each token's k most probable experts (ties to the lowest
-    /// index) in increasing expert order, the slots' experts and weights (normalize: over the sum of the token's k, added in
-    /// increasing expert order), and the offsets, tokenOfRow and slotRow of the slots listed expert by expert.</summary>
+    /// <summary>The routing's float64 reference (RouteTopK): each token's k first experts in TopK's order (Precedes), the
+    /// expert of rank s at the token's slot s; the slots' experts and weights (normalize: over the sum of the token's k, added
+    /// in slot order), and the offsets, tokenOfRow and slotRow of the slots listed expert by expert.</summary>
     public static (double[] Weights, int[] Chosen, int[] Offsets, int[] TokenOfRow, int[] SlotRow) RouteTopKReference(double[] p, int tokens, int experts, int k, bool normalize)
     {
         var weights = new double[tokens * k];
@@ -57,19 +57,17 @@ public static class Experts
         for (int t = 0; t < tokens; t++)
         {
             var row = p.AsSpan(t * experts, experts);
-            int s = 0;
-            double sum = 0;
             for (int e = 0; e < experts; e++)
             {
                 int rank = 0;
-                for (int q = 0; q < experts; q++) if (row[q] > row[e] || (row[q] == row[e] && q < e)) rank++;
+                for (int q = 0; q < experts; q++) if (Precedes(row[q], q, row[e], e)) rank++;
                 if (rank >= k) continue;
-                chosen[t * k + s] = e;
-                weights[t * k + s] = row[e];
-                sum += row[e];
-                s++;
+                chosen[t * k + rank] = e;
+                weights[t * k + rank] = row[e];
             }
 
+            double sum = 0;
+            for (int i = 0; i < k; i++) sum += weights[t * k + i];
             if (normalize) for (int i = 0; i < k; i++) weights[t * k + i] /= sum;
         }
 
@@ -84,6 +82,11 @@ public static class Experts
 
         return (weights, chosen, offsets, tokenOfRow, slotRow);
     }
+
+    /// <summary>TopK's order (IRouting.TopK): a at column ia ranks before b at column ib when a is NaN and b a number, when
+    /// a &gt; b, or when they are equal (−0 = +0) or both NaN and ia &lt; ib.</summary>
+    public static bool Precedes(double a, int ia, double b, int ib) =>
+        double.IsNaN(a) || double.IsNaN(b) ? double.IsNaN(a) && (!double.IsNaN(b) || ia < ib) : a > b || (a == b && ia < ib);
 
     public static void ValidateRoute(int tokens, int experts, int k)
     {

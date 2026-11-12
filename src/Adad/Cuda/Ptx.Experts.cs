@@ -2,9 +2,9 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // The mixture of experts' kernels on CUDA (GpuOps.Experts.cs; Experts.cs): the routing's ranks (a thread per token and
-// expert: how many of the token's experts are more probable, or as probable at a lower index), its picks (a thread per
-// token: the experts of rank below k in increasing order, their probabilities in the lane, normalized by their sum in that
-// order) and its rows (from the route's order); the experts' tiles (each expert's ⌈rows / tile⌉, prefix-summed: the grouped
+// expert: how many of the token's experts come before it in TopK's order, Experts.Precedes), its picks (a thread per token:
+// each expert of rank below k at the slot of its rank, its probability in the lane, normalized by their sum in slot order)
+// and its rows (from the route's order); the experts' tiles (each expert's ⌈rows / tile⌉, prefix-summed: the grouped
 // GEMM's grid, Ptx.Gemm) and each row's expert; and the store: y = gate(g + gb[e], u + ub[e]) (or g + gb[e]) of the lane
 // sums, the biases read where they are stored, the gate Map's formula in the lane, rounded to the type once.
 using Adad.Abstraction;
@@ -42,31 +42,41 @@ internal static partial class Ptx
         return v;
     }
 
-    /// <summary>flags[t·E + e] = 1 where expert e's rank among token t's probabilities is below k. Params: p, flags, count
-    /// (tokens·E), experts, k.</summary>
+    /// <summary>ranks[t·E + e] = expert e's rank among token t's probabilities (the experts before it in TopK's order),
+    /// counted up to k. Params: p, ranks, count (tokens·E), experts, k.</summary>
     public static string ExpertRanks(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"expert_ranks_{f.Name}_{lane.Name}";
         var b = new PtxBuilder();
-        string pp = Param64(b, "p_p"), pf = Param64(b, "p_flags"), count = Param32(b, "p_count"), E = Param32(b, "p_experts"), k = Param32(b, "p_k");
+        string pp = Param64(b, "p_p"), pf = Param64(b, "p_ranks"), count = Param32(b, "p_count"), E = Param32(b, "p_experts"), k = Param32(b, "p_k");
         string i = EachIndex(b, count);
         string t = b.R(), e = b.R(), row = b.R(), at = b.R(), q = b.R(), rank = b.R(), inc = b.R();
-        string pDone = b.P(), pGt = b.P(), pEq = b.P(), pLo = b.P();
+        string pDone = b.P(), pGt = b.P(), pEq = b.P(), pLo = b.P(), pEn = b.P(), pEnum = b.P(), pQn = b.P(), pBoth = b.P();
         b.L($"div.u32 {t}, {i}, {E};");
         b.L($"rem.u32 {e}, {i}, {E};");
         b.L($"mul.lo.u32 {row}, {t}, {E};");
         b.L($"add.u32 {at}, {row}, {e};");
         string pe = Codec.UnpackAt(b, f, pp, at, lane);
+        b.L($"setp.nan.{lane.Op} {pEn}, {pe}, {pe};");
+        b.L($"not.pred {pEnum}, {pEn};");
         b.L($"mov.u32 {q}, 0;");
         b.L($"mov.u32 {rank}, 0;");
         b.Label("RLOOP");
         b.L($"setp.ge.u32 {pDone}, {q}, {E};");
         b.L($"@{pDone} bra RDONE;");
+        b.L($"setp.ge.u32 {pDone}, {rank}, {k};");
+        b.L($"@{pDone} bra RDONE;");
         string qa = b.R();
         b.L($"add.u32 {qa}, {row}, {q};");
         string pq = Codec.UnpackAt(b, f, pp, qa, lane);
+        // q before e: q NaN and e a number, q > e, or q = e (both NaN alike) at a lower index.
+        b.L($"setp.nan.{lane.Op} {pQn}, {pq}, {pq};");
         b.L($"setp.gt.{lane.Op} {pGt}, {pq}, {pe};");
+        b.L($"and.pred {pBoth}, {pQn}, {pEnum};");
+        b.L($"or.pred {pGt}, {pGt}, {pBoth};");
         b.L($"setp.eq.{lane.Op} {pEq}, {pq}, {pe};");
+        b.L($"and.pred {pBoth}, {pQn}, {pEn};");
+        b.L($"or.pred {pEq}, {pEq}, {pBoth};");
         b.L($"setp.lt.u32 {pLo}, {q}, {e};");
         b.L($"and.pred {pEq}, {pEq}, {pLo};");
         b.L($"or.pred {pGt}, {pGt}, {pEq};");
@@ -75,49 +85,44 @@ internal static partial class Ptx
         b.L($"add.u32 {q}, {q}, 1;");
         b.L("bra RLOOP;");
         b.Label("RDONE");
-        string flag = b.R(), pK = b.P();
-        b.L($"setp.lt.u32 {pK}, {rank}, {k};");
-        b.L($"selp.u32 {flag}, 1, 0, {pK};");
-        StoreU32(b, pf, i, flag);
+        StoreU32(b, pf, i, rank);
         b.Label("DONE");
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_p, .param .u64 p_flags, .param .u32 p_count, .param .u32 p_experts, .param .u32 p_k");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_p, .param .u64 p_ranks, .param .u32 p_count, .param .u32 p_experts, .param .u32 p_k");
     }
 
-    /// <summary>A thread per token: the flagged experts in increasing order at its slots (chosen, s32) and their probabilities
-    /// (lane storage), normalized (p_norm 1) by their sum in that order. Params: p, flags, chosen, lanes, tokens, experts, k, norm.</summary>
+    /// <summary>A thread per token: each expert of rank below k at the slot of its rank (chosen, s32) with its probability
+    /// (lane storage), normalized (p_norm 1) by their sum in slot order. Params: p, ranks, chosen, lanes, tokens, experts, k,
+    /// norm.</summary>
     public static string ExpertPicks(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"expert_picks_{f.Name}_{lane.Name}";
         var b = new PtxBuilder();
-        string pp = Param64(b, "p_p"), pf = Param64(b, "p_flags"), pc = Param64(b, "p_chosen"), pl = Param64(b, "p_lanes");
+        string pp = Param64(b, "p_p"), pf = Param64(b, "p_ranks"), pc = Param64(b, "p_chosen"), pl = Param64(b, "p_lanes");
         string tokens = Param32(b, "p_tokens"), E = Param32(b, "p_experts"), k = Param32(b, "p_k"), norm = Param32(b, "p_norm");
         string t = EachIndex(b, tokens);
-        string row = b.R(), slot0 = b.R(), e = b.R(), s = b.R(), pDone = b.P(), pSkip = b.P();
+        string row = b.R(), slot0 = b.R(), e = b.R(), pDone = b.P(), pSkip = b.P();
         string sum = lane.NewReg(b);
         b.L($"mov.{lane.Reg} {sum}, {lane.Zero};");
         b.L($"mul.lo.u32 {row}, {t}, {E};");
         b.L($"mul.lo.u32 {slot0}, {t}, {k};");
         b.L($"mov.u32 {e}, 0;");
-        b.L($"mov.u32 {s}, 0;");
         b.Label("PLOOP");
         b.L($"setp.ge.u32 {pDone}, {e}, {E};");
         b.L($"@{pDone} bra PDONE;");
         string at = b.R();
         b.L($"add.u32 {at}, {row}, {e};");
-        string flag = LoadU32(b, pf, at);
-        b.L($"setp.eq.u32 {pSkip}, {flag}, 0;");
+        string rank = LoadU32(b, pf, at);
+        b.L($"setp.ge.u32 {pSkip}, {rank}, {k};");
         b.L($"@{pSkip} bra PNEXT;");
         string slot = b.R();
-        b.L($"add.u32 {slot}, {slot0}, {s};");
+        b.L($"add.u32 {slot}, {slot0}, {rank};");
         StoreU32(b, pc, slot, e);
         string v = Codec.UnpackAt(b, f, pp, at, lane);
         string la = b.RD();
         b.L($"mul.wide.u32 {la}, {slot}, {lane.Size};");
         b.L($"add.u64 {la}, {pl}, {la};");
         b.L($"st.global.{lane.Mem} [{la}], {v};");
-        b.L($"add.rn.{lane.Op} {sum}, {sum}, {v};");
-        b.L($"add.u32 {s}, {s}, 1;");
         b.Label("PNEXT");
         b.L($"add.u32 {e}, {e}, 1;");
         b.L("bra PLOOP;");
@@ -125,6 +130,20 @@ internal static partial class Ptx
         string pNo = b.P(), i = b.R(), pEnd = b.P();
         b.L($"setp.eq.u32 {pNo}, {norm}, 0;");
         b.L($"@{pNo} bra DONE;");
+        // The sum of the token's weights in slot order (the thread's own stores, read back).
+        b.L($"mov.u32 {i}, 0;");
+        b.Label("SLOOP");
+        b.L($"setp.ge.u32 {pEnd}, {i}, {k};");
+        b.L($"@{pEnd} bra SDONE;");
+        string ss = b.R(), sa = b.RD(), sv = lane.NewReg(b);
+        b.L($"add.u32 {ss}, {slot0}, {i};");
+        b.L($"mul.wide.u32 {sa}, {ss}, {lane.Size};");
+        b.L($"add.u64 {sa}, {pl}, {sa};");
+        b.L($"ld.global.{lane.Mem} {sv}, [{sa}];");
+        b.L($"add.rn.{lane.Op} {sum}, {sum}, {sv};");
+        b.L($"add.u32 {i}, {i}, 1;");
+        b.L("bra SLOOP;");
+        b.Label("SDONE");
         b.L($"mov.u32 {i}, 0;");
         b.Label("NLOOP");
         b.L($"setp.ge.u32 {pEnd}, {i}, {k};");
@@ -140,7 +159,7 @@ internal static partial class Ptx
         b.L("bra NLOOP;");
         b.Label("DONE");
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_p, .param .u64 p_flags, .param .u64 p_chosen, .param .u64 p_lanes, .param .u32 p_tokens, .param .u32 p_experts, .param .u32 p_k, .param .u32 p_norm");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_p, .param .u64 p_ranks, .param .u64 p_chosen, .param .u64 p_lanes, .param .u32 p_tokens, .param .u32 p_experts, .param .u32 p_k, .param .u32 p_norm");
     }
 
     /// <summary>A thread per row: slot = order[row], tokenOfRow[row] = slot / k, slotRow[slot] = row. Params: order,

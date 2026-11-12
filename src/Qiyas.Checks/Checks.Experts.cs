@@ -2,8 +2,9 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // The mixture of experts (Experts.cs) on every device against its float64 reference, every float type (the block formats
-// among them): the routing (each token's experts with ties among the probabilities, normalized and not: offsets, rows
-// and slots exactly, the weights within the sum's and the quotient's rounding), the experts' products and the gated pair
+// among them): the routing (each token's experts in TopK's order with ties among the probabilities, and with NaN and
+// signed zeros, normalized and not: offsets, rows and slots exactly, the weights within the sum's and the quotient's
+// rounding, NaN where the reference's is), the experts' products and the gated pair
 // over uneven groups (an expert without rows, rows outside every expert's), the weights stored and transposed, with and
 // without biases; within the lane's rounding of each value's terms (through the gate) plus the type's step.
 namespace Qiyas;
@@ -21,7 +22,7 @@ internal static partial class Checks
             ok &= ExpertProductsCheck(ops, where, type);
         }
 
-        if (ok) Console.WriteLine($"check experts                {where,-6} every float type{(blocks ? "" : " but the block formats")}: the top-k routing with ties (normalized and not) exactly, and the experts' products and gated pairs over uneven groups (an empty expert, rows outside every expert), weights stored and transposed, with and without biases, within the products' rounding");
+        if (ok) Console.WriteLine($"check experts                {where,-6} every float type{(blocks ? "" : " but the block formats")}: the top-k routing in TopK's order with ties, NaN and ±0 (normalized and not) exactly, and the experts' products and gated pairs over uneven groups (an empty expert, rows outside every expert), weights stored and transposed, with and without biases, within the products' rounding");
         return ok;
     }
 
@@ -29,25 +30,48 @@ internal static partial class Checks
     {
         bool ok = true;
         const int tokens = 37, experts = 9, k = 3;
-        var p = Bench.Registry.Values(type, Bench.Registry.Make(type, tokens * experts, 101, 0, 1), tokens * experts);
-        for (int t = 0; t < tokens; t += 4) { p[t * experts + 5] = p[t * experts + 2]; p[t * experts + 7] = p[t * experts + 2]; }   // ties
-        var stored = Bench.Registry.Encode(type, p);
-        p = Bench.Registry.Values(type, stored, tokens * experts);
-        foreach (bool normalize in new[] { false, true })
+        var drawn = Bench.Registry.Values(type, Bench.Registry.Make(type, tokens * experts, 101, 0, 1), tokens * experts);
+        for (int t = 0; t < tokens; t += 4) { drawn[t * experts + 5] = drawn[t * experts + 2]; drawn[t * experts + 7] = drawn[t * experts + 2]; }   // ties
+        // TopK's order past the numbers: a NaN above every number (one in a token, two, more than k), NaN beside NaN and −0
+        // beside +0 by the lower index.
+        var odd = (double[])drawn.Clone();
+        odd[1 * experts + 4] = double.NaN;
+        odd[2 * experts + 6] = odd[2 * experts + 1] = double.NaN;
+        for (int e = 0; e < 4; e++) odd[3 * experts + e] = double.NaN;
+        for (int e = 0; e < experts; e++) odd[5 * experts + e] = e % 2 == 0 ? -0.0 : 0.0;
+        foreach (var (input, special) in new[] { (drawn, false), (odd, true) })
         {
-            var (want, _, wantOffsets, wantTokens, wantSlots) = Experts.RouteTopKReference(p, tokens, experts, k, normalize);
-            var weights = new byte[Bench.Registry.Bytes(type, tokens * k)];
-            int[] offsets = new int[experts + 1], tokenOfRow = new int[tokens * k], slotRow = new int[tokens * k];
-            Bench.Registry.WithFloat(type, new RouteTopKRun(ops, stored, tokens, experts, k, normalize, weights, offsets, tokenOfRow, slotRow));
-            string what = $"route top-{k} of {experts}{(normalize ? " normalized" : "")}";
-            if (!offsets.SequenceEqual(wantOffsets) || !tokenOfRow.SequenceEqual(wantTokens) || !slotRow.SequenceEqual(wantSlots))
+            var stored = Bench.Registry.Encode(type, input);
+            var p = Bench.Registry.Values(type, stored, tokens * experts);
+            foreach (bool normalize in new[] { false, true })
             {
-                Console.WriteLine($"check {what,-50} {where,-6} {type,-12} DIFFERS in its rows");
-                ok = false;
-            }
+                var (want, _, wantOffsets, wantTokens, wantSlots) = Experts.RouteTopKReference(p, tokens, experts, k, normalize);
+                var weights = new byte[Bench.Registry.Bytes(type, tokens * k)];
+                int[] offsets = new int[experts + 1], tokenOfRow = new int[tokens * k], slotRow = new int[tokens * k];
+                Bench.Registry.WithFloat(type, new RouteTopKRun(ops, stored, tokens, experts, k, normalize, weights, offsets, tokenOfRow, slotRow));
+                string what = $"route top-{k} of {experts}{(special ? " NaN ±0" : "")}{(normalize ? " normalized" : "")}";
+                if (!offsets.SequenceEqual(wantOffsets) || !tokenOfRow.SequenceEqual(wantTokens) || !slotRow.SequenceEqual(wantSlots))
+                {
+                    Console.WriteLine($"check {what,-50} {where,-6} {type,-12} DIFFERS in its rows");
+                    ok = false;
+                }
 
-            double bad = Excess(type, what, weights, want, i => normalize ? (k + 2) * Math.Abs(want[i]) : 0, 1);
-            if (bad > 0) { Console.WriteLine($"check {what,-50} {where,-6} {type,-12} DIFFERS by {bad:0.##}"); ok = false; }
+                // The weights: NaN exactly where the reference's are, the others within the rounding. A block format's
+                // weights share a block's scale with its neighbours, a NaN among them the codec's own matter (its checks), so
+                // with NaN in the input a block format is held to its rows alone.
+                if (special && Bench.Registry.IsBlock(type)) continue;
+                var got = Bench.Registry.Values(type, weights, tokens * k);
+                if (Enumerable.Range(0, tokens * k).Any(i => double.IsNaN(got[i]) != double.IsNaN(want[i])))
+                {
+                    Console.WriteLine($"check {what,-50} {where,-6} {type,-12} DIFFERS in its NaN weights");
+                    ok = false;
+                }
+
+                var wantNumbers = want.Select(w => double.IsNaN(w) ? 0 : w).ToArray();
+                var gotNumbers = special ? Bench.Registry.Encode(type, got.Select(w => double.IsNaN(w) ? 0 : w).ToArray()) : weights;
+                double bad = Excess(type, what, gotNumbers, wantNumbers, i => normalize ? (k + 2) * Math.Abs(wantNumbers[i]) : 0, 1);
+                if (bad > 0) { Console.WriteLine($"check {what,-50} {where,-6} {type,-12} DIFFERS by {bad:0.##}"); ok = false; }
+            }
         }
 
         return ok;

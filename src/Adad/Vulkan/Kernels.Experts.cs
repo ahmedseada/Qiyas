@@ -11,8 +11,8 @@ namespace Adad.Vulkan;
 
 internal static partial class VkKernels
 {
-    /// <summary>flags[t·E + e] = 1 where expert e's rank among token t's probabilities is below k. Slots: p, flags, count
-    /// (tokens·E), experts, k.</summary>
+    /// <summary>ranks[t·E + e] = expert e's rank among token t's probabilities (the experts before it in TopK's order,
+    /// Experts.Precedes). Slots: p, ranks, count (tokens·E), experts, k.</summary>
     public static SpvKernel ExpertRanks(Vulkan vk, Fmt f, Lane lane)
     {
         var b = new Spv($"expert_ranks_{f.Name}_{lane.Name}", Threads, vk.Controls);
@@ -25,21 +25,24 @@ internal static partial class VkKernels
             var row = t * E;
             var e = i - row;
             var pe = Codec.UnpackAt(b, f, pp, row + e, lane);
+            var en = b.IsNan(pe);
             var rank = b.Local(b.U(0));
             b.For(b.U(0), E, q =>
             {
                 var pq = Codec.UnpackAt(b, f, pp, row + q, lane);
-                var above = (pq > pe) | ((pq == pe) & (q < e));
-                rank.V = rank.V + b.Select(above, b.U(1), b.U(0));
+                var qn = b.IsNan(pq);
+                // q before e: q NaN and e a number, q > e, or q = e (both NaN alike) at a lower index.
+                var before = (qn & !en) | (pq > pe) | (((pq == pe) | (qn & en)) & (q < e));
+                rank.V = rank.V + b.Select(before, b.U(1), b.U(0));
             });
-            b.Store(b.At(pf, i, 4), b.Select(rank.V < k, b.U(1), b.U(0)));
+            b.Store(b.At(pf, i, 4), rank.V);
         });
         return b.Build();
     }
 
-    /// <summary>An invocation per token: the flagged experts in increasing order at its slots (chosen) and their
-    /// probabilities (lane storage), normalized (norm 1) by their sum in that order. Slots: p, flags, chosen, lanes, tokens,
-    /// experts, k, norm.</summary>
+    /// <summary>An invocation per token: each expert of rank below k at the slot of its rank (chosen) with its probability
+    /// (lane storage), normalized (norm 1) by their sum in slot order. Slots: p, ranks, chosen, lanes, tokens, experts, k,
+    /// norm.</summary>
     public static SpvKernel ExpertPicks(Vulkan vk, Fmt f, Lane lane)
     {
         var kk = Kinds.Of(lane);
@@ -51,26 +54,28 @@ internal static partial class VkKernels
         {
             var row = t * E;
             var slot0 = t * k;
-            var s = b.Local(b.U(0));
             var sum = b.Local(b.C(kk, 0));
             b.For(b.U(0), E, e =>
             {
                 var at = row + e;
-                b.If(b.Load(K.U32, b.At(pf, at, 4)) != 0.0, () =>
+                var rank = b.Load(K.U32, b.At(pf, at, 4));
+                b.If(rank < k, () =>
                 {
-                    var slot = slot0 + s.V;
+                    var slot = slot0 + rank;
                     b.Store(b.At(pc, slot, 4), e);
-                    var v = Codec.UnpackAt(b, f, pp, at, lane);
-                    b.Store(b.At(pl, slot, lane.Size), v);
-                    sum.V = sum.V + v;
-                    s.V = s.V + 1.0;
+                    b.Store(b.At(pl, slot, lane.Size), Codec.UnpackAt(b, f, pp, at, lane));
                 });
             });
-            b.If(norm != 0.0, () => b.For(b.U(0), k, i =>
+            // The sum of the token's weights in slot order (the invocation's own stores, read back), then each divided by it.
+            b.If(norm != 0.0, () =>
             {
-                var a = b.At(pl, slot0 + i, lane.Size);
-                b.Store(a, b.Load(kk, a) / sum.V);
-            }));
+                b.For(b.U(0), k, i => { sum.V = sum.V + b.Load(kk, b.At(pl, slot0 + i, lane.Size)); });
+                b.For(b.U(0), k, i =>
+                {
+                    var a = b.At(pl, slot0 + i, lane.Size);
+                    b.Store(a, b.Load(kk, a) / sum.V);
+                });
+            });
         });
         return b.Build();
     }

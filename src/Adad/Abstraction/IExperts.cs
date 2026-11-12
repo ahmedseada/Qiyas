@@ -7,9 +7,10 @@ namespace Adad.Abstraction;
 /// rows the routing groups by expert, its offsets read where they are.</summary>
 public interface IExperts<TBuffer, TIndex>
 {
-    /// <summary>The routing of tokens rows of router probabilities (tokens × experts): each token's k most probable experts
-    /// (ties to the lowest index) in increasing expert order, token t's s-th at slot t·k + s; weights[slot] its probability
-    /// (normalize: divided by the sum of the token's k, added in increasing expert order; in the float lane, stored as TN);
+    /// <summary>The routing of tokens rows of router probabilities (tokens × experts): each token's k first experts in
+    /// IRouting.TopK's order (a NaN above every number, then the larger first, −0 equal to +0, an equal value or NaN beside NaN
+    /// by the lower index), the expert of rank s at slot t·k + s; weights[slot] its probability (normalize: divided by the sum
+    /// of the token's k, added in slot order; in the float lane, stored as TN);
     /// offsets (experts + 1) the first row of each expert when the slots are listed expert by expert (each expert's in slot
     /// order), tokenOfRow[row] that row's token, slotRow[slot] that slot's row.</summary>
     string RouteTopK<TN>(TBuffer probabilities, int tokens, int experts, int k, bool normalize, TBuffer weights, TIndex offsets, TIndex tokenOfRow, TIndex slotRow)

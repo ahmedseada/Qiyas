@@ -21,13 +21,13 @@ public sealed partial class GpuOps
         ulong Rent(long bytes) { ulong q = gpu.Rent(Math.Max(16, bytes)); rented.Add(q); return q; }
         try
         {
-            ulong flags = Rent((long)tokens * experts * 4), chosen = Rent(slots * 4L), lanes = Rent(slots * (long)lane.Size), counts = Rent(experts * 4L), order = Rent(slots * 4L);
+            ulong ranked = Rent((long)tokens * experts * 4), chosen = Rent(slots * 4L), lanes = Rent(slots * (long)lane.Size), counts = Rent(experts * 4L), order = Rent(slots * 4L);
             if (tokens > 0)
             {
                 var ranks = gpu.Cached($"expert_ranks:{f.Name}:{lane.Name}", (out string e) => Ptx.ExpertRanks(gpu, f, lane, out e));
-                Gpu.Launch(ranks, Grid((long)tokens * experts, 256), 1, 256, 1, 0, p, flags, Gpu.U(tokens * experts), Gpu.U(experts), Gpu.U(k));
+                Gpu.Launch(ranks, Grid((long)tokens * experts, 256), 1, 256, 1, 0, p, ranked, Gpu.U(tokens * experts), Gpu.U(experts), Gpu.U(k));
                 var picks = gpu.Cached($"expert_picks:{f.Name}:{lane.Name}", (out string e) => Ptx.ExpertPicks(gpu, f, lane, out e));
-                Gpu.Launch(picks, Grid(tokens, 256), 1, 256, 1, 0, p, flags, chosen, lanes, Gpu.U(tokens), Gpu.U(experts), Gpu.U(k), Gpu.U(normalize ? 1 : 0));
+                Gpu.Launch(picks, Grid(tokens, 256), 1, 256, 1, 0, p, ranked, chosen, lanes, Gpu.U(tokens), Gpu.U(experts), Gpu.U(k), Gpu.U(normalize ? 1 : 0));
                 Back(f, lane, lanes, weights, slots);
             }
 

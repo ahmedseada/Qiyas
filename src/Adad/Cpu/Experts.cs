@@ -1,11 +1,11 @@
 // Copyright (c) 2026 Ahmed Seada
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
-// The mixture of experts on the CPU (Experts.cs): the routing (each token's k experts by their rank among the token's
-// probabilities, in the float lane, then the route of the slots, Routing.cs), and the experts' products over the rows
-// grouped by expert: each expert's rows of x times its weights (read where they are stored, transposed or not) into the
-// float lane's sums, then one store adding each row's expert's bias and applying the gate (a formula of Map, in the lane),
-// rounded to the type once.
+// The mixture of experts on the CPU (Experts.cs): the routing (each token's k experts at the slots of their ranks among
+// the token's probabilities in TopK's order, in the float lane, then the route of the slots, Routing.cs), and the experts'
+// products over the rows grouped by expert: each expert's rows of x times its weights (read where they are stored,
+// transposed or not) into the float lane's sums, then one store adding each row's expert's bias and applying the gate (a
+// formula of Map, in the lane), rounded to the type once.
 
 using System.Buffers;
 using System.Numerics;
@@ -57,8 +57,8 @@ internal sealed partial class Kernels
         }
     }
 
-    // Each token's k experts: those of rank below k (the experts more probable, or as probable at a lower index), in
-    // increasing expert order; their probabilities, normalized by their sum in that order.
+    // Each token's k experts: those of rank below k (the experts before it in TopK's order, Experts.Precedes), each at the
+    // slot of its rank; their probabilities, normalized by their sum in slot order.
     private readonly struct PicksBody<TN, TLane, TL>(byte[] p, int experts, int k, bool normalize, TLane[] w, int[] chosen) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
@@ -70,28 +70,32 @@ internal sealed partial class Kernels
                 for (int t = first; t < last; t++)
                 {
                     TN.Load(p, t * experts, row.AsSpan(0, experts));
-                    int s = 0;
-                    TLane sum = TL.Zero;
                     for (int e = 0; e < experts; e++)
                     {
                         int rank = 0;
-                        for (int q = 0; q < experts && rank < k; q++)
-                        {
-                            int c = Widths.Compare(row[q], row[e]);
-                            if (c > 0 || (c == 0 && q < e)) rank++;
-                        }
-
+                        for (int q = 0; q < experts && rank < k; q++) if (Precedes(row[q], q, row[e], e)) rank++;
                         if (rank >= k) continue;
-                        chosen[t * k + s] = e;
-                        w[t * k + s] = row[e];
-                        sum = TL.Add(sum, row[e]);
-                        s++;
+                        chosen[t * k + rank] = e;
+                        w[t * k + rank] = row[e];
                     }
 
-                    if (normalize) for (int i = 0; i < k; i++) w[t * k + i] = TL.Div(w[t * k + i], sum);
+                    if (!normalize) continue;
+                    TLane sum = TL.Zero;
+                    for (int i = 0; i < k; i++) sum = TL.Add(sum, w[t * k + i]);
+                    for (int i = 0; i < k; i++) w[t * k + i] = TL.Div(w[t * k + i], sum);
                 }
             }
             finally { ArrayPool<TLane>.Shared.Return(row); }
+        }
+
+        // TopK's order in the lane (Experts.Precedes): a NaN (unequal to itself) above every number, then by value (−0 = +0),
+        // an equal value or NaN beside NaN by the lower index.
+        private static bool Precedes(TLane a, int ia, TLane b, int ib)
+        {
+            bool an = !Vector.EqualsAll(new Vector<TLane>(a), new Vector<TLane>(a)), bn = !Vector.EqualsAll(new Vector<TLane>(b), new Vector<TLane>(b));
+            if (an || bn) return an && (!bn || ia < ib);
+            int c = Widths.Compare(a, b);
+            return c > 0 || (c == 0 && ia < ib);
         }
     }
 
