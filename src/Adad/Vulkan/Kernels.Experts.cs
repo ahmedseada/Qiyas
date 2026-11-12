@@ -12,7 +12,7 @@ namespace Adad.Vulkan;
 internal static partial class VkKernels
 {
     /// <summary>ranks[t·E + e] = expert e's rank among token t's probabilities (the experts before it in TopK's order,
-    /// Experts.Precedes). Slots: p, ranks, count (tokens·E), experts, k.</summary>
+    /// Routing.Precedes). Slots: p, ranks, count (tokens·E), experts, k.</summary>
     public static SpvKernel ExpertRanks(Vulkan vk, Fmt f, Lane lane)
     {
         var b = new Spv($"expert_ranks_{f.Name}_{lane.Name}", Threads, vk.Controls);

@@ -47,7 +47,7 @@ public sealed record ExpertView(int Experts, int Rows, int K, int N, bool TransW
 
 public static class Experts
 {
-    /// <summary>The routing's float64 reference (RouteTopK): each token's k first experts in TopK's order (Precedes), the
+    /// <summary>The routing's float64 reference (RouteTopK): each token's k first experts in TopK's order (Routing.Precedes), the
     /// expert of rank s at the token's slot s; the slots' experts and weights (normalize: over the sum of the token's k, added
     /// in slot order), and the offsets, tokenOfRow and slotRow of the slots listed expert by expert.</summary>
     public static (double[] Weights, int[] Chosen, int[] Offsets, int[] TokenOfRow, int[] SlotRow) RouteTopKReference(double[] p, int tokens, int experts, int k, bool normalize)
@@ -60,7 +60,7 @@ public static class Experts
             for (int e = 0; e < experts; e++)
             {
                 int rank = 0;
-                for (int q = 0; q < experts; q++) if (Precedes(row[q], q, row[e], e)) rank++;
+                for (int q = 0; q < experts; q++) if (Routing.Precedes(row[q], q, row[e], e)) rank++;
                 if (rank >= k) continue;
                 chosen[t * k + rank] = e;
                 weights[t * k + rank] = row[e];
@@ -82,11 +82,6 @@ public static class Experts
 
         return (weights, chosen, offsets, tokenOfRow, slotRow);
     }
-
-    /// <summary>TopK's order (IRouting.TopK): a at column ia ranks before b at column ib when a is NaN and b a number, when
-    /// a &gt; b, or when they are equal (−0 = +0) or both NaN and ia &lt; ib.</summary>
-    public static bool Precedes(double a, int ia, double b, int ib) =>
-        double.IsNaN(a) || double.IsNaN(b) ? double.IsNaN(a) && (!double.IsNaN(b) || ia < ib) : a > b || (a == b && ia < ib);
 
     public static void ValidateRoute(int tokens, int experts, int k)
     {

@@ -2,7 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // The mixture of experts' kernels on CUDA (GpuOps.Experts.cs; Experts.cs): the routing's ranks (a thread per token and
-// expert: how many of the token's experts come before it in TopK's order, Experts.Precedes), its picks (a thread per token:
+// expert: how many of the token's experts come before it in TopK's order, Routing.Precedes), its picks (a thread per token:
 // each expert of rank below k at the slot of its rank, its probability in the lane, normalized by their sum in slot order)
 // and its rows (from the route's order); the experts' tiles (each expert's ⌈rows / tile⌉, prefix-summed: the grouped
 // GEMM's grid, Ptx.Gemm) and each row's expert; and the store: y = gate(g + gb[e], u + ub[e]) (or g + gb[e]) of the lane

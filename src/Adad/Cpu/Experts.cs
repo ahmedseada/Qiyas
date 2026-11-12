@@ -57,7 +57,7 @@ internal sealed partial class Kernels
         }
     }
 
-    // Each token's k experts: those of rank below k (the experts before it in TopK's order, Experts.Precedes), each at the
+    // Each token's k experts: those of rank below k (the experts before it in TopK's order, Routing.Precedes), each at the
     // slot of its rank; their probabilities, normalized by their sum in slot order.
     private readonly struct PicksBody<TN, TLane, TL>(byte[] p, int experts, int k, bool normalize, TLane[] w, int[] chosen) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
@@ -88,12 +88,10 @@ internal sealed partial class Kernels
             finally { ArrayPool<TLane>.Shared.Return(row); }
         }
 
-        // TopK's order in the lane (Experts.Precedes): a NaN (unequal to itself) above every number, then by value (−0 = +0),
-        // an equal value or NaN beside NaN by the lower index.
+        // TopK's order in the lane (Routing.Precedes; Widths.Compare: a NaN above every number, two NaNs equal, −0 = +0),
+        // an equal value by the lower index.
         private static bool Precedes(TLane a, int ia, TLane b, int ib)
         {
-            bool an = !Vector.EqualsAll(new Vector<TLane>(a), new Vector<TLane>(a)), bn = !Vector.EqualsAll(new Vector<TLane>(b), new Vector<TLane>(b));
-            if (an || bn) return an && (!bn || ia < ib);
             int c = Widths.Compare(a, b);
             return c > 0 || (c == 0 && ia < ib);
         }
