@@ -148,8 +148,8 @@ internal static partial class Checks
         double worst = 0;
         for (int i = 0; i < n; i++)
         {
-            double tol = 2 * first[i] + 2 * second[i] + (4 * Math.Abs(want[i]) + 4 * terms) * laneEps, err = Math.Abs(got[i] - want[i]);
-            if (double.IsNaN(err) || err > tol) worst = Math.Max(worst, double.IsNaN(err) ? double.PositiveInfinity : err / second[i]);
+            double tol = 2 * first[i] + 2 * second[i] + (4 * Math.Abs(want[i]) + 4 * terms) * laneEps, gap = Gap(got[i], want[i]);
+            if (Off(gap, tol)) worst = Math.Max(worst, Checks.Steps(gap, second[i]));
         }
 
         if (worst > 0) Console.WriteLine($"check {what,-12} {where,-6} {type,-12} DIFFERS by {worst:0.##} steps");
