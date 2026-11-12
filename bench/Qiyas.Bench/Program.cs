@@ -9,9 +9,12 @@
 //   unsigned uint64 uint32 uint16 uint8 uint2
 //
 // Usage: Qiyas.dll [cpu|cuda|cuda,cpu] [--subjects a,b] [--types t1,t2] [--ops add,matmul,softmax,rms_norm] [--baseline name]
+//                  [--proven]
 //        Qiyas.dll profile | gpuprofile | team       (Qiyas's own diagnostics)
 //
-// Every proof in Checks must pass before anything is timed. Times are medians over an adaptive number of runs.
+// Every proof in Checks must pass before anything is timed. Times are medians over an adaptive number of runs. A run
+// whose checks pass on a device records so beside its build (Proof.cs); --proven skips the checks where every device the
+// run benches has that record for these very assemblies, and runs them otherwise. Each run says which it did.
 //
 // The readout: before a device's rows, its limits are measured (Limits.cs: the copy bandwidth, each lane's peak
 // multiply-add rate); each row states what its operation moves and computes by its own definition (Readout.cs: Work),
@@ -24,13 +27,31 @@ using Qiyas;
 using Qiyas.Bench;
 
 CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;
+Watched.Install();                                                     // a failing line keeps the run's proofs unwritten (Proof.cs)
 var options = Options.Parse(args);
 Bench.Odd = options.Shapes == "odd";
 Console.WriteLine($"bench: {Environment.ProcessorCount} logical processors, .NET {Environment.Version}");
-if (!Checks.Run())
+var proof = Proof.Of(AppContext.BaseDirectory);
+bool proven = false;
+if (options.Proven)
 {
-    Console.WriteLine("A check failed: no timing until it is fixed.");
-    return 1;
+    proven = proof.Covers(options.Devices, Checks.Stress, out string said);
+    Console.WriteLine(proven ? $"proof: checks not run; build {proof.Short} passed them on {said}" : $"proof: checks run; build {proof.Short} has no passing proof on {said}");
+}
+else
+{
+    Console.WriteLine($"proof: checks run (build {proof.Short})");
+}
+
+if (!proven)
+{
+    if (!Checks.Run())
+    {
+        Console.WriteLine("A check failed: no timing until it is fixed.");
+        return 1;
+    }
+
+    proof.Record(Device.Cpu, Checks.Stress);
 }
 
 if (options.Report) Console.WriteLine(Adad.Cpu.Kernels.Report());
@@ -57,7 +78,7 @@ if (options.Mode == "gpuprofile")
 
 var subjects = Subjects.Discover(options.Subjects);
 Console.WriteLine($"subjects: {string.Join(", ", subjects.Select(s => s.Name))}; baseline: {options.BaselineOf(subjects)}");
-var bench = new Bench(subjects, options);
+var bench = new Bench(subjects, options) { Proof = proven ? $"the checks not run: build {proof.Short} had passed them on every device benched" : $"the checks passed in this run (build {proof.Short})" };
 foreach (var device in options.Devices)
 {
     if (device == Device.Cuda)
@@ -68,10 +89,15 @@ foreach (var device in options.Devices)
             continue;
         }
 
-        if (!Checks.Gpu(Devices.Ops))
+        if (!proven)
         {
-            Console.WriteLine("A device check failed: no timing until it is fixed.");
-            return 1;
+            if (!Checks.Gpu(Devices.Ops))
+            {
+                Console.WriteLine("A device check failed: no timing until it is fixed.");
+                return 1;
+            }
+
+            proof.Record(Device.Cuda, Checks.Stress);
         }
 
         if (options.Report) Console.WriteLine(Devices.Ops.Report());
@@ -85,10 +111,15 @@ foreach (var device in options.Devices)
             continue;
         }
 
-        if (!Checks.Vulkan(Devices.Vk))
+        if (!proven)
         {
-            Console.WriteLine("A device check failed: no timing until it is fixed.");
-            return 1;
+            if (!Checks.Vulkan(Devices.Vk))
+            {
+                Console.WriteLine("A device check failed: no timing until it is fixed.");
+                return 1;
+            }
+
+            proof.Record(Device.Vulkan, Checks.Stress);
         }
     }
 
@@ -168,6 +199,10 @@ internal sealed class Options
     /// spread shown (the checks run N times as hard too: a stress for intermittent failures).</summary>
     public int Repeat = 1;
 
+    /// <summary>--proven: the checks are skipped where every device benched has a passing proof of this very build (Proof.cs)
+    /// at the run's stress; otherwise they run.</summary>
+    public bool Proven;
+
     public static Options Parse(string[] args)
     {
         var o = new Options();
@@ -201,6 +236,7 @@ internal sealed class Options
                 case "--baseline": o.Baseline = args[++i]; break;
                 case "--shapes": o.Shapes = args[++i]; if (o.Shapes is not ("regular" or "odd")) throw new ArgumentException($"--shapes takes regular or odd, not {o.Shapes}"); break;
                 case "--report": o.Report = true; break;
+                case "--proven": o.Proven = true; break;
                 case "--repeat": o.Repeat = int.Parse(args[++i]); Qiyas.Checks.Stress = Math.Max(Qiyas.Checks.Stress, o.Repeat); break;
                 case "profile" or "gpuprofile" or "team": o.Mode = a; break;
                 default:
@@ -254,6 +290,10 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
 
     /// <summary>Seconds idled after the gates before the first timed row (--report runs; 0: none), stated in the header.</summary>
     public int CoolDownSeconds;
+
+    /// <summary>What proved the build before this run's timing: its checks, or the proofs it found (Proof.cs).</summary>
+    public string Proof = "";
+
     public static int Rows => Odd ? 4093 : 4096;
     public static int Cols => Odd ? 4091 : 4096;
     public static int Prime(int n) => Odd ? NearestPrimeBelow(n) : n;
@@ -1307,6 +1347,8 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             $"{DateTime.Now:yyyy-MM-dd HH:mm}. Median wall time (ms){(options.Repeat > 1 ? $" of {options.Repeat} readings, the subjects in turn" : "")}; `×` = {_baseline} ÷ subject (above 1: faster than {_baseline}). `err` = largest |result − float64 math on the same stored inputs|. `lane` = what the subject computed in.{(CoolDownSeconds > 0 ? $" Timed after {CoolDownSeconds} s idle following the gates (the processor's boost budget recovered)." : "")}"));
         sb.AppendLine();
         sb.AppendLine("The readout: `bytes` and `ops` are what the row's operation moves and computes by its own definition (every operand read once and every result written once at its stored width; each arithmetic operation or elementary function one, a multiply-add two); `bound` is the time those take at this device's limits, measured at the start of this run (the larger of the bytes at the copy bandwidth and the operations at the lane's peak; `by` names which); each subject's `rate` is what it reached in the bound's unit and `of bound` the bound ÷ its time; `held` a bound on the working memory its run held beyond its operands (host: the pooled buffers out at once at their peak, every other allocation as if all were live together, and the subject's kept buffers, each thread's peak summed; + device on a GPU, the subject's buffers at their peak; ? where the subject cannot tell).");
+        sb.AppendLine();
+        sb.AppendLine($"Proof: {Proof}.");
         sb.AppendLine();
         foreach (var l in Limits.Values) sb.AppendLine($"Limits measured: {l.Short()} (MA/s: multiply-adds a second).");
         sb.AppendLine();
