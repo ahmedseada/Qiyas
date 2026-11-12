@@ -22,8 +22,7 @@ internal static partial class VkKernels
     /// <summary>Workgroup bytes of the ctc kernel for states up to cap: two state buffers with pads, the per-state terms, log P.</summary>
     public static int CtcShared(Lane lane, int cap) => (3 * cap + 5) * lane.Size;
 
-    /// <summary>Arguments: x, lse, ilen, grad (0 for the loss alone), T, B, C, the row strides of a frame and of a sequence
-    /// (frame-major B and 1, batch-first 1 and T); a workgroup per row (T·B of them).</summary>
+    /// <summary>Arguments: x, lse, ilen, grad (0 for the loss alone), T, B, C; a workgroup per row (T·B of them).</summary>
     public static SpvKernel CtcRows(Vulkan vk, Fmt f, Lane lane, bool backward)
     {
         var k = Kinds.Of(lane);
@@ -32,15 +31,12 @@ internal static partial class VkKernels
         var lse = b.Arg(1);
         var ilen = b.Arg(2);
         var grad = b.Arg(3);
-        var T = b.Arg(4, K.U32);
         var B = b.Arg(5, K.U32);
         var C = b.Arg(6, K.U32);
-        var ts = b.Arg(7, K.U32);
-        var bs = b.Arg(8, K.U32);
         var tid = b.LocalIdX;
         var r = b.GroupX;
-        var t = r / ts % T;
-        var seq = r / bs % B;
+        var t = r / B;
+        var seq = r - t * B;
         var tb = b.Load(K.U32, b.At(ilen, seq, 4));
         var row = r * C;
         var past = t >= tb;
@@ -66,9 +62,8 @@ internal static partial class VkKernels
         return b.Build();
     }
 
-    /// <summary>Arguments: x, lse, alpha, cls, flags, ilen, slen, loss, grad (0 for the loss alone), T, B, C, smax, the row
-    /// strides of a frame and of a sequence, zero-infinity (1: a sequence no alignment fits counts 0); a workgroup per
-    /// sequence.</summary>
+    /// <summary>Arguments: x, lse, alpha, cls, flags, ilen, slen, loss, grad (0 for the loss alone), T, B, C, smax; a
+    /// workgroup per sequence.</summary>
     public static SpvKernel Ctc(Vulkan vk, Fmt f, Lane lane, int cap, bool backward)
     {
         var k = Kinds.Of(lane);
@@ -86,9 +81,6 @@ internal static partial class VkKernels
         var B = b.Arg(10, K.U32);
         var C = b.Arg(11, K.U32);
         var smax = b.Arg(12, K.U32);
-        var ts = b.Arg(13, K.U32);
-        var bs = b.Arg(14, K.U32);
-        var zinf = b.Arg(15, K.U32);
         var tid = b.LocalIdX;
         var seq = b.GroupX;
         var negInf = b.C(k, double.NegativeInfinity);
@@ -104,9 +96,8 @@ internal static partial class VkKernels
         var flagRow = (smax + 2) * seq;
         var alphaRow = seq * T;
         V U(V basePtr, V index) => b.Load(K.U32, b.At(basePtr, index, 4));
-        var seqRow = seq * bs;                                                  // the sequence's row at frame 0; a frame on, ts rows
-        V RowBase(V t) => (t * ts + seqRow) * C;
-        V LseAt(V t) => b.Load(k, b.At(lseG, t * ts + seqRow, lane.Size));
+        V RowBase(V t) => (t * B + seq) * C;
+        V LseAt(V t) => b.Load(k, b.At(lseG, t * B + seq, lane.Size));
         V Base(V t) => (t & 1UL) * stride;
         // log y_t(l'_s) = x[t][seq][cls(s)] − lse_t.
         V Emit(V row, V lseT, V s) => Codec.UnpackAt(b, f, x, row + U(clsG, flagRow + s), lane) - lseT;
@@ -158,7 +149,7 @@ internal static partial class VkKernels
             var last = Base(tb - 1);
             var logP = Lse3(buf[last + S + 1], buf[last + S], negInf);
             logPs[0] = logP;
-            b.Store(b.At(loss, seq, lane.Size), b.Select((zinf != 0) & (logP == negInf), zero, -logP));
+            b.Store(b.At(loss, seq, lane.Size), -logP);
         });
         b.Barrier();
         if (!backward) return b.Build();

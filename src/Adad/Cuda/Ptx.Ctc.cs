@@ -46,7 +46,7 @@ internal static partial class Ptx
         b.L($"and.b32 {ln}, {tid}, 31;");
         b.L($"mad.lo.u32 {r}, {blk}, {CtcThreads / 32}, {warp};");
         string x = Param64(b, "p_x"), lseG = Param64(b, "p_lse"), ilen = Param64(b, "p_ilen"), grad = Param64(b, "p_grad");
-        string T = Param32(b, "p_t"), B = Param32(b, "p_b"), C = Param32(b, "p_c"), ts = Param32(b, "p_ts"), bs = Param32(b, "p_bs");
+        string T = Param32(b, "p_t"), B = Param32(b, "p_b"), C = Param32(b, "p_c");
         string rows = b.R(), pOut = b.P();
         // A logit (decoded where it is stored when fx), a gradient value (stored as fo when given).
         string LoadX(string idx)
@@ -101,12 +101,10 @@ internal static partial class Ptx
             }
         }
 
-        // The row's frame and sequence by the layout's row strides (frame-major B and 1, batch-first 1 and T); its first value.
+        // The row's frame and sequence; its first value.
         string t = b.R(), seq = b.R(), tb = b.R(), row = b.R(), pPast = b.P();
-        b.L($"div.u32 {t}, {r}, {ts};");
-        b.L($"rem.u32 {t}, {t}, {T};");
-        b.L($"div.u32 {seq}, {r}, {bs};");
-        b.L($"rem.u32 {seq}, {seq}, {B};");
+        b.L($"div.u32 {t}, {r}, {B};");
+        b.L($"rem.u32 {seq}, {r}, {B};");
         b.L($"ld.global.u32 {tb}, [{Addr(ilen, seq, 4)}];");
         b.L($"mul.lo.u32 {row}, {r}, {C};");
         b.L($"setp.ge.u32 {pPast}, {t}, {tb};");
@@ -173,7 +171,7 @@ internal static partial class Ptx
 
         b.Label("DONE");
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_lse, .param .u64 p_ilen, .param .u64 p_grad, .param .u32 p_t, .param .u32 p_b, .param .u32 p_c, .param .u32 p_ts, .param .u32 p_bs");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_lse, .param .u64 p_ilen, .param .u64 p_grad, .param .u32 p_t, .param .u32 p_b, .param .u32 p_c");
     }
 
     public static string Ctc(Gpu gpu, Lane lane, int cap, bool backward, out string entry) => Ctc(gpu, lane, cap, backward, false, out entry);
@@ -201,16 +199,6 @@ internal static partial class Ptx
         string x = Param64(b, "p_x"), lseG = Param64(b, "p_lse"), alphaG = Param64(b, "p_alpha"), clsG = Param64(b, "p_cls"), flagsG = Param64(b, "p_flags");
         string ilen = Param64(b, "p_ilen"), slen = Param64(b, "p_slen"), loss = Param64(b, "p_loss"), grad = Param64(b, "p_grad");
         string T = Param32(b, "p_t"), B = Param32(b, "p_b"), C = Param32(b, "p_c"), smax = Param32(b, "p_smax");
-        string ts = Param32(b, "p_ts"), bs = Param32(b, "p_bs"), zinf = Param32(b, "p_zinf");
-
-        // The loss −log P, 0 where no alignment fits and the caller asks it to count 0 (p_zinf).
-        void Loss(string nl, string logP)
-        {
-            string pz = b.P();
-            b.L($"setp.ne.u32 {pz}, {zinf}, 0;");
-            b.L($"setp.eq.and.{op} {pz}, {logP}, {negInf}, {pz};");
-            b.L($"selp.{op} {nl}, {zero}, {nl}, {pz};");
-        }
 
         string Addr(string basePtr, string index, int elem)
         {
@@ -279,13 +267,11 @@ internal static partial class Ptx
         b.L($"add.u32 {flagRow}, {smax}, 2;");
         b.L($"mul.lo.u32 {flagRow}, {flagRow}, {seq};");                       // the sequence's first entry in cls / flags
         b.L($"mul.lo.u32 {alphaRow}, {seq}, {T};");                            // (seq · T + t) · smax: α_t's first state
-        string seqRow = b.R();
-        b.L($"mul.lo.u32 {seqRow}, {seq}, {bs};");                             // the sequence's row at frame 0; a frame on, ts rows
 
         string RowBase(string t)
         {
             string r = b.R();
-            b.L($"mad.lo.u32 {r}, {t}, {ts}, {seqRow};");
+            b.L($"mad.lo.u32 {r}, {t}, {B}, {seq};");
             b.L($"mul.lo.u32 {r}, {r}, {C};");
             return r;
         }
@@ -293,7 +279,7 @@ internal static partial class Ptx
         string LseAt(string t)
         {
             string i = b.R();
-            b.L($"mad.lo.u32 {i}, {t}, {ts}, {seqRow};");
+            b.L($"mad.lo.u32 {i}, {t}, {B}, {seq};");
             return LdG(lseG, i);
         }
 
@@ -421,7 +407,6 @@ internal static partial class Ptx
                 string logP = Lse3(a1, a2, negInf), nl = lane.NewReg(b);
                 b.L($"st.shared.{mem} [{sm}+{pOff}], {logP};");
                 b.L($"neg.{op} {nl}, {logP};");
-                Loss(nl, logP);
                 StoreOut(loss, seq, nl);
                 b.Label("A1_LOSS_END");
                 b.L("bar.sync 0;");
@@ -588,7 +573,7 @@ internal static partial class Ptx
 
             b.Label("DONE");
             b.L("ret;");
-            string pa1 = ".param .u64 p_x, .param .u64 p_lse, .param .u64 p_alpha, .param .u64 p_cls, .param .u64 p_flags, .param .u64 p_ilen, .param .u64 p_slen, .param .u64 p_loss, .param .u64 p_grad, .param .u32 p_t, .param .u32 p_b, .param .u32 p_c, .param .u32 p_smax, .param .u32 p_ts, .param .u32 p_bs, .param .u32 p_zinf";
+            string pa1 = ".param .u64 p_x, .param .u64 p_lse, .param .u64 p_alpha, .param .u64 p_cls, .param .u64 p_flags, .param .u64 p_ilen, .param .u64 p_slen, .param .u64 p_loss, .param .u64 p_grad, .param .u32 p_t, .param .u32 p_b, .param .u32 p_c, .param .u32 p_smax";
             return b.Finish(Header(gpu), entry, pa1, CtcOneShared(lane, cap));
         }
 
@@ -650,7 +635,6 @@ internal static partial class Ptx
             string logP = Lse3(a1, a2, negInf), nl = lane.NewReg(b);
             b.L($"st.shared.{mem} [{sm}+{pOff}], {logP};");
             b.L($"neg.{op} {nl}, {logP};");
-            Loss(nl, logP);
             StoreOut(loss, seq, nl);
             b.Label("LOSS_END");
             b.L("bar.sync 0;");
@@ -782,7 +766,7 @@ internal static partial class Ptx
 
         b.Label("DONE");
         b.L("ret;");
-        string pa = ".param .u64 p_x, .param .u64 p_lse, .param .u64 p_alpha, .param .u64 p_cls, .param .u64 p_flags, .param .u64 p_ilen, .param .u64 p_slen, .param .u64 p_loss, .param .u64 p_grad, .param .u32 p_t, .param .u32 p_b, .param .u32 p_c, .param .u32 p_smax, .param .u32 p_ts, .param .u32 p_bs, .param .u32 p_zinf";
+        string pa = ".param .u64 p_x, .param .u64 p_lse, .param .u64 p_alpha, .param .u64 p_cls, .param .u64 p_flags, .param .u64 p_ilen, .param .u64 p_slen, .param .u64 p_loss, .param .u64 p_grad, .param .u32 p_t, .param .u32 p_b, .param .u32 p_c, .param .u32 p_smax";
         return b.Finish(Header(gpu), entry, pa, CtcShared(lane, cap));
     }
 }
