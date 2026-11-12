@@ -282,6 +282,51 @@ internal sealed partial class Kernels
         return (f[0], TL.Sub(new Vector<TLane>(TL.From(1)), f)[0]);
     }
 
+    // An interpolation's column axis, the same for every row (found once a task): nearest, each output column's source;
+    // bilinear, each output column's two sources (the result) and weights f g (w); a backward, for each input column its
+    // outputs (the result: W + 1 starts, then the outputs in order) and their weights (w).
+    private static int[] InterpolateAxis<TLane, TL>(string name, int[] p, out TLane[]? w) where TLane : unmanaged where TL : struct, ILane<TL, TLane>
+    {
+        int W = p[2], OW = p[4];
+        w = null;
+        if (name == "interpolate_nearest")
+        {
+            var at = new int[OW];
+            for (int ow = 0; ow < OW; ow++) at[ow] = LayoutArgs.NearestAt(ow, W, p[8], p[9], p[10]);
+            return at;
+        }
+
+        if (name == "interpolate_bilinear")
+        {
+            var at = new int[2 * OW];
+            w = new TLane[2 * OW];
+            for (int ow = 0; ow < OW; ow++)
+            {
+                var (x0, x1, rx) = LayoutArgs.BilinearAt(ow, W, p[8], p[9], p[10]);
+                (w[2 * ow], w[2 * ow + 1]) = Weights<TLane, TL>(rx, p[10]);
+                (at[2 * ow], at[2 * ow + 1]) = (x0, x1);
+            }
+
+            return at;
+        }
+
+        bool bilinear = name == "interpolate_bilinear_bwd";
+        var starts = new int[W + 1];
+        var outs = new List<int>();
+        var weights = new List<TLane>();
+        for (int iw = 0; iw < W; iw++)
+        {
+            starts[iw] = outs.Count;
+            var (w0, w1) = LayoutArgs.InterpolateSources(bilinear, iw, W, OW, p[8], p[9], p[10]);
+            for (int ow = w0; ow <= w1; ow++)
+                if (InterpolateWeight<TLane, TL>(bilinear, ow, iw, W, p[8], p[9], p[10], out TLane wx)) { outs.Add(ow); weights.Add(wx); }
+        }
+
+        starts[W] = outs.Count;
+        w = [.. weights];
+        return [.. starts, .. outs];
+    }
+
     // The weight output o of an interpolation axis gives input position i: nearest 1 where it reads i; bilinear the first
     // row's weight g where its first row is i, else f where its second is (both are i only past the input's end, f then 0).
     private static bool InterpolateWeight<TLane, TL>(bool bilinear, int o, int i, int inp, int alpha, int beta, int delta, out TLane w)
@@ -472,8 +517,11 @@ internal sealed partial class Kernels
             var row = pool.Rent(cols);
             var tile = v0 >= 0 ? pool.Rent((int)(v1 - v0)) : null;
             TLane[]? source = null, source2 = null;
-            TLane[]? weights = null;                                                    // an interpolation backward's weights and their places
+            TLane[]? weights = null;                                                    // an interpolation backward's row weights and their places
             int[]? places = null;
+            // An interpolation's column axis, found once a task (InterpolateAxis): the sources and weights of every column.
+            int[]? axis = null;
+            TLane[]? axisW = null;
             var input = new Reader<TN, TLane>(k.X, k.InputCount, inLanes);
             var second = k.X2 is null ? null : new Reader<TN, TLane>(k.X2, SecondCount(k));
             try
@@ -556,7 +604,8 @@ internal sealed partial class Kernels
                             int ih = LayoutArgs.NearestAt(oh, H, p[5], p[6], p[7]);
                             source ??= pool.Rent(W);
                             var line = input.Span(((long)c * H + ih) * W, W, source);
-                            for (int ow = 0; ow < OW; ow++) o[ow] = line[LayoutArgs.NearestAt(ow, W, p[8], p[9], p[10])];
+                            axis ??= InterpolateAxis<TLane, TL>(k.Name, p, out axisW);
+                            for (int ow = 0; ow < OW; ow++) o[ow] = line[axis[ow]];
                             break;
                         }
 
@@ -571,10 +620,11 @@ internal sealed partial class Kernels
                             source2 ??= pool.Rent(W);
                             var row0 = input.Span(((long)c * H + y0) * W, W, source);
                             var row1 = input.Span(((long)c * H + y1) * W, W, source2);
+                            axis ??= InterpolateAxis<TLane, TL>(k.Name, p, out axisW);
                             for (int ow = 0; ow < OW; ow++)
                             {
-                                var (x0, x1, rx) = LayoutArgs.BilinearAt(ow, W, p[8], p[9], p[10]);
-                                var (fx, gx) = Weights<TLane, TL>(rx, p[10]);
+                                int x0 = axis[2 * ow], x1 = axis[2 * ow + 1];
+                                TLane fx = axisW![2 * ow], gx = axisW[2 * ow + 1];
                                 TLane top = TL.Fma(row0[x1], fx, TL.Mul(row0[x0], gx));
                                 TLane bottom = TL.Fma(row1[x1], fx, TL.Mul(row1[x0], gx));
                                 o[ow] = TL.Fma(bottom, fy, TL.Mul(top, gy));
@@ -586,9 +636,10 @@ internal sealed partial class Kernels
                         case "interpolate_nearest_bwd":
                         case "interpolate_bilinear_bwd":
                         {
-                            weights ??= pool.Rent(p[3] + p[4]);
-                            places ??= ArrayPool<int>.Shared.Rent(p[3] + p[4]);
-                            InterpolateBackRow(k.Name == "interpolate_bilinear_bwd", input, p, r, o, weights, places);
+                            weights ??= pool.Rent(p[3]);
+                            places ??= ArrayPool<int>.Shared.Rent(p[3]);
+                            axis ??= InterpolateAxis<TLane, TL>(k.Name, p, out axisW);
+                            InterpolateBackRow(k.Name == "interpolate_bilinear_bwd", input, p, r, o, weights, places, axis, axisW!);
                             break;
                         }
 
@@ -939,10 +990,11 @@ internal sealed partial class Kernels
 
         // An interpolation's backward, input row r (c, ih): each position iw sums the outputs whose source rows and columns
         // include it (oh, then ow ascending), each dy by its weight there: acc = fma(dy, wy·wx, acc). The row's weights wy
-        // are found once a row and a position's wx once a position, not again for every term (weights and places: OH + OW
-        // each, the row's first, then the position's): the same terms in the same order.
+        // are found once a row (weights and places: OH each) and the columns' wx once a task (axis and axisW, InterpolateAxis:
+        // W + 1 starts, then each input column's outputs, and their weights), not again for every term: the same terms in
+        // the same order.
         [MethodImpl(MethodImplOptions.NoInlining)]
-        private static void InterpolateBackRow(bool bilinear, Reader<TN, TLane> input, int[] p, int r, Span<TLane> o, TLane[] weights, int[] places)
+        private static void InterpolateBackRow(bool bilinear, Reader<TN, TLane> input, int[] p, int r, Span<TLane> o, TLane[] weights, int[] places, int[] axis, TLane[] axisW)
         {
             int H = p[1], W = p[2], OH = p[3], OW = p[4];
             int ih = r % H, c = r / H;
@@ -952,16 +1004,13 @@ internal sealed partial class Kernels
                 if (InterpolateWeight<TLane, TL>(bilinear, oh, ih, H, p[5], p[6], p[7], out TLane wy)) { places[rows] = oh; weights[rows++] = wy; }
             for (int iw = 0; iw < W; iw++)
             {
-                var (w0, w1) = LayoutArgs.InterpolateSources(bilinear, iw, W, OW, p[8], p[9], p[10]);
-                int columns = 0;
-                for (int ow = w0; ow <= w1; ow++)
-                    if (InterpolateWeight<TLane, TL>(bilinear, ow, iw, W, p[8], p[9], p[10], out TLane wx)) { places[OH + columns] = ow; weights[OH + columns++] = wx; }
+                int e0 = axis[iw], e1 = axis[iw + 1];
                 TLane acc = TL.Zero;
                 for (int j = 0; j < rows; j++)
                 {
                     long dyRow = ((long)c * OH + places[j]) * OW;
                     TLane wy = weights[j];
-                    for (int e = 0; e < columns; e++) acc = TL.Fma(input[dyRow + places[OH + e]], TL.Mul(wy, weights[OH + e]), acc);
+                    for (int e = e0; e < e1; e++) acc = TL.Fma(input[dyRow + axis[W + 1 + e]], TL.Mul(wy, axisW[e]), acc);
                 }
 
                 o[iw] = acc;
