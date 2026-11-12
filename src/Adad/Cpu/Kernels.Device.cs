@@ -237,7 +237,7 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
 
     string IOptimizers<byte[]>.OptimizerMany<TN>(OptimizerArgs a, ReadOnlySpan<OptimizerTensor<byte[]>> tensors, byte[]? sumSquares) => OptimizerMany<TN>(a, tensors, sumSquares);
 
-    string IConvolution<byte[]>.Conv<TN>(ConvArgs a, byte[] x, byte[] w, byte[]? bias, byte[] y) => Conv<TN>(a, x, w, bias, y);
+    string IConvolution<byte[]>.Conv<TN>(ConvArgs a, ProductEpilogue e, byte[] x, byte[] w, byte[] y, ProductTerms<byte[]> t) => Conv<TN>(a, e, x, w, y, t);
 
 
     string IConvolution<byte[]>.ConvBackward<TN>(ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dx, byte[] dw, byte[]? db) => ConvBackward<TN>(a, x, w, dy, dx, dw, db);

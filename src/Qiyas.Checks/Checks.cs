@@ -922,9 +922,9 @@ internal static partial class Checks
                 bool refused = false;
                 try
                 {
-                    if (ops is null && !backward) CpuDevice.Device.Conv<Float32>(bad, [], [], null, []);
+                    if (ops is null && !backward) CpuDevice.Device.Conv<Float32>(bad, new ProductEpilogue(), [], [], [], default);
                     else if (ops is null) CpuDevice.Device.ConvBackward<Float32>(bad, [], [], [], [], [], null);
-                    else if (!backward) ops.Conv<Float32>(bad, 0, 0, 0, 0);
+                    else if (!backward) ops.Conv<Float32>(bad, new ProductEpilogue(), 0, 0, 0, default);
                     else ops.ConvBackward<Float32>(bad, 0, 0, 0, 0, 0, 0);
                 }
                 catch (ArgumentException) { refused = true; }
@@ -1006,7 +1006,7 @@ internal static partial class Checks
             if (ops is null) { Kernels.Conv<TN>(a, x, w, y); return true; }
             ulong dX = ops.Rent(x.Length + 16), dW = ops.Rent(w.Length + 16), dY = ops.Rent(y.Length + 16);
             ops.Upload(x, dX); ops.Upload(w, dW);
-            ops.Conv<TN>(a, dX, dW, 0, dY);
+            ops.Conv<TN>(a, new ProductEpilogue(), dX, dW, dY, default);
             ops.Synchronize();
             ops.Download(dY, y);
             ops.Return(dX); ops.Return(dW); ops.Return(dY);

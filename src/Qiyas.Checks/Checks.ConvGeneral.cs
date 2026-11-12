@@ -2,23 +2,32 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // The convolution's general path (Conv.cs) on every device against its float64 reference: images, groups (a group a
-// channel, two filters each, among them), uneven pads, a bias and an activation, every float type (the block formats
-// among them); the backward's dx, dw and db over the same shapes, every type. Within the lane's rounding of each value's
-// sums (and the activation's own rounding) plus the type's step; an integer type's backward exactly (its lanes exact, each
-// gradient its one rounding: the type's own conversion).
+// channel, two filters each, among them), uneven pads, and the product's epilogue over the output (a bias a value an
+// output channel, an activation, β·y, a residual, the sums kept, a gradient through the activation's inputs, a second
+// product), every float type (the block formats among them); the backward's dx, dw and db over the same shapes, every
+// type. Within the lane's rounding of each value's sums (and the formula's own rounding) plus the type's step; an integer
+// type's backward exactly (its lanes exact, each gradient its one rounding: the type's own conversion).
 namespace Qiyas;
 
 internal static partial class Checks
 {
-    private static readonly (string Name, ConvArgs Args, bool Bias)[] GeneralConvs =
+    // A general case: the shape, the epilogue, and which of the epilogue's operands are given (the bias, the residual, the
+    // sums kept, the activation's inputs; the second product's operands with its view).
+    private sealed record ConvCase(string Name, ConvArgs Args, ProductEpilogue E, bool Bias = false, bool Residual = false, bool Keep = false, bool ActInputs = false);
+
+    private static readonly ConvCase[] GeneralConvs =
     [
-        ("2 images 3x7x9>4 3x3 s2 p1 relu", Padded(new ConvArgs(3, 7, 9, 4, 3, 3) { Sh = 2, Sw = 2, N = 2, Act = "relu" }, 1, 1, 1, 1), true),
-        ("groups 3 6x6x5>6 3x2 pads 1,0,2,1 silu", Padded(new ConvArgs(6, 6, 5, 6, 3, 2) { Groups = 3, Act = "silu" }, 1, 0, 2, 1), true),
-        ("3 images a channel a group x2 4x5x5>8 3x3 d2 p2 gelu", Padded(new ConvArgs(4, 5, 5, 8, 3, 3) { Dh = 2, Dw = 2, N = 3, Groups = 4, Act = "gelu" }, 2, 2, 2, 2), false),
-        ("2 images groups 2 4x8x6>6 1x1 bias", new ConvArgs(4, 8, 6, 6, 1, 1) { N = 2, Groups = 2 }, true),
-        ("3x5x5>2 3x3 p1 bias sigmoid", Padded(new ConvArgs(3, 5, 5, 2, 3, 3) { Act = "sigmoid" }, 1, 1, 1, 1), true),
-        ("2 images 2x4x4>3 2x2 pad right 2 tanh", new ConvArgs(2, 4, 4, 3, 2, 2) { N = 2, PadRight = 2, Act = "tanh" }, false),
-        ("3x6x7>4 3x3 s2 pads 0,2,1,0 bias", Padded(new ConvArgs(3, 6, 7, 4, 3, 3) { Sh = 2, Sw = 2 }, 0, 2, 1, 0), true),
+        new("2 images 3x7x9>4 3x3 s2 p1 bias relu", Padded(new ConvArgs(3, 7, 9, 4, 3, 3) { Sh = 2, Sw = 2, N = 2 }, 1, 1, 1, 1), new() { Act = "relu" }, Bias: true),
+        new("groups 3 6x6x5>6 3x2 pads 1,0,2,1 bias silu", Padded(new ConvArgs(6, 6, 5, 6, 3, 2) { Groups = 3 }, 1, 0, 2, 1), new() { Act = "silu" }, Bias: true),
+        new("3 images a channel a group x2 4x5x5>8 3x3 d2 p2 gelu", Padded(new ConvArgs(4, 5, 5, 8, 3, 3) { Dh = 2, Dw = 2, N = 3, Groups = 4 }, 2, 2, 2, 2), new() { Act = "gelu" }),
+        new("2 images groups 2 4x8x6>6 1x1 bias", new ConvArgs(4, 8, 6, 6, 1, 1) { N = 2, Groups = 2 }, new(), Bias: true),
+        new("3x5x5>2 3x3 p1 bias sigmoid", Padded(new ConvArgs(3, 5, 5, 2, 3, 3), 1, 1, 1, 1), new() { Act = "sigmoid" }, Bias: true),
+        new("2 images 2x4x4>3 2x2 pad right 2 tanh", new ConvArgs(2, 4, 4, 3, 2, 2) { N = 2, PadRight = 2 }, new() { Act = "tanh" }),
+        new("3x6x7>4 3x3 s2 pads 0,2,1,0 bias", Padded(new ConvArgs(3, 6, 7, 4, 3, 3) { Sh = 2, Sw = 2 }, 0, 2, 1, 0), new(), Bias: true),
+        new("2 images groups 2 4x6x5>4 3x3 p1 bias b0.5 leaky_relu residual", Padded(new ConvArgs(4, 6, 5, 4, 3, 3) { N = 2, Groups = 2 }, 1, 1, 1, 1), new() { Beta = 0.5, Act = "leaky_relu", ActA = 0.1 }, Bias: true, Residual: true),
+        new("3 images 3x5x6>4 2x3 bias gelu sums kept", new ConvArgs(3, 5, 6, 4, 2, 3) { N = 3 }, new() { Act = "gelu" }, Bias: true, Keep: true),
+        new("2 images 2x6x6>3 3x3 p1 gelu_bwd through its inputs", Padded(new ConvArgs(2, 6, 6, 3, 3, 3) { N = 2 }, 1, 1, 1, 1), new() { Grad = "gelu_bwd" }, ActInputs: true),
+        new("3x5x5>4 3x3 p1 bias a second product of depth 5 silu", Padded(new ConvArgs(3, 5, 5, 4, 3, 3), 1, 1, 1, 1), new() { Act = "silu", Second = new ProductView(4, 25, 5, false, false) }, Bias: true),
     ];
 
     private static bool ConvGeneral(IDevice<ulong, ulong>? ops, string where, bool blocks)
@@ -28,25 +37,15 @@ internal static partial class Checks
         {
             if (!blocks && Bench.Registry.IsBlock(type)) continue;
             bool floats = Bench.Registry.IsFloat(type);
-            foreach (var (name, a, hasBias) in GeneralConvs)
+            foreach (var c in GeneralConvs)
             {
+                var a = c.Args;
+                string name = c.Name;
                 var x = Bench.Registry.Make(type, (int)a.XValues, 67, -1, 1);
                 var w = Bench.Registry.Make(type, (int)a.WValues, 68, -1, 1);
                 var xv = Bench.Registry.Values(type, x, (int)a.XValues);
                 var wv = Bench.Registry.Values(type, w, (int)a.WValues);
-                if (floats)
-                {
-                    var bias = hasBias ? Bench.Registry.Make(type, a.OC, 69, -1, 1) : null;
-                    var bv = bias is null ? null : Bench.Registry.Values(type, bias, a.OC);
-                    var want = a.Reference(xv, wv, bv);
-                    var pre = (a with { Act = null }).Reference(xv, wv, bv);
-                    var scale = a.Scale(xv, wv, bv);
-                    var y = new byte[Bench.Registry.Bytes(type, a.YValues)];
-                    Bench.Registry.WithFloat(type, new ConvGeneralRun(ops, a, x, w, bias, y));
-                    // The sums' rounding through the activation (its slope at most 1.2), and the activation's own.
-                    double worst = Excess(type, $"conv {name}", y, want, i => 1.25 * (a.Rows + 2) * scale[i] + 64 * (Math.Abs(want[i]) + Math.Abs(pre[i])), 1);
-                    if (worst > 0) { Console.WriteLine($"check conv {name,-48} {where,-6} {type,-12} DIFFERS by {worst:0.##}"); ok = false; }
-                }
+                if (floats) ok &= ConvGeneralForward(ops, where, type, c, x, w, xv, wv);
 
                 // The backward: dy the gradient of the sums plus the bias.
                 var dy = Bench.Registry.Make(type, (int)a.YValues, 70, -1, 1);
@@ -73,13 +72,54 @@ internal static partial class Checks
         return ok;
     }
 
-    private sealed class ConvGeneralRun(IDevice<ulong, ulong>? ops, ConvArgs a, byte[] x, byte[] w, byte[]? bias, byte[] y) : Bench.IFloatTypeVisitor<string>
+    // The forward of one case: y (and the sums kept) against the epilogue's float64 reference over the convolution's sums.
+    private static bool ConvGeneralForward(IDevice<ulong, ulong>? ops, string where, string type, ConvCase c, byte[] x, byte[] w, double[] xv, double[] wv)
+    {
+        var a = c.Args;
+        var e = c.E;
+        int n = (int)a.YValues;
+        byte[]? Made(bool given, long count, int seed) => given ? Bench.Registry.Make(type, (int)count, seed, -1, 1) : null;
+        double[]? Of(byte[]? b, long count) => b is null ? null : Bench.Registry.Values(type, b, (int)count);
+        var bias = Made(c.Bias, a.OC, 69);
+        var residual = Made(c.Residual, n, 71);
+        var inputs = Made(c.ActInputs, n, 72);
+        var a2 = Made(e.Second is not null, e.Second?.ValuesA ?? 0, 73);
+        var b2 = Made(e.Second is not null, e.Second?.ValuesB ?? 0, 74);
+        // y's values before: read by β, else zeros.
+        var y = e.Beta != 0 ? Bench.Registry.Make(type, n, 75, -1, 1) : new byte[Bench.Registry.Bytes(type, a.YValues)];
+        var y0 = Bench.Registry.Values(type, y, n);
+        var sums = c.Keep ? new byte[Bench.Registry.Bytes(type, a.YValues)] : null;
+        double[]? bv = Of(bias, a.OC), a2v = Of(a2, e.Second?.ValuesA ?? 0), b2v = Of(b2, e.Second?.ValuesB ?? 0);
+        var (want, s) = a.Reference(e, xv, wv, y0, bv, Of(residual, n), Of(inputs, n), a2v, b2v);
+
+        // The sums' error scale: Σ|w·x| and the magnitude of every term added to them before the formula.
+        var scale = a.Scale(xv, wv);
+        var second = e.Second?.Reference(a2v!.Select(Math.Abs).ToArray(), b2v!.Select(Math.Abs).ToArray());
+        for (int i = 0; i < n; i++)
+            scale[i] += (bv is null ? 0 : Math.Abs(bv[i / a.Cols % a.OC])) + Math.Abs(e.Beta * y0[i]) + (second is null ? 0 : second[i]);
+
+        Bench.Registry.WithFloat(type, new ConvGeneralRun(ops, a, e, x, w, y, new ProductTerms<byte[]>(bias, residual, sums, inputs, a2, b2)));
+        bool ok = true;
+        // The sums' rounding through the formula (its slope at most 1.2), and the formula's and the residual's own.
+        double worst = Excess(type, $"conv {c.Name}", y, want, i => 1.25 * (a.Rows + (e.Second?.K ?? 0) + 4) * scale[i] + 64 * (Math.Abs(want[i]) + Math.Abs(s[i])), 1);
+        if (worst > 0) { Console.WriteLine($"check conv {c.Name,-48} {where,-6} {type,-12} DIFFERS by {worst:0.##}"); ok = false; }
+        if (sums is not null)
+        {
+            double kept = Excess(type, $"conv kept {c.Name}", sums, s, i => (a.Rows + 4) * scale[i] + 4 * Math.Abs(s[i]), 1);
+            if (kept > 0) { Console.WriteLine($"check conv sums kept {c.Name,-37} {where,-6} {type,-12} DIFFERS by {kept:0.##}"); ok = false; }
+        }
+
+        return ok;
+    }
+
+    private sealed class ConvGeneralRun(IDevice<ulong, ulong>? ops, ConvArgs a, ProductEpilogue e, byte[] x, byte[] w, byte[] y, ProductTerms<byte[]> t) : Bench.IFloatTypeVisitor<string>
     {
         public string Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
         {
-            if (ops is null) return CpuDevice.Device.Conv<TN>(a, x, w, bias, y);
+            if (ops is null) return CpuDevice.Device.Conv<TN>(a, e, x, w, y, t);
             using var st = new Staged(ops);
-            var lane = ops.Conv<TN>(a, st.In(x), st.In(w), st.In(bias), st.Out(y));
+            var terms = new ProductTerms<ulong>(st.In(t.Bias), st.In(t.Residual), st.Out(t.Sums), st.In(t.ActInputs), st.In(t.SecondA), st.In(t.SecondB));
+            var lane = ops.Conv<TN>(a, e, st.In(x), st.In(w), st.Out(y), terms);
             st.Collect();
             return lane;
         }

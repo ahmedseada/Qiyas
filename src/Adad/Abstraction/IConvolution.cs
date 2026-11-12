@@ -7,10 +7,12 @@ namespace Adad.Abstraction;
 /// Kh × Kw), the shape a ConvArgs.</summary>
 public interface IConvolution<TBuffer>
 {
-    /// <summary>y = act(conv(x, w) + bias) (bias: OC values, a filter's each, or none): one image of one group without a bias
-    /// or an activation (ConvArgs.Single) fused, no columns in memory, every type; images, groups, a bias and an activation
-    /// the float types, the sums in the float lane and y stored once.</summary>
-    string Conv<TN>(ConvArgs a, TBuffer x, TBuffer w, TBuffer? bias, TBuffer y) where TN : struct, IAdad<TN>;
+    /// <summary>y = the epilogue's y of the convolution's sums (ProductEpilogue over ConvArgs.Output: N products of OC × OH·OW;
+    /// the bias, t.Bias, a value an output channel; β·y, a second product over the same view, an activation or a gradient
+    /// through one, a residual, the sums kept), every term in the lane and y rounded to the type once. One image of one group
+    /// with no term (ConvArgs.Single) fused, no columns in memory, every type; images, groups or any term the float types,
+    /// the sums in the float lane.</summary>
+    string Conv<TN>(ConvArgs a, ProductEpilogue e, TBuffer x, TBuffer w, TBuffer y, ProductTerms<TBuffer> t) where TN : struct, IAdad<TN>;
 
     /// <summary>dx, dw and db (OC values, or none) from dy, the gradient of the sums plus the bias (the activation's backward
     /// is the caller's: Map's formula backward), every type: dx's sums (w·dy) and dw's and db's (dy·x, dy over the images'

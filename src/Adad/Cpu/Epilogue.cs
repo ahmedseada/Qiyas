@@ -9,7 +9,7 @@
 // type that is not float in the lane its products take by the bounds of every value the store makes
 // (ProductEpilogue.IntegerSums: exact), the sums kept as the lane's own type and the terms added in its plain lane
 // (ILane.Kept: a dot lane's accumulator's), its formulas Map's any-type ones. The convolution's general path (Conv.cs)
-// takes the same store with its bias and activation.
+// takes the same store over its output (ConvArgs.Output), the bias a value an output channel.
 
 using System.Numerics;
 using System.Runtime.InteropServices;

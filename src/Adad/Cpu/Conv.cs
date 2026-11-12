@@ -15,9 +15,10 @@
 // dx; on the CPU dw's columns are read from the image the same way (the transposed packing, a k-range of a row a task).
 // The depthwise convolution is a layout operation (Layout.cs: a gather with weights).
 //
-// Images, groups, a bias and an activation (ConvArgs; the float types) take the general path: the columns of every image's
-// channels into the float lane's storage (exact), each image's and group's product with the group's weights into the lane's
-// sums, then y = act(sums + bias[f]) stored as the type once (Epilogue.cs ProductStore). Its backward:
+// Images, groups or any term of the product's epilogue (ConvArgs.Output; the float types) take the general path: the
+// columns of every image's channels into the float lane's storage (exact), each image's and group's product with the
+// group's weights into the lane's sums, then the epilogue's store over the output, the bias a value an output channel, y
+// stored as the type once (Epilogue.cs EpilogueStore). Its backward:
 // dcols = w_gᵀ·dy_g in the lane, dx = col2im(dcols); dy and the columns laid side by side over the images (exact moves into
 // the lane), dw_g = dy_g · cols_gᵀ in one product a group, stored once; db the lane's sums of dy's rows.
 //
@@ -46,18 +47,15 @@ internal sealed partial class Kernels
             && (per == 1 || (a.OC % per == 0 && a.Rows % per == 0 && a.Cols % per == 0 && (TN.Granularity % 32 == 0 || a.W % per == 0)));
     }
 
-    /// <summary>y = act(conv(x, w) + bias) on the CPU; returns the product's lane.</summary>
-    public static string Conv<TN>(ConvArgs a, byte[] x, byte[] w, byte[]? bias, byte[] y) where TN : struct, IAdad<TN>
+    /// <summary>y = the epilogue's y of conv(x, w) on the CPU (IConvolution.Conv); returns the product's lane.</summary>
+    public static string Conv<TN>(ConvArgs a, ProductEpilogue e, byte[] x, byte[] w, byte[] y, ProductTerms<byte[]> t) where TN : struct, IAdad<TN>
     {
         a.Validate();
-        if (!a.Single || bias is not null)
-        {
-            var general = new MixedVisitor<ConvGeneralCall>(new ConvGeneralCall(a, x, w, bias, y));
-            if (!TN.TryFloat(ref general)) throw new NotSupportedException($"conv: images, groups, a bias or an activation take a float type, not {TN.Name}");
-            return general.Lane;
-        }
-
-        return Conv<TN>(a, x, w, y);
+        var terms = t.Validate(e, a.Output);
+        if (a.Single && terms == default) return Conv<TN>(a, x, w, y);
+        var general = new MixedVisitor<ConvGeneralCall>(new ConvGeneralCall(a, e, terms, x, w, y, t));
+        if (!TN.TryFloat(ref general)) throw new NotSupportedException($"conv: images, groups or an epilogue term take a float type, not {TN.Name}");
+        return general.Lane;
     }
 
     /// <summary>y = conv(x, w) of one image of one group; returns the product's lane.</summary>
@@ -221,8 +219,8 @@ internal sealed partial class Kernels
     }
 
     // The general forward: the columns of every image's channels in the lane (image n group g's at rows (n·G + g)·Rows), a
-    // product an image and group into the lane's sums, then the store with the bias and the activation.
-    private readonly struct ConvGeneralCall(ConvArgs a, byte[] x, byte[] w, byte[]? bias, byte[] y) : IMixed
+    // product an image and group into the lane's sums, then the epilogue's store over the output.
+    private readonly struct ConvGeneralCall(ConvArgs a, ProductEpilogue e, StoreTerms terms, byte[] x, byte[] w, byte[] y, ProductTerms<byte[]> t) : IMixed
     {
         public string Run<TN, TS, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
         {
@@ -236,7 +234,7 @@ internal sealed partial class Kernels
                 for (int g = 0; g < G; g++)
                     MatMul<TN, TS, TS, TLane, TLane, TL>(w, cols, sums, a.OCg, a.Cols, a.Rows,
                         new Operands(AOff: g * a.OCg * a.Rows, BOff: (n * G + g) * a.Rows * a.Cols, COff: (n * a.OC + g * a.OCg) * a.Cols));
-            ProductStore<TN, TLane, TL>(new StoreTerms(false, bias is not null, false, a.Act, null, false), new StoreSources(sums, null, bias, null, null, a.Cols, a.OC, a.ActA, 0), y, (int)a.YValues);
+            EpilogueStore<TN, TS, TLane, TL>(a.Output, e, terms, t, sums, y, a.Cols, a.OC);
             return TL.Name;
         }
     }

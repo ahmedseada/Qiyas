@@ -14,9 +14,9 @@
 // Every type: dx's sums (w·dy, OCg·Kh·Kw terms a value) and dw's (dy·x over the images' positions; db's dy's alone) each in
 // the lane SumLane gives for their bounds (a float type's float lane; an integer type's exact one), each output stored as
 // the type once (BackwardLanes).
-// Images, groups, a bias and an activation (the float types) take the general path (Conv.cs):
-// the columns of every image's channels into lane storage (im2col reading the image where it is stored), a stored-mode
-// product a group over the images into the lane's sums, then Ptx.ProductStore: y = act(sums + bias[f]) stored once. Its
+// Images, groups or any term of the product's epilogue (the float types) take the general path (Conv.cs): the columns of
+// every image's channels into lane storage (im2col reading the image where it is stored), a stored-mode product a group
+// over the images into the lane's sums, then the epilogue's store over the output (EpilogueStore), y stored once. Its
 // backward (every type): dcols = w_gᵀ·dy_g, dx = col2im(dcols); dy and the columns side by side over the images in the
 // lane (exact moves), dw_g = dy_g·cols_gᵀ, db = dy's rows times ones; dw and db stored as the type once.
 using Adad.Abstraction;
@@ -35,13 +35,15 @@ public sealed partial class GpuOps
 
     private readonly Dictionary<string, bool> _convFused = [];
 
-    /// <summary>y = act(conv(x, w) + bias) (ConvArgs.Single without a bias: the one-image path); returns the product's lane.</summary>
-    public string Conv<TN>(ConvArgs a, ulong x, ulong w, ulong bias, ulong y) where TN : struct, IAdad<TN>
+    /// <summary>y = the epilogue's y of conv(x, w) (IConvolution.Conv; ConvArgs.Single with no term: the one-image path);
+    /// returns the product's lane.</summary>
+    public string Conv<TN>(ConvArgs a, ProductEpilogue e, ulong x, ulong w, ulong y, ProductTerms<ulong> t) where TN : struct, IAdad<TN>
     {
         a.Validate();
-        if (a.Single && bias == 0) return Conv<TN>(a, x, w, y);
+        var terms = t.Validate(e, a.Output);
+        if (a.Single && terms == default) return Conv<TN>(a, x, w, y);
         var f = Fmt.Of<TN>();
-        if (!f.IsFloat) throw new NotSupportedException($"conv: images, groups, a bias or an activation take a float type, not {f.Name}");
+        if (!f.IsFloat) throw new NotSupportedException($"conv: images, groups or an epilogue term take a float type, not {f.Name}");
         var lane = RowLane(f);
         if (a.YValues == 0) return lane.Name;
         a.ColumnsFit();
@@ -55,7 +57,7 @@ public sealed partial class GpuOps
             for (int g = 0; g < a.Groups; g++)
                 ProductStored(new ProductView(a.OCg, a.Cols, a.Rows, false, false, a.N, 0, (long)a.Groups * a.Rows * a.Cols, (long)a.OC * a.Cols), lane,
                     w, f, (long)g * a.OCg * a.Rows, cols, lf, (long)g * a.Rows * a.Cols, sums + (ulong)((long)g * a.OCg * a.Cols * lane.Size), null);
-            ProductStore(f, lane, new StoreTerms(false, bias != 0, false, a.Act, null, false), sums, 0, bias, 0, 0, y, a.YValues, a.Cols, a.OC, a.ActA, 0);
+            EpilogueStore(f, lane, a.Output, e, terms, t, sums, y, a.Cols, a.OC);
         }
         finally { foreach (var p in rented) gpu.Return(p); }
 

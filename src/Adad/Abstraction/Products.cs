@@ -253,7 +253,7 @@ public sealed record ProductEpilogue
 }
 
 /// <summary>The terms a product's store adds to its lane sums and what it applies (ProductEpilogue.Terms; the convolution's
-/// store takes the bias and the activation): a store kernel's variant. Second: a second product's lane sums added; Keep: a
+/// over its output, ConvArgs.Output): a store kernel's variant. Second: a second product's lane sums added; Keep: a
 /// pass stores s before y (KeepPass).</summary>
 public readonly record struct StoreTerms(bool Second, bool Bias, bool Beta, string? Act, string? Grad, bool Residual)
 {

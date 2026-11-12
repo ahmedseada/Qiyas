@@ -618,7 +618,7 @@ public sealed class AdadSubject : IBenchSubject
         public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IAdad<TN, float>
         {
             TB dX = s.In(x), dW = s.In(w), dY = s.Out(y);
-            return s.Run(() => s.D.Conv<TN>(a, dX, dW, default, dY));
+            return s.Run(() => s.D.Conv<TN>(a, new ProductEpilogue(), dX, dW, dY, default));
         }
     }
 
