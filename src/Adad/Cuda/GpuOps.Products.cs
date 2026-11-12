@@ -16,8 +16,31 @@ public sealed partial class GpuOps
     /// in whole blocks takes the block-scaled product where it measures faster (MatMulBlocks.cs).</summary>
     public string MatMulView<TN>(ProductView v, ulong a, ulong b, ulong c) where TN : struct, IAdad<TN>
     {
+        if (v.K == 0) return MatMulNoTerms<TN>(v, c);
         if (BlockView<TN>(v) && UseBlocks<TN>(v, a, b, c)) return MatMulViewBlocks<TN>(v, a, b, c);
         return MatMulViewRoute<TN>(v, a, b, c);
+    }
+
+    /// <summary>C of a product of no terms (k = 0): the empty sum, 0 in every value of every batch's C. Taken as the
+    /// product of zeros at one term (A m × 1 and B 1 × n, all 0, shared by the batches), so each batch's C is written as
+    /// any product writes it (at its offset, a sub-byte or a block format's C as such); the routes' kernels assume a
+    /// term (the float64 sliced route's launch had no slices).</summary>
+    private string MatMulNoTerms<TN>(ProductView v, ulong c) where TN : struct, IAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        long Bytes(long values) => Math.Max(16, f.Words(values) * (f.WordBits / 8));
+        ulong za = gpu.Rent(Bytes(v.M)), zb = gpu.Rent(Bytes(v.N));
+        try
+        {
+            Gpu.Clear(za, Bytes(v.M));
+            Gpu.Clear(zb, Bytes(v.N));
+            return MatMulView<TN>(new ProductView(v.M, v.N, 1, false, false, v.Batch, 0, 0, v.StrideC), za, zb, c);
+        }
+        finally
+        {
+            gpu.Return(za);
+            gpu.Return(zb);
+        }
     }
 
     /// <summary>C = op(A)·op(B): each batch's operands read where they are stored by the packing (the tensor and dot
