@@ -221,6 +221,19 @@ internal static partial class VkKernels
 
         public V Neg(V x) => k.IsFloat() || k.IsSigned() ? -x : C(0) - x;
 
+        // Map's div: a float lane's quotient; an integer lane's by Ops.IntegerDivision (toward zero; a signed lane's x / −1
+        // is −x, wrapping; x / 0 = 0). The lane divides by 1 where the divisor is 0 or a signed −1 (SDiv and UDiv are
+        // undefined there).
+        public V Quotient(V x, V y)
+        {
+            if (k.IsFloat()) return x / y;
+            var zero = y == C(0);
+            var minusOne = k.IsSigned() ? y == C(-1) : b.Bool(false);
+            var q = x / b.Select(zero | minusOne, C(1), y);
+            q = b.Select(minusOne, Neg(x), q);
+            return b.Select(zero, C(0), q);
+        }
+
         public V Sign(V x) => b.Select(x > 0, C(1), b.Select(x < 0, Neg(C(1)), C(0)));
 
         public V Exp(V x) => Fn.Exp(b, x);
@@ -300,7 +313,7 @@ internal static partial class VkKernels
             case "add": return x + y;
             case "sub": return x - y;
             case "mul": return x * y;
-            case "div": return x / y;
+            case "div": return e.Quotient(x, y);
             case "max": return First(b, x, y);                   // by the order: a NaN where either is one
             case "min": return b.Min(x, y);                      // NMin: the number where one is a NaN, as the order's last
             case "axpy": return b.Fma(a, x, y);

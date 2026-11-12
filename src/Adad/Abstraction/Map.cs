@@ -26,6 +26,17 @@ public sealed record MapOp(string Name, int Inputs, bool FloatOnly, Func<double,
 
 public static class Ops
 {
+    /// <summary>Integer division, Map's div on an integer type: the exact quotient rounded toward zero, wrapping at the
+    /// type's width as the lanes' arithmetic does (a signed type's least value over −1 is itself); x / 0 = 0, so that
+    /// division is defined for every pair (x = (x / y)·y + r with r = x where y is 0). In 128-bit integers.</summary>
+    public static Int128 IntegerDivision(Int128 x, Int128 y, int bits, bool signed)
+    {
+        if (y == 0) return 0;
+        Int128 q = x / y, m = Int128.One << bits;
+        q = ((q % m) + m) % m;
+        return signed && q >= m / 2 ? q - m : q;
+    }
+
     private const double GeluK = 0.7978845608028654, GeluC = 0.044715;    // √(2/π), the tanh form's cubic coefficient
 
     // The references in forms free of cancellation: 0.5·(1 + tanh u) = σ(2u); 1 − tanh² = sech²; 1 − σ(x) = σ(−x); 1 + erf = erfc(−·).
@@ -80,7 +91,7 @@ public static class Ops
     private const string Cond = " (ill-conditioned past |x| ≈ 3: the result follows σ or sech² of a rounded argument that grows as |x|³, so its error in ulps grows with |x|)";
 
     /// <summary>The catalogue, in Adad's own terms. Integer types run every formula that is not FloatOnly in their own lane
-    /// (truncating division, wrapping arithmetic as the lane does); float types run all of them.</summary>
+    /// (wrapping arithmetic as the lane does; division by Ops.IntegerDivision's rule); float types run all of them.</summary>
     public static readonly MapOp[] All =
     [
         // ---- any lane
@@ -98,7 +109,7 @@ public static class Ops
         new("add", 2, false, (x, y, z, a, b) => x + y, Any, Any, 0, 0),
         new("sub", 2, false, (x, y, z, a, b) => x - y, Any, Any, 0, 0),
         new("mul", 2, false, (x, y, z, a, b) => x * y, Any, Any, 0, 0),
-        new("div", 2, false, (x, y, z, a, b) => x / y, Any, (1, 4), 0, 0, "integer lanes: truncating"),
+        new("div", 2, false, (x, y, z, a, b) => x / y, Any, (1, 4), 0, 0, "float types: the quotient rounded once to the type (x/±0 = ±∞, 0/0 a NaN); integer types: Ops.IntegerDivision"),
         new("max", 2, false, (x, y, z, a, b) => Routing.Order(x, y) >= 0 ? x : y, Any, Any, 0, 0, "the first-ranked of x and y in Adad's order (Routing.Order): a NaN where either is one; a reduction's max of the two"),
         new("min", 2, false, (x, y, z, a, b) => Routing.Order(x, y) <= 0 ? x : y, Any, Any, 0, 0, "the last-ranked: the number where one is a NaN, a NaN where both are; a reduction's min of the two"),
         new("axpy", 2, false, (x, y, z, a, b) => a * x + y, Any, Any, 2, 0),

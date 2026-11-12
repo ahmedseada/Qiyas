@@ -2604,6 +2604,68 @@ internal static partial class Checks
             ok &= worst == 0;
         }
 
+        if (!special) ok &= IntegerDivisions(ops, where);
+        return ok;
+    }
+
+    // Map's div on every integer type by Ops.IntegerDivision, exactly: dividends the type's least and greatest values, the
+    // one above its least, ±1, ±7 and 0, against divisors its least and greatest values, ±1, ±2, 3 and 0 (unsigned types
+    // their own of them; those the type holds), every pair, the rule taken of the stored operands; compared in 128-bit
+    // integers (64-bit values read from the bytes, narrower ones, the packed types among them, through the type's codec,
+    // exact in a double).
+    private static bool IntegerDivisions(IDevice<ulong, ulong>? ops, string where)
+    {
+        bool ok = true;
+        var div = Ops.Find("div");
+        foreach (var type in Bench.Registry.Names)
+        {
+            if (Bench.Registry.IsFloat(type) || type == "bool") continue;
+            int bits = Bench.Registry.Bits(type);
+            bool signed = type.StartsWith("int", StringComparison.Ordinal);
+            Int128 min = signed ? -(Int128.One << (bits - 1)) : 0, max = signed ? (Int128.One << (bits - 1)) - 1 : (Int128.One << bits) - 1;
+            // The values the type holds (a 2- or 4-bit type has fewer of them).
+            Int128[] Held(Int128[] v) => v.Where(t => t >= min && t <= max).Distinct().ToArray();
+            Int128[] xs = Held(signed ? [min, min + 1, -7, -1, 0, 1, 7, max] : [0, 1, 7, max - 1, max]);
+            Int128[] ys = Held(signed ? [min, -2, -1, 0, 1, 2, 3, max] : [0, 1, 2, 3, max]);
+            int n = xs.Length * ys.Length;
+            var xv = new Int128[n];
+            var yv = new Int128[n];
+            for (int i = 0; i < xs.Length; i++)
+                for (int j = 0; j < ys.Length; j++) { xv[i * ys.Length + j] = xs[i]; yv[i * ys.Length + j] = ys[j]; }
+            byte[] Encode(Int128[] v)
+            {
+                if (bits < 64) return Bench.Registry.Encode(type, v.Select(t => (double)t).ToArray());
+                var r = new byte[v.Length * 8];
+                for (int i = 0; i < v.Length; i++) System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(r.AsSpan(i * 8), (ulong)(UInt128)(v[i] & ((Int128.One << 64) - 1)));
+                return r;
+            }
+
+            Int128[] Decode(byte[] b)
+            {
+                if (bits < 64) return Bench.Registry.Values(type, b, n).Select(d => (Int128)d).ToArray();
+                var r = new Int128[n];
+                for (int i = 0; i < n; i++)
+                    r[i] = signed ? System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(b.AsSpan(i * 8)) : System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(b.AsSpan(i * 8));
+                return r;
+            }
+
+            byte[] x = Encode(xv), y = Encode(yv), output = new byte[Bench.Registry.Bytes(type, n)];
+            xv = Decode(x);
+            yv = Decode(y);
+            if (ops is null) Bench.Registry.With(type, new CpuMap(div, x, y, null, output, n));
+            else Bench.Registry.With(type, new DeviceMap(ops, div, x, y, null, output, n));
+            var got = Decode(output);
+            for (int i = 0; i < n; i++)
+            {
+                Int128 want = Ops.IntegerDivision(xv[i], yv[i], bits, signed);
+                if (got[i] == want) continue;
+                Console.WriteLine($"check map div integers      {where,-6} {type,-12} DIFFERS: {xv[i]} / {yv[i]} gave {got[i]}, the rule {want}");
+                ok = false;
+                break;
+            }
+        }
+
+        if (ok) Console.WriteLine($"check map div integers      {where,-6} every integer type by Ops.IntegerDivision exactly: toward zero, x / 0 = 0, the least value over −1 itself, negative operands and the range's ends");
         return ok;
     }
 

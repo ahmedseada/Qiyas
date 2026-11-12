@@ -42,6 +42,19 @@ internal static class MapOps
     private static Vector<T> RanksAbove<T, TL>(Vector<T> p, Vector<T> q) where T : unmanaged where TL : struct, ILane<TL, T> =>
         TL.Greater(p, q) | Vector.AndNot(TL.Equal(q, q), TL.Equal(p, p));
 
+    // Integer division by Ops.IntegerDivision: toward zero; a signed lane's x / −1 is −x, wrapping (its least value over −1
+    // is itself); x / 0 = 0. The lane divides by 1 where the divisor is 0 or a signed −1: no division traps.
+    private static Vector<T> Quotient<T, TL>(Vector<T> x, Vector<T> y) where T : unmanaged where TL : struct, ILane<TL, T>
+    {
+        bool signed = typeof(T) == typeof(int) || typeof(T) == typeof(long) || typeof(T) == typeof(short) || typeof(T) == typeof(sbyte);
+        var zero = Vector.Equals(y, Vector<T>.Zero);
+        var minusOne = signed ? Vector.Equals(y, Vector<T>.AllBitsSet) : Vector<T>.Zero;
+        var q = TL.Div(x, Vector.ConditionalSelect(zero | minusOne, Vector<T>.One, y));
+        q = Vector.ConditionalSelect(minusOne, Vector<T>.Zero - x, q);
+        return Vector.ConditionalSelect(zero, Vector<T>.Zero, q);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector<T> Sign<T, TL>(Vector<T> x) where T : unmanaged where TL : struct, ILane<TL, T>
     {
         var one = C<T, TL>(1);
@@ -65,7 +78,7 @@ internal static class MapOps
     public struct Add<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Add(x, y); }
     public struct Sub<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Sub(x, y); }
     public struct Mul<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(x, y); }
-    public struct Div<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Div(x, y); }
+    public struct Div<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => typeof(T) == typeof(float) || typeof(T) == typeof(double) ? TL.Div(x, y) : Quotient<T, TL>(x, y); }
     public struct Max<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Max(x, y); }
     // max and min by Adad's order: the first-ranked (the lane's max: IEEE maximum, a NaN where either is one) and the
     // last-ranked (IEEE minimumNumber: the number where one is a NaN).

@@ -74,7 +74,7 @@ internal static class References
         return y;
     }
 
-    /// <summary>The formula on the stored values; integer types truncate a division as their lanes do.</summary>
+    /// <summary>The formula on the stored values; integer types divide by Ops.IntegerDivision (toward zero; x / 0 = 0).</summary>
     public static double[] Map(string type, MapOp op, byte[]? x, byte[]? y, byte[]? z, int n, bool wrap = true)
     {
         double[]? vx = x is null ? null : Registry.Values(type, x, n);
@@ -95,6 +95,7 @@ internal static class References
         Parallel.For(0, n, i =>
         {
             double v = op.Reference(vx?[i] ?? 0, vy?[i] ?? 0, vz?[i] ?? 0, a, b);
+            if (integer && op.Name == "div" && (vy?[i] ?? 0) == 0) v = 0;     // Ops.IntegerDivision: x / 0 = 0
             if (integer)
             {
                 // The lanes' arithmetic is modular at the type's width.

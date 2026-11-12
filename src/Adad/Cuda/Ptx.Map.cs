@@ -381,6 +381,22 @@ internal static partial class Ptx
         public string Sub(string x, string y) => Bin(_f ? $"sub.rn.{_op}" : $"sub.{_op}", x, y);
         public string Mul(string x, string y) => Bin(_f ? $"mul.rn.{_op}" : $"mul.lo.{_op}", x, y);
         public string Div(string x, string y) => Bin(_f ? $"div.rn.{_op}" : $"div.{_op}", x, y);
+
+        // Map's div: a float lane's rounded quotient; an integer lane's by Ops.IntegerDivision (toward zero; a signed lane's
+        // x / −1 is −x, wrapping; x / 0 = 0), where the device's own quotient by 0 or of the least value by −1 is unspecified.
+        public string Quotient(string x, string y)
+        {
+            if (_f) return Div(x, y);
+            string q = Div(x, y);
+            if (_op[0] == 's')
+            {
+                string p = b.P();
+                b.L($"setp.eq.{_op} {p}, {y}, -1;");
+                q = Select(p, Neg(x), q);
+            }
+
+            return Select(NotZero(y), q, C(0));
+        }
         public string Max(string x, string y) => Bin($"max.{_op}", x, y);
         public string Min(string x, string y) => Bin($"min.{_op}", x, y);
 
@@ -565,7 +581,7 @@ internal static partial class Ptx
             case "add": return e.Add(x, y);
             case "sub": return e.Sub(x, y);
             case "mul": return e.Mul(x, y);
-            case "div": return e.Div(x, y);
+            case "div": return e.Quotient(x, y);
             case "max": return e.First(x, y);                    // by the order: a NaN where either is one
             case "min": return e.Min(x, y);                      // min.f32 / min.f64: the number where one is a NaN, as the order's last
             case "axpy": return e.Fma(a, x, y);
