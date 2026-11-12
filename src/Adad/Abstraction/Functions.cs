@@ -488,13 +488,12 @@ public static class Funcs
         Vector<double> q0 = Vector<double>.One, q1 = q0, q2 = q0, q3 = q0;
         for (int d = depth; d >= 1; d--)
         {
+            // Each chain's P' = x·P + (d/2)·Q, Q' = P, one chain after the other (fourteen vectors live: no spill).
             var h = new Vector<double>(d * 0.5);
-            var n0 = Vector.FusedMultiplyAdd(a0, p0, h * q0);
-            var n1 = Vector.FusedMultiplyAdd(a1, p1, h * q1);
-            var n2 = Vector.FusedMultiplyAdd(a2, p2, h * q2);
-            var n3 = Vector.FusedMultiplyAdd(a3, p3, h * q3);
-            q0 = p0; q1 = p1; q2 = p2; q3 = p3;
-            p0 = n0; p1 = n1; p2 = n2; p3 = n3;
+            var t = h * q0; q0 = p0; p0 = Vector.FusedMultiplyAdd(a0, p0, t);
+            t = h * q1; q1 = p1; p1 = Vector.FusedMultiplyAdd(a1, p1, t);
+            t = h * q2; q2 = p2; p2 = Vector.FusedMultiplyAdd(a2, p2, t);
+            t = h * q3; q3 = p3; p3 = Vector.FusedMultiplyAdd(a3, p3, t);
             if (d % 16 == 1 && d > 1)
             {
                 q0 /= p0; q1 /= p1; q2 /= p2; q3 /= p3;
