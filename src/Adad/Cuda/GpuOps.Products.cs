@@ -90,8 +90,10 @@ public sealed partial class GpuOps
 
     /// <summary>Every batch of the view in one launch (grid z the batches), each batch's A, B and C read and written where
     /// they are stored, as the per-batch launches read them: the staged kernel (Ptx.Gemm2) for a float type whose product
-    /// lane is its own storage (the view not transposed: a batch's operands contiguous at its offsets), or the tensor
-    /// kernel (Ptx.GemmMma) for a 16-bit float in its own kind at whole tiles (operands as stored, Aᵀ and B k-major by its
+    /// lane is its own storage (Aᵀ read as stored too, by its k-major tile; a single batch so as well, where its tiles fill
+    /// the device without split-k: Aᵀ in place and Bᵀ alone copied into a k × n B, where the copies route copied both
+    /// operands and C), or the tensor kernel
+    /// (Ptx.GemmMma) for a 16-bit float in its own kind at whole tiles (operands as stored, Aᵀ and B k-major by its
     /// in-place reads, C by its epilogue). The batches' C apart (no batch overwrites another's: an order one launch would
     /// not keep) and every batch's operands on 16 bytes (the kernels' copies). One launch at a time, a small product's tiles
     /// leave most of the device idle (16 batches of a 512² C: 16 tiles a launch on 70 multiprocessors); together they fill
@@ -100,13 +102,14 @@ public sealed partial class GpuOps
     {
         laneName = "";
         var f = Fmt.Of<TN>();
-        if (v.Batch < 2 || v.Batch > 65535 || !f.IsFloat || f.IsBlock || v.M == 0 || v.N == 0 || v.K == 0 || v.StrideCOrDefault < (long)v.M * v.N) return false;
+        if ((v.Batch < 2 && !v.TransA && !v.TransB) || v.Batch > 65535 || !f.IsFloat || f.IsBlock || v.M == 0 || v.N == 0 || v.K == 0 || v.StrideCOrDefault < (long)v.M * v.N) return false;
         long bytesA = v.StrideAOrDefault * f.Bits / 8, bytesB = v.StrideBOrDefault * f.Bits / 8, bytesC = v.StrideCOrDefault * f.Bits / 8;
         if ((a | b | c) % 16 != 0 || bytesA % 16 != 0 || bytesB % 16 != 0 || bytesC % 16 != 0) return false;
         var ((aLo, aHi), (bLo, bHi)) = RangePair<TN>(a, v.M * v.K, b, v.K * v.N);
         string name = ProductLane<TN>(new Bounds(aLo, aHi, bLo, bHi, v.K));
         if (name.EndsWith("mma", StringComparison.Ordinal))
         {
+            if (v.Batch < 2) return false;                                    // a single batch: MatMul's own route reads it
             // As MatMul's in-place 16-bit route: whole tiles, the type the kind's own, no padding of k.
             if (v.M % 128 != 0 || v.N % 256 != 0 || v.K % 128 != 0 || InPlace16 == false || Epilogue == false) return false;
             var kind = KindOf(name, v.K);
@@ -120,15 +123,29 @@ public sealed partial class GpuOps
         }
 
         var lane = LaneOf(name);
-        if (v.TransA || v.TransB || Staged == false || v.K % 4 != 0 || v.N % 4 != 0) return false;
+        if ((v.TransB && v.Batch > 1) || Staged == false || v.K % 4 != 0 || v.N % 4 != 0 || (v.TransA && v.M % 4 != 0)) return false;
         if (lane.Wide || f.Natural != lane || f.Bits != lane.Size * 8 || f.IsFloat != lane.IsFloat) return false;
+        if (v.Batch < 2 && SplitK(v.M, v.N, v.K, out _) > 1) return false;     // too few tiles: the split-k route, on copies
         int stages = Gemm2Stages(lane, a, b, c, v.M, v.N, v.K);
         if (stages == 0) return false;
-        var fn = gpu.Cached($"gemm2:{lane.Name}:{stages}:b", (out string e) => Ptx.Gemm2(gpu, lane, stages, out e, batched: true));
-        gpu.AllowShared(fn, Ptx.Gemm2Shared(stages));
-        Gpu.LaunchZ(fn, Grid(v.N, 128), Grid(v.M, 128), (uint)v.Batch, Ptx.GemmThreads, 1, Dynamic(Ptx.Gemm2Shared(stages)), a, b, c, Gpu.U(v.M), Gpu.U(v.N), Gpu.U(v.K),
-            (ulong)bytesA, (ulong)bytesB, (ulong)bytesC);
-        Gpu.Flush();
+        bool ta = v.TransA;
+        int sharedBytes = Ptx.Gemm2Shared(stages, ta);
+        var fn = gpu.Cached($"gemm2:{lane.Name}:{stages}:b:{ta}", (out string e) => Ptx.Gemm2(gpu, lane, stages, out e, batched: true, transA: ta));
+        gpu.AllowShared(fn, sharedBytes);
+        // Bᵀ (a single batch): copied into a k × n B first, its tile's copies taking 16 bytes of a k-row each.
+        ulong bk = v.TransB ? gpu.Rent(Math.Max(16, (long)v.K * v.N * lane.Size)) : 0;
+        try
+        {
+            if (bk != 0) Layout<TN>(new LayoutArgs { Name = "strided", X = [], P = v.ViewB(0), Output = [], Count = v.K * v.N, InputCount = (int)v.ValuesB }, b, 0, bk);
+            Gpu.LaunchZ(fn, Grid(v.N, 128), Grid(v.M, 128), (uint)v.Batch, Ptx.GemmThreads, 1, Dynamic(sharedBytes), a, bk != 0 ? bk : b, c, Gpu.U(v.M), Gpu.U(v.N), Gpu.U(v.K),
+                (ulong)bytesA, (ulong)bytesB, (ulong)bytesC);
+            Gpu.Flush();
+        }
+        finally
+        {
+            if (bk != 0) gpu.Return(bk);
+        }
+
         laneName = name;
         return true;
     }

@@ -1856,10 +1856,10 @@ internal static partial class Checks
         {
             var cases = new List<(string Name, byte[][] Inputs, int OutBytes, Func<ulong[], ulong, string>? Device, Action<byte[][], byte[]>? Cpu)>();
             {
-                var v = new ProductView(192, 160, 300, true, false);
+                var v = new ProductView(192, 160, 300, false, true);                   // Bᵀ: CUDA copies it (rents); Aᵀ it reads in place
                 var a = Bench.Registry.Make(type, 300 * 192, 71, -1, 1); var b = Bench.Registry.Make(type, 300 * 160, 72, -1, 1);
                 int outBytes = (int)Bench.Registry.Bytes(type, 192 * 160);
-                cases.Add(("matmul_tn", [a, b], outBytes,
+                cases.Add(("matmul_nt", [a, b], outBytes,
                     (d, o) => Bench.Registry.WithFloat(type, new ArenaProduct(ops, v, d[0], d[1], o, null, null, null)),
                     (x, o) => Bench.Registry.WithFloat(type, new ArenaProduct(null, v, 0, 0, 0, x[0], x[1], o))));
             }

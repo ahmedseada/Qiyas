@@ -2421,8 +2421,9 @@ internal static partial class Ptx
         }
     }
 
-    /// <summary>Shared bytes the 32-bit-lane product takes: A 128 rows × 80 B and B 16 rows × 512 B per stage.</summary>
-    public static int Gemm2Shared(int stages) => stages * (128 * 80 + 16 * 512);
+    /// <summary>Shared bytes the 32-bit-lane product takes: A 128 rows × 80 B (transA: 16 k-rows × 512 B) and B 16 rows ×
+    /// 512 B per stage.</summary>
+    public static int Gemm2Shared(int stages, bool transA = false) => stages * ((transA ? 16 * 512 : 128 * 80) + 16 * 512);
 
     /// <summary>C = A·B for a 32-bit lane (A m×k, B k×n row-major, k and n multiples of 4): 128×128 of C per block, each thread
     /// rows ty + 16r and columns tx·8 .. +7, k in blocks of 16 through staged asynchronous copies; A rows padded to 80 bytes
@@ -2431,11 +2432,16 @@ internal static partial class Ptx
     /// [z·p_kb, (z + 1)·p_kb) and stores its partial C at p_c + z·m·n lanes (SumSlices joins them in order).</summary>
     /// <summary>batched: grid z = the batches; batch z's A, B and C at z times the byte strides p_sa, p_sb, p_sc (one launch
     /// for every batch of a view whose batches are each contiguous: a batch's tiles fill the device with the others').</summary>
-    public static string Gemm2(Gpu gpu, Lane lane, int stages, out string entry, bool split = false, bool batched = false)
+    /// <summary>transA: A stored k × m (Aᵀ, m a multiple of 4), its tile held k-major in shared (16 k-rows of 128 values,
+    /// 16 bytes of a stored row a copy; a thread's 8 rows read at a k-row as from the row-major tile; the stage 16 kB
+    /// where the padded rows take 18). The same tiles, the same multiply-adds in the same order: the same C as Aᵀ copied
+    /// first.</summary>
+    public static string Gemm2(Gpu gpu, Lane lane, int stages, out string entry, bool split = false, bool batched = false, bool transA = false)
     {
         if (split && batched) throw new NotSupportedException("gemm2: split-k of a batched launch");
-        entry = $"gemm2_{lane.Name}_s{stages}{(split ? "_k" : "")}{(batched ? "_b" : "")}";
-        const int Tile = 128, Bk = 16, AStride = 80, BStride = 512, ABytes = Tile * AStride, BBytes = Bk * BStride;
+        entry = $"gemm2_{lane.Name}_s{stages}{(split ? "_k" : "")}{(batched ? "_b" : "")}{(transA ? "_ta" : "")}";
+        const int Tile = 128, Bk = 16, AStride = 80, BStride = 512, BBytes = Bk * BStride;
+        int ABytes = transA ? Bk * BStride : Tile * AStride;
         int stageBytes = ABytes + BBytes, totalShared = stages * stageBytes;
         var b = new PtxBuilder(gpu);
         string tid = b.R(), bx = b.R(), by = b.R(), tx = b.R(), ty = b.R();
@@ -2519,6 +2525,31 @@ internal static partial class Ptx
             _ = kRow;
         }
 
+        // Aᵀ: chunk c → k-row c/32 of the tile, rows (c%32)·4 .. +3 (16 bytes of a stored row of Aᵀ), at smem + k-row·512 +
+        // (c%32)·16.
+        var gAT = new string[2]; var sAT = new string[2]; var kRowAT = new string[2];
+        string mBytes4 = b.RD();
+        b.L($"mul.wide.u32 {mBytes4}, {m}, 4;");
+        for (int j = 0; transA && j < 2; j++)
+        {
+            string chunk = b.R();
+            b.L($"add.u32 {chunk}, {tid}, {j * 256};");
+            string rpart = b.R(), gRow = b.R(), rowHeld = b.R();
+            kRowAT[j] = b.R();
+            b.L($"shr.u32 {kRowAT[j]}, {chunk}, 5;");
+            b.L($"and.b32 {rpart}, {chunk}, 31;");
+            b.L($"mad.lo.u32 {gRow}, {rpart}, 4, {row0};");
+            pA[j] = b.P();
+            b.L($"setp.lt.u32 {pA[j]}, {gRow}, {m};");
+            b.L($"selp.u32 {rowHeld}, {gRow}, 0, {pA[j]};");
+            gAT[j] = b.RD();
+            b.L($"mul.wide.u32 {gAT[j]}, {rowHeld}, 4;");
+            b.L($"add.u64 {gAT[j]}, {pa}, {gAT[j]};");
+            sAT[j] = b.R();
+            b.L($"mad.lo.u32 {sAT[j]}, {kRowAT[j]}, {BStride}, {smem};");
+            b.L($"mad.lo.u32 {sAT[j]}, {rpart}, 16, {sAT[j]};");
+        }
+
         string blocks = b.R(), first = b.R();
         b.L($"add.u32 {blocks}, {k}, {Bk - 1};");
         b.L($"shr.u32 {blocks}, {blocks}, 4;");
@@ -2551,15 +2582,32 @@ internal static partial class Ptx
             for (int j = 0; j < 2; j++)
             {
                 string kk = b.R(), pk = b.P(), size = b.R(), src = b.RD(), off = b.RD(), dst = b.R();
-                // A: k0 + part·4 < k (k a multiple of 4: the chunk is whole).
-                b.L($"add.u32 {kk}, {k0}, {aPart[j]};");
-                b.L($"setp.lt.u32 {pk}, {kk}, {k};");
-                b.L($"and.pred {pk}, {pk}, {pA[j]};");
-                b.L($"selp.u32 {size}, 16, 0, {pk};");
-                b.L($"mul.wide.u32 {off}, {kk}, 4;");
-                b.L($"add.u64 {src}, {gA[j]}, {off};");
-                b.L($"add.u32 {dst}, {sA[j]}, {stageOff};");
-                b.L($"cp.async.cg.shared.global [{dst}], [{src}], 16, {size};");
+                if (transA)
+                {
+                    // Aᵀ: k-row k0 + kRow < k; its stored row at (k0 + kRow)·m·4 bytes.
+                    b.L($"add.u32 {kk}, {k0}, {kRowAT[j]};");
+                    b.L($"setp.lt.u32 {pk}, {kk}, {k};");
+                    b.L($"and.pred {pk}, {pk}, {pA[j]};");
+                    b.L($"selp.u32 {size}, 16, 0, {pk};");
+                    b.L($"cvt.u64.u32 {off}, {kk};");
+                    b.L($"mul.lo.u64 {off}, {off}, {mBytes4};");
+                    b.L($"add.u64 {src}, {gAT[j]}, {off};");
+                    b.L($"add.u32 {dst}, {sAT[j]}, {stageOff};");
+                    b.L($"cp.async.cg.shared.global [{dst}], [{src}], 16, {size};");
+                }
+                else
+                {
+                    // A: k0 + part·4 < k (k a multiple of 4: the chunk is whole).
+                    b.L($"add.u32 {kk}, {k0}, {aPart[j]};");
+                    b.L($"setp.lt.u32 {pk}, {kk}, {k};");
+                    b.L($"and.pred {pk}, {pk}, {pA[j]};");
+                    b.L($"selp.u32 {size}, 16, 0, {pk};");
+                    b.L($"mul.wide.u32 {off}, {kk}, 4;");
+                    b.L($"add.u64 {src}, {gA[j]}, {off};");
+                    b.L($"add.u32 {dst}, {sA[j]}, {stageOff};");
+                    b.L($"cp.async.cg.shared.global [{dst}], [{src}], 16, {size};");
+                }
+
                 // B: row k0 + kRow < k.
                 string kr = b.R(), pkr = b.P(), sizeB = b.R(), srcB = b.RD(), offB = b.RD(), dstB = b.R();
                 b.L($"add.u32 {kr}, {k0}, {kRowOf[j]};");
@@ -2579,7 +2627,8 @@ internal static partial class Ptx
         }
 
         string aRead = b.R(), bRead = b.R();
-        b.L($"mad.lo.u32 {aRead}, {ty}, {AStride}, {smem};");
+        if (transA) b.L($"mad.lo.u32 {aRead}, {ty}, 4, {smem};");                 // the k-major tile: row ty at 4·ty of a k-row
+        else b.L($"mad.lo.u32 {aRead}, {ty}, {AStride}, {smem};");
         b.L($"mad.lo.u32 {bRead}, {tx}, 32, {smem};");
         b.L($"add.u32 {bRead}, {bRead}, {ABytes};");
 
@@ -2608,7 +2657,7 @@ internal static partial class Ptx
         {
             var av = new string[8];
             var bv = new string[8];
-            for (int r = 0; r < 8; r++) { av[r] = lane.NewReg(b); b.L($"ld.shared.{lane.Mem} {av[r]}, [{aStage}+{r * 16 * AStride + kk * 4}];"); }
+            for (int r = 0; r < 8; r++) { av[r] = lane.NewReg(b); b.L($"ld.shared.{lane.Mem} {av[r]}, [{aStage}+{(transA ? kk * BStride + r * 64 : r * 16 * AStride + kk * 4)}];"); }
             for (int c = 0; c < 8; c++) bv[c] = lane.NewReg(b);
             b.L($"ld.shared.v4.{lane.Mem} {{{bv[0]}, {bv[1]}, {bv[2]}, {bv[3]}}}, [{bStage}+{kk * BStride}];");
             b.L($"ld.shared.v4.{lane.Mem} {{{bv[4]}, {bv[5]}, {bv[6]}, {bv[7]}}}, [{bStage}+{kk * BStride + 16}];");
