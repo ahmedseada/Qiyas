@@ -1,13 +1,12 @@
 // Copyright (c) 2026 Ahmed Seada
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
-// Resampling with a per-channel normalization on CUDA (GpuOps.Resample.cs), the CPU's arithmetic value for value
+// Resampling with a per-channel scale and shift on CUDA (GpuOps.Resample.cs), the CPU's arithmetic value for value
 // (Cpu/Resample.cs):
 //   ResampleRows  a thread per value of the horizontal pass (planes × height × out width): its taps over the input row,
-//                 read where it is stored, summed in the lane (fma, in order) or, 8-bit, as Pillow's integers clipped to
-//                 a byte; stored as a lane value (s32);
+//                 read where it is stored, summed in the lane (fma, in order); stored as a lane value;
 //   ResampleOut   a thread per stored output word (a warp, or a CTA, per block of a block format): each value's vertical
-//                 taps over the horizontal pass (or the input, the width kept), the channel's normalization, the word
+//                 taps over the horizontal pass (or the input, the width kept), the channel's scale and shift, the word
 //                 packed and stored once.
 using Adad.Abstraction;
 
@@ -16,9 +15,9 @@ namespace Adad.Cuda;
 internal static partial class Ptx
 {
     /// <summary>The horizontal pass into mid. Params: x, bounds, weights, mid, n (values), width, across (the output width), taps.</summary>
-    public static string ResampleRows(Gpu gpu, Fmt inFmt, Lane lane, bool bytes, out string entry)
+    public static string ResampleRows(Gpu gpu, Fmt inFmt, Lane lane, out string entry)
     {
-        entry = $"resample_rows_{inFmt.Name}_{(bytes ? "s32" : lane.Name)}";
+        entry = $"resample_rows_{inFmt.Name}_{lane.Name}";
         var b = new PtxBuilder();
         string px = Param64(b, "p_x"), pb = Param64(b, "p_bounds"), pw = Param64(b, "p_w"), pm = Param64(b, "p_mid");
         string n = Param32(b, "p_n"), width = Param32(b, "p_width"), across = Param32(b, "p_across"), taps = Param32(b, "p_taps");
@@ -32,23 +31,22 @@ internal static partial class Ptx
         var (first, cnt) = ResampleBounds(b, pb, bi);
         b.L($"mad.lo.u32 {src}, {row}, {width}, {first};");
         b.L($"mul.lo.u32 {wi}, {ox}, {taps};");
-        string v = ResampleTaps(b, inFmt, lane, bytes, px, pw, src, "1", wi, cnt, "H");
+        string v = ResampleTaps(b, inFmt, lane, px, pw, src, "1", wi, cnt, "H");
         string a = b.RD();
-        int size = bytes ? 4 : lane.Size;
-        b.L($"mul.wide.u32 {a}, {i}, {size};");
+        b.L($"mul.wide.u32 {a}, {i}, {lane.Size};");
         b.L($"add.u64 {a}, {pm}, {a};");
-        b.L($"st.global.{(bytes ? "s32" : lane.Mem)} [{a}], {v};");
+        b.L($"st.global.{lane.Mem} [{a}], {v};");
         b.Label("DONE");
         b.L("ret;");
         return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_bounds, .param .u64 p_w, .param .u64 p_mid, .param .u32 p_n, .param .u32 p_width, .param .u32 p_across, .param .u32 p_taps");
     }
 
     /// <summary>The output of f: each value's vertical pass over src (the horizontal pass's values, or the input, as srcFmt)
-    /// or its value there, then the normalization. Params: src, bounds, weights, values, y, count, oh, ow, h, across, taps,
-    /// the rows' bounds and weights offsets, channels.</summary>
-    public static string ResampleOut(Gpu gpu, Fmt f, Fmt srcFmt, Lane lane, bool bytes, bool vertical, bool norm, out string entry)
+    /// or its value there, then the channel's scale and shift. Params: src, bounds, weights, values, y, count, oh, ow, h,
+    /// across, taps, the rows' bounds and weights offsets, channels.</summary>
+    public static string ResampleOut(Gpu gpu, Fmt f, Fmt srcFmt, Lane lane, bool vertical, bool norm, out string entry)
     {
-        entry = $"resample_out_{f.Name}_{srcFmt.Name}_{lane.Name}{(bytes ? "_8" : "")}{(vertical ? "_v" : "")}{(norm ? "_n" : "")}";
+        entry = $"resample_out_{f.Name}_{srcFmt.Name}_{lane.Name}{(vertical ? "_v" : "")}{(norm ? "_n" : "")}";
         var b = new PtxBuilder();
         string ps = Param64(b, "p_src"), pb = Param64(b, "p_bounds"), pw = Param64(b, "p_w"), pv = Param64(b, "p_values"), py = Param64(b, "p_y");
         string count = Param32(b, "p_count"), oh = Param32(b, "p_oh"), ow = Param32(b, "p_ow"), h = Param32(b, "p_h"), across = Param32(b, "p_across"), taps = Param32(b, "p_taps");
@@ -70,28 +68,13 @@ internal static partial class Ptx
                 b.L($"mad.lo.u32 {src}, {p}, {h}, {first};");
                 b.L($"mad.lo.u32 {src}, {src}, {across}, {ox};");
                 b.L($"mad.lo.u32 {wi}, {oy}, {taps}, {rw};");
-                v = ResampleTaps(b, srcFmt, lane, bytes, ps, pw, src, across, wi, cnt, $"V{tag++}");
+                v = ResampleTaps(b, srcFmt, lane, ps, pw, src, across, wi, cnt, $"V{tag++}");
             }
             else
             {
                 b.L($"mad.lo.u32 {src}, {p}, {h}, {oy};");
                 b.L($"mad.lo.u32 {src}, {src}, {across}, {ox};");
-                v = Codec.UnpackAt(b, srcFmt, ps, src, bytes ? srcFmt.Natural : lane);
-            }
-
-            if (bytes)
-            {
-                // A byte's lane value: the channel's table entry, or the byte itself.
-                if (!norm)
-                {
-                    string fv = lane.NewReg(b);
-                    b.L($"cvt.rn.{lane.Op}.s32 {fv}, {v};");
-                    return fv;
-                }
-
-                string ti = b.R();
-                b.L($"mad.lo.u32 {ti}, {c}, 256, {v};");
-                return LoadLane(b, lane, pv, ti);
+                v = Codec.UnpackAt(b, srcFmt, ps, src, lane);
             }
 
             if (!norm) return v;
@@ -154,13 +137,12 @@ internal static partial class Ptx
         return (first, cnt);
     }
 
-    // Σ over cnt taps of fmt's values from src (step apart) by the weights from wi: the lane's fma in order from 0, or, 8-bit,
-    // 2^21 + Σ v·w as s32 clipped to a byte (Pillow's clip8). Its labels by tag.
-    private static string ResampleTaps(PtxBuilder b, Fmt fmt, Lane lane, bool bytes, string px, string pw, string src, string step, string wi, string cnt, string tag)
+    // Σ over cnt taps of fmt's values from src (step apart) by the weights from wi: the lane's fma in order from 0. Its labels
+    // by tag.
+    private static string ResampleTaps(PtxBuilder b, Fmt fmt, Lane lane, string px, string pw, string src, string step, string wi, string cnt, string tag)
     {
-        string acc = bytes ? b.R() : lane.NewReg(b);
-        if (bytes) b.L($"mov.u32 {acc}, {1 << (Resampling.PrecisionBits - 1)};");
-        else b.L($"mov.{lane.Reg} {acc}, {lane.Zero};");
+        string acc = lane.NewReg(b);
+        b.L($"mov.{lane.Reg} {acc}, {lane.Zero};");
         string t = b.R(), p = b.P(), at = b.R(), wa = b.R();
         b.L($"mov.u32 {t}, 0;");
         b.Label($"RT{tag}");
@@ -168,25 +150,10 @@ internal static partial class Ptx
         b.L($"@{p} bra RT{tag}_END;");
         b.L($"mad.lo.u32 {at}, {t}, {step}, {src};");
         b.L($"add.u32 {wa}, {wi}, {t};");
-        if (bytes)
-        {
-            string v = Codec.UnpackAt(b, fmt, px, at, fmt.Natural), w = b.R(), wad = b.RD();
-            b.L($"mul.wide.u32 {wad}, {wa}, 4;");
-            b.L($"add.u64 {wad}, {pw}, {wad};");
-            b.L($"ld.global.s32 {w}, [{wad}];");
-            b.L($"mad.lo.s32 {acc}, {v}, {w}, {acc};");
-        }
-        else b.L(lane.Fma(acc, Codec.UnpackAt(b, fmt, px, at, lane), LoadLane(b, lane, pw, wa), acc));
+        b.L(lane.Fma(acc, Codec.UnpackAt(b, fmt, px, at, lane), LoadLane(b, lane, pw, wa), acc));
         b.L($"add.u32 {t}, {t}, 1;");
         b.L($"bra RT{tag};");
         b.Label($"RT{tag}_END");
-        if (!bytes) return acc;
-        string r = b.R(), hi = b.P(), lo = b.P();
-        b.L($"shr.s32 {r}, {acc}, {Resampling.PrecisionBits};");
-        b.L($"setp.ge.s32 {hi}, {acc}, {1 << (Resampling.PrecisionBits + 8)};");
-        b.L($"setp.le.s32 {lo}, {acc}, 0;");
-        b.L($"selp.b32 {r}, 255, {r}, {hi};");
-        b.L($"selp.b32 {r}, 0, {r}, {lo};");
-        return r;
+        return acc;
     }
 }
