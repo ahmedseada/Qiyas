@@ -3,10 +3,13 @@
 
 // Resampling with a per-channel scale and shift on the CPU (Abstraction/Resample.cs has the plan and the reference): a
 // task a run of planes (RowChunk: whole stored words and blocks of the output), each plane's input rows read where they
-// are stored into the output type's float lane (Fmt.FloatLane), the horizontal pass into a plane of lane values, then the
-// vertical pass, the channel's scale and shift, and the task's outputs stored once (an integer's or bool's by the type's
-// own conversion: rounded to nearest, ties to even, held to its range).
+// are stored into the output type's float lane (Fmt.FloatLane). The horizontal pass makes each input row's values as the
+// output rows reach it, into a ring of the rows an output row's taps read; the vertical pass then sums them a vector of
+// output columns at a time (each column's taps in the definition's order), then the channel's scale and shift, and each
+// plane's outputs are stored once (an integer's or bool's by the type's own conversion: rounded to nearest, ties to even,
+// held to its range).
 using System.Buffers;
+using System.Numerics;
 using System.Runtime.InteropServices;
 using Adad.Abstraction;
 
@@ -48,83 +51,110 @@ internal sealed partial class Kernels
         public void Run(int first, int last)
         {
             int H = a.Height, W = a.Width, OH = a.OutHeight, OW = a.OutWidth, across = a.Across, plane = OH * OW;
+            // The horizontal pass's rows a ring of `ring` rows holds: the most input rows an output row reads (its taps), or
+            // one row where the vertical pass is skipped. Rows enter in order as the output rows reach them and leave once
+            // no later output row reads them (an axis's bounds rise with the output position).
+            int ring = Math.Max(1, a.YTaps);
             var lanes = ArrayPool<TLane>.Shared;
             var src = ArrayPool<TLF>.Shared.Rent(W);
-            var outs = lanes.Rent((last - first) * plane);
             var row = lanes.Rent(W);
-            var mid = lanes.Rent(H * across);
+            var mid = lanes.Rent(ring * across);
+            // Each plane stored on its own where planes are whole storage units of the type, else the task's planes at once (a
+            // block stored in pieces would be re-encoded with each).
+            bool each = plane % TN.Granularity == 0;
+            int span = each ? plane : (last - first) * plane;
+            var outs = lanes.Rent(span);
+            var natural = typeof(TE) == typeof(TLane) ? null : ArrayPool<TE>.Shared.Rent(span);
             try
             {
                 ReadOnlySpan<TLane> lw = MemoryMarshal.Cast<byte, TLane>(weights.AsSpan());
                 ReadOnlySpan<TLane> vals = values is null ? default : MemoryMarshal.Cast<byte, TLane>(values.AsSpan());
+                int w = Vector<TLane>.Count;
                 for (int p = first; p < last; p++)
                 {
-                    int c = p % a.Channels;
-                    // The horizontal pass: each output column's taps over the row, in order.
-                    for (int r = 0; r < H; r++)
-                    {
-                        TF.Load(x, (p * H + r) * W, src.AsSpan(0, W));
-                        Widths.Load<TLF, TLane>(src.AsSpan(0, W), row.AsSpan(0, W));
-                        for (int ox = 0; ox < across; ox++)
-                        {
-                            int at = r * across + ox;
-                            if (a.XTaps == 0)
-                            {
-                                mid[at] = row[ox];
-                                continue;
-                            }
-
-                            int b0 = bounds[2 * ox], n = bounds[2 * ox + 1], wb = ox * a.XTaps;
-                            TLane sum = TL.Zero;
-                            for (int t = 0; t < n; t++) sum = TL.Fma(row[b0 + t], lw[wb + t], sum);
-                            mid[at] = sum;
-                        }
-                    }
-
-                    // The vertical pass over the horizontal one's values, and the channel's scale and shift.
-                    var o = outs.AsSpan((p - first) * plane, plane);
+                    int c = p % a.Channels, made = 0;                  // the plane's rows made so far: input rows 0 .. made
+                    var o = outs.AsSpan(each ? 0 : (p - first) * plane, plane);
+                    var scale = new Vector<TLane>(values is null ? TL.Zero : vals[2 * c]);
+                    var shift = new Vector<TLane>(values is null ? TL.Zero : vals[2 * c + 1]);
                     for (int oy = 0; oy < OH; oy++)
                     {
-                        int b0 = oy, n = 0, wb = 0;
+                        int b0 = oy, n = 1, wb = 0;
                         if (a.YTaps > 0) { b0 = bounds[a.RowBounds + 2 * oy]; n = bounds[a.RowBounds + 2 * oy + 1]; wb = a.RowWeights + oy * a.YTaps; }
-                        for (int ox = 0; ox < OW; ox++)
+                        for (; made < b0 + n; made++) Horizontal(p, made, mid.AsSpan(made % ring * across, across), src, row, lw);
+                        var dst = o.Slice(oy * OW, OW);
+                        if (a.YTaps == 0)
                         {
-                            TLane v;
-                            if (a.YTaps == 0) v = mid[oy * across + ox];
-                            else
+                            mid.AsSpan(b0 % ring * across, OW).CopyTo(dst);
+                        }
+                        else
+                        {
+                            // The vertical pass a vector of output columns at a time: each column's taps in order (fma), as
+                            // the definition sums them.
+                            int ox = 0;
+                            for (; ox + w <= OW; ox += w)
                             {
-                                v = TL.Zero;
-                                for (int t = 0; t < n; t++) v = TL.Fma(mid[(b0 + t) * across + ox], lw[wb + t], v);
+                                var v = Vector<TLane>.Zero;
+                                for (int t = 0; t < n; t++) v = TL.Fma(new Vector<TLane>(mid.AsSpan((b0 + t) % ring * across + ox, w)), new Vector<TLane>(lw[wb + t]), v);
+                                v.CopyTo(dst[ox..]);
                             }
 
-                            o[oy * OW + ox] = values is null ? v : TL.Fma(v, vals[2 * c], vals[2 * c + 1]);
+                            for (; ox < OW; ox++)
+                            {
+                                TLane v = TL.Zero;
+                                for (int t = 0; t < n; t++) v = TL.Fma(mid[(b0 + t) % ring * across + ox], lw[wb + t], v);
+                                dst[ox] = v;
+                            }
                         }
+
+                        if (values is null) continue;
+                        int q = 0;
+                        for (; q + w <= OW; q += w) TL.Fma(new Vector<TLane>(dst[q..]), scale, shift).CopyTo(dst[q..]);
+                        for (; q < OW; q++) dst[q] = TL.Fma(dst[q], vals[2 * c], vals[2 * c + 1]);
                     }
+
+                    if (each) Store(o, natural, p * plane);
                 }
 
-                var done = outs.AsSpan(0, (last - first) * plane);
-                if (typeof(TE) == typeof(TLane)) TN.Store(MemoryMarshal.Cast<TLane, TE>(done), y, first * plane);
-                else
-                {
-                    // An integer's (or bool's) values: the lane's taken to the natural lane by the type's conversion, then stored.
-                    var natural = ArrayPool<TE>.Shared.Rent(done.Length);
-                    try
-                    {
-                        Widths.Store<TLane, TE>(done, natural.AsSpan(0, done.Length));
-                        TN.Store(natural.AsSpan(0, done.Length), y, first * plane);
-                    }
-                    finally
-                    {
-                        ArrayPool<TE>.Shared.Return(natural);
-                    }
-                }
+                if (!each) Store(outs.AsSpan(0, span), natural, first * plane);
             }
             finally
             {
                 ArrayPool<TLF>.Shared.Return(src);
-                lanes.Return(outs);
                 lanes.Return(row);
                 lanes.Return(mid);
+                lanes.Return(outs);
+                if (natural is not null) ArrayPool<TE>.Shared.Return(natural);
+            }
+        }
+
+        // Outputs stored as the type once (a task's planes start on whole storage units: RowChunk); an integer's (or bool's)
+        // values taken to the natural lane by the type's conversion first.
+        private void Store(Span<TLane> o, TE[]? natural, int at)
+        {
+            if (natural is null) { TN.Store(MemoryMarshal.Cast<TLane, TE>(o), y, at); return; }
+            Widths.Store<TLane, TE>(o, natural.AsSpan(0, o.Length));
+            TN.Store(natural.AsSpan(0, o.Length), y, at);
+        }
+
+        // The horizontal pass of input row r of plane p: each output column's taps over the row, in order (the row read where
+        // it is stored, into the lane).
+        private void Horizontal(int p, int r, Span<TLane> dst, TLF[] src, TLane[] row, ReadOnlySpan<TLane> lw)
+        {
+            int W = a.Width;
+            TF.Load(x, (p * a.Height + r) * W, src.AsSpan(0, W));
+            Widths.Load<TLF, TLane>(src.AsSpan(0, W), row.AsSpan(0, W));
+            if (a.XTaps == 0)
+            {
+                row.AsSpan(0, W).CopyTo(dst);
+                return;
+            }
+
+            for (int ox = 0; ox < dst.Length; ox++)
+            {
+                int b0 = bounds[2 * ox], n = bounds[2 * ox + 1], wb = ox * a.XTaps;
+                TLane sum = TL.Zero;
+                for (int t = 0; t < n; t++) sum = TL.Fma(row[b0 + t], lw[wb + t], sum);
+                dst[ox] = sum;
             }
         }
     }
