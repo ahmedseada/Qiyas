@@ -110,4 +110,105 @@ internal static partial class Ptx
         b.L("ret;");
         return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_o, .param .u32 p_rows, .param .u32 p_cols");
     }
+
+    /// <summary>The input columns a CTA of TransposeBlocksTiled takes.</summary>
+    public const int TransposeBlockCols = 32;
+
+    /// <summary>Whether a transpose of block format f takes the tiled kernel: each output row whole blocks (rows a multiple
+    /// of the values a block holds), so a tile's output values are whole blocks.</summary>
+    public static bool TransposeBlocksTile(Fmt f, int rows) => rows % f.BlockValues == 0;
+
+    /// <summary>The transpose of a block format by tiles (TransposeBlocksTile): a CTA of 256 threads takes input rows
+    /// [r0, r0 + BlockValues) and columns [c0, c0 + 32) (grid: column tiles × row tiles). The tile's values decoded a warp
+    /// a row of it (UnpackAt: a row's 32 values read from where they are stored together) into shared f32, then each
+    /// column of the tile, one output block, encoded from them: a thread a block for the formats of 32 values a block
+    /// (ThreadBlockEncode), a warp a block for the others (EncodeBlock). TransposeBlocks gathered each output value from its
+    /// own input block. Every value decoded and every block encoded as there: the same blocks.</summary>
+    public static string TransposeBlocksTiled(Gpu gpu, Fmt f, out string entry)
+    {
+        entry = $"transpose_{f.Name}_blocks_tiled";
+        int bv = f.BlockValues, stride = TransposeBlockCols + 1;
+        var b = new PtxBuilder(gpu);
+        string px = Param64(b, "p_x"), po = Param64(b, "p_o"), rows = Param32(b, "p_rows"), cols = Param32(b, "p_cols");
+        string tid = b.R(), c0 = b.R(), r0 = b.R(), n = b.R(), smem = b.R(), i = b.R(), rr = b.R(), cc = b.R(), r = b.R(), c = b.R(), src = b.R(), sa = b.R();
+        string pIn = b.P(), pLoop = b.P();
+        b.L($"mov.u32 {tid}, %tid.x;");
+        b.L($"mov.u32 {c0}, %ctaid.x;");
+        b.L($"shl.b32 {c0}, {c0}, 5;");
+        b.L($"mov.u32 {r0}, %ctaid.y;");
+        b.L($"mul.lo.u32 {r0}, {r0}, {bv};");
+        b.L($"mul.lo.u32 {n}, {rows}, {cols};");
+        b.L($"mov.u32 {smem}, smem;");
+        // The tile: value (rr, cc) at smem[rr·33 + cc]; past the last column 0.
+        b.L($"mov.u32 {i}, {tid};");
+        b.Label("LD");
+        b.L($"setp.ge.u32 {pLoop}, {i}, {bv * TransposeBlockCols};");
+        b.L($"@{pLoop} bra LD_END;");
+        b.L($"shr.u32 {rr}, {i}, 5;");
+        b.L($"and.b32 {cc}, {i}, 31;");
+        b.L($"add.u32 {r}, {r0}, {rr};");
+        b.L($"add.u32 {c}, {c0}, {cc};");
+        b.L($"setp.lt.u32 {pIn}, {c}, {cols};");
+        b.L($"min.u32 {c}, {c}, {cols};");
+        b.L($"sub.u32 {c}, {c}, 1;");
+        string held = b.R();
+        b.L($"add.u32 {held}, {c0}, {cc};");
+        b.L($"selp.u32 {c}, {held}, {c}, {pIn};");
+        b.L($"mad.lo.u32 {src}, {r}, {cols}, {c};");
+        string v = Codec.UnpackAt(b, f, px, src, Lane.F32), kept = b.F();
+        b.L($"selp.f32 {kept}, {v}, 0f00000000, {pIn};");
+        b.L($"mad.lo.u32 {sa}, {rr}, {stride}, {cc};");
+        b.L($"mad.lo.u32 {sa}, {sa}, 4, {smem};");
+        b.L($"st.shared.f32 [{sa}], {kept};");
+        b.L($"add.u32 {i}, {i}, 256;");
+        b.L("bra LD;");
+        b.Label("LD_END");
+        b.L("bar.sync 0;");
+        // Output block of input column c = c0 + cc: output values c·rows + r0 …, block (c·rows + r0) / BlockValues.
+        string Block(string col) { string k = b.R(), q = b.R(); b.L($"mul.lo.u32 {k}, {col}, {rows};"); b.L($"add.u32 {k}, {k}, {r0};"); b.L($"div.u32 {q}, {k}, {bv};"); return q; }
+        string Shared(string row, string col) { string a = b.R(), x = b.F(); b.L($"mad.lo.u32 {a}, {row}, {stride}, {col};"); b.L($"mad.lo.u32 {a}, {a}, 4, {smem};"); b.L($"ld.shared.f32 {x}, [{a}];"); return x; }
+        if (BlockByThread(f))
+        {
+            // Threads 0 … 31: column tid's block.
+            string pOut = b.P(), col = b.R();
+            b.L($"add.u32 {col}, {c0}, {tid};");
+            b.L($"setp.ge.u32 {pOut}, {tid}, 32;");
+            b.L($"@{pOut} bra DONE;");
+            b.L($"setp.ge.u32 {pOut}, {col}, {cols};");
+            b.L($"@{pOut} bra DONE;");
+            string blk = Block(col);
+            var vals = new string[bv];
+            for (int k = 0; k < bv; k++) vals[k] = Shared(k.ToString(), tid);
+            ThreadBlockEncode(b, f, po, blk, vals);
+        }
+        else
+        {
+            // Warp w: columns w, w + 8, w + 16, w + 24 of the tile, a block each.
+            string warp = b.R(), lane = b.R(), j = b.R(), col = b.R(), tcol = b.R(), pDone = b.P();
+            b.L($"shr.u32 {warp}, {tid}, 5;");
+            b.L($"and.b32 {lane}, {tid}, 31;");
+            b.L($"mov.u32 {j}, 0;");
+            b.Label("ENC");
+            b.L($"setp.ge.u32 {pDone}, {j}, 4;");
+            b.L($"@{pDone} bra DONE;");
+            b.L($"mad.lo.u32 {tcol}, {j}, 8, {warp};");
+            b.L($"add.u32 {col}, {c0}, {tcol};");
+            b.L($"setp.ge.u32 {pDone}, {col}, {cols};");
+            b.L($"@{pDone} bra DONE;");
+            string blk = Block(col), blockFirst = b.R();
+            b.L($"mul.lo.u32 {blockFirst}, {blk}, {bv};");
+            EncodeBlock(b, f, po, (blk, lane), n, at =>
+            {
+                string row = b.R();
+                b.L($"sub.u32 {row}, {at}, {blockFirst};");
+                return Shared(row, tcol);
+            });
+            b.L($"add.u32 {j}, {j}, 1;");
+            b.L("bra ENC;");
+        }
+
+        b.Label("DONE");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_o, .param .u32 p_rows, .param .u32 p_cols", bv * stride * 4);
+    }
 }

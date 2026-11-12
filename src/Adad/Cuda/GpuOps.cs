@@ -305,6 +305,13 @@ public sealed partial class GpuOps(Gpu gpu)
         var f = Fmt.Of<TN>();
         if (f.IsBlock)
         {
+            if (Ptx.TransposeBlocksTile(f, rows))
+            {
+                var ft = gpu.Cached($"transpose_blocks_tiled:{f.Name}", (out string e) => Ptx.TransposeBlocksTiled(gpu, f, out e));
+                Gpu.Launch(ft, Grid(cols, Ptx.TransposeBlockCols), (uint)(rows / f.BlockValues), 256, 1, 0, x, output, Gpu.U(rows), Gpu.U(cols));
+                return "f32 (blocks in place, tiled)";
+            }
+
             var fb = gpu.Cached($"transpose_blocks:{f.Name}", (out string e) => Ptx.TransposeBlocks(gpu, f, out e));
             Gpu.Launch(fb, BlockGrid(f, (long)rows * cols), 1, 256, 1, 0, x, output, Gpu.U(rows), Gpu.U(cols));
             return "f32 (blocks in place)";
