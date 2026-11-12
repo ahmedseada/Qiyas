@@ -493,10 +493,13 @@ internal sealed partial class Kernels
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane> where TOp : struct, IMapOp<TLane, TL>
     {
         int size = Math.Max(Tile, (n / (Threads * 4) + Tile - 1) / Tile * Tile);
-        Team.For(n, size, (long)n * 4, new MapBody<TN, TLane, TL, TOp>(x, y, z, output, TL.From(a), TL.From(b)));
+        int inputs = (x is null ? 0 : 1) + (y is null ? 0 : 1) + (z is null ? 0 : 1);
+        bool stream = Streams.Past((inputs + 1) * TN.Bytes(n));
+        Team.For(n, size, (long)n * 4, new MapBody<TN, TLane, TL, TOp>(x, y, z, output, TL.From(a), TL.From(b), stream));
     }
 
-    private struct MapBody<TN, TLane, TL, TOp>(byte[]? x, byte[]? y, byte[]? z, byte[] output, TLane a, TLane b) : Team.IBody
+    // stream: the result copied from the stack into the output past the caches (Streams), a tile at a time.
+    private struct MapBody<TN, TLane, TL, TOp>(byte[]? x, byte[]? y, byte[]? z, byte[] output, TLane a, TLane b, bool stream) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane> where TOp : struct, IMapOp<TLane, TL>
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -504,12 +507,31 @@ internal sealed partial class Kernels
         {
             var va = new Vector<TLane>(a);
             var vb = new Vector<TLane>(b);
-            if (TN.Direct)
+            if (TN.Direct && !stream)
             {
                 var ox = x is null ? default : MemoryMarshal.Cast<byte, TLane>(x.AsSpan()).Slice(first, last - first);
                 var oy = y is null ? default : MemoryMarshal.Cast<byte, TLane>(y.AsSpan()).Slice(first, last - first);
                 var oz = z is null ? default : MemoryMarshal.Cast<byte, TLane>(z.AsSpan()).Slice(first, last - first);
                 Apply(ox, oy, oz, MemoryMarshal.Cast<byte, TLane>(output.AsSpan()).Slice(first, last - first), va, vb);
+                return;
+            }
+
+            if (TN.Direct)
+            {
+                // Each tile computed on the stack from the inputs in place, then streamed into the output.
+                Span<TLane> to = stackalloc TLane[Tile];
+                var lanes = MemoryMarshal.Cast<byte, TLane>(output.AsSpan());
+                for (int at = first; at < last; at += Tile)
+                {
+                    int len = Math.Min(Tile, last - at);
+                    var ox = x is null ? default : MemoryMarshal.Cast<byte, TLane>(x.AsSpan()).Slice(at, len);
+                    var oy = y is null ? default : MemoryMarshal.Cast<byte, TLane>(y.AsSpan()).Slice(at, len);
+                    var oz = z is null ? default : MemoryMarshal.Cast<byte, TLane>(z.AsSpan()).Slice(at, len);
+                    Apply(ox, oy, oz, to[..len], va, vb);
+                    Streams.Copy(MemoryMarshal.AsBytes(to[..len]), MemoryMarshal.AsBytes(lanes.Slice(at, len)));
+                }
+
+                Streams.Fence();
                 return;
             }
 
@@ -524,8 +546,20 @@ internal sealed partial class Kernels
                 if (z is not null) TN.Load(z, at, tz[..len]);
                 Apply(x is null ? default : tx[..len], y is null ? default : ty[..len], z is null ? default : tz[..len], tx[..len], va, vb);
                 if (!TN.IsFloat && TN.Bits < 8 * Unsafe.SizeOf<TLane>()) Wrap(tx[..len], TN.Bits, TN.Min < 0);
-                TN.Store(tx[..len], output, at);
+                if (!stream)
+                {
+                    TN.Store(tx[..len], output, at);
+                    continue;
+                }
+
+                // The tile's stored bytes (a tile is whole storage units) made on the stack, then streamed.
+                int bytes = (int)TN.Bytes(len);
+                Span<byte> stored = stackalloc byte[(int)TN.Bytes(Tile)];
+                TN.Store(tx[..len], stored[..bytes], 0);
+                Streams.Copy(stored[..bytes], output.AsSpan((int)TN.Bytes(at), bytes));
             }
+
+            if (stream) Streams.Fence();
         }
 
         // Integer results of a type narrower than its lane, wrapped at the type's width (the arithmetic is modular there, as

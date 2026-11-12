@@ -54,12 +54,39 @@ internal sealed partial class Kernels
             Add<TN, TLane, TL>(a, b, c, n);
     }
 
-    private struct AddBody<TN, TLane, TL>(byte[] a, byte[] b, byte[] c) : Team.IBody
+    private struct AddBody<TN, TLane, TL>(byte[] a, byte[] b, byte[] c, bool stream) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public readonly void Run(int first, int last)
         {
+            if (stream)
+            {
+                // Each tile summed on the stack, then streamed into c past the caches (Streams).
+                Span<TLane> u = stackalloc TLane[Tile];
+                Span<TLane> v = stackalloc TLane[Tile];
+                Span<byte> stored = stackalloc byte[(int)TN.Bytes(Tile)];
+                for (int at = first; at < last; at += Tile)
+                {
+                    int len = Math.Min(Tile, last - at), bytes = (int)TN.Bytes(len);
+                    if (TN.Direct)
+                    {
+                        AddLanes<TLane, TL>(MemoryMarshal.Cast<byte, TLane>(a.AsSpan()).Slice(at, len), MemoryMarshal.Cast<byte, TLane>(b.AsSpan()).Slice(at, len), u[..len]);
+                        Streams.Copy(MemoryMarshal.AsBytes(u[..len]), c.AsSpan((int)TN.Bytes(at), bytes));
+                        continue;
+                    }
+
+                    TN.Load(a, at, u[..len]);
+                    TN.Load(b, at, v[..len]);
+                    AddLanes<TLane, TL>(u[..len], v[..len], u[..len]);
+                    TN.Store(u[..len], stored[..bytes], 0);
+                    Streams.Copy(stored[..bytes], c.AsSpan((int)TN.Bytes(at), bytes));
+                }
+
+                Streams.Fence();
+                return;
+            }
+
             if (TN.Direct)
             {
                 AddLanes<TLane, TL>(MemoryMarshal.Cast<byte, TLane>(a.AsSpan()).Slice(first, last - first),
@@ -85,7 +112,7 @@ internal sealed partial class Kernels
     {
         // Chunks of whole tiles (whole bytes for packed values), about four per thread.
         int size = Math.Max(Tile, (n / (Threads * 4) + Tile - 1) / Tile * Tile);
-        Team.For(n, size, n, new AddBody<TN, TLane, TL>(a, b, c));
+        Team.For(n, size, n, new AddBody<TN, TLane, TL>(a, b, c, Streams.Past(3 * TN.Bytes(n))));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
