@@ -57,13 +57,13 @@ internal static partial class Checks
             {
                 double same = agree[t] / (double)M;
                 if (Math.Abs(same - pSame) <= 5 * sameSigma) continue;
-                Console.WriteLine($"check dropout draws          cpu    {pairs[t]} agree {same:0.#####} (want {pSame:0.#####})");
+                Console.WriteLine($"check dropout draws          cpu    DIFFERS: {pairs[t]} agree {same:0.#####} (want {pSame:0.#####})");
                 ok = false;
             }
 
             if (Math.Abs(share - (1 - P)) > 5 * sigma)
             {
-                Console.WriteLine($"check dropout draws          cpu    kept {share:0.#####} (want {1 - P})");
+                Console.WriteLine($"check dropout draws          cpu    DIFFERS: kept {share:0.#####} (want {1 - P})");
                 ok = false;
             }
 
@@ -77,7 +77,7 @@ internal static partial class Checks
             }, sum => Interlocked.Add(ref all, sum));
             if (all != (1L << 32) - thr)
             {
-                Console.WriteLine($"check dropout draws          cpu    {all} of 2^32 draws kept (want {(1L << 32) - thr})");
+                Console.WriteLine($"check dropout draws          cpu    DIFFERS: {all} of 2^32 draws kept (want {(1L << 32) - thr})");
                 ok = false;
             }
         }

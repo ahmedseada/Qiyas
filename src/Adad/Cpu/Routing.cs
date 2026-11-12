@@ -266,11 +266,11 @@ internal sealed partial class Kernels
         public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
         {
             Lane = TL.Name;
-            Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)rows * cols * 2, new SampleBody<TN, TLane, TL>(x, rows, cols, u, picks));
+            Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)rows * cols * 2, new SampleBody<TN, TLane, TL>(x, cols, u, picks));
         }
     }
 
-    private struct SampleBody<TN, TLane, TL>(byte[] x, int rows, int cols, byte[] u, int[] picks) : Team.IBody
+    private struct SampleBody<TN, TLane, TL>(byte[] x, int cols, byte[] u, int[] picks) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         public readonly void Run(int first, int last)

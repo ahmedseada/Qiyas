@@ -50,10 +50,10 @@ internal static partial class Checks
             {
                 // The values' error: the row's largest (up to 4) and the log of its sum, each a few lane roundings.
                 double bad = Excess(type, what, values, want, _ => 8, 16);
-                if (bad > 0) wrong = $"values DIFFER by {bad:0.##}";
+                if (bad > 0) wrong = $"values by {bad:0.##}";
             }
 
-            if (wrong is not null) { Console.WriteLine($"check {what,-40} {where,-6} {type,-12} {wrong}"); ok = false; }
+            if (wrong is not null) { Console.WriteLine($"check {what,-40} {where,-6} {type,-12} DIFFERS: {wrong}"); ok = false; }
         }
 
         // k past the row: refused (the k largest of fewer values are not defined).

@@ -64,9 +64,11 @@ public static class Resampling
     /// count 0; InLane and LaneBytes round them to the lane). Both arrays hold one value at least.</summary>
     public static (ResampleArgs Args, int[] Bounds, double[] Weights) Plan(int planes, int channels, int h, int w, int oh, int ow, ResampleFilter filter)
     {
-        var cols = w != ow ? Coefficients(w, ow, filter) : default;
-        var rows = h != oh ? Coefficients(h, oh, filter) : default;
-        var a = new ResampleArgs(planes, channels, h, w, oh, ow, cols.Weights is null ? 0 : cols.Taps, rows.Weights is null ? 0 : rows.Taps);
+        // An axis whose size stays has no taps: no coefficients.
+        (int[] Bounds, double[] Weights, int Taps) none = ([], [], 0);
+        var cols = w != ow ? Coefficients(w, ow, filter) : none;
+        var rows = h != oh ? Coefficients(h, oh, filter) : none;
+        var a = new ResampleArgs(planes, channels, h, w, oh, ow, cols.Taps, rows.Taps);
         var bounds = new int[Math.Max(1, a.BoundCount)];
         var weights = new double[Math.Max(1, a.WeightCount)];
         if (a.XTaps > 0) { cols.Bounds.CopyTo(bounds, 0); cols.Weights.CopyTo(weights, 0); }
