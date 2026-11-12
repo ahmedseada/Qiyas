@@ -47,7 +47,7 @@ internal static partial class Ptx
     public static string ExpertRanks(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"expert_ranks_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string pp = Param64(b, "p_p"), pf = Param64(b, "p_ranks"), count = Param32(b, "p_count"), E = Param32(b, "p_experts"), k = Param32(b, "p_k");
         string i = EachIndex(b, count);
         string t = b.R(), e = b.R(), row = b.R(), at = b.R(), q = b.R(), rank = b.R(), inc = b.R();
@@ -97,7 +97,7 @@ internal static partial class Ptx
     public static string ExpertPicks(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"expert_picks_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string pp = Param64(b, "p_p"), pf = Param64(b, "p_ranks"), pc = Param64(b, "p_chosen"), pl = Param64(b, "p_lanes");
         string tokens = Param32(b, "p_tokens"), E = Param32(b, "p_experts"), k = Param32(b, "p_k"), norm = Param32(b, "p_norm");
         string t = EachIndex(b, tokens);
@@ -167,7 +167,7 @@ internal static partial class Ptx
     public static string ExpertRows(Gpu gpu, out string entry)
     {
         entry = "expert_rows";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string po = Param64(b, "p_order"), pt = Param64(b, "p_token"), ps = Param64(b, "p_slot"), slots = Param32(b, "p_slots"), k = Param32(b, "p_k");
         string r = EachIndex(b, slots);
         string slot = LoadU32(b, po, r), token = b.R();
@@ -184,7 +184,7 @@ internal static partial class Ptx
     public static string ExpertTiles(Gpu gpu, out string entry)
     {
         entry = "expert_tiles";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string po = Param64(b, "p_off"), pt = Param64(b, "p_tiles"), E = Param32(b, "p_experts"), tile = Param32(b, "p_tile");
         string tid = b.R(), acc = b.R(), e = b.R(), pDone = b.P(), zero = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
@@ -220,7 +220,7 @@ internal static partial class Ptx
     public static string ExpertOfRows(Gpu gpu, out string entry)
     {
         entry = "expert_of_rows";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string po = Param64(b, "p_off"), pr = Param64(b, "p_rows"), rows = Param32(b, "p_count"), E = Param32(b, "p_experts");
         string r = EachIndex(b, rows);
         string e = b.R(), j = b.R(), pDone = b.P(), pLe = b.P();
@@ -254,7 +254,7 @@ internal static partial class Ptx
     public static string ExpertStore(Gpu gpu, Fmt f, Lane lane, string? gate, bool gateBias, bool upBias, out string entry)
     {
         entry = $"expert_store_{f.Name}_{lane.Name}_{gate ?? "none"}{(gateBias ? "_gb" : "")}{(upBias ? "_ub" : "")}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string pg = Param64(b, "p_g"), pgb = Param64(b, "p_gb"), pu = Param64(b, "p_u"), pub = Param64(b, "p_ub"), pre = Param64(b, "p_re"), py = Param64(b, "p_y");
         string n = Param32(b, "p_n"), cols = Param32(b, "p_cols"), E = Param32(b, "p_experts");
         var em = new Emit(b, lane);

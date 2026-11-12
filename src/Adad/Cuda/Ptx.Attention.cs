@@ -34,7 +34,7 @@ internal static partial class Ptx
     {
         entry = $"attention_decode_{f.Name}_{lane.Name}_d{dCap}{(outFmt is null ? "" : "_o" + outFmt.Name)}{(cache is null ? "" : "_at_" + cache.Key)}{(runs ? "_runs" : "")}";
         var fk = cache?.Fc ?? f;                                                 // K and V's stored format
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");
@@ -253,7 +253,7 @@ internal static partial class Ptx
     public static string Widen(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"widen_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R(), i = b.R(), n = Param32(b, "p_n"), x = Param64(b, "p_x"), outp = Param64(b, "p_out"), pEnd = b.P();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");
@@ -273,7 +273,7 @@ internal static partial class Ptx
     public static string Narrow(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"narrow_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R(), word = b.R(), n = Param32(b, "p_n"), x = Param64(b, "p_x"), outp = Param64(b, "p_out"), pEnd = b.P(), words = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");

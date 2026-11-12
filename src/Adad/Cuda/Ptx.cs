@@ -59,6 +59,16 @@ public sealed class PtxBuilder
     private readonly StringBuilder _body = new();
     private int _r, _rd, _f, _fd, _h, _p;
 
+    public PtxBuilder()
+    {
+    }
+
+    /// <summary>A kernel's text for <paramref name="gpu"/>: what it may emit follows the device's compute capability.</summary>
+    public PtxBuilder(Gpu gpu) => Capability = gpu.Capability;
+
+    /// <summary>The compute capability the kernel is for (major·10 + minor); 0 where not given (the portable forms).</summary>
+    public int Capability { get; }
+
     public string R() => $"%r{_r++}";
     public string RD() => $"%rd{_rd++}";
     public string F() => $"%f{_f++}";
@@ -618,7 +628,7 @@ internal static partial class Ptx
     {
         entry = "add_" + f.Name;
         var lane = f.Natural;
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string pa = Param64(b, "p_a"), pb = Param64(b, "p_b"), pc = Param64(b, "p_c"), n = Param32(b, "p_n");
         int wordsPerThread = f.WordBits == 64 ? 2 : 4, wordBytes = f.WordBits / 8;
@@ -695,7 +705,7 @@ internal static partial class Ptx
     public static string ToLanes(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"cvt_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string src = Param64(b, "p_x"), dst = Param64(b, "p_y"), n = Param32(b, "p_n");
         string words = WordCount(b, f, n), p = b.P();
@@ -729,7 +739,7 @@ internal static partial class Ptx
     public static string FromLanes(Gpu gpu, Lane lane, Fmt f, out string entry)
     {
         entry = $"back_{lane.Name}_{f.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string src = Param64(b, "p_x"), dst = Param64(b, "p_y"), n = Param32(b, "p_n");
         string words = WordCount(b, f, n), p = b.P();
@@ -816,7 +826,7 @@ internal static partial class Ptx
     public static string PackRows(Gpu gpu, Fmt f, Kind kind, bool transposed, out string entry)
     {
         entry = $"pack_{f.Name}_{kind.Name}_{(transposed ? "t" : "n")}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string src = Param64(b, "p_x"), dst = Param64(b, "p_y"), rows = Param32(b, "p_rows"), k = Param32(b, "p_k"), kp = Param32(b, "p_kp"), inner = Param32(b, "p_inner");
         string wordsPerRow = b.R(), total = b.R(), p = b.P(), row = b.R(), w = b.R();
@@ -912,7 +922,7 @@ internal static partial class Ptx
         int stepBytes = kind.KStep * kind.Bits / 8, ksteps = rowBytes / stepBytes;
         int blockValues = rowBytes * 8 / kind.Bits, blockShift = (int)Math.Log2(blockValues);
         var acc = kind.Acc;
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bx = b.R(), by = b.R(), warp = b.R(), lane = b.R(), wmR = b.R(), wnR = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bx}, %ctaid.x;");
@@ -1424,7 +1434,7 @@ internal static partial class Ptx
     public static string RowExponents(Gpu gpu, out string entry)
     {
         entry = "rowexp_f64";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), row = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {row}, %ctaid.x;");
@@ -1464,7 +1474,7 @@ internal static partial class Ptx
     public static string ColumnExponents(Gpu gpu, out string entry)
     {
         entry = "colexp_f64";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string pb = Param64(b, "p_b"), pf = Param64(b, "p_f"), k = Param32(b, "p_k"), n = Param32(b, "p_n");
         string pEnd = b.P(), max = b.FD(), p2 = b.R(), stride = b.RD(), addr = b.RD(), pLoop = b.P();
@@ -1524,7 +1534,7 @@ internal static partial class Ptx
     public static string SliceRows(Gpu gpu, out string entry)
     {
         entry = "slice_rows_f64";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string pa = Param64(b, "p_a"), pe = Param64(b, "p_e"), ps = Param64(b, "p_s"), m = Param32(b, "p_m"), k = Param32(b, "p_k"), kpad = Param32(b, "p_kpad");
         string total = b.R(), pEnd = b.P(), i = b.R(), p2 = b.R(), eAddr = b.RD(), e = b.R(), aAddr = b.RD(), v = b.FD(), rowLen = b.R(), sBase = b.RD();
@@ -1565,7 +1575,7 @@ internal static partial class Ptx
     public static string SliceColumns(Gpu gpu, out string entry)
     {
         entry = "slice_cols_f64";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string pb = Param64(b, "p_b"), pf = Param64(b, "p_f"), ps = Param64(b, "p_s"), k = Param32(b, "p_k"), n = Param32(b, "p_n"), kpad = Param32(b, "p_kpad");
         string total = b.R(), pEnd = b.P(), p2 = b.R(), j = b.R(), fAddr = b.RD(), e = b.R(), bAddr = b.RD(), v = b.FD();
@@ -1609,7 +1619,7 @@ internal static partial class Ptx
     public static string CombineSlices(Gpu gpu, out string entry)
     {
         entry = "combine_f64x";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string pd = Param64(b, "p_d"), pe = Param64(b, "p_e"), pf = Param64(b, "p_f"), pc = Param64(b, "p_c"), m = Param32(b, "p_m"), n = Param32(b, "p_n");
         string total = b.R(), pEnd = b.P(), i = b.R(), j = b.R(), e = b.R(), f = b.R(), tAddr = b.RD();
@@ -1783,7 +1793,7 @@ internal static partial class Ptx
         if (grouped && (stored is null || stored.C is not null || split || transA || conv || scales is not null)) throw new ArgumentException("grouped: the stored mode into lane sums, A as stored rows");
         if (grouped) entry += "_g";
         bool typedC = stored?.C is not null;
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bx = b.R(), by = b.R(), tx = b.R(), ty = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bx}, %ctaid.x;");
@@ -2317,7 +2327,7 @@ internal static partial class Ptx
         entry = $"gemm2_{lane.Name}_s{stages}{(split ? "_k" : "")}";
         const int Tile = 128, Bk = 16, AStride = 80, BStride = 512, ABytes = Tile * AStride, BBytes = Bk * BStride;
         int stageBytes = ABytes + BBytes, totalShared = stages * stageBytes;
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bx = b.R(), by = b.R(), tx = b.R(), ty = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bx}, %ctaid.x;");
@@ -2547,7 +2557,7 @@ internal static partial class Ptx
     public static string SumSlices(Gpu gpu, Lane lane, out string entry)
     {
         entry = $"sum_slices_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string w = Param64(b, "p_w"), y = Param64(b, "p_y"), count = Param32(b, "p_count"), slices = Param32(b, "p_s");
         string i = b.R(), p = b.P(), at = b.RD(), step = b.RD(), z = b.R(), pz = b.P();
@@ -2595,7 +2605,7 @@ internal static partial class Ptx
         const int Tile = 128, Micro = 8, Bk = 16, Stride = Bk + 1;
         entry = (signed ? "gemm_dp4a_s" : "gemm_dp4a_u") + (store is null ? "" : "_e" + store.Name);
         string op = signed ? "dp4a.s32.s32" : "dp4a.u32.u32";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bx = b.R(), by = b.R(), tx = b.R(), ty = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bx}, %ctaid.x;");
@@ -2725,7 +2735,7 @@ internal static partial class Ptx
         entry = "range_" + f.Name;
         bool u64 = f.Is("uint64");
         var wide = u64 ? Lane.U64 : Lane.S64;
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), ctaid = b.R(), nctaid = b.R(), gid = b.R(), stride = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {ctaid}, %ctaid.x;");
@@ -2812,7 +2822,7 @@ internal static partial class Ptx
         entry = $"packt16_{f.Name}_{kind.Name}";
         if (f.Bits != 16 || kind.Bits != 16) throw new ArgumentException("a 16-bit type in its own 16-bit tensor kind");
         const int Tile = 64, Stride = 66;                                    // stride in halves: 132 bytes, a word multiple
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), col0 = b.R(), k0 = b.R(), smem = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {col0}, %ctaid.x;");
@@ -2890,7 +2900,7 @@ internal static partial class Ptx
         const int Cols = 64, Rows = 32, Stride = 33;                        // the tile: n columns, k rows; stride in elements
         int elem = kind.IsFloat ? 2 : 1;
         int wordsPerRow = Rows / kind.Per, totalWords = Cols * wordsPerRow, perThread = Math.Max(1, totalWords / 256);
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bx = b.R(), by = b.R(), col0 = b.R(), k0 = b.R(), smem = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bx}, %ctaid.x;");
@@ -3034,7 +3044,7 @@ internal static partial class Ptx
     public static string Softmax(Gpu gpu, Fmt f, Lane lane, int threads, out string entry)
     {
         entry = $"softmax_{f.Name}_{lane.Name}_t{threads}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         var (tid, src, dst, wordsPerRow, rowSrc, rowDst) = RowPrologue(b, f);
         string max = lane.NewReg(b);
         b.L($"mov.{lane.Reg} {max}, {lane.Literal(double.NegativeInfinity)};");
@@ -3066,7 +3076,7 @@ internal static partial class Ptx
     public static string RmsNorm(Gpu gpu, Fmt f, Lane lane, int threads, out string entry)
     {
         entry = $"rms_{f.Name}_{lane.Name}_t{threads}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         var (tid, src, dst, wordsPerRow, rowSrc, rowDst) = RowPrologue(b, f);
         string eps = lane.NewReg(b), cols = b.R();
         b.L($"ld.param.u32 {cols}, [p_cols];");
@@ -3102,7 +3112,7 @@ internal static partial class Ptx
     public static string SoftmaxRegs(Gpu gpu, Fmt f, Lane lane, int wordsPerThread, int threads, bool vector, out string entry)
     {
         entry = $"softmax_{f.Name}_{lane.Name}_r{wordsPerThread}_t{threads}{(vector ? "_v" : "")}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         var (tid, _, _, words, rowSrc, rowDst) = RowPrologue(b, f);
         var (present, inWords, values) = RowLoad(b, f, lane, tid, words, rowSrc, wordsPerThread, lane.Literal(double.NegativeInfinity), threads, vector);
         string max = lane.NewReg(b);
@@ -3140,7 +3150,7 @@ internal static partial class Ptx
     public static string RmsNormRegs(Gpu gpu, Fmt f, Lane lane, int wordsPerThread, int threads, bool vector, out string entry)
     {
         entry = $"rms_{f.Name}_{lane.Name}_r{wordsPerThread}_t{threads}{(vector ? "_v" : "")}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         var (tid, _, _, words, rowSrc, rowDst) = RowPrologue(b, f);
         string eps = lane.NewReg(b), cols = b.R();
         b.L($"ld.param.u32 {cols}, [p_cols];");

@@ -17,7 +17,7 @@ internal static partial class Ptx
     public static string RowOp(Gpu gpu, Fmt f, Lane lane, RowOp op, int perThread, int threads, bool vector, bool valueWise, bool second, out string entry, bool segmented = false)
     {
         entry = $"row_{op.Name}_{f.Name}_{lane.Name}_r{perThread}_t{threads}{(vector ? "_v" : "")}{(valueWise ? "_w" : "")}{(second ? "" : "_nosecond")}{(segmented ? "_seg" : "")}";
-        var c = new RowCtx(new PtxBuilder(), f, lane, perThread, threads, vector, valueWise, segmented);
+        var c = new RowCtx(new PtxBuilder(gpu), f, lane, perThread, threads, vector, valueWise, segmented);
         c.Prologue(op.Second && second);
         EmitRowOp(c, op);
         c.B.L("ret;");
@@ -38,7 +38,7 @@ internal static partial class Ptx
     public static string RowStats(Gpu gpu, Fmt f, Lane lane, RowOp op, int perThread, int threads, bool second, out string entry, bool segmented = false)
     {
         entry = $"rowstats_{op.Name}_{f.Name}_{lane.Name}_r{perThread}_t{threads}{(second ? "" : "_nosecond")}{(segmented ? "_seg" : "")}";
-        var c = new RowCtx(new PtxBuilder(), f, lane, perThread, threads, false, true, segmented) { Mode = RowMode.Stats };
+        var c = new RowCtx(new PtxBuilder(gpu), f, lane, perThread, threads, false, true, segmented) { Mode = RowMode.Stats };
         c.Prologue(op.Second && second);
         EmitRowOp(c, op);
         c.B.L("ret;");
@@ -50,7 +50,7 @@ internal static partial class Ptx
     public static string RowOpBlocks(Gpu gpu, Fmt f, Lane lane, RowOp op, bool second, bool out2, out string entry)
     {
         entry = $"rowblocks_{op.Name}_{f.Name}_{lane.Name}{(second ? "" : "_nosecond")}{(out2 ? "_y2" : "")}";
-        var c = new RowCtx(new PtxBuilder(), f, lane, 1, 1, false, true) { Mode = RowMode.Replay };
+        var c = new RowCtx(new PtxBuilder(gpu), f, lane, 1, 1, false, true) { Mode = RowMode.Replay };
         var b = c.B;
         c.PrologueReplay(op.Second && second);
         string n = b.R();
@@ -77,7 +77,7 @@ internal static partial class Ptx
     public static string NormStats(Gpu gpu, Fmt f, Lane lane, bool centered, int perThread, int threads, bool vector, bool valueWise, out string entry, bool segmented = false)
     {
         entry = $"norm_stats_{(centered ? "c" : "r")}_{f.Name}_{lane.Name}_r{perThread}_t{threads}{(vector ? "_v" : "")}{(valueWise ? "_w" : "")}{(segmented ? "_seg" : "")}";
-        var c = new RowCtx(new PtxBuilder(), f, lane, perThread, threads, vector, valueWise, segmented);
+        var c = new RowCtx(new PtxBuilder(gpu), f, lane, perThread, threads, vector, valueWise, segmented);
         c.Prologue(false);
         var b = c.B;
         string n = c.Count();
@@ -103,7 +103,7 @@ internal static partial class Ptx
     public static string NormParamsCols(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"norm_params_cols_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R(), split = b.R(), col = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");

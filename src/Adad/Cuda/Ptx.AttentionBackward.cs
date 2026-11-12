@@ -259,7 +259,7 @@ internal static partial class Ptx
         var (Br, Bc) = AttentionTile(lane);
         int T = RowsThreads, tpr = T / Br, spt = Bc / tpr, size = lane.Size;
         entry = $"attention_back_rows_{lane.Name}_d{dCap}{BackSuffix(f, runs)}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), qb = b.R(), h = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {qb}, %ctaid.x;");
@@ -490,7 +490,7 @@ internal static partial class Ptx
         var (Br, Bc) = AttentionTile(lane);
         int T = RowsThreads, tpk = T / Bc, spt = Br / tpk, size = lane.Size;
         entry = $"attention_back_keys_{lane.Name}_d{dCap}{BackSuffix(f, runs)}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), kb = b.R(), h = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {kb}, %ctaid.x;");

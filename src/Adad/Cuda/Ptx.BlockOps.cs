@@ -14,7 +14,7 @@ internal static partial class Ptx
     public static string AddBlocks(Gpu gpu, Fmt f, out string entry)
     {
         entry = $"add_{f.Name}_blocks";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string pa = Param64(b, "p_a"), pb = Param64(b, "p_b"), pc = Param64(b, "p_c"), n = Param32(b, "p_n");
         var w = BlockWarp(b, f, n);
         EncodeBlock(b, f, pc, w, n, at =>
@@ -32,7 +32,7 @@ internal static partial class Ptx
     public static string MapBlocks(Gpu gpu, Fmt f, MapOp op, out string entry)
     {
         entry = $"map_{op.Name}_{f.Name}_blocks";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string px = Param64(b, "p_x"), py = Param64(b, "p_y"), pz = Param64(b, "p_z"), po = Param64(b, "p_o"), n = Param32(b, "p_n");
         string a = b.F(), pb = b.F();
         b.L($"ld.param.f32 {a}, [p_a];");
@@ -56,7 +56,7 @@ internal static partial class Ptx
     public static string MapRowBlocks(Gpu gpu, Fmt f, MapOp op, out string entry)
     {
         entry = $"maprow_{op.Name}_{f.Name}_blocks";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string px = Param64(b, "p_x"), pv = Param64(b, "p_v"), po = Param64(b, "p_o"), n = Param32(b, "p_n"), cols = Param32(b, "p_cols");
         string zero = b.F();
         b.L($"mov.f32 {zero}, 0f00000000;");
@@ -77,7 +77,7 @@ internal static partial class Ptx
     public static string TransposeBlocks(Gpu gpu, Fmt f, out string entry)
     {
         entry = $"transpose_{f.Name}_blocks";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string px = Param64(b, "p_x"), po = Param64(b, "p_o"), rows = Param32(b, "p_rows"), cols = Param32(b, "p_cols"), n = b.R();
         b.L($"mul.lo.u32 {n}, {rows}, {cols};");
         var w = BlockWarp(b, f, n);

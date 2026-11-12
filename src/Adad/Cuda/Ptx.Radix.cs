@@ -28,7 +28,7 @@ internal static partial class Ptx
     public static string ScanTile(Gpu gpu, out string entry)
     {
         entry = "scan_tile";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R(), sm = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");
@@ -110,7 +110,7 @@ internal static partial class Ptx
     public static string ScanAdd(Gpu gpu, out string entry)
     {
         entry = "scan_add";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string pout = Param64(b, "p_out"), padd = Param64(b, "p_add"), n = Param32(b, "p_n"), pEnd = b.P();
         b.L($"setp.ge.u32 {pEnd}, {gid}, {n};");
@@ -167,7 +167,7 @@ internal static partial class Ptx
     public static string RadixTableOffsets(Gpu gpu, out string entry)
     {
         entry = "radix_table_offsets";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R(), i = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");
@@ -204,7 +204,7 @@ internal static partial class Ptx
     public static string RadixCount(Gpu gpu, out string entry)
     {
         entry = "radix_count";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R(), sm = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");
@@ -245,7 +245,7 @@ internal static partial class Ptx
     {
         entry = "radix_place";
         const int Running = 0, Warps = 1024;                                  // shared: running[256], then warpCount[8][256]
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R(), sm = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");

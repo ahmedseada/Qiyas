@@ -19,7 +19,7 @@ internal static partial class Ptx
     public static string ProductStore(Gpu gpu, Fmt f, Lane lane, StoreTerms t, out string entry)
     {
         entry = $"product_store_{f.Name}_{lane.Name}_{t.Key}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string ps = Param64(b, "p_s"), pl = Param64(b, "p_l"), pb = Param64(b, "p_b"), pr = Param64(b, "p_r"), px = Param64(b, "p_x"), py = Param64(b, "p_y"), pc = Param64(b, "p_c");
         string n = Param32(b, "p_n"), cols = Param32(b, "p_cols"), oc = Param32(b, "p_oc");
         string pa = lane.NewReg(b), pab = lane.NewReg(b), beta = lane.NewReg(b);

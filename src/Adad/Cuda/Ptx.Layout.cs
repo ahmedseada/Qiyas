@@ -31,7 +31,7 @@ internal static partial class Ptx
         if (perValue && inFmt is not null) throw new NotSupportedException("a thread per value: the inputs as the output's format");
         if (perValue) return LayoutPerValue(gpu, f, lane, name, out entry);
         entry = $"layout_{name}_{f.Name}_{lane.Name}{(inFmt is null ? "" : "_i" + inFmt.Name)}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R(), word = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");
@@ -82,7 +82,7 @@ internal static partial class Ptx
     {
         entry = $"layout_{name}_{f.Name}_blocks{(inFmt is null ? "" : "_i" + inFmt.Name)}";
         var lane = Lane.F32;
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string x = Param64(b, "p_x"), x2 = Param64(b, "p_x2"), idx = Param64(b, "p_idx"), aux = Param64(b, "p_aux"), outp = Param64(b, "p_out");
         string count = Param32(b, "p_count"), cols = Param32(b, "p_cols");
         var p = new string[LayoutParamCount];
@@ -111,7 +111,7 @@ internal static partial class Ptx
     private static string LayoutPerValue(Gpu gpu, Fmt f, Lane lane, string name, out string entry)
     {
         entry = $"layout_{name}_{f.Name}_{lane.Name}_v";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R(), at = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");
@@ -170,7 +170,7 @@ internal static partial class Ptx
         if (name is not ("maxpool_bwd" or "adaptive_maxpool_bwd")) throw new NotSupportedException($"window first-ranked of {name}");
         bool adaptive = name == "adaptive_maxpool_bwd";
         entry = $"layout_argmax_{name}_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R(), i = b.R(), pd = b.P();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");
@@ -905,7 +905,7 @@ internal static partial class Ptx
     public static string PlaceBits(Gpu gpu, Fmt f, out string entry)
     {
         entry = $"place_bits_{f.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R(), i = b.R(), src = Param64(b, "p_src"), dst = Param64(b, "p_dst"), count = Param32(b, "p_count"), offset = Param32(b, "p_offset"), pEnd = b.P();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");
@@ -942,7 +942,7 @@ internal static partial class Ptx
     public static string ScatterCount(Gpu gpu, out string entry)
     {
         entry = "scatter_count";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R(), i = b.R(), n = Param32(b, "p_n"), targets = Param32(b, "p_targets"), idx = Param64(b, "p_idx"), counts = Param64(b, "p_counts"), pEnd = b.P();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");

@@ -18,7 +18,7 @@ internal static partial class Ptx
     public static string ResampleRows(Gpu gpu, Fmt inFmt, Lane lane, out string entry)
     {
         entry = $"resample_rows_{inFmt.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string px = Param64(b, "p_x"), pb = Param64(b, "p_bounds"), pw = Param64(b, "p_w"), pm = Param64(b, "p_mid");
         string n = Param32(b, "p_n"), width = Param32(b, "p_width"), across = Param32(b, "p_across"), taps = Param32(b, "p_taps");
         string i = GlobalIndex(b), p = b.P();
@@ -47,7 +47,7 @@ internal static partial class Ptx
     public static string ResampleOut(Gpu gpu, Fmt f, Fmt srcFmt, Lane lane, bool vertical, bool norm, out string entry)
     {
         entry = $"resample_out_{f.Name}_{srcFmt.Name}_{lane.Name}{(vertical ? "_v" : "")}{(norm ? "_n" : "")}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string ps = Param64(b, "p_src"), pb = Param64(b, "p_bounds"), pw = Param64(b, "p_w"), pv = Param64(b, "p_values"), py = Param64(b, "p_y");
         string count = Param32(b, "p_count"), oh = Param32(b, "p_oh"), ow = Param32(b, "p_ow"), h = Param32(b, "p_h"), across = Param32(b, "p_across"), taps = Param32(b, "p_taps");
         string rb = Param32(b, "p_rb"), rw = Param32(b, "p_rw"), channels = Param32(b, "p_channels");

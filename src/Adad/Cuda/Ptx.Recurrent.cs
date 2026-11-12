@@ -23,7 +23,7 @@ internal static partial class Ptx
     public static string Cell(Gpu gpu, Fmt f, Lane lane, string kind, bool backward, out string entry, CellFormats? formats = null)
     {
         entry = $"cell_{kind}{(backward ? "_bwd" : "")}_{f.Name}_{lane.Name}{(formats is null ? "" : "_m" + formats.Name)}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R(), word = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");

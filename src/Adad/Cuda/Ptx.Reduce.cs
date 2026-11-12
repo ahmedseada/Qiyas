@@ -52,7 +52,7 @@ internal static partial class Ptx
         if (storeF32 && !compensated) throw new ArgumentException("the f32 store is the compensated pass's");
         if (table && storeF32) throw new ArgumentException("the table is the chunk pass's");
         if (compensated && (lane.Name != "f32" || op != "sum")) throw new ArgumentException("the compensated pass is a float sum in the f32 lane");
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), row = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {row}, %ctaid.x;");
@@ -159,7 +159,7 @@ internal static partial class Ptx
     {
         entry = $"sum_rows_words_{(squares ? "sq" : "")}_{f.Name}";
         if (!f.IsFloat || f.IsBlock || f.WordBits != 32) throw new ArgumentException("a plain float format in 32-bit words");
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), row = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {row}, %ctaid.x;");
@@ -255,7 +255,7 @@ internal static partial class Ptx
     public static string ArgmaxRows(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"argmax_rows_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), row = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {row}, %ctaid.x;");
@@ -328,7 +328,7 @@ internal static partial class Ptx
     public static string ReduceCols(Gpu gpu, Fmt f, Lane lane, string op, bool squares, out string entry)
     {
         entry = $"reduce_cols_{op}{(squares ? "sq" : "")}_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string src = Param64(b, "p_x"), dst = Param64(b, "p_out"), rows = Param32(b, "p_rows"), cols = Param32(b, "p_cols"), per = Param32(b, "p_per");
         string pEnd = b.P(), acc = lane.NewReg(b), r = b.R(), idx = b.R(), pLoop = b.P(), split = b.R(), rEnd = b.R();
@@ -365,7 +365,7 @@ internal static partial class Ptx
     public static string MapRow(Gpu gpu, Fmt f, Lane lane, MapOp op, out string entry)
     {
         entry = $"maprow_{op.Name}_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string px = Param64(b, "p_x"), pv = Param64(b, "p_v"), po = Param64(b, "p_o"), n = Param32(b, "p_n"), cols = Param32(b, "p_cols");
         string zero = lane.NewReg(b);
@@ -426,7 +426,7 @@ internal static partial class Ptx
     {
         entry = $"transpose_{f.Name}{(valueWise ? "_v" : "")}";
         const int T = TransposeTile;
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bx = b.R(), by = b.R(), tx = b.R(), ty = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bx}, %ctaid.x;");
@@ -582,7 +582,7 @@ internal static partial class Ptx
     public static string GemvRows(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"gemv_rows_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), ctaid = b.R(), laneId = b.R(), warp = b.R(), row = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {ctaid}, %ctaid.x;");
@@ -623,7 +623,7 @@ internal static partial class Ptx
     public static string GemvCols(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"gemv_cols_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string pa = Param64(b, "p_a"), px = Param64(b, "p_x"), py = Param64(b, "p_y"), rows = Param32(b, "p_rows"), cols = Param32(b, "p_cols"), per = Param32(b, "p_per");
         string pEnd = b.P(), acc = lane.NewReg(b), r = b.R(), idx = b.R(), pLoop = b.P(), split = b.R(), rEnd = b.R();

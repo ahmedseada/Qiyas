@@ -33,7 +33,7 @@ internal static partial class Ptx
     public static string CacheBlocks(Gpu gpu, Fmt fb, Fmt fx, out string entry)
     {
         entry = $"cache_blocks_{fb.Name}_from_{fx.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string px = Param64(b, "p_x"), ps = Param64(b, "p_s"), pos = Param64(b, "p_pos");
         string n = Param32(b, "p_n"), cap = Param32(b, "p_cap"), steps = Param32(b, "p_steps"), unit = Param32(b, "p_unit");
         var w = BlockWarp(b, fb, n);
@@ -92,7 +92,7 @@ internal static partial class Ptx
     public static string CacheRowsBlocks(Gpu gpu, Fmt fb, Fmt fx, out string entry)
     {
         entry = $"cache_rows_blocks_{fb.Name}_from_{fx.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string px = Param64(b, "p_x"), pc = Param64(b, "p_c"), pos = Param64(b, "p_pos");
         string n = Param32(b, "p_n"), steps = Param32(b, "p_steps"), cap = Param32(b, "p_cap"), bpr = Param32(b, "p_bpr");
         var w = BlockWarp(b, fb, n);
@@ -126,7 +126,7 @@ internal static partial class Ptx
     public static string CacheWrite(Gpu gpu, Fmt f, Fmt fc, Lane lane, out string entry)
     {
         entry = $"cache_write_{f.Name}_{fc.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string word = GlobalIndex(b);
         string px = Param64(b, "p_x"), pc = Param64(b, "p_c"), pos = Param64(b, "p_pos");
         string rows = Param32(b, "p_rows"), steps = Param32(b, "p_steps"), cap = Param32(b, "p_cap"), d = Param32(b, "p_d"), wpr = Param32(b, "p_wpr");
@@ -174,7 +174,7 @@ internal static partial class Ptx
     public static string DecoderMask(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"decoder_mask_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string py = Param64(b, "p_y"), pos = Param64(b, "p_pos"), n = Param32(b, "p_n"), cap = Param32(b, "p_cap"), win = Param32(b, "p_win");
         string low = lane.NewReg(b), p = b.R(), noWin = b.P();
         b.L($"ld.param.{lane.Op} {low}, [p_low];");
@@ -203,7 +203,7 @@ internal static partial class Ptx
     public static string PositionAdvance(Gpu gpu, out string entry)
     {
         entry = "position_advance";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string pos = Param64(b, "p_pos"), steps = Param32(b, "p_steps"), p = b.R();
         b.L($"ld.global.s32 {p}, [{pos}];");
         b.L($"add.s32 {p}, {p}, {steps};");

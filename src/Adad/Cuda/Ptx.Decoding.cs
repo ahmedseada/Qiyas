@@ -30,7 +30,7 @@ internal static partial class Ptx
     public static string HistoryPush(Gpu gpu, out string entry)
     {
         entry = "history_push";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string r = GlobalIndex(b);
         string ids = Param64(b, "p_ids"), hist = Param64(b, "p_hist"), len = Param64(b, "p_len"), rows = Param32(b, "p_rows"), cap = Param32(b, "p_cap");
         string pEnd = b.P(), l = b.R(), slot = b.R(), at = b.R(), ia = b.RD(), ha = b.RD(), id = b.R();
@@ -62,7 +62,7 @@ internal static partial class Ptx
     {
         entry = $"penalty_window_{slots}";
         int shift = int.Log2(slots);
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string hist = Param64(b, "p_hist"), len = Param64(b, "p_len"), win = Param64(b, "p_win"), rows = Param32(b, "p_rows"), cap = Param32(b, "p_cap"), nmax = Param32(b, "p_nmax");
         string r = b.R(), j = b.R(), pEnd = b.P(), l = b.R(), n = b.R(), rowBase = b.R(), last = b.R();
@@ -166,7 +166,7 @@ internal static partial class Ptx
     {
         entry = $"penalize_rows_{f.Name}_{lane.Name}_{slots}{(sparse ? "_sparse" : "")}";
         int shift = int.Log2(slots);
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string px = Param64(b, "p_x"), win = Param64(b, "p_win"), py = Param64(b, "p_y");
         string n = Param32(b, "p_n"), cols = Param32(b, "p_cols"), stride = Param32(b, "p_stride"), off = Param32(b, "p_off");
         string rep = lane.NewReg(b), pres = lane.NewReg(b), freq = lane.NewReg(b);

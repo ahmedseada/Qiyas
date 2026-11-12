@@ -79,7 +79,7 @@ internal static partial class Ptx
     public static string GroupCoefs(Gpu gpu, Fmt f, Lane lane, bool backward, bool given, bool gamma, out string entry)
     {
         entry = $"group_coefs_{f.Name}_{lane.Name}{(backward ? "_bwd" : "")}{(given ? "_given" : "")}{(gamma ? "_g" : "")}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), g = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {g}, %ctaid.x;");
@@ -219,7 +219,7 @@ internal static partial class Ptx
     public static string GroupOut(Gpu gpu, Fmt f, Lane lane, bool backward, bool gamma, bool beta, out string entry)
     {
         entry = $"group_out_{f.Name}_{lane.Name}{(backward ? "_bwd" : "")}{(gamma ? "_g" : "")}{(beta ? "_b" : "")}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string px = Param64(b, "p_x"), pdy = Param64(b, "p_dy"), pg = Param64(b, "p_g"), pb = Param64(b, "p_b"), pcoef = Param64(b, "p_coef"), py = Param64(b, "p_y");
         string n = Param32(b, "p_n"), groups = Param32(b, "p_groups"), inner = Param32(b, "p_inner"), channels = Param32(b, "p_channels"), spatial = Param32(b, "p_spatial");
         WordOut(b, f, lane, px, pdy, py, n, backward, (idx, x, dy) =>
@@ -266,7 +266,7 @@ internal static partial class Ptx
     public static string GroupParams(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"group_params_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), c = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {c}, %ctaid.x;");
@@ -311,7 +311,7 @@ internal static partial class Ptx
     public static string RopeOut(Gpu gpu, Fmt f, Lane lane, bool interleaved, bool inverse, bool rotate, out string entry)
     {
         entry = $"rope_out_{f.Name}_{lane.Name}{(interleaved ? "_il" : "")}{(inverse ? "_inv" : "")}{(rotate ? "" : "_norot")}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string px = Param64(b, "p_x"), pcos = Param64(b, "p_cos"), psin = Param64(b, "p_sin"), ppos = Param64(b, "p_pos"), py = Param64(b, "p_y");
         string n = Param32(b, "p_n"), cols = Param32(b, "p_cols"), heads = Param32(b, "p_heads"), steps = Param32(b, "p_steps"), half = Param32(b, "p_half");
         string nm1 = b.R();

@@ -64,7 +64,7 @@ internal static partial class Ptx
     public static string Dropout(Gpu gpu, Fmt f, Lane lane, bool residual, out string entry)
     {
         entry = $"dropout_{f.Name}_{lane.Name}{(residual ? "_res" : "")}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string px = Param64(b, "p_x"), pr = Param64(b, "p_r"), po = Param64(b, "p_o"), n = Param32(b, "p_n"), ka = Param32(b, "p_ka"), kb = Param32(b, "p_kb"), thr = Param32(b, "p_thr");
         string s = lane.NewReg(b);
@@ -116,7 +116,7 @@ internal static partial class Ptx
     public static string DropoutBlocks(Gpu gpu, Fmt f, bool residual, out string entry)
     {
         entry = $"dropout_{f.Name}_blocks{(residual ? "_res" : "")}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string px = Param64(b, "p_x"), pr = Param64(b, "p_r"), po = Param64(b, "p_o"), n = Param32(b, "p_n"), ka = Param32(b, "p_ka"), kb = Param32(b, "p_kb"), thr = Param32(b, "p_thr");
         string s = b.F();
         b.L($"ld.param.f32 {s}, [p_s];");
@@ -183,7 +183,7 @@ internal static partial class Ptx
         entry = $"convert_{ff.Name}_{ft.Name}";
         var (lane, toOdd) = Fmt.ConvertPlan(ff, ft);
         var nat = ff.IsBlock ? Lane.F32 : ff.Natural;
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string px = Param64(b, "p_x"), po = Param64(b, "p_o"), n = Param32(b, "p_n");
         string words = WordsOf(b, ft, n), p = b.P(), last = b.R();
@@ -256,7 +256,7 @@ internal static partial class Ptx
     public static string ConvertBlocks(Gpu gpu, Fmt ff, Fmt ft, out string entry)
     {
         entry = $"convert_{ff.Name}_{ft.Name}_blocks";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string px = Param64(b, "p_x"), po = Param64(b, "p_o"), n = Param32(b, "p_n");
         var w = BlockWarp(b, ft, n);
         EncodeBlock(b, ft, po, w, n, at => Codec.UnpackAt(b, ff, px, at, Lane.F32));

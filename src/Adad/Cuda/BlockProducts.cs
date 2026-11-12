@@ -20,7 +20,7 @@ internal static partial class Ptx
     public static string GemvBlocks(Gpu gpu, Fmt f, bool dp4a, out string entry)
     {
         entry = $"gemv_blocks_{f.Name}{(dp4a ? "_dp" : "")}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R(), row = b.R(), a = Param64(b, "p_a"), x = Param64(b, "p_x"), y = Param64(b, "p_y"), rows = Param32(b, "p_rows"), blocks = Param32(b, "p_blocks"), pEnd = b.P();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");

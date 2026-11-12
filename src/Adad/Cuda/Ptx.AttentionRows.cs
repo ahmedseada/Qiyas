@@ -38,7 +38,7 @@ internal static partial class Ptx
         int T = RowsThreads, tpr = T / Br, spt = Bc / tpr, vec = 16 / lane.Size, stride = dCap + vec, nvec = dCap / (vec * tpr), size = lane.Size;
         int logTpr = System.Numerics.BitOperations.Log2((uint)tpr), logD = System.Numerics.BitOperations.Log2((uint)dCap);
         entry = $"attention_rows_{f.Name}_{lane.Name}_d{dCap}{(outFmt is null ? "" : "_o" + outFmt.Name)}{(runs ? "_runs" : "")}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), qb = b.R(), h = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {qb}, %ctaid.x;");

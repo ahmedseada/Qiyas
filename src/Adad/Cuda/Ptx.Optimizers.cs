@@ -51,7 +51,7 @@ internal static partial class Ptx
     public static string Optimizer(Gpu gpu, Fmt f, Lane lane, string name, out string entry, bool scaled = false, bool table = false)
     {
         entry = $"optimizer_{name}_{f.Name}_{lane.Name}{(scaled ? "_gs" : "")}{(table ? "_tab" : "")}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R(), word = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");
@@ -134,7 +134,7 @@ internal static partial class Ptx
     {
         entry = $"optimizer_{name}_{f.Name}_blocks{(scaled ? "_gs" : "")}";
         var lane = Lane.F32;
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string pp = Param64(b, "p_p"), pg = Param64(b, "p_g"), pm = Param64(b, "p_m"), pv = Param64(b, "p_v"), n = Param32(b, "p_n");
         var k = StepScalars.Load(b, lane);
         string? gs = scaled ? GradientScale(b, lane) : null;

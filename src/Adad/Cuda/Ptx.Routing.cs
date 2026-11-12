@@ -17,7 +17,7 @@ internal static partial class Ptx
     public static string TopKRows(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"topk_rows_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), row = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {row}, %ctaid.x;");
@@ -131,6 +131,9 @@ internal static partial class Ptx
     internal static void First(PtxBuilder b, Lane lane, string d, string a, string c)
     {
         if (!lane.IsFloat) { b.L($"max.{lane.Op} {d}, {a}, {c};"); return; }
+        // A device of capability 8.0 or more has the order's max of two f32 in one instruction (max.NaN: a NaN where either
+        // is one, the canonical NaN; else max's): every NaN is one key in Adad's order.
+        if (lane.Name == "f32" && b.Capability >= 80) { b.L($"max.NaN.f32 {d}, {a}, {c};"); return; }
         string t = lane.NewReg(b), pa = b.P(), pc = b.P();
         b.L($"testp.notanumber.{lane.Op} {pa}, {a};");
         b.L($"testp.notanumber.{lane.Op} {pc}, {c};");
@@ -175,7 +178,7 @@ internal static partial class Ptx
     {
         entry = $"gather_rows_{f.Name}";
         var lane = f.IsBlock ? Lane.F32 : f.Natural;
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string x = Param64(b, "p_x"), index = Param64(b, "p_index"), po = Param64(b, "p_o"), n = Param32(b, "p_n"), cols = Param32(b, "p_cols"), k = Param32(b, "p_k");
         StoreEach(b, f, lane, po, n, at =>
         {
@@ -285,7 +288,7 @@ internal static partial class Ptx
     {
         entry = $"log_prob_rows_{f.Name}_{lane.Name}";
         const int Threads = ReduceThreads, Sums = 4;
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), row = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {row}, %ctaid.x;");
@@ -358,7 +361,7 @@ internal static partial class Ptx
     public static string CrossEntropyRows(Gpu gpu, Fmt f, Lane lane, bool weighted, out string entry)
     {
         entry = $"cross_entropy_rows_{f.Name}_{lane.Name}{(weighted ? "_w" : "")}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), row = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {row}, %ctaid.x;");
@@ -496,7 +499,7 @@ internal static partial class Ptx
     public static string SampleRows(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"sample_rows_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), row = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {row}, %ctaid.x;");

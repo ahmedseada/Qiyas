@@ -34,7 +34,7 @@ internal static partial class Ptx
         int bb = f.BlockBytes, halves = bb / 2, tile = BlocksTile, rowB = BlocksRow, ks = BlocksStage, T = BlocksThreads;
         int rowHalves = ks * halves, slab = tile * rowB;                       // a row's halves per stage; one k-block's tile
         int aOff = 0, bOff = ks * slab, saOff = 2 * ks * slab, sbOff = saOff + ks * tile * 4, shared = sbOff + ks * tile * 4;
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bx = b.R(), by = b.R(), sm = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bx}, %ctaid.x;");

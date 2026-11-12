@@ -39,7 +39,7 @@ internal static partial class Ptx
     public static string SampleWeights(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"sample_weights_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), row = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {row}, %ctaid.x;");
@@ -105,7 +105,7 @@ internal static partial class Ptx
         bool wide = natural.Wide;
         string kt = wide ? "u64" : "u32", kbits = wide ? "b64" : "b32";
         var keyLane = wide ? Lane.U64 : Lane.U32;
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string Key() => wide ? b.RD() : b.R();
         string tid = b.R(), row = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
@@ -624,7 +624,7 @@ internal static partial class Ptx
     public static string OrderKeys(Gpu gpu, Fmt f, out string entry)
     {
         entry = $"order_keys_{f.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string px = Param64(b, "p_x"), pk = Param64(b, "p_keys"), n = Param32(b, "p_n"), pEnd = b.P();
         b.L($"setp.ge.u32 {pEnd}, {gid}, {n};");

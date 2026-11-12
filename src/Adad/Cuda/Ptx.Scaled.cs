@@ -31,7 +31,7 @@ internal static partial class Ptx
     {
         entry = $"quantize_range_{f.Name}_{lane.Name}{(zeros ? "_z" : "")}";
         const int Threads = 256;
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), si = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {si}, %ctaid.x;");
@@ -133,7 +133,7 @@ internal static partial class Ptx
     public static string QuantizeZeros(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"quantize_zeros_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string ps = Param64(b, "p_s"), pl = Param64(b, "p_l"), pz = Param64(b, "p_z"), n = Param32(b, "p_n");
         string min = lane.NewReg(b), max = lane.NewReg(b), pEnd = b.P();
@@ -161,7 +161,7 @@ internal static partial class Ptx
     public static string QuantizeCodes(Gpu gpu, Fmt f, Fmt fw, Lane lane, bool zeros, out string entry)
     {
         entry = $"quantize_codes_{f.Name}_{fw.Name}_{lane.Name}{(zeros ? "_z" : "")}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string px = Param64(b, "p_x"), ps = Param64(b, "p_s"), pz = Param64(b, "p_z"), pc = Param64(b, "p_c");
         string n = Param32(b, "p_n"), k = Param32(b, "p_k"), br = Param32(b, "p_br"), bc = Param32(b, "p_bc"), sc = Param32(b, "p_sc");
         string min = lane.NewReg(b), max = lane.NewReg(b);
@@ -196,7 +196,7 @@ internal static partial class Ptx
     public static string ExpandScaled(Gpu gpu, Fmt f, Fmt fw, Lane lane, bool zeros, out string entry)
     {
         entry = $"expand_scaled_{fw.Name}_{f.Name}_{lane.Name}{(zeros ? "_z" : "")}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string pc = Param64(b, "p_c"), ps = Param64(b, "p_s"), pz = Param64(b, "p_z"), py = Param64(b, "p_y");
         string n = Param32(b, "p_n"), k = Param32(b, "p_k"), br = Param32(b, "p_br"), bc = Param32(b, "p_bc"), sc = Param32(b, "p_sc");
         StoreEach(b, f, lane, py, n, at =>

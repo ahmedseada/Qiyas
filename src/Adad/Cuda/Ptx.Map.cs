@@ -679,7 +679,7 @@ internal static partial class Ptx
     {
         if (fo.IsBlock || fo.Bits < 8) throw new ArgumentException($"{fo.Name}: the mixed map stores whole bytes");
         entry = $"mapmix_{op.Name}_{fx.Name}_{fy.Name}_{fo.Name}_{lane.Name}{(row ? "_row" : "")}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string px = Param64(b, "p_x"), py = Param64(b, "p_y"), po = Param64(b, "p_o"), n = Param32(b, "p_n"), cols = Param32(b, "p_cols"), xoff = Param32(b, "p_xoff"), yoff = Param32(b, "p_yoff");
         string a = lane.NewReg(b), pb = lane.NewReg(b), p = b.P(), ix = b.R(), iy = b.R();
@@ -703,7 +703,7 @@ internal static partial class Ptx
     public static string Map(Gpu gpu, Fmt f, Lane lane, MapOp op, out string entry)
     {
         entry = $"map_{op.Name}_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string gid = GlobalIndex(b);
         string px = Param64(b, "p_x"), py = Param64(b, "p_y"), pz = Param64(b, "p_z"), po = Param64(b, "p_o"), n = Param32(b, "p_n");
         string a = lane.NewReg(b), pb = lane.NewReg(b);

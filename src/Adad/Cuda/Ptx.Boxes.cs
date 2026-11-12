@@ -15,7 +15,7 @@ internal static partial class Ptx
     public static string BoxLoss(Gpu gpu, Fmt f, Lane lane, BoxOverlap overlap, bool backward, out string entry)
     {
         entry = $"box_{Boxes.Name(overlap)}{(backward ? "_bwd" : "")}_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string pp = Param64(b, "p_p"), pt = Param64(b, "p_t"), pd = Param64(b, "p_d"), py = Param64(b, "p_y"), n = Param32(b, "p_n");
         string eps = lane.NewReg(b);
         b.L($"ld.param.{lane.Mem} {eps}, [p_eps];");

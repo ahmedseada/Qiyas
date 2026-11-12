@@ -329,7 +329,7 @@ internal static partial class Ptx
         int ksteps = dCap / 16, ntO = dCap / 8, ntS = Bc / 8;
         var F = Lane.F32;
         entry = $"attention_back_rows_mma_{f.Name}_{kind.Name}_d{dCap}_{load}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), qb = b.R(), h = b.R(), warp = b.R(), ln = b.R(), g = b.R(), t4 = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {qb}, %ctaid.x;");
@@ -617,7 +617,7 @@ internal static partial class Ptx
         int ntO = dCap / 8;
         var F = Lane.F32;
         entry = $"attention_back_keys_mma_{f.Name}_{kind.Name}_d{dCap}_{load}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), kb = b.R(), h = b.R(), warp = b.R(), ln = b.R(), g = b.R(), t4 = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {kb}, %ctaid.x;");

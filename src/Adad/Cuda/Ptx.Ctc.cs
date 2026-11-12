@@ -38,7 +38,7 @@ internal static partial class Ptx
         entry = $"ctc_rows_{lane.Name}_{(backward ? "bwd" : "fwd")}{CtcSuffix(fx, fo)}";
         int size = lane.Size;
         string op = lane.Op, mem = lane.Mem, negInf = lane.Literal(double.NegativeInfinity), zero = lane.Literal(0);
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), blk = b.R(), warp = b.R(), ln = b.R(), r = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {blk}, %ctaid.x;");
@@ -191,7 +191,7 @@ internal static partial class Ptx
         entry = $"ctc{(oneState ? "1" : "")}_{lane.Name}_{(backward ? "bwd" : "fwd")}_{cap}{CtcSuffix(fx, fo)}";
         int size = lane.Size, bufBytes = (cap + 2) * size, gOff = 2 * bufBytes, pOff = gOff + cap * size;
         string op = lane.Op, mem = lane.Mem, negInf = lane.Literal(double.NegativeInfinity), zero = lane.Literal(0);
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), seq = b.R(), sm = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {seq}, %ctaid.x;");

@@ -19,7 +19,7 @@ internal static partial class Ptx
     public static string LanesToBlock(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"lanes_to_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        var b = new PtxBuilder(gpu);
         string x = Param64(b, "p_x"), outp = Param64(b, "p_out"), n = Param32(b, "p_n");
         var w = BlockWarp(b, f, n);
         EncodeBlock(b, f, outp, w, n, at =>
