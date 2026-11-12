@@ -14,7 +14,7 @@ namespace Adad.Cuda;
 internal static unsafe partial class Driver
 {
     // "nvcuda" is the driver's name on Windows; elsewhere a resolver maps it to libcuda (set only where no other
-    // binding in this assembly has set one: the bench also carries the lib's).
+    // resolver for this assembly is set: a host program may have set its own).
     private const string Library = "nvcuda";
 
     static Driver()

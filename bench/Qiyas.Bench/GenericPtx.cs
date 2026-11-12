@@ -315,7 +315,7 @@ internal static class GenericPtx
             add.u64 %rd2, %rd2, %rd3;
         """;
 
-    // e = exp(x - max) in T where PTX has the instruction (f32: ex2.approx.ftz.f32 as the lib's softmax; f16: ex2.approx.f16).
+    // e = exp(x - max) in T where PTX has the instruction (f32: ex2.approx.ftz.f32; f16: ex2.approx.f16, the instructions PTX has for exp in T).
     private static string Exp(PtxType t) => t.Name switch
     {
         "f32" => $"sub.f32 %e, %x, %acc_max;\n    mul.f32 %e, %e, {t.Log2ELiteral};\n    ex2.approx.ftz.f32 %e, %e;",
