@@ -256,13 +256,18 @@ internal static partial class Ptx
     /// scores by the lanes' products joined by shuffles, the running softmax rescaled (online), the context p · v. Each warp
     /// writes its part's m, l and context (unnormalized) to p_ws; DecodeCombine joins the parts in order. The device's
     /// warps all at work where a block a query left most of them idle (32 heads, one query: 32 blocks on 70 multiprocessors)
-    /// and K read along its rows (a thread a key read across them). K and V not a block format (the runs kernel's).</summary>
-    public static string AttentionDecodeSplit(Gpu gpu, Fmt f, Lane lane, int dCap, out string entry, DecodeCache? cache = null)
+    /// and K read along its rows (a thread a key read across them).
+    /// runs (K and V a block format, d a multiple of 8, dCap at most 256): each lane takes 8 consecutive dimensions
+    /// (8·lane …), a key's run of them decoded at once (Codec.UnpackRun: the block's and the sub-block's scales read once a
+    /// run) where a value at a time decoded them per value.</summary>
+    public static string AttentionDecodeSplit(Gpu gpu, Fmt f, Lane lane, int dCap, out string entry, DecodeCache? cache = null, bool runs = false)
     {
-        entry = $"attention_decode_split_{f.Name}_{lane.Name}_d{dCap}{(cache is null ? "" : "_at_" + cache.Key)}";
+        entry = $"attention_decode_split_{f.Name}_{lane.Name}_d{dCap}{(cache is null ? "" : "_at_" + cache.Key)}{(runs ? "_runs" : "")}";
         var fk = cache?.Fc ?? f;
-        if (fk.IsBlock) throw new NotSupportedException("the split decode reads K and V value by value: a block format's take the runs kernel");
-        int perLane = dCap / 32;
+        if (fk.IsBlock && !runs) throw new NotSupportedException("the split decode reads a block format's K and V in runs");
+        if (runs && dCap > 256) throw new NotSupportedException("the split decode's runs: 8 dimensions a lane, dCap at most 256");
+        const int Run = 8;
+        int perLane = runs ? Run : dCap / 32;
         var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R(), split = b.R(), warp = b.R(), wl = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
@@ -333,7 +338,8 @@ internal static partial class Ptx
         {
             dim[e] = b.R(); inD[e] = b.P(); qr[e] = lane.NewReg(b);
             string at = b.R(), idx = b.R();
-            b.L($"add.u32 {dim[e]}, {wl}, {32 * e};");
+            if (runs) b.L($"mad.lo.u32 {dim[e]}, {wl}, {Run}, {e};");
+            else b.L($"add.u32 {dim[e]}, {wl}, {32 * e};");
             b.L($"setp.lt.u32 {inD[e]}, {dim[e]}, {d};");
             b.L($"min.u32 {at}, {dim[e]}, {dm1};");
             b.L($"add.u32 {idx}, {qBase}, {at};");
@@ -368,8 +374,28 @@ internal static partial class Ptx
             b.L($"mov.{lane.Reg} {s[g]}, {lane.Zero};");
         }
 
+        // A key's run of this lane's 8 dimensions (runs): decoded at once, 0 where the run is past d.
+        string[] RunOf(string src, string row)
+        {
+            string idx = b.R();
+            b.L($"add.u32 {idx}, {row}, {dim[0]};");
+            b.L($"@!{inD[0]} mov.u32 {idx}, {row};");
+            var vals = Codec.UnpackRun(b, fk, src, idx, Run, lane);
+            var kept = new string[Run];
+            for (int e = 0; e < Run; e++) { kept[e] = lane.NewReg(b); b.L($"selp.{lane.Op} {kept[e]}, {vals[e]}, {lane.Zero}, {inD[0]};"); }
+            return kept;
+        }
+
         // The scores: this lane's products, then the warp's sum by butterflies (every lane holds it).
-        for (int e = 0; e < perLane; e++)
+        if (runs)
+        {
+            for (int g = 0; g < G; g++)
+            {
+                var kr = RunOf(k, rowAt[g]);
+                for (int e = 0; e < Run; e++) b.L(lane.Fma(s[g], qr[e], kr[e], s[g]));
+            }
+        }
+        else for (int e = 0; e < perLane; e++)
         {
             for (int g = 0; g < G; g++)
             {
@@ -420,7 +446,16 @@ internal static partial class Ptx
         b.L(lane.Fma(l, l, alpha, psum));
         b.L($"mov.{lane.Reg} {m}, {mNew};");
         // The context: acc = alpha·acc + Σ_g p_g · v_g (this lane's dimensions).
-        for (int e = 0; e < perLane; e++)
+        if (runs)
+        {
+            for (int e = 0; e < Run; e++) b.L(lane.Mul(acc[e], acc[e], alpha));
+            for (int g = 0; g < G; g++)
+            {
+                var vr = RunOf(v, rowAt[g]);
+                for (int e = 0; e < Run; e++) b.L(lane.Fma(acc[e], p[g], vr[e], acc[e]));
+            }
+        }
+        else for (int e = 0; e < perLane; e++)
         {
             b.L(lane.Mul(acc[e], acc[e], alpha));
             for (int g = 0; g < G; g++)
@@ -451,7 +486,7 @@ internal static partial class Ptx
             string at = b.RD();
             b.L($"mul.wide.u32 {at}, {dim[e]}, {lane.Size};");
             b.L($"add.u64 {at}, {wAddr}, {at};");
-            b.L($"st.global.{lane.Mem} [{at}+{2 * lane.Size}], {acc[e]};");
+            b.L($"@{inD[e]} st.global.{lane.Mem} [{at}+{2 * lane.Size}], {acc[e]};");          // dimensions past d (a run's lanes past it) not stored
         }
 
         b.L("ret;");

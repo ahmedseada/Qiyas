@@ -63,8 +63,8 @@ public sealed partial class GpuOps
         ulong lo = f.IsBlock ? gpu.Rent(a.QValues * 4) : o;
         try
         {
-            if (!fc.IsBlock && DecodeSplit(f, lane, dCap, over, a.KvHeadCount * rows, a.Lk, lo, f.IsBlock ? Fmt.Of<Float32>() : null, [q, k, v],
-                    [position, 0, Gpu.U(rows), Gpu.U(a.Lk), Gpu.U(a.D), LaneValue(lane, a.Scale)], [Gpu.U(a.Lq), Gpu.U(a.Window), LaneValue(lane, a.Softcap)]))
+            if ((!fc.IsBlock || a.D % 8 == 0) && DecodeSplit(f, lane, dCap, over, a.KvHeadCount * rows, a.Lk, lo, f.IsBlock ? Fmt.Of<Float32>() : null, [q, k, v],
+                    [position, 0, Gpu.U(rows), Gpu.U(a.Lk), Gpu.U(a.D), LaneValue(lane, a.Scale)], [Gpu.U(a.Lq), Gpu.U(a.Window), LaneValue(lane, a.Softcap)], runs: fc.IsBlock))
             {
                 if (!f.IsBlock) return lane.Name;
                 Back(f, lane, lo, o, a.QValues);
