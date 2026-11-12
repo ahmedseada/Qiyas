@@ -182,9 +182,24 @@ internal sealed partial class Kernels
             return (new Boundary(true, top[topK - 1].Key, top[topK - 1].Col), n);
         }
 
-        // Equal keys past the room: lo is the k-th column's key; its columns cut by column order.
+        // Equal keys past the room: lo is the k-th column's key; its columns cut by column order. Where the k fit `top`, they
+        // are gathered as the room's are (the keys above lo, then lo's first columns in column order: exactly the first k of
+        // the order), so the nucleus and the draw read them alone.
         long above = lo == ulong.MaxValue ? 0 : CountAtLeast(k, lo + 1);
         long need = topK - above;
+        if (topK <= top.Length)
+        {
+            int n = 0;
+            for (int c = 0; c < k.Length; c++)
+            {
+                if (k[c] > lo) top[n++] = (k[c], c);
+                else if (k[c] == lo && need > 0) { top[n++] = (k[c], c); need--; }
+            }
+
+            Array.Sort(top, 0, n, ByOrder.Instance);
+            return (new Boundary(true, top[topK - 1].Key, top[topK - 1].Col), n);
+        }
+
         for (int c = 0; c < k.Length; c++)
             if (k[c] == lo && --need == 0) return (new Boundary(true, lo, c), 0);
         return (new Boundary(true, lo, k.Length - 1), 0);
@@ -259,6 +274,26 @@ internal sealed partial class Kernels
                 k0.CopyTo(keys[c..]);
                 k1.CopyTo(keys[(c + half)..]);
             }
+        }
+        else if (typeof(TE) == typeof(int))
+        {
+            // A signed integer's key: its value with the sign bit flipped (Routing.OrderKey), widened to 64 bits first.
+            var e = MemoryMarshal.Cast<TE, int>(v);
+            int width = Vector<int>.Count, half = width / 2;
+            var sign = new Vector<long>(long.MinValue);
+            for (; c + width <= e.Length; c += width)
+            {
+                Vector.Widen(new Vector<int>(e[c..]), out var k0, out var k1);
+                Vector.AsVectorUInt64(k0 ^ sign).CopyTo(keys[c..]);
+                Vector.AsVectorUInt64(k1 ^ sign).CopyTo(keys[(c + half)..]);
+            }
+        }
+        else if (typeof(TE) == typeof(long))
+        {
+            var e = MemoryMarshal.Cast<TE, long>(v);
+            int width = Vector<long>.Count;
+            var sign = new Vector<long>(long.MinValue);
+            for (; c + width <= e.Length; c += width) Vector.AsVectorUInt64(new Vector<long>(e[c..]) ^ sign).CopyTo(keys[c..]);
         }
         else if (typeof(TE) == typeof(double))
         {
