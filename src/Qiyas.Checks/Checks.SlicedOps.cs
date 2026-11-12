@@ -3,7 +3,8 @@
 
 // The float64 operations that take the sliced product (GpuOps.MatMulSliced) beside MatMul, each forced onto it (the checks'
 // SlicedChoice: their small shapes would measure the plain lane faster) and held, as Checks.Sliced holds the product, to
-// float64 math accumulated in double-double on the CPU within an ulp of every value: a batched view and a view of Aᵀ
+// float64 math accumulated in double-double on the CPU within an ulp of every value: a batched view, a product split in k
+// (few tiles, a long k: conv_bwd's dw) and a view of Aᵀ
 // (MatMulView: a batch's product, conv_bwd's dcols and dw), the epilogue's sums and its second product's (MatMulEpilogue
 // with no activation, no bias, no residual: y the sums; the second alone over an A of zeros), and every expert's product (ExpertMatMul without a bias, the
 // experts' rows uneven, one count not a multiple of 8). Only where the device proved the sliced product (SlicedProven).
@@ -81,6 +82,15 @@ internal static partial class Checks
                     int z = at / (M * N), i = at % (M * N) / N, j = at % N;
                     return Exact(a, b, K, p => z * M * K + i * K + p, p => z * K * N + p * N + j);
                 }));
+            }
+
+            {
+                // A product of few tiles and a long k (conv_bwd's dw's shape in small: 16 × 24 × 4096), its diagonals split in k.
+                const int M = 16, N = 24, K = 4096;
+                double[] a = Values(M * K), b = Values(K * N);
+                var v = new ProductView(M, N, K, false, false);
+                var got = Run(a, b, M * N, (da, db, dc) => ops.MatMulView<Float64>(v, da, db, dc));
+                Say("sliced float64 split in k", M * N, Worst(got, at => Exact(a, b, K, p => at / N * K + p, p => p * N + at % N)));
             }
 
             {

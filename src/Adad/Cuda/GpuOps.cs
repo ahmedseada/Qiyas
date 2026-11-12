@@ -1022,19 +1022,38 @@ public sealed partial class GpuOps(Gpu gpu)
             // One product per diagonal d: the digit pairs (t, u) with t + u = d. B's digits are stacked most significant last,
             // so for d below the slice count A's first d + 1 slices meet B's last d + 1; above it, A's last 15 − d meet B's first.
             var fn = MmaFunction(kind, out uint shared, out int bn, batched: batches > 1);
+            // Split-k (a single product whose tiles fill at most half the multiprocessors; at 64 tiles of 70 a split measured
+            // slower, 2.32 ms against 2.20 at 128 × 16384 × 640): a diagonal's k-range in parts, each
+            // part's 8-bit product a z of one launch (A and B advanced by the part's bytes, its integer sums at z·m·n),
+            // the parts' sums added in order (SumSlices in s32). Integers: exactly the unsplit diagonal's sums.
+            long tiles = (long)Grid(n, bn) * Grid(m, 128);
+            int want = batches == 1 && tiles * 2 <= gpu.Multiprocessors ? (int)((2L * gpu.Multiprocessors + tiles - 1) / tiles) : 1;
+            var fparts = want > 1 ? MmaFunction(kind, out _, out _, batched: true) : IntPtr.Zero;
+            var joinParts = want > 1 ? gpu.Cached($"sum_slices:{Lane.S32.Name}", (out string x) => Ptx.SumSlices(gpu, Lane.S32, out x)) : IntPtr.Zero;
+            ulong parts = want > 1 ? gpu.Rent(want * mn * 4) : 0;
             for (int diag = 0; diag < Ptx.Diagonals; diag++)
             {
                 int pairs = diag < Ptx.Slices ? diag + 1 : 2 * Ptx.Slices - 1 - diag, extent = pairs * kpad;
                 ulong pa = diag < Ptx.Slices ? sa : sa + (ulong)((diag - Ptx.Slices + 1) * kpad);
                 ulong pb = diag < Ptx.Slices ? bt + (ulong)((Ptx.Slices - 1 - diag) * kpad) : bt;
                 ulong pd = d + (ulong)(diag * mn * 4);
-                if (batches == 1) Gpu.Launch(fn, Grid(n, bn), Grid(m, 128), Ptx.GemmThreads, 1, shared, pa, pb, pd, Gpu.U(m), Gpu.U(n), Gpu.U(extent), Gpu.U(rowLen));
+                int split = 1;
+                for (int sp = Math.Min(want, extent / 128); sp > 1; sp--) if (extent / 128 % sp == 0) { split = sp; break; }
+                if (split > 1)
+                {
+                    int part = extent / split;
+                    Gpu.LaunchZ(fparts, Grid(n, bn), Grid(m, 128), (uint)split, Ptx.GemmThreads, 1, shared, pa, pb, parts, Gpu.U(m), Gpu.U(n), Gpu.U(part), Gpu.U(rowLen),
+                        (ulong)part, (ulong)part, (ulong)(mn * 4));
+                    Gpu.Launch(joinParts, Grid(mn / 4, 256), 1, 256, 1, 0, parts, pd, Gpu.U((int)mn), Gpu.U(split));
+                }
+                else if (batches == 1) Gpu.Launch(fn, Grid(n, bn), Grid(m, 128), Ptx.GemmThreads, 1, shared, pa, pb, pd, Gpu.U(m), Gpu.U(n), Gpu.U(extent), Gpu.U(rowLen));
                 else Gpu.LaunchZ(fn, Grid(n, bn), Grid(m, 128), (uint)batches, Ptx.GemmThreads, 1, shared, pa, pb, pd, Gpu.U(m), Gpu.U(n), Gpu.U(extent), Gpu.U(rowLen),
                     (ulong)saBytes, (ulong)btBytes, (ulong)dBytes);
             }
 
             for (int z = 0; z < batches; z++)
                 Gpu.Launch(combine, Grid(mn, 256), 1, 256, 1, 0, At(d, dBytes, z), e + (ulong)(z * m * 4L), f + (ulong)(z * n * 4L), At(c, sC, z), Gpu.U(m), Gpu.U(n));
+            if (parts != 0) gpu.Return(parts);
             return true;
         }
         finally
