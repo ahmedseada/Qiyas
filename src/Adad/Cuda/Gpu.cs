@@ -139,9 +139,26 @@ public sealed unsafe partial class Gpu : IDisposable
     /// <summary>The PTX target line: the device's own capability, held to what PTX ISA 7.0 names (the JIT builds for the real device).</summary>
     public string Target => $".version 7.0\n.target sm_{Math.Min(Capability, 80)}\n.address_size 64\n";
 
-    /// <summary>The function <paramref name="entry"/> of the module built from <paramref name="ptx"/> (JIT-compiled once per text).</summary>
+    // The first non-ASCII character of a kernel's PTX, refused with the kernel's name, its line and the line's text.
+    private static void RefuseNonAscii(string ptx, string entry)
+    {
+        for (int i = 0; i < ptx.Length; i++)
+        {
+            if (ptx[i] < 128) continue;
+            int line = 1;
+            for (int j = 0; j < i; j++) if (ptx[j] == '\n') line++;
+            int start = ptx.LastIndexOf('\n', i) + 1, end = ptx.IndexOf('\n', i);
+            string text = ptx[start..(end < 0 ? ptx.Length : end)].Trim();
+            throw new InvalidOperationException($"{entry}: its PTX holds a non-ASCII character (U+{(int)ptx[i]:X4}) on line {line}, which ptxas refuses: {text}");
+        }
+    }
+
+    /// <summary>The function <paramref name="entry"/> of the module built from <paramref name="ptx"/> (JIT-compiled once per text).
+    /// PTX is ASCII (ptxas stops at any other character, a comment's too): a text holding one is refused here, naming the
+    /// kernel and the line, before the driver sees it.</summary>
     public IntPtr Function(string ptx, string entry)
     {
+        if (!_modules.ContainsKey(ptx)) RefuseNonAscii(ptx, entry);
         if (Environment.GetEnvironmentVariable("ADAD_PTX_DUMP") is { Length: > 0 } dir && !_modules.ContainsKey(ptx))
         {
             Directory.CreateDirectory(dir);

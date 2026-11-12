@@ -376,7 +376,7 @@ internal static class GenericPtx
                 ld.param.u32 %r15, [p_dw];
                 ld.param.u32 %r16, [p_oh];
                 ld.param.u32 %r17, [p_ow];
-                mul.lo.u32 %r18, %r16, %r17;          // OH·OW
+                mul.lo.u32 %r18, %r16, %r17;          // OH*OW
                 div.u32 %r19, %r4, %r18;              // r
                 rem.u32 %r20, %r4, %r18;              // q
                 div.u32 %r21, %r20, %r17;             // i
@@ -453,7 +453,7 @@ internal static class GenericPtx
                 rem.u32 %r20, %r4, %r18;
                 div.u32 %r21, %r20, %r7;              // ih
                 rem.u32 %r22, %r20, %r7;              // iw
-                mul.lo.u32 %r23, %r16, %r17;          // OH·OW
+                mul.lo.u32 %r23, %r16, %r17;          // OH*OW
                 ld.param.u64 %rd1, [p_c];
                 cvta.to.global.u64 %rd1, %rd1;
                 {{t.MovLiteral("%v1", t.ZeroLiteral)}}
@@ -465,7 +465,7 @@ internal static class GenericPtx
                 mul.lo.u32 %r26, %r24, %r14;
                 setp.lt.u32 %p3, %r25, %r26;
                 @%p3 bra NEXTROW;
-                sub.u32 %r25, %r25, %r26;             // ih + pt − a·dh
+                sub.u32 %r25, %r25, %r26;             // ih + pt - a*dh
                 rem.u32 %r27, %r25, %r10;
                 setp.ne.u32 %p3, %r27, 0;
                 @%p3 bra NEXTROW;
@@ -542,7 +542,7 @@ internal static class GenericPtx
                 cvta.to.global.u64 %rd2, %rd2;
                 add.u64 %rd2, %rd2, %rd1;
                 ld.global.{{t.Mem}} %v1, [%rd2];
-                mad.lo.u32 %r10, %r9, %r5, %r8;       // j·rows + i
+                mad.lo.u32 %r10, %r9, %r5, %r8;       // j*rows + i
                 mul.wide.u32 %rd3, %r10, {{t.Size}};
                 ld.param.u64 %rd4, [p_t];
                 cvta.to.global.u64 %rd4, %rd4;

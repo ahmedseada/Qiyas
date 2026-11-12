@@ -45,7 +45,7 @@ else
 
 if (!proven)
 {
-    if (!Checks.Run())
+    if (!Checks.Run() | !NumberSubject.CheckCudaKernels(options.Devices))
     {
         Console.WriteLine("A check failed: no timing until it is fixed.");
         return 1;

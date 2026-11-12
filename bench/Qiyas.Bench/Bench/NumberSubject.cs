@@ -472,6 +472,69 @@ public sealed class NumberSubject : IBenchSubject
             () => new(0, ((long)rows * oc + 3L * rows * cols) * size));
     }
 
+    // ---------------------------------------------------------------- every CUDA kernel of the cells, for the gate
+
+    /// <summary>Every CUDA kernel the cells above build, each cell on each type its dispatcher takes, as (cell, type, PTX,
+    /// entry). The gate loads them all (CheckCudaKernels): a row loads only the types it benches, and the rows run after
+    /// the gate.</summary>
+    public static IEnumerable<(string Cell, string Type, string Ptx, string Entry)> CudaKernels() =>
+        Every<double>("float64").Concat(Every<float>("float32")).Concat(Every<Half>("float16"))
+            .Concat(Every<long>("int64")).Concat(Every<int>("int32")).Concat(Every<short>("int16")).Concat(Every<sbyte>("int8"))
+            .Concat(Every<ulong>("uint64")).Concat(Every<uint>("uint32")).Concat(Every<ushort>("uint16")).Concat(Every<byte>("uint8"))
+            .Concat(Floats<double, double>("float64")).Concat(Floats<float, float>("float32")).Concat(Floats<Half, float>("float16"));
+
+    // The cells every type takes: add, matmul (both tiles), conv (im2col, col2im, the transpose; its products matmul's).
+    private static IEnumerable<(string, string, string, string)> Every<T>(string type) where T : unmanaged, INumberBase<T>
+    {
+        string e;
+        yield return ("add", type, GenericPtx.Add<T>(out e), e);
+        foreach (int micro in new[] { 8, 4 }) yield return ("matmul", type, GenericPtx.MatMul<T>(micro, out e), e);
+        yield return ("conv", type, GenericPtx.Im2col<T>(out e), e);
+        yield return ("conv", type, GenericPtx.Col2im<T>(out e), e);
+        yield return ("conv", type, GenericPtx.Transpose<T>(out e), e);
+    }
+
+    // The float types' cells, TM their moments' and tables' type (the dispatchers' pairs).
+    private static IEnumerable<(string, string, string, string)> Floats<T, TM>(string type)
+        where T : unmanaged, IFloatingPointIeee754<T> where TM : unmanaged, IFloatingPointIeee754<TM>
+    {
+        string e;
+        yield return ("softmax", type, GenericPtx.Softmax<T>(out e), e);
+        yield return ("rms_norm", type, GenericPtx.RmsNorm<T>(out e), e);
+        foreach (var name in OptimizerArgs.Names) yield return ("optimizer:" + name, type, GenericPtx.Optimizer<T, TM>(name, out e), e);
+        yield return ("optimizer_many", type, GenericPtx.SumSquares<T, TM>(out e), e);
+        yield return ("rope_table", type, GenericPtx.Rope<T, TM>(out e), e);
+        foreach (var overlap in Enum.GetValues<BoxOverlap>())
+            foreach (bool backward in new[] { false, true }) yield return ("box_loss", type, GenericPtx.BoxLoss<T>(overlap, backward, out e), e);
+        yield return ("ctc", type, GenericPtx.Ctc<T>(out e), e);
+    }
+
+    /// <summary>The gate's check of the cells on CUDA: every kernel of CudaKernels loaded by the driver (the JIT's ptxas,
+    /// and the module load's refusal of a non-ASCII text). A line per kernel that does not load; true when all do or
+    /// the run has no CUDA device.</summary>
+    public static bool CheckCudaKernels(IReadOnlyCollection<Device> devices)
+    {
+        if (!devices.Contains(Device.Cuda) || !Devices.HasCuda) return true;
+        bool ok = true;
+        int loaded = 0;
+        foreach (var (cell, type, ptx, entry) in CudaKernels())
+        {
+            try
+            {
+                Devices.Gpu.Function(ptx, entry);
+                loaded++;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"check number cell {cell} {type} cuda: FAILS: {ex.Message.Split('\n')[0]}");
+                ok = false;
+            }
+        }
+
+        if (ok) Console.WriteLine($"check {"number cells",-28} {"cuda",-6} every cell on every type it takes: {loaded} kernels load");
+        return ok;
+    }
+
     private static T[] Of<T>(byte[] bytes) where T : unmanaged => MemoryMarshal.Cast<byte, T>(bytes.AsSpan()).ToArray();
 
     private static void Back<T>(T[] values, byte[] bytes) where T : unmanaged => MemoryMarshal.AsBytes(values.AsSpan()).CopyTo(bytes);
