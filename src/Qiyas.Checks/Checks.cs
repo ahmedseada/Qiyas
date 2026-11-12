@@ -124,6 +124,7 @@ internal static partial class Checks
         ok &= Function64("atan f64 wide", Funcs.Atan, Math.Atan, -1e6, 1e6, 3, atanRandom);
         ok &= Function32("erfc f32", Funcs.Erfc, Funcs.ErfcReference, -4, 9, 4, random);
         ok &= Function64("erfc f64", Funcs.Erfc, Funcs.ErfcReference, -4, 26, 4, random);
+        ok &= ErfFour(new Random(74));
         ok &= Maps(null);
         ok &= Maps(null, special: true);
         ok &= Elementwise(null);
@@ -3082,6 +3083,44 @@ internal static partial class Checks
 
         Console.WriteLine($"check {"exp f64 (ulps)",-36} {x.Length,9} values: worst {worst:0.00} ulp at x = {x[worstAt]:R}{(worst <= 2 ? "" : "  DIFFERS: too far")}");
         return worst <= 2;
+    }
+
+    // Funcs.Erf4 and Erfc4 (four vectors side by side, the CPU's float64 erf formulas) against Erf and Erfc a vector at a
+    // time, bit for bit: the special values, both sides of the series' bounds, the fraction's cap at 28, and draws.
+    private static bool ErfFour(Random random)
+    {
+        int w = System.Numerics.Vector<double>.Count, group = 4 * w;
+        double[] special = [0, -0.0, double.Epsilon, -double.Epsilon, 1e-300, -1e-300, 0.75, -0.75, Math.BitDecrement(0.75), 1.5, -1.5, Math.BitIncrement(1.5),
+            27.999, 28, 28.5, -28.5, 40, -40, 1e300, -1e300, double.MaxValue, double.MinValue, double.PositiveInfinity, double.NegativeInfinity, double.NaN];
+        int n = (special.Length + 8192 + group - 1) / group * group;
+        var x = new double[n];
+        special.CopyTo(x, 0);
+        for (int i = special.Length; i < n; i++) x[i] = i % 2 == 0 ? random.NextDouble() * 60 - 30 : random.NextDouble() * 6 - 3;
+        bool ok = true;
+        foreach (bool c in new[] { false, true })
+        {
+            var one = new double[n];
+            var four = new double[n];
+            for (int i = 0; i < n; i += w)
+            {
+                var v = new System.Numerics.Vector<double>(x, i);
+                (c ? Funcs.Erfc(v) : Funcs.Erf(v)).CopyTo(one, i);
+            }
+
+            for (int i = 0; i < n; i += group)
+            {
+                var v0 = new System.Numerics.Vector<double>(x, i);
+                var v1 = new System.Numerics.Vector<double>(x, i + w);
+                var v2 = new System.Numerics.Vector<double>(x, i + 2 * w);
+                var v3 = new System.Numerics.Vector<double>(x, i + 3 * w);
+                if (c) Funcs.Erfc4(ref v0, ref v1, ref v2, ref v3); else Funcs.Erf4(ref v0, ref v1, ref v2, ref v3);
+                v0.CopyTo(four, i); v1.CopyTo(four, i + w); v2.CopyTo(four, i + 2 * w); v3.CopyTo(four, i + 3 * w);
+            }
+
+            ok &= Report(c ? "erfc f64 four vectors at once" : "erf f64 four vectors at once", MemoryMarshal.AsBytes(four.AsSpan()).ToArray(), MemoryMarshal.AsBytes(one.AsSpan()).ToArray(), 8, null);
+        }
+
+        return ok;
     }
 
     private static bool Report(string name, byte[] got, byte[] want, int size, float[]? inputs)

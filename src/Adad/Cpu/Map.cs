@@ -23,6 +23,45 @@ namespace Adad.Cpu;
 public interface IMapOp<TLane, TL> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
 {
     static abstract Vector<TLane> Apply(Vector<TLane> x, Vector<TLane> y, Vector<TLane> z, Vector<TLane> a, Vector<TLane> b);
+
+    /// <summary>Whether Apply4 runs four vectors side by side: a formula whose dependent chains are long enough that one
+    /// vector at a time waits on each step's latency (the float64 erf and erfc's continued fractions).</summary>
+    static virtual bool Four => false;
+
+    /// <summary>Four vectors (x and y 4·Count values each; o may be x) at once, each value the one Apply gives.</summary>
+    static virtual void Apply4(ReadOnlySpan<TLane> x, ReadOnlySpan<TLane> y, Span<TLane> o, Vector<TLane> a, Vector<TLane> b) => throw new NotSupportedException();
+}
+
+// The float64 erf-based formulas four vectors at a time (Funcs.Erf4, Erfc4: the same values as Erf and Erfc, their chains
+// in step).
+internal static class Four
+{
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void Load<T>(ReadOnlySpan<T> s, out Vector<double> v0, out Vector<double> v1, out Vector<double> v2, out Vector<double> v3) where T : unmanaged
+    {
+        var d = MemoryMarshal.Cast<T, double>(s);
+        int w = Vector<double>.Count;
+        v0 = new(d); v1 = new(d[w..]); v2 = new(d[(2 * w)..]); v3 = new(d[(3 * w)..]);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void Store<T>(Span<T> s, Vector<double> v0, Vector<double> v1, Vector<double> v2, Vector<double> v3) where T : unmanaged
+    {
+        var d = MemoryMarshal.Cast<T, double>(s);
+        int w = Vector<double>.Count;
+        v0.CopyTo(d); v1.CopyTo(d[w..]); v2.CopyTo(d[(2 * w)..]); v3.CopyTo(d[(3 * w)..]);
+    }
+
+    // Φ(x) = ½·erfc(−x/√2) of four vectors, as PhiF computes it in the f64 lane.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void Phi(ref Vector<double> x0, ref Vector<double> x1, ref Vector<double> x2, ref Vector<double> x3)
+    {
+        var k = new Vector<double>(-MapOps.InvSqrt2);
+        Vector<double> t0 = x0 * k, t1 = x1 * k, t2 = x2 * k, t3 = x3 * k;
+        Funcs.Erfc4(ref t0, ref t1, ref t2, ref t3);
+        var h = new Vector<double>(0.5);
+        x0 = h * t0; x1 = h * t1; x2 = h * t2; x3 = h * t3;
+    }
 }
 
 /// <summary>What runs a formula once its struct is known: a map over values, over rows.</summary>
@@ -101,7 +140,7 @@ internal static class MapOps
     public struct GatedReluBwdY<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Max(x, Vector<T>.Zero), z); }
 
     // float lanes
-    private const double GeluK = 0.7978845608028654, GeluC = 0.044715, InvSqrt2 = 0.7071067811865476, InvSqrt2Pi = 0.3989422804014327;
+    internal const double GeluK = 0.7978845608028654, GeluC = 0.044715, InvSqrt2 = 0.7071067811865476, InvSqrt2Pi = 0.3989422804014327;
 
     // gelu = x·σ(2u), u = √(2/π)(x + 0.044715x³); its gradient σ(2u) + 2x·σ(2u)σ(−2u)·u′ (1 − tanh²u = 4σ(2u)σ(−2u)): no cancellation.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -158,9 +197,34 @@ internal static class MapOps
     public struct Tanh<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Tanh(x); }
     public struct Atan<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Atan(x); }
     public struct Sigmoid<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Sigmoid(x); }
-    public struct Erf<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Erf(x); }
+    public struct Erf<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T>
+    {
+        public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Erf(x);
+
+        public static bool Four => typeof(T) == typeof(double);
+
+        public static void Apply4(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> o, Vector<T> a, Vector<T> b)
+        {
+            Cpu.Four.Load(x, out var v0, out var v1, out var v2, out var v3);
+            Funcs.Erf4(ref v0, ref v1, ref v2, ref v3);
+            Cpu.Four.Store(o, v0, v1, v2, v3);
+        }
+    }
     public struct Gelu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => GeluF<T, TL>(x); }
-    public struct GeluErf<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(x, PhiF<T, TL>(x)); }
+    public struct GeluErf<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T>
+    {
+        public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(x, PhiF<T, TL>(x));
+
+        public static bool Four => typeof(T) == typeof(double);
+
+        public static void Apply4(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> o, Vector<T> a, Vector<T> b)
+        {
+            Cpu.Four.Load(x, out var x0, out var x1, out var x2, out var x3);
+            Vector<double> p0 = x0, p1 = x1, p2 = x2, p3 = x3;
+            Cpu.Four.Phi(ref p0, ref p1, ref p2, ref p3);
+            Cpu.Four.Store(o, x0 * p0, x1 * p1, x2 * p2, x3 * p3);
+        }
+    }
     public struct Silu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(x, TL.Sigmoid(x)); }
     public struct LeakyRelu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(x, Vector<T>.Zero), x, TL.Mul(a, x)); }
     public struct Pow<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => PowF<T, TL>(x, a); }
@@ -186,6 +250,24 @@ internal static class MapOps
             var phi = PhiF<T, TL>(x);
             var dens = TL.Mul(C<T, TL>(InvSqrt2Pi), TL.Exp(TL.Mul(C<T, TL>(-0.5), TL.Mul(x, x))));
             return TL.Mul(TL.Fma(x, dens, phi), y);
+        }
+
+        public static bool Four => typeof(T) == typeof(double);
+
+        public static void Apply4(ReadOnlySpan<T> x, ReadOnlySpan<T> y, Span<T> o, Vector<T> a, Vector<T> b)
+        {
+            Cpu.Four.Load(x, out var x0, out var x1, out var x2, out var x3);
+            Cpu.Four.Load(y, out var y0, out var y1, out var y2, out var y3);
+            Vector<double> p0 = x0, p1 = x1, p2 = x2, p3 = x3;
+            Cpu.Four.Phi(ref p0, ref p1, ref p2, ref p3);
+            Cpu.Four.Store(o, Back(x0, p0, y0), Back(x1, p1, y1), Back(x2, p2, y2), Back(x3, p3, y3));
+        }
+
+        // Apply's arithmetic in the f64 lane from Φ.
+        private static Vector<double> Back(Vector<double> x, Vector<double> phi, Vector<double> y)
+        {
+            var dens = new Vector<double>(InvSqrt2Pi) * Exps.Exp(new Vector<double>(-0.5) * (x * x));
+            return Vector.FusedMultiplyAdd(x, dens, phi) * y;
         }
     }
     public struct LeakyReluBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(x, Vector<T>.Zero), y, TL.Mul(a, y)); }
@@ -477,6 +559,8 @@ internal sealed partial class Kernels
             ref TLane ry = ref y.IsEmpty ? ref Unsafe.NullRef<TLane>() : ref MemoryMarshal.GetReference(y);
             ref TLane rz = ref z.IsEmpty ? ref Unsafe.NullRef<TLane>() : ref MemoryMarshal.GetReference(z);
             ref TLane ro = ref MemoryMarshal.GetReference(o);
+            if (TOp.Four)
+                for (; i + 4 * w <= count; i += 4 * w) TOp.Apply4(x.Slice(i, 4 * w), y.IsEmpty ? default : y.Slice(i, 4 * w), o.Slice(i, 4 * w), a, b);
             for (; i + w <= count; i += w)
             {
                 var vx = x.IsEmpty ? default : Vector.LoadUnsafe(ref rx, (nuint)i);

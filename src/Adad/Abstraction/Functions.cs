@@ -472,6 +472,100 @@ public static class Funcs
         return Vector.ConditionalSelect(Vector.Equals(x, x), y, x);
     }
 
+    // ---------------------------------------------------------------- f64 erf and erfc four vectors at a time
+    // The same arithmetic as Erf and Erfc above, lane for lane and step for step, over four vectors side by side: their
+    // series and continued fractions are chains of dependent multiply-adds hundreds long, so one vector at a time runs at
+    // the multiply-add's latency; four chains in step run at its throughput. Every value is the one Erf or Erfc gives
+    // (Checks.ErfFour proves it bit for bit).
+
+    // Fraction for four vectors: each its own P, Q, rescaled at the same levels.
+    private static void Fraction4(Vector<double> x0, Vector<double> x1, Vector<double> x2, Vector<double> x3, int depth,
+        out Vector<double> f0, out Vector<double> f1, out Vector<double> f2, out Vector<double> f3)
+    {
+        var top = new Vector<double>(28.0);
+        Vector<double> a0 = Vector.Min(x0, top), a1 = Vector.Min(x1, top), a2 = Vector.Min(x2, top), a3 = Vector.Min(x3, top);
+        Vector<double> p0 = a0, p1 = a1, p2 = a2, p3 = a3;
+        Vector<double> q0 = Vector<double>.One, q1 = q0, q2 = q0, q3 = q0;
+        for (int d = depth; d >= 1; d--)
+        {
+            var h = new Vector<double>(d * 0.5);
+            var n0 = Vector.FusedMultiplyAdd(a0, p0, h * q0);
+            var n1 = Vector.FusedMultiplyAdd(a1, p1, h * q1);
+            var n2 = Vector.FusedMultiplyAdd(a2, p2, h * q2);
+            var n3 = Vector.FusedMultiplyAdd(a3, p3, h * q3);
+            q0 = p0; q1 = p1; q2 = p2; q3 = p3;
+            p0 = n0; p1 = n1; p2 = n2; p3 = n3;
+            if (d % 16 == 1 && d > 1)
+            {
+                q0 /= p0; q1 /= p1; q2 /= p2; q3 /= p3;
+                p0 = p1 = p2 = p3 = Vector<double>.One;
+            }
+        }
+
+        f0 = p0 / q0; f1 = p1 / q1; f2 = p2 / q2; f3 = p3 / q3;
+    }
+
+    // The f64 series Σ ErfSeries[k]·x2^k (ErfTerms64 terms) for four vectors.
+    private static void Series4(Vector<double> s0, Vector<double> s1, Vector<double> s2, Vector<double> s3,
+        out Vector<double> r0, out Vector<double> r1, out Vector<double> r2, out Vector<double> r3)
+    {
+        r0 = r1 = r2 = r3 = new Vector<double>(ErfSeries[ErfTerms64 - 1]);
+        for (int k = ErfTerms64 - 2; k >= 0; k--)
+        {
+            var c = new Vector<double>(ErfSeries[k]);
+            r0 = Vector.FusedMultiplyAdd(r0, s0, c);
+            r1 = Vector.FusedMultiplyAdd(r1, s1, c);
+            r2 = Vector.FusedMultiplyAdd(r2, s2, c);
+            r3 = Vector.FusedMultiplyAdd(r3, s3, c);
+        }
+    }
+
+    // Erf's or Erfc's last steps for one vector, from its series sum (not yet times x) and its fraction.
+    private static Vector<double> ErfFrom(Vector<double> x, Vector<double> series, Vector<double> f)
+    {
+        var ax = Vector.Abs(x);
+        var x2 = ax * ax;
+        series *= ax;
+        var x2lo = Vector.FusedMultiplyAdd(ax, ax, -x2);
+        x2lo = Vector.ConditionalSelect(Vector.Equals(x2lo, x2lo), x2lo, Vector<double>.Zero);
+        var tail = Vector<double>.One - Exps.Exp(-x2) * (Vector<double>.One - x2lo) * new Vector<double>(InvSqrtPi) / f;
+        var y = Vector.ConditionalSelect(Vector.LessThan(ax, new Vector<double>(ErfBound64)), series, tail);
+        y = Vector.Min(y, Vector<double>.One);
+        y = Vector.ConditionalSelect(Vector.LessThan(x, Vector<double>.Zero), -y, y);
+        return Vector.ConditionalSelect(Vector.Equals(x, x), y, x);
+    }
+
+    private static Vector<double> ErfcFrom(Vector<double> x, Vector<double> series, Vector<double> f)
+    {
+        var ax = Vector.Abs(x);
+        var x2 = ax * ax;
+        series *= x;
+        var x2lo = Vector.FusedMultiplyAdd(ax, ax, -x2);
+        x2lo = Vector.ConditionalSelect(Vector.Equals(x2lo, x2lo), x2lo, Vector<double>.Zero);
+        var tail = Exps.Exp(-x2) * (Vector<double>.One - x2lo) * new Vector<double>(InvSqrtPi) / f;
+        var y = Vector.ConditionalSelect(Vector.LessThan(ax, new Vector<double>(ErfcBound64)), Vector<double>.One - series,
+            Vector.ConditionalSelect(Vector.LessThan(x, Vector<double>.Zero), new Vector<double>(2.0) - tail, tail));
+        return Vector.ConditionalSelect(Vector.Equals(x, x), y, x);
+    }
+
+    /// <summary>Erf of four vectors at once: each the value Erf gives it.</summary>
+    public static void Erf4(ref Vector<double> x0, ref Vector<double> x1, ref Vector<double> x2, ref Vector<double> x3)
+    {
+        Vector<double> a0 = Vector.Abs(x0), a1 = Vector.Abs(x1), a2 = Vector.Abs(x2), a3 = Vector.Abs(x3);
+        Series4(a0 * a0, a1 * a1, a2 * a2, a3 * a3, out var s0, out var s1, out var s2, out var s3);
+        Fraction4(a0, a1, a2, a3, ErfDepth64, out var f0, out var f1, out var f2, out var f3);
+        x0 = ErfFrom(x0, s0, f0); x1 = ErfFrom(x1, s1, f1); x2 = ErfFrom(x2, s2, f2); x3 = ErfFrom(x3, s3, f3);
+    }
+
+    /// <summary>Erfc of four vectors at once: each the value Erfc gives it.</summary>
+    public static void Erfc4(ref Vector<double> x0, ref Vector<double> x1, ref Vector<double> x2, ref Vector<double> x3)
+    {
+        Vector<double> a0 = Vector.Abs(x0), a1 = Vector.Abs(x1), a2 = Vector.Abs(x2), a3 = Vector.Abs(x3);
+        Series4(a0 * a0, a1 * a1, a2 * a2, a3 * a3, out var s0, out var s1, out var s2, out var s3);
+        Fraction4(a0, a1, a2, a3, ErfcDepth64, out var f0, out var f1, out var f2, out var f3);
+        x0 = ErfcFrom(x0, s0, f0); x1 = ErfcFrom(x1, s1, f1); x2 = ErfcFrom(x2, s2, f2); x3 = ErfcFrom(x3, s3, f3);
+    }
+
     // ---------------------------------------------------------------- scalar references (double): what the proofs compare against
 
     public static double ErfcReference(double x)
