@@ -2,9 +2,10 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // The INumberBase<T> version as a bench subject: one implementation over T : INumberBase<T> (CpuGeneric.cs on the
-// CPU, GenericPtx.cs on the device), for the types .NET has such a T for. Stored bytes of those types are the .NET
-// layout, so they are used in place. Its runs hold nothing beyond their operands but rms_norm's row of inverse norms (a
-// value a row on the CPU, 8 bytes a row on the device), prepared with the run and said in Held.
+// CPU, GenericPtx.cs on CUDA; there is no Vulkan version, so a Vulkan row has no number cell), for the types .NET has
+// such a T for. Stored bytes of those types are the .NET layout, so they are used in place. Its runs hold nothing
+// beyond their operands but rms_norm's row of inverse norms (a value a row on the CPU, 8 bytes a row on CUDA), prepared
+// with the run and said in Held.
 using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -17,7 +18,10 @@ public sealed class NumberSubject : IBenchSubject
 
     public string? Describe(Device device) => device == Device.Cpu ? $"number: INumberBase<T>, Vector<T> where .NET has it, {Environment.ProcessorCount} threads" : null;
 
-    public IBenchRun? Add(Device device, string type, byte[] a, byte[] b, byte[] c, int n) => type switch
+    // The devices it has a version for: the CPU and CUDA (any other device would time CUDA's kernels under its name).
+    private static bool Runs(Device device) => device is Device.Cpu or Device.Cuda;
+
+    public IBenchRun? Add(Device device, string type, byte[] a, byte[] b, byte[] c, int n) => !Runs(device) ? null : type switch
     {
         "float64" => Add<double>(device, a, b, c, n),
         "float32" => Add<float>(device, a, b, c, n),
@@ -33,7 +37,7 @@ public sealed class NumberSubject : IBenchSubject
         _ => null,
     };
 
-    public IBenchRun? MatMul(Device device, string type, byte[] a, byte[] b, byte[] c, int m, int n, int k) => type switch
+    public IBenchRun? MatMul(Device device, string type, byte[] a, byte[] b, byte[] c, int m, int n, int k) => !Runs(device) ? null : type switch
     {
         "float64" => MatMul<double>(device, a, b, c, m, n, k),
         "float32" => MatMul<float>(device, a, b, c, m, n, k),
@@ -49,7 +53,7 @@ public sealed class NumberSubject : IBenchSubject
         _ => null,
     };
 
-    public IBenchRun? Softmax(Device device, string type, byte[] x, byte[] y, int rows, int cols) => type switch
+    public IBenchRun? Softmax(Device device, string type, byte[] x, byte[] y, int rows, int cols) => !Runs(device) ? null : type switch
     {
         "float64" => Rows<double>(device, x, y, rows, cols, null),
         "float32" => Rows<float>(device, x, y, rows, cols, null),
@@ -57,7 +61,7 @@ public sealed class NumberSubject : IBenchSubject
         _ => null,
     };
 
-    public IBenchRun? RmsNorm(Device device, string type, byte[] x, byte[] y, int rows, int cols, double eps) => type switch
+    public IBenchRun? RmsNorm(Device device, string type, byte[] x, byte[] y, int rows, int cols, double eps) => !Runs(device) ? null : type switch
     {
         "float64" => Rows<double>(device, x, y, rows, cols, (float)eps),
         "float32" => Rows<float>(device, x, y, rows, cols, (float)eps),
