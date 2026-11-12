@@ -2140,13 +2140,14 @@ internal static partial class Checks
             var values = Bench.Registry.Values(type, data, R * C);
             bool integer = !Bench.Registry.IsFloat(type);
             // Whole reductions also over a long odd length (97 × 4099: more parts than the team, parts not ending on a word);
-            // its columns too (several strips and row blocks of the column tiles, the last of each partial).
+            // its columns too (several strips and row blocks of the column tiles, the last of each partial), and read as 4099 ×
+            // 97 (the device's columns in splits of the rows, joined after).
             const int LR = 97, LC = 4099;
             var longData = Bench.Registry.Make(type, LR * LC, 44, -1, 1);
             var longValues = Bench.Registry.Values(type, longData, LR * LC);
             foreach (string op in new[] { "sum", "sumsq", "max", "min", "argmax" })
             {
-                foreach (var (axis, r, c, d, vals) in new[] { (Axis.Whole, R, C, data, values), (Axis.Rows, R, C, data, values), (Axis.Cols, R, C, data, values), (Axis.Whole, LR, LC, longData, longValues), (Axis.Cols, LR, LC, longData, longValues) })
+                foreach (var (axis, r, c, d, vals) in new[] { (Axis.Whole, R, C, data, values), (Axis.Rows, R, C, data, values), (Axis.Cols, R, C, data, values), (Axis.Whole, LR, LC, longData, longValues), (Axis.Cols, LR, LC, longData, longValues), (Axis.Cols, LC, LR, longData, longValues) })
                 {
 
                     int count = axis == Axis.Whole ? 1 : axis == Axis.Rows ? r : c;
@@ -2216,7 +2217,8 @@ internal static partial class Checks
 
     // Adad's order in max, min and argmax (a float type, the values as the type stores them; a block format's as its
     // blocks hold them): rows, columns and wholes of rows holding NaN, every value NaN, every value −∞, zeros of both
-    // signs, ±∞ and ties, and a long array with one NaN far in (many parts, many row blocks): max and min exactly the
+    // signs, ±∞ and ties, and a long array with one NaN far in (many parts, many row blocks; its columns also as 4099 rows
+    // of 97, the device's splits of the rows): max and min exactly the
     // reference's (Routing.Order: a NaN where it has one, −0 equal to +0), argmax's positions exactly.
     private static bool ReduceOrder(IDevice<ulong, ulong>? ops, string where, string type)
     {
@@ -2248,7 +2250,7 @@ internal static partial class Checks
         l[300001] = double.NaN;
         bool ok = true;
         static bool Same(double x, double y) => x == y || (double.IsNaN(x) && double.IsNaN(y));
-        foreach (var (axis, rr, cc, v) in new[] { (Axis.Rows, rows, cols, a), (Axis.Whole, rows, cols, a), (Axis.Cols, cols, 36, t), (Axis.Whole, LR, LC, l), (Axis.Cols, LR, LC, l) })
+        foreach (var (axis, rr, cc, v) in new[] { (Axis.Rows, rows, cols, a), (Axis.Whole, rows, cols, a), (Axis.Cols, cols, 36, t), (Axis.Whole, LR, LC, l), (Axis.Cols, LR, LC, l), (Axis.Cols, LC, LR, l) })
         {
             var x = Bench.Registry.Encode(type, v);
             var xv = Bench.Registry.Values(type, x, rr * cc);

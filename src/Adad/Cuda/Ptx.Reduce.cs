@@ -46,6 +46,7 @@ internal static partial class Ptx
     /// <summary>A sum table's row: the array's first block, its values, its chunk, where it is.</summary>
     public const int SumRow = 4;
 
+
     public static string ReduceRows(Gpu gpu, Fmt f, Lane lane, string op, bool squares, out string entry, bool compensated = false, bool storeF32 = false, bool table = false)
     {
         entry = $"reduce_rows_{op}{(squares ? "sq" : "")}_{f.Name}_{lane.Name}{(compensated ? "_kahan" : "")}{(storeF32 ? "_f32" : "")}{(table ? "_tab" : "")}";
@@ -213,23 +214,36 @@ internal static partial class Ptx
     }
 
     /// <summary>out[col] = the row of the column's first-ranked value in Adad's order (Rank; the first row among those that
-    /// rank the same), s32, a thread per column.</summary>
-    public static string ArgmaxCols(Gpu gpu, Fmt f, Lane lane, out string entry)
+    /// rank the same), s32, a thread per column. split: a thread per column and split of the rows (grid y the splits, p_per
+    /// rows each), each split's first-ranked value (lane storage, p_out) and its row (s32, p_idx; −1 for none) at
+    /// split·cols + col, for ArgmaxColsJoin: the first-ranked of first-ranked values, the earlier split's on a tie, is the
+    /// column's first-ranked with the lowest row, the one scan's answer.</summary>
+    public static string ArgmaxCols(Gpu gpu, Fmt f, Lane lane, out string entry, bool split = false)
     {
-        entry = $"argmax_cols_{f.Name}_{lane.Name}";
-        var b = new PtxBuilder();
+        entry = $"argmax_cols_{f.Name}_{lane.Name}{(split ? "_split" : "")}";
+        var b = new PtxBuilder(gpu);
         string tid = b.R(), bid = b.R(), col = b.R(), src = Param64(b, "p_x"), dst = Param64(b, "p_out"), rows = Param32(b, "p_rows"), cols = Param32(b, "p_cols"), pEnd = b.P();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");
         b.L($"mad.lo.u32 {col}, {bid}, 256, {tid};");
         b.L($"setp.ge.u32 {pEnd}, {col}, {cols};");
         b.L($"@{pEnd} bra DONE;");
-        string r = b.R(), best = lane.NewReg(b), bestAt = b.R(), idx = b.R(), pR = b.P(), pFirst = b.P();
+        string r = b.R(), best = lane.NewReg(b), bestAt = b.R(), idx = b.R(), pR = b.P(), pFirst = b.P(), last = rows;
         b.L($"mov.{lane.Reg} {best}, {Identity(lane, "max")};");
         b.L($"mov.u32 {bestAt}, 0xFFFFFFFF;");
         b.L($"mov.u32 {r}, 0;");
+        if (split)
+        {
+            string per = Param32(b, "p_per"), sp = b.R();
+            last = b.R();
+            b.L($"mov.u32 {sp}, %ctaid.y;");
+            b.L($"mul.lo.u32 {r}, {sp}, {per};");
+            b.L($"add.u32 {last}, {r}, {per};");
+            b.L($"min.u32 {last}, {last}, {rows};");
+        }
+
         b.Label("LOOP");
-        b.L($"setp.ge.u32 {pR}, {r}, {rows};");
+        b.L($"setp.ge.u32 {pR}, {r}, {last};");
         b.L($"@{pR} bra END;");
         b.L($"mad.lo.u32 {idx}, {r}, {cols}, {col};");
         string v = Codec.UnpackAt(b, f, src, idx, lane);
@@ -242,12 +256,73 @@ internal static partial class Ptx
         b.L("bra LOOP;");
         b.Label("END");
         string addr = b.RD();
-        b.L($"mul.wide.u32 {addr}, {col}, 4;");
-        b.L($"add.u64 {addr}, {dst}, {addr};");
+        if (split)
+        {
+            string at = b.R(), vAddr = b.RD(), sp2 = b.R();
+            b.L($"mov.u32 {sp2}, %ctaid.y;");
+            b.L($"mad.lo.u32 {at}, {sp2}, {cols}, {col};");
+            b.L($"mul.wide.u32 {vAddr}, {at}, {lane.Size};");
+            b.L($"add.u64 {vAddr}, {dst}, {vAddr};");
+            b.L($"st.global.{lane.Mem} [{vAddr}], {best};");
+            string pIdx = Param64(b, "p_idx");
+            b.L($"mul.wide.u32 {addr}, {at}, 4;");
+            b.L($"add.u64 {addr}, {pIdx}, {addr};");
+        }
+        else
+        {
+            b.L($"mul.wide.u32 {addr}, {col}, 4;");
+            b.L($"add.u64 {addr}, {dst}, {addr};");
+        }
+
         b.L($"st.global.s32 [{addr}], {bestAt};");
         b.Label("DONE");
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_out, .param .u32 p_rows, .param .u32 p_cols");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_out, .param .u32 p_rows, .param .u32 p_cols" + (split ? ", .param .u32 p_per, .param .u64 p_idx" : ""));
+    }
+
+    /// <summary>out[col] (s32) = the row of the first-ranked of the splits' first-ranked values (ArgmaxCols, split), the
+    /// splits taken in order and a later one's taking only where it ranks strictly above: the lowest row on a tie.</summary>
+    public static string ArgmaxColsJoin(Gpu gpu, Lane lane, out string entry)
+    {
+        entry = $"argmax_cols_join_{lane.Name}";
+        var b = new PtxBuilder(gpu);
+        string tid = b.R(), bid = b.R(), col = b.R(), vals = Param64(b, "p_vals"), rowsAt = Param64(b, "p_idx"), dst = Param64(b, "p_out"), splits = Param32(b, "p_splits"), cols = Param32(b, "p_cols"), pEnd = b.P();
+        b.L($"mov.u32 {tid}, %tid.x;");
+        b.L($"mov.u32 {bid}, %ctaid.x;");
+        b.L($"mad.lo.u32 {col}, {bid}, 256, {tid};");
+        b.L($"setp.ge.u32 {pEnd}, {col}, {cols};");
+        b.L($"@{pEnd} bra DONE;");
+        string sp = b.R(), best = lane.NewReg(b), bestAt = b.R(), at = b.R(), row = b.R(), v = lane.NewReg(b), pS = b.P(), pNone = b.P(), pFirst = b.P(), a = b.RD();
+        b.L($"mov.{lane.Reg} {best}, {Identity(lane, "max")};");
+        b.L($"mov.u32 {bestAt}, 0xFFFFFFFF;");
+        b.L($"mov.u32 {sp}, 0;");
+        b.Label("LOOP");
+        b.L($"setp.ge.u32 {pS}, {sp}, {splits};");
+        b.L($"@{pS} bra END;");
+        b.L($"mad.lo.u32 {at}, {sp}, {cols}, {col};");
+        b.L($"mul.wide.u32 {a}, {at}, 4;");
+        b.L($"add.u64 {a}, {rowsAt}, {a};");
+        b.L($"ld.global.u32 {row}, [{a}];");
+        b.L($"setp.eq.u32 {pNone}, {row}, 0xFFFFFFFF;");
+        b.L($"@{pNone} bra NEXT;");
+        b.L($"mul.wide.u32 {a}, {at}, {lane.Size};");
+        b.L($"add.u64 {a}, {vals}, {a};");
+        b.L($"ld.global.{lane.Mem} {v}, [{a}];");
+        string pGt = RankAbove(b, lane, v, best);
+        b.L($"setp.eq.u32 {pFirst}, {bestAt}, 0xFFFFFFFF;");
+        b.L($"or.pred {pGt}, {pGt}, {pFirst};");
+        b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {best}, {v}, {best}, {pGt};");
+        b.L($"selp.u32 {bestAt}, {row}, {bestAt}, {pGt};");
+        b.Label("NEXT");
+        b.L($"add.u32 {sp}, {sp}, 1;");
+        b.L("bra LOOP;");
+        b.Label("END");
+        b.L($"mul.wide.u32 {a}, {col}, 4;");
+        b.L($"add.u64 {a}, {dst}, {a};");
+        b.L($"st.global.s32 [{a}], {bestAt};");
+        b.Label("DONE");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_vals, .param .u64 p_idx, .param .u64 p_out, .param .u32 p_splits, .param .u32 p_cols");
     }
 
     /// <summary>out[row] = the column of the row's first-ranked value in Adad's order (Rank; the lowest column among those

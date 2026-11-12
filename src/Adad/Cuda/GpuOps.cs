@@ -76,8 +76,29 @@ public sealed partial class GpuOps(Gpu gpu)
             {
                 if (axis == Axis.Cols)
                 {
-                    var fc = gpu.Cached($"argmax_cols:{f.Name}", (out string e) => Ptx.ArgmaxCols(gpu, f, own, out e));
-                    Gpu.Launch(fc, Grid(cols, 256), 1, 256, 1, 0, x, output, Gpu.U(rows), Gpu.U(cols));
+                    // The rows in splits where a thread per column would not fill the device (as the column sums); the
+                    // splits' first-ranked values joined in order: the same row as one scan of the column.
+                    int splits = Splits(rows, cols), per = (rows + splits - 1) / splits;
+                    if (splits == 1)
+                    {
+                        var fc = gpu.Cached($"argmax_cols:{f.Name}", (out string e) => Ptx.ArgmaxCols(gpu, f, own, out e));
+                        Gpu.Launch(fc, Grid(cols, 256), 1, 256, 1, 0, x, output, Gpu.U(rows), Gpu.U(cols));
+                        return "s32 index";
+                    }
+
+                    ulong vals = gpu.Rent((long)splits * cols * own.Size), at = gpu.Rent((long)splits * cols * 4);
+                    try
+                    {
+                        var fs = gpu.Cached($"argmax_cols:{f.Name}:split", (out string e) => Ptx.ArgmaxCols(gpu, f, own, out e, split: true));
+                        Gpu.Launch(fs, Grid(cols, 256), (uint)splits, 256, 1, 0, x, vals, Gpu.U(rows), Gpu.U(cols), Gpu.U(per), at);
+                        var join = gpu.Cached($"argmax_cols_join:{own.Name}", (out string e) => Ptx.ArgmaxColsJoin(gpu, own, out e));
+                        Gpu.Launch(join, Grid(cols, 256), 1, 256, 1, 0, vals, at, output, Gpu.U(splits), Gpu.U(cols));
+                    }
+                    finally
+                    {
+                        gpu.Return(vals); gpu.Return(at);
+                    }
+
                     return "s32 index";
                 }
 
