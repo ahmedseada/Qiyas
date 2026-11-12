@@ -303,15 +303,17 @@ internal sealed partial class Kernels
         }
     }
 
-    /// <summary>counts, offsets (buckets + 1) and the sources' order by bucket (source order within a bucket).</summary>
+    /// <summary>counts, offsets (buckets + 1) and the sources' order by bucket (source order within a bucket); an index
+    /// outside [0, buckets) in no bucket, the order −1 past the sources placed (IRouting.Route).</summary>
     public static void Route(int[] index, int buckets, int[] counts, int[] offsets, int[] order)
     {
         Array.Clear(counts);
-        foreach (int i in index) counts[i]++;
+        foreach (int i in index) if ((uint)i < (uint)buckets) counts[i]++;
         offsets[0] = 0;
         for (int b = 0; b < buckets; b++) offsets[b + 1] = offsets[b] + counts[b];
         var cursor = new int[buckets];
         Array.Copy(offsets, cursor, buckets);
-        for (int i = 0; i < index.Length; i++) order[cursor[index[i]]++] = i;
+        for (int i = 0; i < index.Length; i++) if ((uint)index[i] < (uint)buckets) order[cursor[index[i]]++] = i;
+        order.AsSpan(offsets[buckets], index.Length - offsets[buckets]).Fill(-1);
     }
 }

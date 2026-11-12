@@ -524,18 +524,23 @@ internal static partial class Checks
 
         // The ordering at size (item 4f: the device's radix sort and multi-block scan): order, counts and offsets equal to
         // the stable reference — many sources into few targets, into many (three radix passes, a scan over 98 blocks),
-        // all into one, and descending indices (every tile's pairs reversed).
+        // all into one, and descending indices (every tile's pairs reversed); every third index outside the buckets (−1,
+        // buckets, the extremes: in no bucket, the order −1 past the sources placed) into 7, 64 and 256 (one pass, every
+        // digit a bucket) and 100 000 (three passes).
         // Under --repeat the device's cases run Stress / 20 passes (the radix place's barriers and shared counts: a race shows).
         // On the device also with the counting atomics for few targets (TableCounts false): both ways of taking the counts.
         foreach (bool? table in cuda is null ? new bool?[] { null } : new bool?[] { null, false })
         for (int pass = 0, passes = ops is null ? 1 : Math.Max(1, Stress / 20); pass < passes && ok; pass++)
-        foreach (var (n, buckets, kind) in new[] { (1 << 20, 64, "random"), (1_000_003, 100_000, "random"), (5_000, 1, "one"), (70_001, 65_536, "descending"), (1001, 7, "random") })
+        foreach (var (n, buckets, kind) in new[] { (1 << 20, 64, "random"), (1_000_003, 100_000, "random"), (5_000, 1, "one"), (70_001, 65_536, "descending"), (1001, 7, "random"),
+            (1001, 7, "outside"), (70_001, 64, "outside"), (50_000, 256, "outside"), (1_000_003, 100_000, "outside") })
         {
             if (cuda is not null) cuda.TableCounts = table;
+            int[] outside = [-1, buckets, int.MinValue, int.MaxValue, buckets + 5];
             var index = kind switch
             {
                 "one" => new int[n],
                 "descending" => Enumerable.Range(0, n).Select(i => (n - 1 - i) % buckets).ToArray(),
+                "outside" => Enumerable.Range(0, n).Select(i => i % 3 == 0 ? outside[i / 3 % outside.Length] : random.Next(buckets)).ToArray(),
                 _ => Enumerable.Range(0, n).Select(_ => random.Next(buckets)).ToArray(),
             };
             var (wc, wo, worder) = Routing.RouteReference(index, buckets);
@@ -549,7 +554,7 @@ internal static partial class Checks
 
         if (cuda is not null) cuda.TableCounts = null;
 
-        if (ok) Console.WriteLine($"check routing                {where,-6} every type{(blocks ? "" : " but the block formats")}: top-k in Adad's order (ties by the lower column; rows of NaN, ±0, ±inf and ties exactly, with log-softmax top-k; k = cols; k past the row refused), pick (a column outside the row: 0), sampling and the cross-entropy loss (float types; unweighted and with a weight a row, zeros among them) and the route as the references (also 1M into 64, 1 000 003 into 100 000, all into one, descending into 65 536)");
+        if (ok) Console.WriteLine($"check routing                {where,-6} every type{(blocks ? "" : " but the block formats")}: top-k in Adad's order (ties by the lower column; rows of NaN, ±0, ±inf and ties exactly, with log-softmax top-k; k = cols; k past the row refused), pick (a column outside the row: 0), sampling and the cross-entropy loss (float types; unweighted and with a weight a row, zeros among them) and the route as the references (also 1M into 64, 1 000 003 into 100 000, all into one, descending into 65 536; indices outside the buckets in none, the order −1 past the placed)");
         return ok;
     }
 

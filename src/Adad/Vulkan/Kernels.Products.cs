@@ -51,8 +51,9 @@ internal static partial class VkKernels
 
     /// <summary>The convolution's product (implicit GEMM: no columns in memory): A (m × k, stored as fa) times the image's
     /// columns (im2col of x, stored as fb, gathered by the index map on the load: Im2colAt), or, transB, times their
-    /// transpose (dw = dy · colsᵀ). Arguments: a, x, c (lane values), m, n, k, then the im2col parameters (ConvArgs.P, the
-    /// four pads among them) two a slot; workgroups (⌈n/64⌉, ⌈m/64⌉).</summary>
+    /// transpose (dw = dy · colsᵀ). Arguments: a, x, c (lane values), m, n, k, then im2col's parameters as the kernels take
+    /// them (LayoutArgs.KernelP of ConvArgs.P: the four pads, the dilations, OH and OW) two a slot; workgroups (⌈n/64⌉,
+    /// ⌈m/64⌉).</summary>
     public static SpvKernel MatMulConv(Vulkan vk, Fmt fa, Fmt fb, Lane lane, bool transB)
     {
         string formats = fa.Name == fb.Name ? fa.Name : $"{fa.Name}_{fb.Name}";
@@ -63,8 +64,8 @@ internal static partial class VkKernels
         var M = b.Arg(3, K.U32);
         var N = b.Arg(4, K.U32);
         var Kd = b.Arg(5, K.U32);
-        var p = new V[14];
-        for (int i = 0; i < 14; i++)
+        var p = new V[15];
+        for (int i = 0; i < 15; i++)
         {
             var raw = b.Arg(6 + i / 2);
             p[i] = b.Convert(i % 2 == 0 ? raw : raw >> 32, K.U32);

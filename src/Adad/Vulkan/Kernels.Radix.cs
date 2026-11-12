@@ -9,7 +9,10 @@
 //                   prefixed (the digits' bases);
 //   RadixScatter    a workgroup per tile: each source to base[d] + hist[d][t] + its rank among the tile's earlier sources
 //                   of its digit — stable, so the passes compose to the order by bucket, sources in order within one.
-// The counts by integer atomics and the offsets by a scan (ScatterCount, ScatterScan).
+// The counts by integer atomics and the offsets by a scan (ScatterCount, ScatterScan). A source whose bucket is outside
+// [0, buckets) (the limit; unsigned, so a negative one too) is in no place: the first pass drops it, the later passes take
+// the sources with a bucket (valid: their count on the device) as their n, and the last pass writes −1 ("no source") past
+// them (tail), so every value of the order is written.
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
@@ -18,21 +21,27 @@ internal static partial class VkKernels
 {
     public const int RadixTile = 256, RadixDigits = 256;
 
-    /// <summary>Arguments: keys (s32; or the bucket index array on the first pass), n, shift, hist, tiles.</summary>
+    /// <summary>Arguments: keys (s32; or the bucket index array on the first pass), n, shift, hist, tiles, limit (the
+    /// buckets), valid (0, or the kept count's address: a later pass's n).</summary>
     public static SpvKernel RadixHistogram(Vulkan vk)
     {
         var b = new Spv("radix_histogram", RadixTile, vk.Controls);
         var keys = b.Arg(0);
-        var n = b.Arg(1, K.U32);
+        var n = Kept(b, b.Arg(1, K.U32), b.Arg(6));
         var shift = b.Arg(2, K.U32);
         var hist = b.Arg(3);
         var tiles = b.Arg(4, K.U32);
+        var limit = b.Arg(5, K.U32);
         var tid = b.LocalIdX;
         var tile = b.GroupX;
         var i = tile * RadixTile + tid;
         var digits = b.Shared(K.U32, RadixTile);
-        var key = b.Local(b.U(0xFFFFFFFF));                                          // past n: no digit
-        b.If(i < n, () => key.V = (b.Bitcast(b.Load(K.S32, b.At(keys, i, 4)), K.U32).Shr(shift)) & 255UL);
+        var key = b.Local(b.U(0xFFFFFFFF));                                          // past n or the limit: no digit
+        b.If(i < n, () =>
+        {
+            var k = b.Bitcast(b.Load(K.S32, b.At(keys, i, 4)), K.U32);
+            key.V = b.Select(k < limit, k.Shr(shift) & 255UL, b.U(0xFFFFFFFF));
+        });
         digits[tid] = key.V;
         b.Barrier();
         // Invocation d counts digit d over the tile.
@@ -75,25 +84,30 @@ internal static partial class VkKernels
     }
 
     /// <summary>Each source of the tile to base[d] + hist[d][t] + its rank among the tile's earlier sources of digit d.
-    /// Arguments: keys, values (0: the sources' own indices, the first pass), n, shift, hist, tiles, bases, keysOut, valuesOut.</summary>
+    /// Arguments: keys, values (0: the sources' own indices, the first pass), n, shift, hist, tiles, bases, keysOut, valuesOut,
+    /// limit, valid (as RadixHistogram's), tail (the last pass: the kept count's address; valuesOut[i] = −1 from it to n).</summary>
     public static SpvKernel RadixScatter(Vulkan vk)
     {
         var b = new Spv("radix_scatter", RadixTile, vk.Controls);
         var keys = b.Arg(0);
         var values = b.Arg(1);
-        var n = b.Arg(2, K.U32);
+        var all = b.Arg(2, K.U32);
+        var n = Kept(b, all, b.Arg(10));
         var shift = b.Arg(3, K.U32);
         var hist = b.Arg(4);
         var tiles = b.Arg(5, K.U32);
         var bases = b.Arg(6);
         var keysOut = b.Arg(7);
         var valuesOut = b.Arg(8);
+        var limit = b.Arg(9, K.U32);
+        var tail = b.Arg(11);
         var tid = b.LocalIdX;
         var tile = b.GroupX;
         var i = tile * RadixTile + tid;
-        var inside = i < n;
-        var safe = b.Select(inside, i, b.U(0));
+        var before = i < n;
+        var safe = b.Select(before, i, b.U(0));
         var key = b.Load(K.U32, b.At(keys, safe, 4));
+        var inside = before & (key < limit);
         var digit = b.Select(inside, key.Shr(shift) & 255UL, b.U(0xFFFFFFFF));
         var digits = b.Shared(K.U32, RadixTile);
         digits[tid] = digit;
@@ -108,6 +122,20 @@ internal static partial class VkKernels
             b.Store(b.At(keysOut, dest, 4), key);
             b.Store(b.At(valuesOut, dest, 4), value.V);
         });
+        // Past the sources placed: −1 at position i itself (no placed source's rank reaches it).
+        b.If(tail != 0UL, () =>
+        {
+            var from = b.Load(K.U32, b.At(tail, b.U(0), 4));
+            b.If((i >= from) & (i < all), () => b.Store(b.At(valuesOut, i, 4), b.U(0xFFFFFFFF)));
+        });
         return b.Build();
+    }
+
+    // A pass's n: n, or the kept count at `valid` where it is given (a later pass: the sources the first kept).
+    private static V Kept(Spv b, V n, V valid)
+    {
+        var kept = b.Local(n);
+        b.If(valid != 0UL, () => kept.V = b.Min(n, b.Load(K.U32, b.At(valid, b.U(0), 4))));
+        return kept.V;
     }
 }

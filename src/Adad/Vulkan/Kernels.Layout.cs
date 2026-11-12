@@ -262,10 +262,20 @@ internal static partial class VkKernels
                 return b.Select(Index(a.Idx, r) == c, b.C(k, 1), Zero());
 
             case "gather_rows":
-                return Load(Index(a.Idx, r) * cols + c);
+            {
+                // An index outside the input's rows (p[0], unsigned: a negative one too) reads nothing: 0 (the address 0 a
+                // safe one).
+                var row = Index(a.Idx, r);
+                var inside = row < p[0];
+                return b.Select(inside, Load(b.Select(inside, row * cols + c, b.U(0))), Zero());
+            }
 
             case "gather_cols":
-                return Load(r * p[1] + Index(a.Idx, c));
+            {
+                var col = Index(a.Idx, c);
+                var inside = col < p[1];
+                return b.Select(inside, Load(b.Select(inside, r * p[1] + col, b.U(0))), Zero());
+            }
 
             case "scatter_add_rows":
             {

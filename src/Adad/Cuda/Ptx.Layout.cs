@@ -299,16 +299,21 @@ internal static partial class Ptx
 
             case "gather_rows":
             {
-                string row = Index(idx, r), src = b.R();
+                // An index outside the input's rows (p[0], unsigned: a negative one too) reads nothing: 0.
+                string row = Index(idx, r), src = b.R(), pin = b.P();
+                b.L($"setp.lt.u32 {pin}, {row}, {p[0]};");
                 b.L($"mad.lo.u32 {src}, {row}, {cols}, {c};");
-                return Load(src);
+                b.L($"selp.u32 {src}, {src}, 0, {pin};");             // a safe address when out of range (dropped)
+                return Sel(pin, Load(src), Zero());
             }
 
             case "gather_cols":
             {
-                string col = Index(idx, c), src = b.R();
+                string col = Index(idx, c), src = b.R(), pin = b.P();
+                b.L($"setp.lt.u32 {pin}, {col}, {p[1]};");
                 b.L($"mad.lo.u32 {src}, {r}, {p[1]}, {col};");
-                return Load(src);
+                b.L($"selp.u32 {src}, {src}, 0, {pin};");
+                return Sel(pin, Load(src), Zero());
             }
 
             case "scatter_add_rows":
@@ -931,14 +936,14 @@ internal static partial class Ptx
         return b.Finish(Header(gpu), entry, ".param .u64 p_src, .param .u64 p_dst, .param .u32 p_count, .param .u32 p_offset");
     }
 
-    // ---------------------------------------------------------------- scatter-add's ordering: counts, offsets, ordered sources
+    // ---------------------------------------------------------------- the ordering's counts (GpuOps.OrderByTarget)
 
-    /// <summary>counts[index[i]] += 1 over n sources (integer atomics: exact).</summary>
+    /// <summary>counts[index[i]] += 1 over n sources (integer atomics: exact); an index outside [0, targets) counts nowhere.</summary>
     public static string ScatterCount(Gpu gpu, out string entry)
     {
         entry = "scatter_count";
         var b = new PtxBuilder();
-        string tid = b.R(), bid = b.R(), i = b.R(), n = Param32(b, "p_n"), idx = Param64(b, "p_idx"), counts = Param64(b, "p_counts"), pEnd = b.P();
+        string tid = b.R(), bid = b.R(), i = b.R(), n = Param32(b, "p_n"), targets = Param32(b, "p_targets"), idx = Param64(b, "p_idx"), counts = Param64(b, "p_counts"), pEnd = b.P();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");
         b.L($"mad.lo.u32 {i}, {bid}, 256, {tid};");
@@ -948,82 +953,13 @@ internal static partial class Ptx
         b.L($"mul.wide.u32 {a}, {i}, 4;");
         b.L($"add.u64 {a}, {idx}, {a};");
         b.L($"ld.global.s32 {target}, [{a}];");
+        b.L($"setp.ge.u32 {pEnd}, {target}, {targets};");            // unsigned: a negative index too
+        b.L($"@{pEnd} bra DONE;");
         b.L($"mul.wide.u32 {ca}, {target}, 4;");
         b.L($"add.u64 {ca}, {counts}, {ca};");
         b.L($"atom.global.add.u32 {old}, [{ca}], 1;");
         b.Label("DONE");
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_idx, .param .u64 p_counts, .param .u32 p_n");
-    }
-
-    /// <summary>offsets[0] = 0, offsets[r + 1] = offsets[r] + counts[r]: one block, a serial scan by its first thread
-    /// (rows are thousands here; a parallel scan is the step for millions).</summary>
-    public static string ScatterScan(Gpu gpu, out string entry)
-    {
-        entry = "scatter_scan";
-        var b = new PtxBuilder();
-        string tid = b.R(), rows = Param32(b, "p_rows"), counts = Param64(b, "p_counts"), offsets = Param64(b, "p_offsets"), p0 = b.P();
-        b.L($"mov.u32 {tid}, %tid.x;");
-        b.L($"setp.ne.u32 {p0}, {tid}, 0;");
-        b.L($"@{p0} bra DONE;");
-        string r = b.R(), acc = b.R(), cnt = b.R(), ca = b.RD(), oa = b.RD(), pEnd = b.P();
-        b.L($"mov.u32 {acc}, 0;");
-        b.L($"st.global.u32 [{offsets}], {acc};");
-        b.L($"mov.u32 {r}, 0;");
-        b.Label("LOOP");
-        b.L($"setp.ge.u32 {pEnd}, {r}, {rows};");
-        b.L($"@{pEnd} bra DONE;");
-        b.L($"mul.wide.u32 {ca}, {r}, 4;");
-        b.L($"add.u64 {oa}, {offsets}, {ca};");
-        b.L($"add.u64 {ca}, {counts}, {ca};");
-        b.L($"ld.global.u32 {cnt}, [{ca}];");
-        b.L($"add.u32 {acc}, {acc}, {cnt};");
-        b.L($"st.global.u32 [{oa}+4], {acc};");
-        b.L($"add.u32 {r}, {r}, 1;");
-        b.L("bra LOOP;");
-        b.Label("DONE");
-        b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_counts, .param .u64 p_offsets, .param .u32 p_rows");
-    }
-
-    /// <summary>sources[offsets[index[i]] + rank] = i, rank = the number of earlier sources with the same index (a scan
-    /// over the earlier indices: deterministic, quadratic in the source count — the radix step is for millions).</summary>
-    public static string ScatterPlace(Gpu gpu, out string entry)
-    {
-        entry = "scatter_place";
-        var b = new PtxBuilder();
-        string tid = b.R(), bid = b.R(), i = b.R(), n = Param32(b, "p_n"), idx = Param64(b, "p_idx"), offsets = Param64(b, "p_offsets"), sources = Param64(b, "p_sources"), pEnd = b.P();
-        b.L($"mov.u32 {tid}, %tid.x;");
-        b.L($"mov.u32 {bid}, %ctaid.x;");
-        b.L($"mad.lo.u32 {i}, {bid}, 256, {tid};");
-        b.L($"setp.ge.u32 {pEnd}, {i}, {n};");
-        b.L($"@{pEnd} bra DONE;");
-        string a = b.RD(), mine = b.R(), j = b.R(), rank = b.R(), ja = b.RD(), other = b.R(), pj = b.P(), peq = b.P(), oa = b.RD(), off = b.R(), sa = b.RD();
-        b.L($"mul.wide.u32 {a}, {i}, 4;");
-        b.L($"add.u64 {a}, {idx}, {a};");
-        b.L($"ld.global.s32 {mine}, [{a}];");
-        b.L($"mov.u32 {rank}, 0;");
-        b.L($"mov.u32 {j}, 0;");
-        b.Label("LOOP");
-        b.L($"setp.ge.u32 {pj}, {j}, {i};");
-        b.L($"@{pj} bra END;");
-        b.L($"mul.wide.u32 {ja}, {j}, 4;");
-        b.L($"add.u64 {ja}, {idx}, {ja};");
-        b.L($"ld.global.s32 {other}, [{ja}];");
-        b.L($"setp.eq.u32 {peq}, {other}, {mine};");
-        b.L($"@{peq} add.u32 {rank}, {rank}, 1;");
-        b.L($"add.u32 {j}, {j}, 1;");
-        b.L("bra LOOP;");
-        b.Label("END");
-        b.L($"mul.wide.u32 {oa}, {mine}, 4;");
-        b.L($"add.u64 {oa}, {offsets}, {oa};");
-        b.L($"ld.global.u32 {off}, [{oa}];");
-        b.L($"add.u32 {off}, {off}, {rank};");
-        b.L($"mul.wide.u32 {sa}, {off}, 4;");
-        b.L($"add.u64 {sa}, {sources}, {sa};");
-        b.L($"st.global.u32 [{sa}], {i};");
-        b.Label("DONE");
-        b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_idx, .param .u64 p_offsets, .param .u64 p_sources, .param .u32 p_n");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_idx, .param .u64 p_counts, .param .u32 p_n, .param .u32 p_targets");
     }
 }

@@ -220,8 +220,8 @@ public sealed partial class VulkanOps
     {
         if (m == 0 || n == 0) return;
         var fn = vk.Cached($"matmul_conv:{fa.Name}:{fb.Name}:{lane.Name}:{transB}", () => VkKernels.MatMulConv(vk, fa, fb, lane, transB));
-        // The im2col parameters (ConvArgs.P, every pad among them) two a slot.
-        var p = conv.P;
+        // im2col's parameters as the kernels take them (every pad, the dilations, OH and OW) two a slot.
+        var p = LayoutArgs.KernelP("im2col", conv.P);
         var args = new ulong[6 + (p.Length + 1) / 2];
         args[0] = a; args[1] = x; args[2] = c;
         args[3] = Vulkan.U(m); args[4] = Vulkan.U(n); args[5] = Vulkan.U(k);

@@ -150,13 +150,15 @@ public static class Routing
 
     public static (int[] Counts, int[] Offsets, int[] Order) RouteReference(int[] index, int buckets)
     {
+        // An index outside [0, buckets) is in no bucket; the order −1 past the sources placed (IRouting.Route).
         var counts = new int[buckets];
-        foreach (int i in index) counts[i]++;
+        foreach (int i in index) if ((uint)i < (uint)buckets) counts[i]++;
         var offsets = new int[buckets + 1];
         for (int b = 0; b < buckets; b++) offsets[b + 1] = offsets[b] + counts[b];
         var order = new int[index.Length];
+        Array.Fill(order, -1);
         var cursor = (int[])offsets.Clone();
-        for (int i = 0; i < index.Length; i++) order[cursor[index[i]]++] = i;
+        for (int i = 0; i < index.Length; i++) if ((uint)index[i] < (uint)buckets) order[cursor[index[i]]++] = i;
         return (counts, offsets, order);
     }
 }

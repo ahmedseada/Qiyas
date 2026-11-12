@@ -3,7 +3,10 @@
 
 // Scatter-add's ordering at any size (item 4f): the sources' order by target as a stable LSD radix sort of the
 // (target, source) pairs, 8-bit digits; and the exclusive scan over many blocks that the offsets and the radix passes
-// need. Every step is deterministic: the same order as the CPU's stable counting sort, no atomics on the order.
+// need. Every step is deterministic: the same order as the CPU's stable counting sort, no atomics on the order. A source
+// whose target is outside [0, targets) (the limit; unsigned, so a negative one too) is in no place: the first pass drops
+// it, the later passes take the sources with a target (p_valid: their count on the device) as their n, and the last pass
+// writes −1 ("no source") past them (p_tail), so every value of the order is written.
 //   scan_tile   a block of 256 threads scans 1024 values (4 a thread, a warp scan by shuffles, the warps' sums through
 //               shared memory) and writes its total; scan_add adds each block's scanned total back (the host recurses
 //               on the totals).
@@ -127,8 +130,9 @@ internal static partial class Ptx
         return b.Finish(Header(gpu), entry, ".param .u64 p_out, .param .u64 p_add, .param .u32 p_n");
     }
 
-    // The tile's item loop shared by both radix kernels: i = tile·2048 + t·256 + tid for t in 0..8.
-    private static (string I, string Valid, string Key, string Digit) RadixItem(PtxBuilder b, string tileFirst, string t, string tid, string n, string keys, string shift)
+    // The tile's item loop shared by both radix kernels: i = tile·2048 + t·256 + tid for t in 0..8; a pair only where its
+    // key is below the limit.
+    private static (string I, string Valid, string Key, string Digit) RadixItem(PtxBuilder b, string tileFirst, string t, string tid, string n, string keys, string shift, string limit)
     {
         string i = b.R(), valid = b.P(), key = b.R(), digit = b.R(), ka = b.RD();
         b.L($"mad.lo.u32 {i}, {t}, 256, {tileFirst};");
@@ -138,14 +142,28 @@ internal static partial class Ptx
         b.L($"mul.wide.u32 {ka}, {i}, 4;");
         b.L($"add.u64 {ka}, {keys}, {ka};");
         b.L($"@{valid} ld.global.u32 {key}, [{ka}];");
+        b.L($"setp.lt.and.u32 {valid}, {key}, {limit}, {valid};");
         b.L($"shr.u32 {digit}, {key}, {shift};");
         b.L($"and.b32 {digit}, {digit}, 255;");
         return (i, valid, key, digit);
     }
 
+    // The pairs a radix pass takes: n, or the count at p_valid where it is given (a later pass: the sources the first kept).
+    private static string RadixLimit(PtxBuilder b, string n)
+    {
+        string limit = Param32(b, "p_limit"), valid = Param64(b, "p_valid"), has = b.P(), kept = b.R();
+        b.L($"setp.ne.u64 {has}, {valid}, 0;");
+        b.L($"@{has} ld.global.u32 {kept}, [{valid}];");
+        b.L($"@{has} min.u32 {n}, {n}, {kept};");
+        return limit;
+    }
+
+    private const string RadixLimitParams = ", .param .u32 p_limit, .param .u64 p_valid";
+
     /// <summary>Item 6j: a one-pass sort's scanned table (targets ≤ 256: the digit is the target) as the route's counts and
-    /// offsets — offsets[t] = table[t · tiles] (target t's first place), offsets[targets] = n, counts[t] the difference.
-    /// No atomics (the counts were 1M atomics on 64 counters).</summary>
+    /// offsets — offsets[t] = table[t · tiles] (target t's first place) for t &lt; targets, counts[t] the difference to the
+    /// next, the last's to offsets[targets] (the sources with a target: the table scan's total, already there). No atomics
+    /// (the counts were 1M atomics on 64 counters).</summary>
     public static string RadixTableOffsets(Gpu gpu, out string entry)
     {
         entry = "radix_table_offsets";
@@ -154,15 +172,12 @@ internal static partial class Ptx
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {bid}, %ctaid.x;");
         b.L($"mad.lo.u32 {i}, {bid}, 256, {tid};");
-        string table = Param64(b, "p_table"), counts = Param64(b, "p_counts"), offsets = Param64(b, "p_offsets"), targets = Param32(b, "p_targets"), tiles = Param32(b, "p_tiles"), n = Param32(b, "p_n");
-        string pPast = b.P(), pLast = b.P(), oa = b.RD();
-        b.L($"setp.gt.u32 {pPast}, {i}, {targets};");
+        string table = Param64(b, "p_table"), counts = Param64(b, "p_counts"), offsets = Param64(b, "p_offsets"), targets = Param32(b, "p_targets"), tiles = Param32(b, "p_tiles");
+        string pPast = b.P(), oa = b.RD();
+        b.L($"setp.ge.u32 {pPast}, {i}, {targets};");
         b.L($"@{pPast} bra DONE;");
         b.L($"mul.wide.u32 {oa}, {i}, 4;");
         b.L($"add.u64 {oa}, {offsets}, {oa};");
-        b.L($"setp.eq.u32 {pLast}, {i}, {targets};");
-        b.L($"@{pLast} st.global.u32 [{oa}], {n};");
-        b.L($"@{pLast} bra DONE;");
         string at = b.R(), ta = b.RD(), start = b.R(), next = b.R(), pIn = b.P(), i1 = b.R(), at2 = b.R(), ta2 = b.RD(), ca = b.RD(), count = b.R();
         b.L($"mul.lo.u32 {at}, {i}, {tiles};");
         b.L($"mul.wide.u32 {ta}, {at}, 4;");
@@ -170,11 +185,11 @@ internal static partial class Ptx
         b.L($"ld.global.u32 {start}, [{ta}];");
         b.L($"add.u32 {i1}, {i}, 1;");
         b.L($"setp.lt.u32 {pIn}, {i1}, {targets};");
-        b.L($"mov.u32 {next}, {n};");
         b.L($"mul.lo.u32 {at2}, {i1}, {tiles};");
         b.L($"mul.wide.u32 {ta2}, {at2}, 4;");
         b.L($"add.u64 {ta2}, {table}, {ta2};");
-        b.L($"@{pIn} ld.global.u32 {next}, [{ta2}];");
+        b.L($"@!{pIn} add.u64 {ta2}, {oa}, 4;");                     // the last target: offsets[targets]
+        b.L($"ld.global.u32 {next}, [{ta2}];");
         b.L($"st.global.u32 [{oa}], {start};");
         b.L($"sub.u32 {count}, {next}, {start};");
         b.L($"mul.wide.u32 {ca}, {i}, 4;");
@@ -182,7 +197,7 @@ internal static partial class Ptx
         b.L($"st.global.u32 [{ca}], {count};");
         b.Label("DONE");
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_table, .param .u64 p_counts, .param .u64 p_offsets, .param .u32 p_targets, .param .u32 p_tiles, .param .u32 p_n");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_table, .param .u64 p_counts, .param .u64 p_offsets, .param .u32 p_targets, .param .u32 p_tiles");
     }
 
     /// <summary>table[digit · tiles + tile] = the count of digit ((key >> shift) &amp; 255) among the tile's 2048 keys.</summary>
@@ -195,6 +210,7 @@ internal static partial class Ptx
         b.L($"mov.u32 {bid}, %ctaid.x;");
         b.L($"mov.u32 {sm}, smem;");
         string keys = Param64(b, "p_keys"), table = Param64(b, "p_table"), n = Param32(b, "p_n"), tiles = Param32(b, "p_tiles"), shift = Param32(b, "p_shift");
+        string limit = RadixLimit(b, n);
         string mine = b.R(), zero = b.R(), tileFirst = b.R();
         b.L($"mad.lo.u32 {mine}, {tid}, 4, {sm};");
         b.L($"mov.u32 {zero}, 0;");
@@ -204,7 +220,7 @@ internal static partial class Ptx
         string t = b.R(), pt = b.P();
         b.L($"mov.u32 {t}, 0;");
         b.Label("ITEM");
-        var (_, valid, _, digit) = RadixItem(b, tileFirst, t, tid, n, keys, shift);
+        var (_, valid, _, digit) = RadixItem(b, tileFirst, t, tid, n, keys, shift, limit);
         string da = b.R(), old = b.R();
         b.L($"mad.lo.u32 {da}, {digit}, 4, {sm};");
         b.L($"@{valid} atom.shared.add.u32 {old}, [{da}], 1;");
@@ -219,11 +235,12 @@ internal static partial class Ptx
         b.L($"add.u64 {ta}, {table}, {ta};");
         b.L($"st.global.u32 [{ta}], {count};");
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_keys, .param .u64 p_table, .param .u32 p_n, .param .u32 p_tiles, .param .u32 p_shift", 1024);
+        return b.Finish(Header(gpu), entry, ".param .u64 p_keys, .param .u64 p_table, .param .u32 p_n, .param .u32 p_tiles, .param .u32 p_shift" + RadixLimitParams, 1024);
     }
 
     /// <summary>The tile's pairs placed stably by digit: keysOut[r] = key, valsOut[r] = value (the source's index i when
-    /// p_vals is 0), r = base[digit · tiles + tile] + the earlier same-digit pairs of the tile.</summary>
+    /// p_vals is 0), r = base[digit · tiles + tile] + the earlier same-digit pairs of the tile. With p_tail (the last pass:
+    /// the count of the sources placed, on the device), valsOut[i] = −1 for i from that count to n.</summary>
     public static string RadixPlace(Gpu gpu, out string entry)
     {
         entry = "radix_place";
@@ -235,6 +252,12 @@ internal static partial class Ptx
         b.L($"mov.u32 {sm}, smem;");
         string keys = Param64(b, "p_keys"), vals = Param64(b, "p_vals"), keysOut = Param64(b, "p_keys_out"), valsOut = Param64(b, "p_vals_out"), bases = Param64(b, "p_base");
         string n = Param32(b, "p_n"), tiles = Param32(b, "p_tiles"), shift = Param32(b, "p_shift");
+        string all = b.R(), tail = Param64(b, "p_tail"), tailFrom = b.R(), hasTail = b.P();
+        b.L($"mov.u32 {all}, {n};");
+        b.L($"mov.u32 {tailFrom}, {all};");                                  // no tail: from n, none
+        b.L($"setp.ne.u64 {hasTail}, {tail}, 0;");
+        b.L($"@{hasTail} ld.global.u32 {tailFrom}, [{tail}];");
+        string limit = RadixLimit(b, n);
         string lane = b.R(), warp = b.R(), tileFirst = b.R(), mine = b.R();
         b.L($"and.b32 {lane}, {tid}, 31;");
         b.L($"shr.u32 {warp}, {tid}, 5;");
@@ -257,7 +280,7 @@ internal static partial class Ptx
         b.L($"mov.u32 {lt}, %lanemask_lt;");
         b.L($"mov.u32 {t}, 0;");
         b.Label("ITEM");
-        var (i, valid, key, digit) = RadixItem(b, tileFirst, t, tid, n, keys, shift);
+        var (i, valid, key, digit) = RadixItem(b, tileFirst, t, tid, n, keys, shift, limit);
         // The lanes holding a valid pair with this lane's digit.
         string peers = b.R();
         b.L($"vote.sync.ballot.b32 {peers}, {valid}, 0xffffffff;");
@@ -306,6 +329,14 @@ internal static partial class Ptx
             b.L($"@{valid} st.global.u32 [{ka}], {key};");
             b.L($"add.u64 {oa}, {valsOut}, {oa};");
             b.L($"@{valid} st.global.u32 [{oa}], {value};");
+            // Past the sources placed: −1 at position i itself (no placed pair's rank reaches it).
+            string pTail = b.P(), pIn = b.P(), none = b.R(), na = b.RD();
+            b.L($"setp.lt.u32 {pIn}, {i}, {all};");
+            b.L($"setp.ge.and.u32 {pTail}, {i}, {tailFrom}, {pIn};");
+            b.L($"mov.u32 {none}, 0xFFFFFFFF;");
+            b.L($"mul.wide.u32 {na}, {i}, 4;");
+            b.L($"add.u64 {na}, {valsOut}, {na};");
+            b.L($"@{pTail} st.global.u32 [{na}], {none};");
         }
 
         b.L("bar.sync 0;");
@@ -332,6 +363,6 @@ internal static partial class Ptx
         b.L($"setp.lt.u32 {pt}, {t}, {RadixItems};");
         b.L($"@{pt} bra ITEM;");
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_keys, .param .u64 p_vals, .param .u64 p_keys_out, .param .u64 p_vals_out, .param .u64 p_base, .param .u32 p_n, .param .u32 p_tiles, .param .u32 p_shift", Warps + 8 * 1024);
+        return b.Finish(Header(gpu), entry, ".param .u64 p_keys, .param .u64 p_vals, .param .u64 p_keys_out, .param .u64 p_vals_out, .param .u64 p_base, .param .u32 p_n, .param .u32 p_tiles, .param .u32 p_shift" + RadixLimitParams + ", .param .u64 p_tail", Warps + 8 * 1024);
     }
 }

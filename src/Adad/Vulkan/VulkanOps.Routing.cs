@@ -113,7 +113,8 @@ public sealed partial class VulkanOps
     public void Route(ulong index, int count, int buckets, ulong counts, ulong offsets, ulong order) => Order(index, count, buckets, counts, offsets, order);
 
     // The sources' counts by bucket (integer atomics), their offsets (a scan) and their stable order by bucket (the radix
-    // sort of Kernels.Radix.cs): route's, and scatter-add's ordering. Every index within [0, buckets).
+    // sort of Kernels.Radix.cs): route's, and scatter-add's ordering. An index outside [0, buckets) is in no bucket: not
+    // counted, offsets[buckets] the sources with one, the order −1 past them (IRouting.Route).
     private void Order(ulong index, int n, int buckets, ulong counts, ulong offsets, ulong order)
     {
         vk.Clear(counts, Math.Max(1, buckets) * 4L);
@@ -126,6 +127,7 @@ public sealed partial class VulkanOps
         var scan = vk.Cached("scatter_scan", () => VkKernels.ScatterScan(vk));
         vk.Launch(scan, 1, 1, counts, offsets, Vulkan.U(buckets));
         if (n == 0) return;
+        ulong kept = offsets + (ulong)(buckets * 4L);
         int bits = buckets <= 1 ? 0 : 32 - BitOperations.LeadingZeroCount((uint)(buckets - 1));
         int passes = Math.Max(1, (bits + 7) / 8), tiles = (n + VkKernels.RadixTile - 1) / VkKernels.RadixTile;
         var histogram = vk.Cached("radix_histogram", () => VkKernels.RadixHistogram(vk));
@@ -139,9 +141,11 @@ public sealed partial class VulkanOps
             for (int p = 0; p < passes; p++)
             {
                 ulong keysOut = p % 2 == 0 ? keysA : keysB, valuesOut = p == passes - 1 ? order : p % 2 == 0 ? valuesA : valuesB;
-                vk.Launch(histogram, (uint)tiles, 1, keys, Vulkan.U(n), Vulkan.U(8 * p), hist, Vulkan.U(tiles));
+                // The first pass drops the indices outside [0, buckets); the later ones take the kept (offsets[buckets]).
+                ulong valid = p == 0 ? 0 : kept, tail = p == passes - 1 ? kept : 0;
+                vk.Launch(histogram, (uint)tiles, 1, keys, Vulkan.U(n), Vulkan.U(8 * p), hist, Vulkan.U(tiles), Vulkan.U(buckets), valid);
                 vk.Launch(prefix, 1, 1, hist, Vulkan.U(tiles), bases);
-                vk.Launch(scatter, (uint)tiles, 1, keys, values, Vulkan.U(n), Vulkan.U(8 * p), hist, Vulkan.U(tiles), bases, keysOut, valuesOut);
+                vk.Launch(scatter, (uint)tiles, 1, keys, values, Vulkan.U(n), Vulkan.U(8 * p), hist, Vulkan.U(tiles), bases, keysOut, valuesOut, Vulkan.U(buckets), valid, tail);
                 keys = keysOut;
                 values = valuesOut;
             }

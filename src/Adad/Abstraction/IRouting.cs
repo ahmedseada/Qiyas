@@ -27,8 +27,9 @@ public interface IRouting<TBuffer, TIndex>
     /// is a row operation: cross_entropy_bwd, weighted_cross_entropy_bwd (the same weights, and the loss's scale).</summary>
     string CrossEntropy<TN>(TBuffer x, int rows, int cols, TIndex targets, TBuffer? weights, TBuffer output) where TN : struct, IFloatAdad<TN>;
 
-    /// <summary>counts (buckets), offsets (buckets + 1) and order (count: the sources grouped by bucket, in source order) of
-    /// count indices into buckets.</summary>
+    /// <summary>counts (buckets), offsets (buckets + 1) and order (count values: the sources grouped by bucket, in source
+    /// order) of count indices into buckets. An index outside [0, buckets) (a negative one too) is in no bucket: not
+    /// counted, offsets[buckets] the sources with a bucket, and order −1 ("no source") from offsets[buckets] to count.</summary>
     void Route(TIndex index, int count, int buckets, TIndex counts, TIndex offsets, TIndex order);
 
 }

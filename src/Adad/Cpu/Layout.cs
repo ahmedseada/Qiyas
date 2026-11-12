@@ -9,7 +9,8 @@
 //   one_hot    output[i][c] = (c == index[i]) ? 1 : 0 over `classes` columns
 //   gather_rows   output[i] = x[index[i]] (a row each); gather_cols output[r][j] = x[r][index[j]]
 //   scatter_add_rows   output[index[i]] += x[i] (the embedding gradient): every output row sums its sources in source
-//              order (deterministic on both devices)
+//              order (deterministic on every device)
+//   An index outside its range selects nothing: no 1, a gathered 0, a source that adds nowhere.
 //   im2col     x (C × H × W) to columns ((C·kh·kw) × (OH·OW)) for a kernel kh × kw, strides, a pad a side, dilations;
 //   col2im     the reverse sum (each input pixel gathers its column entries in kernel order: exact order)
 //   interpolate   x (C × H × W) resized to (C × OH × OW), nearest or bilinear, along each axis the source coordinate
@@ -199,7 +200,7 @@ internal sealed partial class Kernels
         {
             Lane = TL.Name;
             var (rows, cols) = OutputRows(k);
-            var at = WindowArgmax<TN, TLane>(k);
+            var at = Aux<TN, TLane>(k);
             if (StridedTiled<TN, TLane>(k, cols, out int dim))
             {
                 // A tile's line is whole storage units where the type's bytes are not lanes (a block decoded once, not once
@@ -222,7 +223,7 @@ internal sealed partial class Kernels
         {
             Lane = TL.Name;
             var (rows, cols) = OutputRows(k);
-            var at = WindowArgmax<TN, TLane>(k);
+            var at = Aux<TN, TLane>(k);
             Move<TN, TLane, TL>(k, rows, cols, at);
         }
     }
@@ -235,7 +236,7 @@ internal sealed partial class Kernels
         {
             Lane = TL.Name;
             var (rows, cols) = OutputRows(k);
-            var at = WindowArgmax<TN, TLane>(k);
+            var at = Aux<TN, TLane>(k);
             Move<TN, TLane, TL>(k, rows, cols, at);
         }
 
@@ -254,7 +255,7 @@ internal sealed partial class Kernels
         private static void Plain<TN, TLane, TL>(LayoutArgs k) where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
         {
             var (rows, cols) = OutputRows(k);
-            var at = WindowArgmax<TN, TLane>(k);
+            var at = Aux<TN, TLane>(k);
             Move<TN, TLane, TL>(k, rows, cols, at);
         }
     }
@@ -356,11 +357,26 @@ internal sealed partial class Kernels
         }
     }
 
-    /// <summary>The max-pool backward's first largest of every window of the forward input (x2), found once by the team
-    /// (index into the input, -1 for an empty window): each input row then reads its windows' choice instead of scanning
-    /// every window it lies in. Null for the other operations.</summary>
-    private static long[]? WindowArgmax<TN, TLane>(LayoutArgs k) where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
+    /// <summary>What the rows read besides the inputs, found once. The max-pool backwards: the first largest of every
+    /// window of the forward input (x2), found by the team (index into the input; every window holds a value), so each
+    /// input row reads its windows' choice instead of scanning every window it lies in. scatter_add_rows: its offsets
+    /// (rows + 1), then its sources in order of their row (Route: source order within a row, an index outside the rows in
+    /// none), as the devices' aux. Null for the other operations.</summary>
+    private static long[]? Aux<TN, TLane>(LayoutArgs k) where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
     {
+        if (k.Name == "scatter_add_rows")
+        {
+            int sources = k.P[0], targets = k.P[2];
+            var index = k.Index!.Length == sources ? k.Index : k.Index[..sources];
+            var offsets = new int[targets + 1];
+            var order = new int[sources];
+            Route(index, targets, new int[targets], offsets, order);
+            var aux = new long[targets + 1 + sources];
+            for (int t = 0; t <= targets; t++) aux[t] = offsets[t];
+            for (int q = 0; q < sources; q++) aux[targets + 1 + q] = order[q];
+            return aux;
+        }
+
         if (k.Name is not ("maxpool_bwd" or "adaptive_maxpool_bwd")) return null;
         var p = k.P;
         int C = p[0], H = p[1], W = p[2];
@@ -438,7 +454,8 @@ internal sealed partial class Kernels
         }
 
         // The input and the second input read through the task's readers (in place, or chunks decoded as reached).
-        // at: the max-pool backward's first largest of every window (input index, -1 for an empty window), found once.
+        // at: what the rows read besides the inputs (Aux): the max-pool backward's first largest of every window, or
+        // scatter-add's offsets and ordered sources.
         // v0 ≥ 0: only the output values [v0, v1) are this task's (whole storage units), gathered and stored at once.
         private static void RunRows(int first, int last, LayoutArgs k, int rows, int cols, bool exclusiveBytes, long[]? at, bool inLanes, bool outLanes, long v0 = -1, long v1 = -1)
         {
@@ -473,27 +490,27 @@ internal sealed partial class Kernels
                             if ((uint)idx![r] < (uint)cols) o[idx[r]] = TL.From(1);
                             break;
                         case "gather_rows":
-                            TN.Load(k.X, idx![r] * cols, o);
+                            if ((uint)idx![r] < (uint)p[0]) TN.Load(k.X, idx[r] * cols, o);
+                            else o.Clear();
                             break;
                         case "gather_cols":
                         {
                             // The input row read in place or loaded once, then gathered.
                             source ??= pool.Rent(p[1]);
                             var line = input.Span((long)r * p[1], p[1], source);
-                            for (int c = 0; c < cols; c++) o[c] = line[idx![c]];
+                            for (int c = 0; c < cols; c++) o[c] = (uint)idx![c] < (uint)p[1] ? line[idx[c]] : default;
                             break;
                         }
                         case "scatter_add_rows":
                         {
-                            // Output row r: the sum of every source row whose index is r, in source order; a source row read
-                            // whole (one load of its values: a block format decodes each block once, not once per value).
+                            // Output row r: the sum of its source rows in source order (at: the offsets, then the sources in
+                            // order of their row); a source row read whole (one load of its values: a block format decodes
+                            // each block once, not once per value).
                             o.Clear();
-                            for (int i = 0; i < p[0]; i++)
+                            for (long q = at![r], end = at[r + 1], sources = p[2] + 1; q < end; q++)
                             {
-                                if (idx![i] != r) continue;
                                 source ??= pool.Rent(cols);
-                                var s = input.Span((long)i * cols, cols, source);
-
+                                var s = input.Span(at[sources + q] * cols, cols, source);
                                 for (int c = 0; c < cols; c++) o[c] = TL.Add(o[c], s[c]);
                             }
 

@@ -3,7 +3,8 @@
 
 // Scatter-add's ordering on the device (item 4f): counts by integer atomics (exact), offsets by the multi-block scan,
 // the sources' order by target by the stable LSD radix sort of (target, source) pairs (Ptx.Radix.cs) — linear in the
-// sources, for any number of targets; before 4f the order took a quadratic rank loop and the offsets one thread.
+// sources, for any number of targets. A source whose target is outside [0, targets) is in no place: not counted,
+// offsets[targets] the sources with a target, the order's values past them −1 (IRouting.Route).
 using Adad.Abstraction;
 
 namespace Adad.Cuda;
@@ -14,15 +15,20 @@ public sealed partial class GpuOps
     internal bool? TableCounts;
 
     /// <summary>out[i] = Σ in[0..i) over n values (in and out may be the same buffer): blocks of 1024, the blocks' totals
-    /// scanned the same way, then added back.</summary>
-    internal void ExclusiveScan(ulong input, ulong output, int n)
+    /// scanned the same way, then added back; total (where not 0) the sum of all n.</summary>
+    internal void ExclusiveScan(ulong input, ulong output, int n, ulong total = 0)
     {
-        if (n <= 0) return;
+        if (n <= 0)
+        {
+            if (total != 0) Gpu.Clear(total, 4);
+            return;
+        }
+
         var tile = gpu.Cached("scan_tile", (out string e) => Ptx.ScanTile(gpu, out e));
         int blocks = (n + Ptx.ScanBlock - 1) / Ptx.ScanBlock;
         if (blocks == 1)
         {
-            Gpu.Launch(tile, 1, 1, 256, 1, 0, input, output, 0UL, Gpu.U(n));
+            Gpu.Launch(tile, 1, 1, 256, 1, 0, input, output, total, Gpu.U(n));      // the block's total: all n
             return;
         }
 
@@ -30,20 +36,21 @@ public sealed partial class GpuOps
         try
         {
             Gpu.Launch(tile, (uint)blocks, 1, 256, 1, 0, input, output, totals, Gpu.U(n));
-            ExclusiveScan(totals, totals, blocks);
+            ExclusiveScan(totals, totals, blocks, total);
             var add = gpu.Cached("scan_add", (out string e) => Ptx.ScanAdd(gpu, out e));
             Gpu.Launch(add, Grid(n, 256), 1, 256, 1, 0, output, totals, Gpu.U(n));
         }
         finally { gpu.Return(totals); }
     }
 
-    /// <summary>order[k] = the sources sorted by index[source] (0 ≤ index &lt; targets), stable: the source order within a
-    /// target. An LSD radix sort, 8 bits a pass over the bits the targets need.</summary>
-    internal void RadixOrder(ulong index, int n, int targets, ulong order) => RadixOrder(index, n, targets, order, 0, 0);
+    /// <summary>order[k] = the sources sorted by index[source] (those in [0, targets)), stable: the source order within a
+    /// target; −1 past them. kept: the device's count of the sources with a target (written before the last pass). An LSD
+    /// radix sort, 8 bits a pass over the bits the targets need.</summary>
+    internal void RadixOrder(ulong index, int n, int targets, ulong order, ulong kept) => RadixOrder(index, n, targets, order, kept, 0, 0);
 
     // countsOut / offsetsOut (item 6j, one pass only: targets ≤ 256): the route's counts and offsets from the pass's scanned
-    // table (RadixTableOffsets), the place kernel reading the table only.
-    private void RadixOrder(ulong index, int n, int targets, ulong order, ulong countsOut, ulong offsetsOut)
+    // table (RadixTableOffsets; kept, offsets[targets], its total), the place kernel reading the table only.
+    private void RadixOrder(ulong index, int n, int targets, ulong order, ulong kept, ulong countsOut, ulong offsetsOut)
     {
         if (n <= 0) return;
         int bits = targets <= 1 ? 1 : 32 - System.Numerics.BitOperations.LeadingZeroCount((uint)(targets - 1));
@@ -61,29 +68,33 @@ public sealed partial class GpuOps
             {
                 uint shift = (uint)(8 * pass);
                 ulong keysOut = keys[pass % 2], valsOut = pass == passes - 1 ? order : vals[pass % 2];
-                Gpu.Launch(count, (uint)tiles, 1, 256, 1, 0, keysIn, table, Gpu.U(n), Gpu.U(tiles), shift);
-                ExclusiveScan(table, table, 256 * tiles);
-                if (countsOut != 0 && passes == 1)
+                // The first pass takes the n indices, dropping those outside [0, targets); the later ones the kept.
+                ulong valid = pass == 0 ? 0 : kept, tail = pass == passes - 1 ? kept : 0;
+                bool fromTable = countsOut != 0 && passes == 1;
+                Gpu.Launch(count, (uint)tiles, 1, 256, 1, 0, keysIn, table, Gpu.U(n), Gpu.U(tiles), shift, Gpu.U(targets), valid);
+                ExclusiveScan(table, table, 256 * tiles, fromTable ? kept : 0);
+                if (fromTable)
                 {
-                    var fromTable = gpu.Cached("radix_table_offsets", (out string e) => Ptx.RadixTableOffsets(gpu, out e));
-                    Gpu.Launch(fromTable, Grid(targets + 1, 256), 1, 256, 1, 0, table, countsOut, offsetsOut, Gpu.U(targets), Gpu.U(tiles), Gpu.U(n));
+                    var offsets = gpu.Cached("radix_table_offsets", (out string e) => Ptx.RadixTableOffsets(gpu, out e));
+                    Gpu.Launch(offsets, Grid(targets + 1, 256), 1, 256, 1, 0, table, countsOut, offsetsOut, Gpu.U(targets), Gpu.U(tiles));
                 }
 
-                Gpu.Launch(place, (uint)tiles, 1, 256, 1, 0, keysIn, valsIn, keysOut, valsOut, table, Gpu.U(n), Gpu.U(tiles), shift);
+                Gpu.Launch(place, (uint)tiles, 1, 256, 1, 0, keysIn, valsIn, keysOut, valsOut, table, Gpu.U(n), Gpu.U(tiles), shift, Gpu.U(targets), valid, tail);
                 (keysIn, valsIn) = (keysOut, valsOut);
             }
         }
         finally { foreach (var p in rented) gpu.Return(p); }
     }
 
-    /// <summary>counts[t] (targets), offsets[t] (targets + 1: offsets[targets] = n) and the sources' order by target
-    /// (stable) from n indices: scatter-add's ordering and the route.</summary>
+    /// <summary>counts[t] (targets), offsets[t] (targets + 1: offsets[targets] = the sources with a target) and the sources'
+    /// order by target (stable; −1 past offsets[targets]) from n indices: scatter-add's ordering and the route.</summary>
     internal void OrderByTarget(ulong index, int n, int targets, ulong counts, ulong offsets, ulong order)
     {
+        ulong kept = offsets + (ulong)(targets * 4L);
         if (n > 0 && targets <= 256 && TableCounts != false)
         {
             // One radix pass: the counts and offsets from its scanned table (item 6j), no counting atomics.
-            RadixOrder(index, n, targets, order, counts, offsets);
+            RadixOrder(index, n, targets, order, kept, counts, offsets);
             return;
         }
 
@@ -91,11 +102,10 @@ public sealed partial class GpuOps
         if (n > 0)
         {
             var count = gpu.Cached("scatter_count", (out string e) => Ptx.ScatterCount(gpu, out e));
-            Gpu.Launch(count, Grid(n, 256), 1, 256, 1, 0, index, counts, Gpu.U(n));
+            Gpu.Launch(count, Grid(n, 256), 1, 256, 1, 0, index, counts, Gpu.U(n), Gpu.U(targets));
         }
 
-        ExclusiveScan(counts, offsets, targets);
-        Gpu.Upload<int>([n], offsets + (ulong)(targets * 4L));
-        RadixOrder(index, n, targets, order);
+        ExclusiveScan(counts, offsets, targets, kept);
+        RadixOrder(index, n, targets, order, kept);
     }
 }

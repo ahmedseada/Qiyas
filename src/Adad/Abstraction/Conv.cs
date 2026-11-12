@@ -54,10 +54,10 @@ public sealed record ConvArgs(int C, int H, int W, int OC, int Kh, int Kw)
     public int OCg => OC / Groups;
 
     /// <summary>im2col's parameters over one image (C channels).</summary>
-    public int[] P => [C, H, W, Kh, Kw, Sh, Sw, PadTop, PadLeft, Dh, Dw, 0, PadBottom, PadRight];
+    public int[] P => [C, H, W, Kh, Kw, Sh, Sw, PadTop, PadLeft, PadBottom, PadRight, Dh, Dw];
 
     /// <summary>im2col's parameters over every image's channels (N·C of them).</summary>
-    public int[] ImagesP => [N * C, H, W, Kh, Kw, Sh, Sw, PadTop, PadLeft, Dh, Dw, 0, PadBottom, PadRight];
+    public int[] ImagesP => [N * C, H, W, Kh, Kw, Sh, Sw, PadTop, PadLeft, PadBottom, PadRight, Dh, Dw];
 
     public (int OH, int OW) Out => LayoutArgs.ConvOut(P);
     public int Rows => Cg * Kh * Kw;                     // a group's columns' rows
@@ -160,5 +160,5 @@ public sealed record ConvArgs(int C, int H, int W, int OC, int Kh, int Kw)
     }
 
     // im2col's parameters over one group's channels.
-    private int[] GroupP => [Cg, H, W, Kh, Kw, Sh, Sw, PadTop, PadLeft, Dh, Dw, 0, PadBottom, PadRight];
+    private int[] GroupP => [Cg, H, W, Kh, Kw, Sh, Sw, PadTop, PadLeft, PadBottom, PadRight, Dh, Dw];
 }

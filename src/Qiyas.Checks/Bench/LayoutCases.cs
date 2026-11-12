@@ -14,6 +14,15 @@ public static class LayoutCases
         return idx;
     }
 
+    // Indices with every third outside [0, range): −1, range, the extremes, past range — each selects nothing.
+    private static int[] Outside(int count, int range, int seed)
+    {
+        var idx = Indices(count, range, seed);
+        int[] outside = [-1, range, int.MinValue, int.MaxValue, range + 5];
+        for (int i = 0; i < count; i += 3) idx[i] = outside[i / 3 % outside.Length];
+        return idx;
+    }
+
     private static LayoutArgs Make(string name, string type, int inputCount, int[]? index, int[] p, int count, int seed, int secondCount = 0) => new()
     {
         Name = name, X = Registry.Make(type, inputCount, seed, -1, 1), X2 = secondCount == 0 ? null : Registry.Make(type, secondCount, seed + 100, -1, 1),
@@ -114,19 +123,29 @@ public static class LayoutCases
                 yield return Make(name, type, 9, null, [9, -1, 8], 9, 58);
                 yield return Make(name, type, 35, null, [5, 7, 1, -5, 30], 35, 59);
                 break;
+            // The index operations also with indices outside their range (Outside: no 1, a gathered 0, a source that adds
+            // nowhere); scatter-add's into 256 rows (the device's one-pass ordering with every digit a row), 1000 (two
+            // passes) and 70 000 (three).
             case "one_hot":
                 yield return Make(name, type, 1, Indices(37, 17, 64), [37, 17], 37 * 17, 64);
+                yield return Make(name, type, 1, Outside(37, 17, 70), [37, 17], 37 * 17, 70);
                 break;
             case "gather_rows":
                 yield return Make(name, type, 37 * 1001, Indices(23, 37, 65), [37, 1001, 23], 23 * 1001, 65);
                 yield return Make(name, type, 11 * 5, Indices(13, 11, 66), [11, 5, 13], 13 * 5, 66);
+                yield return Make(name, type, 11 * 5, Outside(13, 11, 71), [11, 5, 13], 13 * 5, 71);
                 break;
             case "gather_cols":
                 yield return Make(name, type, 37 * 1001, Indices(19, 1001, 67), [37, 1001, 19], 37 * 19, 67);
+                yield return Make(name, type, 37 * 101, Outside(19, 101, 72), [37, 101, 19], 37 * 19, 72);
                 break;
             case "scatter_add_rows":
                 yield return Make(name, type, 37 * 1001, Indices(37, 11, 68), [37, 1001, 11], 11 * 1001, 68);
                 yield return Make(name, type, 9 * 5, Indices(9, 3, 69), [9, 5, 3], 3 * 5, 69);
+                yield return Make(name, type, 9 * 5, Outside(9, 3, 73), [9, 5, 3], 3 * 5, 73);
+                yield return Make(name, type, 300 * 3, Outside(300, 256, 74), [300, 3, 256], 256 * 3, 74);
+                yield return Make(name, type, 500 * 3, Outside(500, 1000, 75), [500, 3, 1000], 1000 * 3, 75);
+                yield return Make(name, type, 700 * 2, Outside(700, 70_000, 76), [700, 2, 70_000], 70_000 * 2, 76);
                 break;
             case "im2col":
             case "col2im":

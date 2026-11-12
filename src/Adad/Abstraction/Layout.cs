@@ -83,10 +83,12 @@ public sealed class LayoutArgs
 
     // ---- the shapes behind P, in each operation's order
     // strided: d0 … d(r−1) | s0 … s(r−1) | base             output d0·…·d(r−1), any rank r (P has 2r + 1 integers)
-    // one_hot: n classes                                   output n·classes
-    // gather_rows: rows cols n                             output n·cols
-    // gather_cols: rows cols m                             output rows·m
-    // scatter_add_rows: n cols rows                        output rows·cols
+    // An index selects within its range [0, size) or nothing: one_hot's row has no 1, a gather's value is 0, scatter-add's
+    // source adds nowhere (the gather's gradient: what it read nothing from takes nothing back).
+    // one_hot: n classes                                   output n·classes: row i a 1 at index[i]
+    // gather_rows: rows cols n                             output n·cols: row i x's row index[i]
+    // gather_cols: rows cols m                             output rows·m: column j x's column index[j]
+    // scatter_add_rows: n cols rows                        output rows·cols: row r the sum of the source rows i with index[i] = r
     // im2col / col2im: C H W kh kw sh sw top left bottom right dh dw    cols (C·kh·kw) × (OH·OW): window (oh, ow) tap (a, b)
     //              reads x[c][oh·sh − top + a·dh][ow·sw − left + b·dw], 0 off the image; OH, OW the windows that fit
     //              (WindowCount: the bottom and right pads only add windows)
@@ -219,6 +221,28 @@ public sealed class LayoutArgs
             if (P[0] < 0 || P[1] < 0 || P[2] < 0 || P[3] < 0 || P[4] < 0) throw new ArgumentException($"{Name}: a negative size");
             if ((long)P[0] * P[3] * P[4] > 0 && (P[1] == 0 || P[2] == 0)) throw new ArgumentException($"{Name}: windows over an image of no positions");
             long count = Name.EndsWith("_bwd", StringComparison.Ordinal) ? (long)P[0] * P[1] * P[2] : (long)P[0] * P[3] * P[4];
+            if (Count != count) throw new ArgumentException($"{Name}: an output of {Count} values ({count} by its shape)");
+        }
+        else if (Name is "one_hot" or "gather_rows" or "gather_cols" or "scatter_add_rows" or "shift" or "pad2d")
+        {
+            // Sizes ≥ 0 (shift's k any); a gather's values from an input with some (an index of no row reads none, and the
+            // kernels' safe address is the input's first value); the indices the CPU reads, one a selection; the output's count.
+            int length = Name == "one_hot" ? 2 : 3;
+            if (P.Length != length) throw new ArgumentException($"{Name}: {P.Length} parameters ({length} by its shape)");
+            if (P[0] < 0 || P[1] < 0 || (length == 3 && Name != "shift" && P[2] < 0)) throw new ArgumentException($"{Name}: a negative size");
+            if (Name == "gather_rows" && (long)P[2] * P[1] > 0 && P[0] == 0) throw new ArgumentException("gather_rows: rows gathered from an input of none");
+            if (Name == "gather_cols" && (long)P[0] * P[2] > 0 && P[1] == 0) throw new ArgumentException("gather_cols: columns gathered from rows of none");
+            int indices = Name switch { "one_hot" or "scatter_add_rows" => P[0], "gather_rows" or "gather_cols" => P[2], _ => 0 };
+            if (Index is not null && Index.Length < indices) throw new ArgumentException($"{Name}: {Index.Length} indices ({indices} by its shape)");
+            long count = Name switch
+            {
+                "one_hot" => (long)P[0] * P[1],
+                "gather_rows" => (long)P[2] * P[1],
+                "gather_cols" => (long)P[0] * P[2],
+                "scatter_add_rows" => (long)P[2] * P[1],
+                "shift" => (long)P[0] * P[1],
+                _ => (long)P[0] * P[2],
+            };
             if (Count != count) throw new ArgumentException($"{Name}: an output of {Count} values ({count} by its shape)");
         }
     }
@@ -486,13 +510,13 @@ public sealed class LayoutArgs
                 for (int i = 0; i < p[0]; i++) if ((uint)index![i] < (uint)p[1]) y[i * p[1] + index[i]] = 1;
                 return y;
             case "gather_rows":
-                for (int i = 0; i < p[2]; i++) Array.Copy(x, index![i] * p[1], y, i * p[1], p[1]);
+                for (int i = 0; i < p[2]; i++) if ((uint)index![i] < (uint)p[0]) Array.Copy(x, (long)index[i] * p[1], y, (long)i * p[1], p[1]);
                 return y;
             case "gather_cols":
-                for (int r = 0; r < p[0]; r++) for (int j = 0; j < p[2]; j++) y[r * p[2] + j] = x[r * p[1] + index![j]];
+                for (int r = 0; r < p[0]; r++) for (int j = 0; j < p[2]; j++) if ((uint)index![j] < (uint)p[1]) y[r * p[2] + j] = x[r * p[1] + index[j]];
                 return y;
             case "scatter_add_rows":
-                for (int i = 0; i < p[0]; i++) for (int c = 0; c < p[1]; c++) y[index![i] * p[1] + c] += x[i * p[1] + c];
+                for (int i = 0; i < p[0]; i++) if ((uint)index![i] < (uint)p[2]) for (int c = 0; c < p[1]; c++) y[index[i] * p[1] + c] += x[i * p[1] + c];
                 return y;
             case "im2col":
             {
