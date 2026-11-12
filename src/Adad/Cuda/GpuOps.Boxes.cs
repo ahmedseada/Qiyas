@@ -1,8 +1,10 @@
 // Copyright (c) 2026 Ahmed Seada
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
-// The box overlap losses on CUDA (Abstraction/Boxes.cs; the kernel Ptx.Boxes.cs): one launch, each output word computed
-// where it is stored (a block format's by its encoder) in the float lane; the corners read where they are stored.
+// The box overlap losses on CUDA (Abstraction/Boxes.cs; the kernels Ptx.Boxes.cs): one launch in the float lane, the corners
+// read where they are stored — the pairs kernel (each pair once, its outputs packed into whole words) where the format is
+// words of a power of two values and the arrays are 16-byte aligned, else the value kernel (each output word computed where
+// it is stored, a block format's by its encoder).
 using Adad.Abstraction;
 
 namespace Adad.Cuda;
@@ -26,9 +28,19 @@ public sealed partial class GpuOps
         var lane = RowLane(f);
         bool backward = dloss != 0;
         long n = (long)count * (backward ? 4 : 1);
-        if (n > uint.MaxValue) throw new NotSupportedException($"box losses: {n} values past 2^32");
-        var fn = gpu.Cached($"box:{overlap}:{backward}:{f.Name}:{lane.Name}", (out string e) => Ptx.BoxLoss(gpu, f, lane, overlap, backward, out e));
-        LaunchEach(fn, f, n, predicted, target, dloss, output, Gpu.U((int)n), lane.Wide ? Gpu.D(eps) : Gpu.F((float)eps));
+        if (4L * count > uint.MaxValue) throw new NotSupportedException($"box losses: {4L * count} corners past 2^32");
+        ulong e = lane.Wide ? Gpu.D(eps) : Gpu.F((float)eps);
+        if (count == 0) return lane.Name;
+        if (Ptx.BoxPairWise(f) && (predicted | target | output) % 16 == 0)
+        {
+            var fp = gpu.Cached($"box_pairs:{overlap}:{backward}:{f.Name}:{lane.Name}", (out string err) => Ptx.BoxLossPairs(gpu, f, lane, overlap, backward, out err));
+            int pairs = Ptx.BoxThreadPairs(f, backward);
+            Gpu.Launch(fp, Grid((count + pairs - 1) / pairs, 256), 1, 256, 1, 0, predicted, target, dloss, output, Gpu.U(count), e);
+            return lane.Name;
+        }
+
+        var fn = gpu.Cached($"box:{overlap}:{backward}:{f.Name}:{lane.Name}", (out string err) => Ptx.BoxLoss(gpu, f, lane, overlap, backward, out err));
+        LaunchEach(fn, f, n, predicted, target, dloss, output, Gpu.U((int)n), e);
         return lane.Name;
     }
 }
