@@ -43,22 +43,22 @@ public sealed partial class GpuOps
         return lane.Name;
     }
 
-    public string ExpertMatMul<TN>(ExpertView v, ulong x, ulong offsets, ulong weights, ulong bias, ulong y) where TN : struct, IFloatAdad<TN> =>
+    public string ExpertMatMul<TN>(ExpertView v, ulong x, ulong offsets, ulong weights, ulong bias, ulong y) where TN : struct, IAdad<TN> =>
         ExpertRun<TN>(v, null, x, offsets, weights, bias, 0, 0, y);
 
     public string ExpertGatedPair<TN>(ExpertView v, string gate, ulong x, ulong offsets, ulong gateWeights, ulong gateBias, ulong upWeights, ulong upBias, ulong hidden)
-        where TN : struct, IFloatAdad<TN>
+        where TN : struct, IAdad<TN>
     {
         Experts.Gate(gate);
         return ExpertRun<TN>(v, gate, x, offsets, gateWeights, gateBias, upWeights, upBias, hidden);
     }
 
-    private string ExpertRun<TN>(ExpertView v, string? gate, ulong x, ulong offsets, ulong gw, ulong gb, ulong uw, ulong ub, ulong y) where TN : struct, IFloatAdad<TN>
+    private string ExpertRun<TN>(ExpertView v, string? gate, ulong x, ulong offsets, ulong gw, ulong gb, ulong uw, ulong ub, ulong y) where TN : struct, IAdad<TN>
     {
         v.Validate();
         var f = Fmt.Of<TN>();
-        var lane = RowLane(f);
-        if (v.YValues == 0) return lane.Name;
+        if (v.YValues == 0) return f.IsFloat ? RowLane(f).Name : f.Natural.Name;
+        var lane = f.IsFloat ? RowLane(f) : ExpertLane<TN>(v, gate, x, gw, gb, uw, ub);
         var rented = new List<ulong>();
         ulong Rent(long bytes) { ulong q = gpu.Rent(Math.Max(16, bytes)); rented.Add(q); return q; }
         try
@@ -78,6 +78,17 @@ public sealed partial class GpuOps
         finally { foreach (var q in rented) gpu.Return(q); }
 
         return lane.Name;
+    }
+
+    // A type that is not float: its products' lane by the bounds of every value the store makes (ExpertView.IntegerSums, the
+    // ranges read on the device); an unsigned type whose values may fall below 0 takes the float64 lane (ExactSums).
+    private Lane ExpertLane<TN>(ExpertView v, string? gate, ulong x, ulong gw, ulong gb, ulong uw, ulong ub) where TN : struct, IAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        (double, double) R(ulong b, long n) => Range<TN>(b, (int)n);
+        var (bounds, negative) = v.IntegerSums(f.Name, f.Signed, gate, R(x, v.XValues), R(gw, v.WeightValues), gb == 0 ? null : R(gb, v.BiasValues),
+            gate is null ? null : R(uw, v.WeightValues), ub == 0 ? null : R(ub, v.BiasValues));
+        return negative && !f.Signed ? Lane.F64 : SumLane(f, bounds);
     }
 
     // Every expert's rows of x times its weights into the lane's sums (Ptx.Gemm's grouped mode): the grid's y every

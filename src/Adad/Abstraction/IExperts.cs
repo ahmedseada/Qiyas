@@ -17,11 +17,13 @@ public interface IExperts<TBuffer, TIndex>
         where TN : struct, IFloatAdad<TN>;
 
     /// <summary>y's rows of expert e = its rows of x · W_e + bias_e (ExpertView; bias absent: none), the sums in the float lane
+    /// (a type that is not float: exactly, in the lane its products take by the bounds of every value, ExpertView.IntegerSums)
     /// and y rounded to TN once.</summary>
-    string ExpertMatMul<TN>(ExpertView v, TBuffer x, TIndex offsets, TBuffer weights, TBuffer? bias, TBuffer y) where TN : struct, IFloatAdad<TN>;
+    string ExpertMatMul<TN>(ExpertView v, TBuffer x, TIndex offsets, TBuffer weights, TBuffer? bias, TBuffer y) where TN : struct, IAdad<TN>;
 
-    /// <summary>hidden's rows of expert e = gate(x · G_e + gb_e, x · U_e + ub_e): two products a row in the float lane, the gate
-    /// a two-input formula of Map (gated_silu, gated_gelu, …) applied there, hidden rounded to TN once.</summary>
+    /// <summary>hidden's rows of expert e = gate(x · G_e + gb_e, x · U_e + ub_e): two products a row in the lane, the gate a
+    /// two-input formula of Map (gated_silu, gated_gelu, gated_relu, …; a type that is not float takes an any-type one, as
+    /// Map) applied there, hidden rounded to TN once.</summary>
     string ExpertGatedPair<TN>(ExpertView v, string gate, TBuffer x, TIndex offsets, TBuffer gateWeights, TBuffer? gateBias, TBuffer upWeights, TBuffer? upBias, TBuffer hidden)
-        where TN : struct, IFloatAdad<TN>;
+        where TN : struct, IAdad<TN>;
 }

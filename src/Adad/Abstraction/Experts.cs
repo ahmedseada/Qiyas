@@ -24,6 +24,54 @@ public sealed record ExpertView(int Experts, int Rows, int K, int N, bool TransW
         if (WeightValues > int.MaxValue || XValues > int.MaxValue || YValues > int.MaxValue) throw new ArgumentException("experts: past 2^31 values");
     }
 
+    /// <summary>The lane a type that is not float sums its experts' products in (ProductEpilogue.ExactSums): every value the
+    /// store makes held exactly (each product's sums, with its bias, and the gate's value over their ranges: its ends and 0),
+    /// the operands x's and the weights' ranges; ranges (low, high), a bias's or the up product's null where not taken. A
+    /// float-only gate is refused, as Map refuses it, and so is one whose value at integers is not an integer
+    /// (ProductEpilogue.Integral: div).</summary>
+    public (Bounds Bounds, bool Negative) IntegerSums(string type, bool signed, string? gate, (double Lo, double Hi) x, (double Lo, double Hi) gw,
+        (double Lo, double Hi)? gb, (double Lo, double Hi)? uw, (double Lo, double Hi)? ub)
+    {
+        if (gate is not null && Ops.Find(gate).FloatOnly) throw new NotSupportedException($"experts: the gate {gate} is a float formula, and {type} is not a float type");
+        if (gate is not null && !ProductEpilogue.Integral(Ops.Find(gate), 0, 0))
+            throw new NotSupportedException($"experts: the gate {gate}'s value at integers is not always an integer, and {type} is not a float type");
+        (double Lo, double Hi) Products((double Lo, double Hi) w)
+        {
+            if (K == 0) return (0, 0);
+            double p = x.Lo * w.Lo, q = x.Lo * w.Hi, r = x.Hi * w.Lo, s = x.Hi * w.Hi;
+            return (K * Math.Min(Math.Min(p, q), Math.Min(r, s)), K * Math.Max(Math.Max(p, q), Math.Max(r, s)));
+        }
+
+        double lo = 0, hi = 0;
+        (double Lo, double Hi) Sums((double Lo, double Hi) w, (double Lo, double Hi)? bias)
+        {
+            var p = Products(w);
+            var s = (Lo: p.Lo + (bias?.Lo ?? 0), Hi: p.Hi + (bias?.Hi ?? 0));
+            lo = Math.Min(lo, Math.Min(p.Lo, s.Lo));
+            hi = Math.Max(hi, Math.Max(p.Hi, s.Hi));
+            return s;
+        }
+
+        var g = Sums(gw, gb);
+        var wr = gw;
+        if (gate is not null)
+        {
+            var u = Sums(uw!.Value, ub);
+            var f = Ops.Find(gate);
+            foreach (double gv in new[] { g.Lo, 0, g.Hi })
+                foreach (double uv in new[] { u.Lo, 0, u.Hi })
+                {
+                    double r = f.Reference(gv, uv, 0, 0, 0);
+                    lo = Math.Min(lo, r);
+                    hi = Math.Max(hi, r);
+                }
+
+            wr = (Math.Min(gw.Lo, uw.Value.Lo), Math.Max(gw.Hi, uw.Value.Hi));
+        }
+
+        return ProductEpilogue.ExactSums("experts", type, signed, lo, hi, x, wr);
+    }
+
     /// <summary>The float64 reference of y (bias: Experts × N, or none).</summary>
     public double[] Reference(double[] x, int[] offsets, double[] w, double[]? bias)
     {

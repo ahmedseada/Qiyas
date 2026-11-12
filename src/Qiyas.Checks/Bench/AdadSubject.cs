@@ -508,14 +508,14 @@ public sealed class AdadSubject : IBenchSubject
     }
 
     public IBenchRun? ExpertProducts(Device device, string type, ExpertView v, string? gate, byte[] x, int[] offsets, byte[] gw, byte[]? gb, byte[]? uw, byte[]? ub, byte[] y) =>
-        Registry.IsFloat(type) ? Registry.WithFloat(type, new ExpertsVisitor(device, v, gate, x, offsets, gw, gb, uw, ub, y)) : null;
+        Registry.With(type, new ExpertsVisitor(device, v, gate, x, offsets, gw, gb, uw, ub, y));
 
     private sealed class ExpertsVisitor(Device device, ExpertView v, string? gate, byte[] x, int[] offsets, byte[] gw, byte[]? gb, byte[]? uw, byte[]? ub, byte[] y)
-        : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+        : ITypeVisitor<IBenchRun?>, INumberRun
     {
-        public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, ExpertsVisitor>(device, this);
+        public IBenchRun? Visit<TN>() where TN : struct, IAdad<TN, float> => On<TN, ExpertsVisitor>(device, this);
 
-        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IAdad<TN, float>
         {
             int pad = s.Slack;
             TB dx = s.In(x, pad), dg = s.In(gw, pad), dy = s.Out(y, pad);

@@ -17,12 +17,18 @@ internal static partial class Checks
         string where = ops is null ? "cpu" : device;
         foreach (var type in Bench.Registry.Names)
         {
-            if (!Bench.Registry.IsFloat(type) || (!blocks && Bench.Registry.IsBlock(type))) continue;
+            if (!blocks && Bench.Registry.IsBlock(type)) continue;
+            if (!Bench.Registry.IsFloat(type))
+            {
+                ok &= IntegerExpertsCheck(ops, where, type);
+                continue;
+            }
+
             ok &= RouteTopKCheck(ops, where, type);
             ok &= ExpertProductsCheck(ops, where, type);
         }
 
-        if (ok) Console.WriteLine($"check experts                {where,-6} every float type{(blocks ? "" : " but the block formats")}: the top-k routing in TopK's order with ties, NaN and ±0 (normalized and not) exactly, and the experts' products and gated pairs over uneven groups (an empty expert, rows outside every expert), weights stored and transposed, with and without biases, within the products' rounding");
+        if (ok) Console.WriteLine($"check experts                {where,-6} every type{(blocks ? "" : " but the block formats")}: the top-k routing in TopK's order with ties, NaN and ±0 (normalized and not) exactly (the float types: its weights are probabilities), and the experts' products and gated pairs over uneven groups (an empty expert, rows outside every expert), weights stored and transposed, with and without biases: the float types within the products' rounding, the others exactly (gated_relu, wide values saturating)");
         return ok;
     }
 
@@ -124,7 +130,7 @@ internal static partial class Checks
             }
 
             var y = new byte[Bench.Registry.Bytes(type, v.YValues)];
-            Bench.Registry.WithFloat(type, new ExpertRunCase(ops, v, gate, x, offsets, gw, gb, uw, ub, y));
+            Bench.Registry.With(type, new ExpertRunCase(ops, v, gate, x, offsets, gw, gb, uw, ub, y));
             double bad = Excess(type, $"experts {name}", y, want, i => scale[i], 1);
             if (bad > 0) { Console.WriteLine($"check experts {name,-44} {where,-6} {type,-12} DIFFERS by {bad:0.##}"); ok = false; }
         }
@@ -145,10 +151,68 @@ internal static partial class Checks
         }
     }
 
-    private sealed class ExpertRunCase(IDevice<ulong, ulong>? ops, ExpertView v, string? gate, byte[] x, int[] offsets, byte[] gw, byte[]? gb, byte[] uw, byte[]? ub, byte[] y)
-        : Bench.IFloatTypeVisitor<string>
+    // Every type that is not float: the experts' products and gated_relu pairs exactly (y the reference held to the type's
+    // range once), and a case of values far past the small ones (twice the square root of the type's largest, at most
+    // 2^22): the 64-bit and float64 lanes, y saturating.
+    private static readonly (string Name, bool TransW, string? Gate, bool Biases, int[] Offsets, bool Wide)[] IntegerExpertCases =
+    [
+        ("products, bias", false, null, true, [0, 9, 9, 23, 30, 41], false),
+        ("products W transposed, rows outside", true, null, false, [2, 9, 9, 23, 30, 38], false),
+        ("gated relu, biases", false, "gated_relu", true, [0, 9, 9, 23, 30, 41], false),
+        ("gated relu W transposed, rows outside", true, "gated_relu", false, [2, 9, 9, 23, 30, 38], false),
+        ("products wide values, bias", false, null, true, [0, 9, 9, 23, 30, 41], true),
+    ];
+
+    private static bool IntegerExpertsCheck(IDevice<ulong, ulong>? ops, string where, string type)
     {
-        public string Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        bool ok = true;
+        int seed = 210;
+        double max = Bench.Registry.Values(type, Bench.Registry.Encode(type, [1e300]), 1)[0], min = Bench.Registry.Values(type, Bench.Registry.Encode(type, [-1e300]), 1)[0];
+        double wide = Math.Min(Math.Floor(2 * Math.Sqrt(max)), 1 << 22);
+        foreach (var (name, transW, gate, biases, offsets, isWide) in IntegerExpertCases)
+        {
+            var v = new ExpertView(5, 41, 33, 27, transW);
+            byte[] Draw(long n)
+            {
+                if (!isWide) return Bench.Registry.Make(type, (int)n, seed++, -1, 1);
+                var random = new Random(seed++);
+                var values = new double[n];
+                for (long i = 0; i < n; i++) values[i] = Math.Floor((min < 0 ? -wide : 0) + (min < 0 ? 2 * wide + 1 : wide + 1) * random.NextDouble());
+                return Bench.Registry.Encode(type, values);
+            }
+
+            double[]? Read(byte[]? b, long n) => b is null ? null : Bench.Registry.Values(type, b, (int)n);
+            byte[] x = Draw(v.XValues), gw = Draw(v.WeightValues), uw = Draw(v.WeightValues);
+            byte[]? gb = biases ? Draw(v.BiasValues) : null, ub = biases ? Draw(v.BiasValues) : null;
+            var g = v.Reference(Read(x, v.XValues)!, offsets, Read(gw, v.WeightValues)!, Read(gb, v.BiasValues));
+            var want = g;
+            if (gate is not null)
+            {
+                var op = Ops.Find(gate);
+                var u = v.Reference(Read(x, v.XValues)!, offsets, Read(uw, v.WeightValues)!, Read(ub, v.BiasValues));
+                want = g.Select((gi, i) => op.Reference(gi, u[i], 0, 0, 0)).ToArray();
+            }
+
+            var y = new byte[Bench.Registry.Bytes(type, v.YValues)];
+            string lane = Bench.Registry.With(type, new ExpertRunCase(ops, v, gate, x, offsets, gw, gb, uw, ub, y));
+            var got = Bench.Registry.Values(type, y, (int)v.YValues);
+            var held = Bench.Registry.Values(type, Bench.Registry.Encode(type, want), (int)v.YValues);
+            for (int i = 0; i < got.Length; i++)
+            {
+                if (got[i] == held[i]) continue;
+                Console.WriteLine($"check experts {name,-44} {where,-6} {type,-12} DIFFERS: [{i}] {got[i]:R}, not {held[i]:R} (of {want[i]:R}; lane {lane})");
+                ok = false;
+                break;
+            }
+        }
+
+        return ok;
+    }
+
+    private sealed class ExpertRunCase(IDevice<ulong, ulong>? ops, ExpertView v, string? gate, byte[] x, int[] offsets, byte[] gw, byte[]? gb, byte[] uw, byte[]? ub, byte[] y)
+        : Bench.ITypeVisitor<string>
+    {
+        public string Visit<TN>() where TN : struct, IAdad<TN, float>
         {
             if (ops is null)
                 return gate is null

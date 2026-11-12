@@ -901,15 +901,17 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         Measure(device, name, type, $"{a.Heads}h {a.Lq}x{a.Lk} d{a.D}", wantO, (s, o) => s.AttentionCached(device, type, own, a, position, q, k, v, o), q.Length);
     }
 
-    // A mixture of experts (float types). route_topk: 4096 tokens' 8 first of 64 experts, normalized (the weights scored).
-    // expert_matmul and expert_gated (gated_silu): the core product's size as 8 experts' products, the rows grouped as
-    // routing half as many tokens to 2 experts each groups them, the weights stored (K × N an expert) and drawn within
-    // ±√(3 / K) (the sums of order one, inside every type's range), with biases.
+    // A mixture of experts. route_topk (the float types: its weights are probabilities): 4096 tokens' 8 first of 64
+    // experts, normalized (the weights scored). expert_matmul and expert_gated (gated_silu; gated_relu on the types that
+    // are not float): the core product's size as 8 experts' products, the rows grouped as routing half as many tokens to 2
+    // experts each groups them, the weights stored (K × N an expert) and drawn within ±√(3 / K) (the sums of order one,
+    // inside every type's range; the integer types' small values), with biases; an integer type's reference held to its
+    // range.
     private void ExpertsRow(Device device, string type, string name)
     {
-        if (!Registry.IsFloat(type)) return;
         if (name == "route_topk")
         {
+            if (!Registry.IsFloat(type)) return;
             int tokens = Prime(4096), experts = Prime(64), k = 8;
             var p = Registry.Make(type, tokens * experts, 111, 0, 1);
             var want = Experts.RouteTopKReference(Registry.Values(type, p, tokens * experts), tokens, experts, k, true).Weights;
@@ -927,20 +929,22 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         byte[] Draw(long n, int seed, double bound = 1) => Registry.Make(type, (int)n, seed, -bound, bound);
         byte[] x = Draw(v.XValues, 113), gw = Draw(v.WeightValues, 114, r), gb = Draw(v.BiasValues, 115);
         double[] xv = Registry.Values(type, x, (int)v.XValues);
+        double[] Held(double[] w) => Registry.IsFloat(type) ? w : Registry.Values(type, Registry.Encode(type, w), w.Length);
         var g = v.Reference(xv, offsets2, Registry.Values(type, gw, (int)v.WeightValues), Registry.Values(type, gb, (int)v.BiasValues));
         string shape = $"{groups}x {v.Rows}x{v.N}x{v.K}";
         if (name == "expert_matmul")
         {
-            Measure(device, name, type, shape, g, (s, y) => s.ExpertProducts(device, type, v, null, x, offsets2, gw, gb, null, null, y), (int)Registry.Bytes(type, v.YValues));
+            Measure(device, name, type, shape, Held(g), (s, y) => s.ExpertProducts(device, type, v, null, x, offsets2, gw, gb, null, null, y), (int)Registry.Bytes(type, v.YValues));
             return;
         }
 
         byte[] uw = Draw(v.WeightValues, 116, r), ub = Draw(v.BiasValues, 117);
         var u = v.Reference(xv, offsets2, Registry.Values(type, uw, (int)v.WeightValues), Registry.Values(type, ub, (int)v.BiasValues));
-        var gate = Adad.Abstraction.Ops.Find("gated_silu");
+        var gate = Adad.Abstraction.Ops.Find(Registry.IsFloat(type) ? "gated_silu" : "gated_relu");
         var want2 = new double[g.Length];
         for (int i = 0; i < g.Length; i++) want2[i] = gate.Reference(g[i], u[i], 0, 0, 0);
-        Measure(device, name, type, shape + " gated_silu", want2, (s, y) => s.ExpertProducts(device, type, v, gate.Name, x, offsets2, gw, gb, uw, ub, y), (int)Registry.Bytes(type, v.YValues));
+        want2 = Held(want2);
+        Measure(device, name, type, shape + " " + gate.Name, want2, (s, y) => s.ExpertProducts(device, type, v, gate.Name, x, offsets2, gw, gb, uw, ub, y), (int)Registry.Bytes(type, v.YValues));
     }
 
     // The score a decoder's mask excludes by, as the type stores it (CacheView.Excluded).
