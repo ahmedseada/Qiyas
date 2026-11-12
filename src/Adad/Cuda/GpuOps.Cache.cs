@@ -49,7 +49,7 @@ public sealed partial class GpuOps
     /// row of KvHeadCount heads of Group·Lq rows, its limits from the position on the device; returns the lane's name.</summary>
     public string AttentionCached<TN, TC>(AttentionArgs a, ulong position, ulong q, ulong k, ulong v, ulong o) where TN : struct, IFloatAdad<TN> where TC : struct, IAdad<TC>
     {
-        if (a.StepsFirst)
+        if (a.Laid)
             return AttentionLayout.Queries<ulong, ulong, TN>(this, a, q, o, (d, h, qh, oh) => d.AttentionCached<TN, TC>(h, position, qh, k, v, oh));
         CacheRule.Validate(a);
         Fmt f = Fmt.Of<TN>(), fc = Fmt.Of<TC>();

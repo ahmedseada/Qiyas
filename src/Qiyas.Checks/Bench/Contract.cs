@@ -106,7 +106,7 @@ public interface IBenchSubject
     /// storage.</summary>
     IBenchRun? Rope(Device device, string type, RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y) => null;
 
-    /// <summary>O for Q, K, V and O a step at a time (AttentionArgs.StepsFirst).</summary>
+    /// <summary>O for Q, K, V and O through their views (AttentionArgs.QRows, KRows, VRows, ORows).</summary>
     IBenchRun? AttentionStepsFirst(Device device, string type, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) => null;
 
     /// <summary>The mask of rows decoder steps over capacity positions at the position (ICache.DecoderMask), as the type.</summary>

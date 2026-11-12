@@ -11,7 +11,8 @@ using System.Runtime.InteropServices;
 
 namespace Adad.Abstraction;
 
-/// <summary>Q (heads × Lq × d), K and V (KvHeads × Lk × d), O (heads × Lq × d); the scale; causal or spans per query.</summary>
+/// <summary>Q (heads × Lq × d), K and V (KvHeads × Lk × d), O (heads × Lq × d), each a head at a time unless its view says
+/// where its rows lie (QRows, KRows, VRows, ORows); the scale; causal or spans per query.</summary>
 public sealed record AttentionArgs(int Heads, int Lq, int Lk, int D, double Scale, bool Causal, int[]? Spans = null, int[]? SpanStarts = null)
 {
     /// <summary>The heads K and V hold (0: Heads): query head h reads K and V's head h / Group (grouped queries; 1 head: multi-query).</summary>
@@ -23,15 +24,24 @@ public sealed record AttentionArgs(int Heads, int Lq, int Lk, int D, double Scal
     /// <summary>A cap on the scores (0: none): s = Softcap·tanh(Scale·q·k / Softcap) in place of Scale·q·k.</summary>
     public double Softcap { get; init; }
 
-    /// <summary>Q and O a step at a time: query i of head h of batch b at ((b·Lq + i)·(Heads / Batch) + h)·D, and K and V the
-    /// same over Lk and their heads — the layout a layer's projections come in ([batch, steps, heads · d]); false: a head at
-    /// a time. Every form takes it (AttentionLayout); the log-sum-exp stays heads × Lq.</summary>
-    public bool StepsFirst { get; init; }
+    /// <summary>Where Q's rows lie (HeadRows, a strided view; null: a head at a time). dQ is laid as Q.</summary>
+    public HeadRows? QRows { get; init; }
 
-    /// <summary>The batches the heads are of under StepsFirst (0: one): the heads of Q and of K and V whole multiples of it.</summary>
-    public int Batch { get; init; }
+    /// <summary>Where K's rows lie (null: a head at a time). dK is laid as K.</summary>
+    public HeadRows? KRows { get; init; }
 
-    public int BatchCount => Batch == 0 ? 1 : Batch;
+    /// <summary>Where V's rows lie (null: a head at a time). dV is laid as V.</summary>
+    public HeadRows? VRows { get; init; }
+
+    /// <summary>Where O's rows lie (null: a head at a time; a dense order of its values). dO is laid as O. The log-sum-exp
+    /// stays heads × Lq.</summary>
+    public HeadRows? ORows { get; init; }
+
+    /// <summary>Whether a tensor has a view: every form then takes AttentionLayout's copies.</summary>
+    public bool Laid => QRows is not null || KRows is not null || VRows is not null || ORows is not null;
+
+    /// <summary>The same attention over tensors a head at a time (no views).</summary>
+    public AttentionArgs HeadMajor => this with { QRows = null, KRows = null, VRows = null, ORows = null };
 
     public int KvHeadCount => KvHeads == 0 ? Heads : KvHeads;
 
@@ -61,8 +71,20 @@ public sealed record AttentionArgs(int Heads, int Lq, int Lk, int D, double Scal
         if (Heads < 0 || Lq < 0 || Lk < 0 || D < 0) throw new ArgumentException($"attention: {Heads} heads of {Lq} × {Lk} at d {D}");
         if (KvHeads < 0 || (KvHeads > 0 && Heads % KvHeads != 0)) throw new ArgumentException($"attention: {Heads} query heads do not group over {KvHeads} key and value heads");
         if (Window < 0) throw new ArgumentException($"attention: a window of {Window} keys");
-        if (Batch < 0 || Heads % BatchCount != 0 || KvHeadCount % BatchCount != 0) throw new ArgumentException($"attention: {Heads} query heads and {KvHeadCount} of keys and values in {Batch} batches");
+        QRows?.Validate("Q", Heads, Lq, D, false);
+        KRows?.Validate("K", KvHeadCount, Lk, D, false);
+        VRows?.Validate("V", KvHeadCount, Lk, D, false);
+        ORows?.Validate("O", Heads, Lq, D, true);
         if (!(Softcap >= 0) || double.IsInfinity(Softcap)) throw new ArgumentException($"attention: a score cap of {Softcap}");
+    }
+
+    /// <summary>Validate, and the backward's outputs laid as Q, K and V: their views dense orders too.</summary>
+    public void ValidateBackward()
+    {
+        Validate();
+        QRows?.Validate("dQ", Heads, Lq, D, true);
+        KRows?.Validate("dK", KvHeadCount, Lk, D, true);
+        VRows?.Validate("dV", KvHeadCount, Lk, D, true);
     }
 
     /// <summary>The same attention over KvHeadCount heads of Group·Lq query rows each: a group's query heads are adjacent in

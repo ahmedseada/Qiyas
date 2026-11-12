@@ -163,8 +163,8 @@ internal sealed partial class Kernels
     public static string AttentionCached<TN, TC>(AttentionArgs a, int[] position, byte[] q, byte[] k, byte[] v, byte[] o)
         where TN : struct, IFloatAdad<TN> where TC : struct, IAdad<TC>
     {
-        if (a.StepsFirst)
-            return StepsFirstQueries<TN>(a, q, o, (h, qh, oh) => AttentionCached<TN, TC>(h, position, qh, k, v, oh));
+        if (a.Laid)
+            return LaidQueries<TN>(a, q, o, (h, qh, oh) => AttentionCached<TN, TC>(h, position, qh, k, v, oh));
         CacheRule.Validate(a);
         new CacheView(a.KvHeadCount, a.Lk, a.D).Validate(Fmt.Of<TC>());
         return Mixed<TN, CachedCall<TC>>(new CachedCall<TC>(CacheRule.AtPosition(a, position[0]), q, k, v, o));

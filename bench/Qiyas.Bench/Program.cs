@@ -901,12 +901,14 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         if (!Registry.IsFloat(type)) return;
         if (name == "attention_steps")
         {
-            var a = new AttentionArgs(16, Prime(2048), Prime(2048), Prime(128), 1 / Math.Sqrt(128), true) { StepsFirst = true };
+            var h = new AttentionArgs(16, Prime(2048), Prime(2048), Prime(128), 1 / Math.Sqrt(128), true);
+            HeadRows qo = HeadRows.StepsFirst(h.Heads, h.Lq, h.D), kv = HeadRows.StepsFirst(h.Heads, h.Lk, h.D);
+            var a = h with { QRows = qo, KRows = kv, VRows = kv, ORows = qo };
             int nq = (int)a.QValues, nk = (int)a.KValues;
             byte[] q = Registry.Make(type, nq, 41, -1, 1), k = Registry.Make(type, nk, 42, -1, 1), v = Registry.Make(type, nk, 43, -1, 1);
-            var wantHeads = (a with { StepsFirst = false }).Reference(AttentionLayout.ToHeads(Registry.Values(type, q, nq), 1, a.Lq, a.Heads, a.D),
-                AttentionLayout.ToHeads(Registry.Values(type, k, nk), 1, a.Lk, a.Heads, a.D), AttentionLayout.ToHeads(Registry.Values(type, v, nk), 1, a.Lk, a.Heads, a.D));
-            Measure(device, name, type, $"{a.Heads}h {a.Lq}x{a.Lk} d{a.D}", AttentionLayout.FromHeads(wantHeads, 1, a.Lq, a.Heads, a.D), (s, o) => s.AttentionStepsFirst(device, type, a, q, k, v, o), q.Length);
+            var wantHeads = h.Reference(AttentionLayout.ToHeads(Registry.Values(type, q, nq), qo, a.Heads, a.Lq, a.D),
+                AttentionLayout.ToHeads(Registry.Values(type, k, nk), kv, a.Heads, a.Lk, a.D), AttentionLayout.ToHeads(Registry.Values(type, v, nk), kv, a.Heads, a.Lk, a.D));
+            Measure(device, name, type, $"{a.Heads}h {a.Lq}x{a.Lk} d{a.D}", AttentionLayout.FromHeads(wantHeads, qo, a.Heads, a.Lq, a.D), (s, o) => s.AttentionStepsFirst(device, type, a, q, k, v, o), q.Length);
             return;
         }
 
