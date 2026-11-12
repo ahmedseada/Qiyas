@@ -93,11 +93,16 @@ public sealed class AdadSubject : IBenchSubject
             return i;
         }
 
+        // What a run held: on the CPU the kept buffers it was lent (the product's workspace, the sequences' scratch:
+        // Workspace.HeldPeak, counted from the run's start, each thread's peak summed: a bound); on CUDA the device buffers
+        // it rented, all at once at their peak (the arena scope the bench times every run in: Gpu.LastScope).
         public IBenchRun Run(Func<string> op, string note = "")
         {
             string lane = "";
-            return new BenchRun(() => { lane = op(); device.Synchronize(); }, () => { foreach (var c in _collect) c(); },
-                () => { foreach (var b in _buffers) device.Return(b); foreach (var i in _indices) device.ReturnIndices(i); }, () => lane + note);
+            bool cpu = device is Kernels;
+            return new BenchRun(() => { if (cpu) Workspace.ResetHeld(); lane = op(); device.Synchronize(); }, () => { foreach (var c in _collect) c(); },
+                () => { foreach (var b in _buffers) device.Return(b); foreach (var i in _indices) device.ReturnIndices(i); }, () => lane + note,
+                () => cpu ? new Held(Workspace.HeldPeak, null) : new Held(0, device is GpuOps ops ? ops.Gpu.LastScope.Peak : null));
         }
     }
 

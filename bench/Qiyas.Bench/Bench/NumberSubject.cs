@@ -3,7 +3,8 @@
 
 // The INumberBase<T> version as a bench subject: one implementation over T : INumberBase<T> (CpuGeneric.cs on the
 // CPU, GenericPtx.cs on the device), for the types .NET has such a T for. Stored bytes of those types are the .NET
-// layout, so they are used in place.
+// layout, so they are used in place. Its runs hold nothing beyond their operands but rms_norm's row of inverse norms (a
+// value a row on the CPU, 8 bytes a row on the device), prepared with the run and said in Held.
 using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -73,7 +74,7 @@ public sealed class NumberSubject : IBenchSubject
         if (device == Device.Cpu)
         {
             T[] a = Of<T>(x), b = Of<T>(y), c = new T[n];
-            return new BenchRun(() => CpuGeneric.Add(a, b, c, n), () => Back(c, z), lane: () => CpuGeneric.Vectorized<T>() ? $"Vector<{typeof(T).Name}>" : "scalar");
+            return new BenchRun(() => CpuGeneric.Add(a, b, c, n), () => Back(c, z), lane: () => CpuGeneric.Vectorized<T>() ? $"Vector<{typeof(T).Name}>" : "scalar", held: () => new(0, null));
         }
 
         var gpu = Devices.Gpu;
@@ -82,7 +83,7 @@ public sealed class NumberSubject : IBenchSubject
         Gpu.Upload<byte>(y, db);
         var f = gpu.Function(GenericPtx.Add<T>(out string entry), entry);
         return new BenchRun(() => { Gpu.Launch(f, (uint)((n + 255) / 256), 1, 256, 1, 0, da, db, dc, Gpu.U(n)); Gpu.Synchronize(); },
-            () => Gpu.Download<byte>(dc, z), () => { gpu.Return(da); gpu.Return(db); gpu.Return(dc); }, () => entry);
+            () => Gpu.Download<byte>(dc, z), () => { gpu.Return(da); gpu.Return(db); gpu.Return(dc); }, () => entry, () => new(0, 0));
     }
 
     private static IBenchRun MatMul<T>(Device device, byte[] x, byte[] y, byte[] z, int m, int n, int k) where T : unmanaged, INumberBase<T>
@@ -90,7 +91,7 @@ public sealed class NumberSubject : IBenchSubject
         if (device == Device.Cpu)
         {
             T[] a = Of<T>(x), b = Of<T>(y), c = new T[m * n];
-            return new BenchRun(() => CpuGeneric.MatMul(a, b, c, m, n, k), () => Back(c, z), lane: () => CpuGeneric.Vectorized<T>() ? $"Vector<{typeof(T).Name}>" : "scalar");
+            return new BenchRun(() => CpuGeneric.MatMul(a, b, c, m, n, k), () => Back(c, z), lane: () => CpuGeneric.Vectorized<T>() ? $"Vector<{typeof(T).Name}>" : "scalar", held: () => new(0, null));
         }
 
         var gpu = Devices.Gpu;
@@ -117,7 +118,7 @@ public sealed class NumberSubject : IBenchSubject
         }
 
         return new BenchRun(() => { Gpu.Launch(function, (uint)((n + tile - 1) / tile), (uint)((m + tile - 1) / tile), 16, 16, 0, da, db, dc, Gpu.U(m), Gpu.U(n), Gpu.U(k)); Gpu.Synchronize(); },
-            () => Gpu.Download<byte>(dc, z), () => { gpu.Return(da); gpu.Return(db); gpu.Return(dc); }, () => chosen);
+            () => Gpu.Download<byte>(dc, z), () => { gpu.Return(da); gpu.Return(db); gpu.Return(dc); }, () => chosen, () => new(0, 0));
     }
 
     private static IBenchRun Rows<T>(Device device, byte[] x, byte[] y, int rows, int cols, float? eps) where T : unmanaged, IFloatingPointIeee754<T>
@@ -127,7 +128,7 @@ public sealed class NumberSubject : IBenchSubject
             T[] a = Of<T>(x), d = new T[rows * cols], inv = new T[rows];
             T e = T.CreateTruncating(eps ?? 0);
             return new BenchRun(() => { if (eps is null) CpuGeneric.Softmax(a, d, rows, cols); else CpuGeneric.RmsNorm(a, d, inv, rows, cols, e); },
-                () => Back(d, y), lane: () => CpuGeneric.Vectorized<T>() ? $"Vector<{typeof(T).Name}>" : "scalar");
+                () => Back(d, y), lane: () => CpuGeneric.Vectorized<T>() ? $"Vector<{typeof(T).Name}>" : "scalar", held: () => new(eps is null ? 0 : (long)rows * Marshal.SizeOf<T>(), null));
         }
 
         var gpu = Devices.Gpu;
@@ -140,6 +141,6 @@ public sealed class NumberSubject : IBenchSubject
             if (eps is null) Gpu.Launch(g, (uint)rows, 1, 256, 1, 0, dx, dy, Gpu.U(cols), Gpu.F(0f));
             else Gpu.Launch(g, (uint)rows, 1, 256, 1, 0, dx, dy, dinv, Gpu.U(cols), Gpu.F(eps.Value));
             Gpu.Synchronize();
-        }, () => Gpu.Download<byte>(dy, y), () => { gpu.Return(dx); gpu.Return(dy); gpu.Return(dinv); }, () => entry);
+        }, () => Gpu.Download<byte>(dy, y), () => { gpu.Return(dx); gpu.Return(dy); gpu.Return(dinv); }, () => entry, () => new(0, eps is null ? 0 : rows * 8L));
     }
 }

@@ -461,12 +461,30 @@ internal sealed partial class Kernels
         public const int AttnVt = 27, AttnPt = 28, AttnDst = 29;           // the fused attention backward's Vᵀ, Pᵀ, dSᵀ (AttentionBackRows.cs)
 
         [ThreadStatic] private static byte[]?[]? s_slots;
+        [ThreadStatic] private static long[]? s_counted, s_countedBytes;
 
         public static byte[] Get(int slot, long bytes)
         {
             var slots = s_slots ??= new byte[Count][];
             var array = slots[slot];
             if (array is null || array.LongLength != bytes) slots[slot] = array = GC.AllocateUninitializedArray<byte>(checked((int)bytes));
+            // Lent without a return: its bytes counted once a count (Workspace.ResetHeld), as held from here on (a slot
+            // grown within a count, the growth).
+            var counted = s_counted ??= new long[Count];
+            var countedBytes = s_countedBytes ??= new long[Count];
+            long generation = Workspace.Generation;
+            if (counted[slot] != generation)
+            {
+                counted[slot] = generation;
+                countedBytes[slot] = 0;
+            }
+
+            if (bytes > countedBytes[slot])
+            {
+                Workspace.Hold(bytes - countedBytes[slot]);
+                countedBytes[slot] = bytes;
+            }
+
             return array;
         }
     }

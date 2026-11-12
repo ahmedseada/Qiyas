@@ -12,6 +12,11 @@
 //        Qiyas.dll profile | gpuprofile | team       (Qiyas's own diagnostics)
 //
 // Every proof in Checks must pass before anything is timed. Times are medians over an adaptive number of runs.
+//
+// The readout: before a device's rows, its limits are measured (Limits.cs: the copy bandwidth, each lane's peak
+// multiply-add rate); each row states what its operation moves and computes by its own definition (Readout.cs: Work),
+// the time those take at the limits (the bound), and for each subject the rate it reached, the fraction of the bound it
+// sits at, and the working memory its run held beyond its operands (host, and device on a GPU).
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
@@ -92,6 +97,11 @@ foreach (var device in options.Devices)
         if (s.Describe(device) is { } line) Console.WriteLine(line);
     }
 
+    // The device's limits, measured now (before the cool-down, which it is part of the reason for).
+    var limits = Limits.Measure(device);
+    bench.Limits[device] = limits;
+    Console.WriteLine(limits.Describe());
+
     if (options.Report && bench.CoolDownSeconds == 0)
     {
         // The full runs (--report: the baseline and the README) idle once after the gates before the first timed row: the
@@ -154,7 +164,8 @@ internal sealed class Options
     /// <summary>With --report: print the device's facts and the lanes chosen for the run's operations before the rows.</summary>
     public bool Report;
 
-    /// <summary>--repeat N: every row measured N times over (a stress for intermittent failures; the last measurement is kept).</summary>
+    /// <summary>--repeat N: every row timed N times over, the subjects in turn, the median of the N readings kept and their
+    /// spread shown (the checks run N times as hard too: a stress for intermittent failures).</summary>
     public int Repeat = 1;
 
     public static Options Parse(string[] args)
@@ -227,9 +238,13 @@ internal static class Subjects
 
 // ---------------------------------------------------------------------------------------------- the bench
 
-internal sealed record Cell(string Subject, string Lane, double Ms, double Err);
+// Held: the working memory the run held beyond its operands, a bound (host: HostMeter's count with the subject's kept
+// buffers; device: the subject's count, null where it cannot tell). Spread: (slowest − fastest) / median over the --repeat
+// readings. Clock: on CUDA the GPU's performance state and memory clock at the end of the subject's timing (the lowest
+// memory clock over the --repeat readings; GpuClock), null where it cannot be read.
+internal sealed record Cell(string Subject, string Lane, double Ms, double Err, Held Held, double Spread, string? Clock = null);
 
-internal sealed record Row(Device Device, string Op, string Type, string Shape, List<Cell?> Cells);
+internal sealed record Row(Device Device, string Op, string Type, string Shape, Work Work, List<Cell?> Cells);
 
 internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options options)
 {
@@ -258,6 +273,11 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
     private readonly List<Row> _rows = [];
     private readonly string _baseline = options.BaselineOf(subjects);
 
+    /// <summary>Each device's limits, measured before its rows.</summary>
+    public readonly Dictionary<Device, Limits> Limits = [];
+
+    private readonly HostMeter _meter = new();
+
     public static int MatSize(Device device) => Prime(device == Device.Cpu ? 1024 : 2048);
 
     public void Run(Device device, string type)
@@ -268,7 +288,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var b = Registry.Make(type, AddCount, 2, -1, 1);
             double[] reference = Registry.Values(type, a, AddCount), vb = Registry.Values(type, b, AddCount);
             for (int i = 0; i < reference.Length; i++) reference[i] += vb[i];
-            Measure(device, "add", type, $"{AddCount}", reference, (s, c) => s.Add(device, type, a, b, c, AddCount), a.Length);
+            Measure(device, "add", type, $"{AddCount}", new Work(3 * Work.B(type, AddCount), AddCount), reference, (s, c) => s.Add(device, type, a, b, c, AddCount), a.Length);
         }
 
         if (options.Ops.Contains("matmul"))
@@ -277,7 +297,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var a = Registry.Make(type, s * s, 3, -1, 1);
             var b = Registry.Make(type, s * s, 4, -1, 1);
             var reference = ProductView.Reference(Registry.Values(type, a, s * s), Registry.Values(type, b, s * s), s, s, s);
-            for (int rep = 0; rep < options.Repeat; rep++) Measure(device, "matmul", type, $"{s}x{s}x{s}", reference, (subject, c) => subject.MatMul(device, type, a, b, c, s, s, s), a.Length);
+            Measure(device, "matmul", type, $"{s}x{s}x{s}", Works.Product(type, (long)s * s, (long)s * s, (long)s * s, (double)s * s * s), reference, (subject, c) => subject.MatMul(device, type, a, b, c, s, s, s), a.Length);
         }
 
         foreach (var op in Adad.Abstraction.Ops.All)
@@ -365,14 +385,14 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         {
             var x = Registry.Make(type, count, 5, -4, 4);
             var reference = References.Softmax(Registry.Values(type, x, count), Rows, Cols);
-            Measure(device, "softmax", type, $"{Rows}x{Cols}", reference, (s, y) => s.Softmax(device, type, x, y, Rows, Cols), x.Length);
+            Measure(device, "softmax", type, $"{Rows}x{Cols}", new Work(2 * Work.B(type, count), 5.0 * count), reference, (s, y) => s.Softmax(device, type, x, y, Rows, Cols), x.Length);
         }
 
         if (options.Ops.Contains("rms_norm"))
         {
             var x = Registry.Make(type, count, 6, -2, 2);
             var reference = References.RmsNorm(Registry.Values(type, x, count), Rows, Cols, Eps);
-            Measure(device, "rms_norm", type, $"{Rows}x{Cols}", reference, (s, y) => s.RmsNorm(device, type, x, y, Rows, Cols, Eps), x.Length);
+            Measure(device, "rms_norm", type, $"{Rows}x{Cols}", new Work(2 * Work.B(type, count), 3.0 * count + 4.0 * Rows), reference, (s, y) => s.RmsNorm(device, type, x, y, Rows, Cols, Eps), x.Length);
         }
     }
 
@@ -389,7 +409,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var a = Registry.Make(type, m * k, 21, -1, 1);
             var x = Registry.Make(type, t ? m : k, 22, -1, 1);
             var reference = References.Gemv(Registry.Values(type, a, m * k), Registry.Values(type, x, t ? m : k), m, k, t);
-            Measure(device, name, type, $"{m}x{k}", reference, (s, y) => s.Gemv(device, type, a, x, y, m, k, t), (int)Registry.Bytes(type, t ? k : m));
+            Measure(device, name, type, $"{m}x{k}", Works.Product(type, (long)m * k, t ? m : k, t ? k : m, (double)m * k), reference, (s, y) => s.Gemv(device, type, a, x, y, m, k, t), (int)Registry.Bytes(type, t ? k : m));
             return;
         }
 
@@ -397,7 +417,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         var values = Registry.Values(type, data, r * c);
         if (name == "transpose")
         {
-            Measure(device, name, type, $"{r}x{c}", References.Transpose(values, r, c), (s, o) => s.Transpose(device, type, data, o, r, c), data.Length);
+            Measure(device, name, type, $"{r}x{c}", new Work(2 * Work.B(type, (long)r * c), 0), References.Transpose(values, r, c), (s, o) => s.Transpose(device, type, data, o, r, c), data.Length);
             return;
         }
 
@@ -406,7 +426,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var op = Adad.Abstraction.Ops.Find(name[7..]);
             var v = Registry.Make(type, c, 24, -1, 1);
             var reference = References.MapRow(type, op, values, Registry.Values(type, v, c), r, c);
-            Measure(device, name, type, $"{r}x{c}", reference, (s, o) => s.MapRow(device, op, type, data, v, o, r, c), data.Length);
+            Measure(device, name, type, $"{r}x{c}", new Work(2 * Work.B(type, (long)r * c) + Work.B(type, c), (double)r * c), reference, (s, o) => s.MapRow(device, op, type, data, v, o, r, c), data.Length);
             return;
         }
 
@@ -414,7 +434,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         var axis = name.EndsWith(":rows", StringComparison.Ordinal) ? Axis.Rows : name.EndsWith(":cols", StringComparison.Ordinal) ? Axis.Cols : Axis.Whole;
         int count = axis == Axis.Whole ? 1 : axis == Axis.Rows ? r : c;
         var reduced = References.Reduce(rop, axis, values, r, c);
-        MeasureLanes(device, name, type, $"{r}x{c}", reduced, (s, o) => s.Reduce(device, rop, axis, type, data, r, c, o), count);
+        MeasureLanes(device, name, type, $"{r}x{c}", Works.Reduce(rop, type, (long)r * c, count), reduced, (s, o) => s.Reduce(device, rop, axis, type, data, r, c, o), count);
     }
 
     // Routing, sampling and the loss: top-8 of 4096 rows of 32768 (a vocabulary), pick and sample over the same rows, a
@@ -430,7 +450,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
                 var x = Registry.Make(type, rows * cols, 95, -4, 4);
                 var (want, _) = Routing.TopKReference(Registry.Values(type, x, rows * cols), rows, cols, k);
                 var indices = new int[rows * k];
-                Measure(device, name, type, $"{rows}x{cols} k{k}", want, (s, values) => s.TopK(device, type, x, rows, cols, k, values, indices), (int)Registry.Bytes(type, rows * k));
+                Measure(device, name, type, $"{rows}x{cols} k{k}", new Work(Work.B(type, (long)rows * cols) + Work.B(type, rows * k) + 4.0 * rows * k, (double)rows * cols), want, (s, values) => s.TopK(device, type, x, rows, cols, k, values, indices), (int)Registry.Bytes(type, rows * k));
                 return;
             }
 
@@ -440,7 +460,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
                 var x = Registry.Make(type, rows * cols, 95, -4, 4);
                 var (want, _) = Routing.LogSoftmaxTopKReference(Registry.Values(type, x, rows * cols), rows, cols, k);
                 var indices = new int[rows * k];
-                Measure(device, name, type, $"{rows}x{cols} k{k}", want, (s, values) => s.LogSoftmaxTopK(device, type, x, rows, cols, k, values, indices), (int)Registry.Bytes(type, rows * k));
+                Measure(device, name, type, $"{rows}x{cols} k{k}", new Work(Work.B(type, (long)rows * cols) + Work.B(type, rows * k) + 4.0 * rows * k, 4.0 * rows * cols), want, (s, values) => s.LogSoftmaxTopK(device, type, x, rows, cols, k, values, indices), (int)Registry.Bytes(type, rows * k));
                 return;
             }
 
@@ -449,7 +469,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
                 var x = Registry.Make(type, rows * cols, 95, -4, 4);
                 var index = Enumerable.Range(0, rows).Select(_ => random.Next(cols)).ToArray();
                 var want = Routing.PickReference(Registry.Values(type, x, rows * cols), rows, cols, index);
-                Measure(device, name, type, $"{rows}x{cols}", want, (s, o) => s.Pick(device, type, x, rows, cols, index, o), (int)Registry.Bytes(type, rows));
+                Measure(device, name, type, $"{rows}x{cols}", new Work(2 * Work.B(type, rows) + 4.0 * rows, 0), want, (s, o) => s.Pick(device, type, x, rows, cols, index, o), (int)Registry.Bytes(type, rows));
                 return;
             }
 
@@ -459,7 +479,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
                 var x = Registry.Make(type, rows * cols, 95, 0, 1);
                 var u = Registry.Make(type, rows, 96, 0, 1);
                 var want = Routing.SampleReference(Registry.Values(type, x, rows * cols), rows, cols, Registry.Values(type, u, rows));
-                MeasureIndices(device, name, type, $"{rows}x{cols}", want, (s, picks) => s.Sample(device, type, x, rows, cols, u, picks));
+                MeasureIndices(device, name, type, $"{rows}x{cols}", new Work(Work.B(type, (long)rows * cols) + Work.B(type, rows) + 4.0 * rows, 2.0 * rows * cols), want, (s, picks) => s.Sample(device, type, x, rows, cols, u, picks));
                 return;
             }
 
@@ -472,7 +492,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
                 var (wantCounts, wantOffsets, wantOrder) = Routing.RouteReference(index, buckets);
                 var counts = new int[buckets];
                 var offsets = new int[buckets + 1];
-                MeasureIndices(device, name, "s32", $"{n} into {buckets}", wantOrder, (s, order) => s.Route(device, index, buckets, counts, offsets, order), extra: () => counts.SequenceEqual(wantCounts) && offsets.SequenceEqual(wantOffsets) ? 0 : 1);
+                MeasureIndices(device, name, "s32", $"{n} into {buckets}", new Work(8.0 * n + 8.0 * buckets, n), wantOrder, (s, order) => s.Route(device, index, buckets, counts, offsets, order), extra: () => counts.SequenceEqual(wantCounts) && offsets.SequenceEqual(wantOffsets) ? 0 : 1);
                 return;
             }
 
@@ -488,11 +508,11 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
                 var x = Registry.Make(type, (int)a.Values, 99, -4, 4);
                 var (wantLoss, wantGrad) = a.Reference(Registry.Values(type, x, (int)a.Values));
                 string shape = $"T{T} B{B} C{C} L{L}";
-                if (name == "ctc") Measure(device, name, type, shape, wantLoss, (s, o) => s.Ctc(device, type, a, x, o, null), (int)Registry.Bytes(type, B));
+                if (name == "ctc") Measure(device, name, type, shape, Works.Ctc(a, type, false), wantLoss, (s, o) => s.Ctc(device, type, a, x, o, null), (int)Registry.Bytes(type, B));
                 else
                 {
                     var loss = new byte[Registry.Bytes(type, B)];
-                    Measure(device, name, type, shape, wantGrad, (s, o) => s.Ctc(device, type, a, x, loss, o), (int)Registry.Bytes(type, a.Values));
+                    Measure(device, name, type, shape, Works.Ctc(a, type, true), wantGrad, (s, o) => s.Ctc(device, type, a, x, loss, o), (int)Registry.Bytes(type, a.Values));
                 }
 
                 return;
@@ -507,7 +527,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
                 var logp = new byte[x.Length];
                 var op = RowOps.Find("log_softmax");
                 var neg = Adad.Abstraction.Ops.Find("neg");
-                Measure(device, name, type, $"{rows}x{cols}", want, (s, o) =>
+                Measure(device, name, type, $"{rows}x{cols}", new Work(Work.B(type, (long)rows * cols) + 4.0 * rows + Work.B(type, rows), 4.0 * rows * cols), want, (s, o) =>
                 {
                     // The subject's own loss per row where it has one; else the composition.
                     var fused = s.CrossEntropy(device, type, x, rows, cols, targets, o);
@@ -534,26 +554,18 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
 
     // A result of s32 indices, compared exactly with the reference (extra: a further check, 0 when it holds), or scored by
     // `score` where the distance between two indices is not the error (a sampler's picks: the probability a pick is off by).
-    private void MeasureIndices(Device device, string op, string type, string shape, int[] reference, Func<IBenchSubject, int[], IBenchRun?> prepare, Func<int>? extra = null,
+    private void MeasureIndices(Device device, string op, string type, string shape, Work work, int[] reference, Func<IBenchSubject, int[], IBenchRun?> prepare, Func<int>? extra = null,
         Func<IBenchSubject, int[], double>? score = null)
     {
-        var cells = new List<Cell?>();
-        foreach (var subject in subjects)
+        var outputs = new Dictionary<IBenchSubject, int[]>();
+        Record(device, op, type, shape, work, s => prepare(s, outputs[s] = new int[reference.Length]), (subject, _) =>
         {
-            var output = new int[reference.Length];
-            using var run = prepare(subject, output);
-            if (run is null) { cells.Add(null); continue; }
-            if (TimeOrRefused(device, subject, run) is not { } ms) { cells.Add(null); continue; }
-            run.Collect();
+            var output = outputs[subject];
             double worst = extra?.Invoke() ?? 0;
             if (score is not null) worst = Math.Max(worst, score(subject, output));
             else for (int i = 0; i < reference.Length; i++) worst = Math.Max(worst, Math.Abs((double)output[i] - reference[i]));
-            cells.Add(new Cell(subject.Name, run.Lane, ms, worst));
-        }
-
-        var row = new Row(device, op, type, shape, cells);
-        _rows.Add(row);
-        Console.WriteLine(Line(row));
+            return worst;
+        });
     }
 
     // A recurrent step over a batch of 1024 rows, input 1024, hidden 1024 (h' scored; the backward: dx scored, the rest computed too).
@@ -572,7 +584,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var b = Registry.Make(type, GH, 96, -0.1, 0.1); var bh = Registry.Make(type, GH, 97, -0.1, 0.1);
             double[] V(byte[] s, int n) => Registry.Values(type, s, n);
             var wantH = RecurrentCase.GruSequenceReference(ga, T, V(x, T * ga.B * ga.D), V(h0, ga.B * ga.H), V(w, GH * ga.D), V(u, GH * ga.H), V(b, GH), V(bh, GH));
-            Measure(device, name, type, $"T{T} B{ga.B} D{ga.D} H{ga.H}", wantH, (s, hOut) => s.GruSequence(device, type, ga, T, x, h0, w, u, b, bh, hOut), (int)Registry.Bytes(type, T * ga.B * ga.H));
+            Measure(device, name, type, $"T{T} B{ga.B} D{ga.D} H{ga.H}", Works.Recurrent(ga, T, type, false), wantH, (s, hOut) => s.GruSequence(device, type, ga, T, x, h0, w, u, b, bh, hOut), (int)Registry.Bytes(type, T * ga.B * ga.H));
             return;
         }
 
@@ -590,7 +602,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             double[] V(byte[] s, int n) => Registry.Values(type, s, n);
             var (wdx, _, _, _, _, _) = RecurrentCase.GruSequenceBackwardReference(ga, T, V(x, T * ga.B * ga.D), V(h0, ga.B * ga.H), V(w, GH * ga.D), V(u, GH * ga.H), V(b, GH), V(bh, GH), V(dhOut, T * ga.B * ga.H));
             var dh0 = new byte[h0.Length]; var dw = new byte[w.Length]; var du = new byte[u.Length]; var db = new byte[b.Length]; var dbh = new byte[bh.Length];
-            Measure(device, name, type, $"T{T} B{ga.B} D{ga.D} H{ga.H}", wdx, (s, dx) => s.GruSequenceBackward(device, type, ga, T, x, h0, w, u, b, bh, dhOut, dx, dh0, dw, du, db, dbh), x.Length);
+            Measure(device, name, type, $"T{T} B{ga.B} D{ga.D} H{ga.H}", Works.Recurrent(ga, T, type, true), wdx, (s, dx) => s.GruSequenceBackward(device, type, ga, T, x, h0, w, u, b, bh, dhOut, dx, dh0, dw, du, db, dbh), x.Length);
             return;
         }
 
@@ -610,14 +622,14 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             {
                 var (wantH, _) = RecurrentCase.LstmSequenceReference(sa, T, V(x, T * sa.B * sa.D), V(h0, sa.B * sa.H), V(c0, sa.B * sa.H), V(w, GH * sa.D), V(u, GH * sa.H), V(b, GH));
                 var cOut = new byte[Registry.Bytes(type, T * sa.B * sa.H)];
-                Measure(device, name, type, seqShape, wantH, (s, hOut) => s.LstmSequence(device, type, sa, T, x, h0, c0, w, u, b, hOut, cOut, null, null, null, null, null, null), (int)Registry.Bytes(type, T * sa.B * sa.H));
+                Measure(device, name, type, seqShape, Works.Recurrent(sa, T, type, false), wantH, (s, hOut) => s.LstmSequence(device, type, sa, T, x, h0, c0, w, u, b, hOut, cOut, null, null, null, null, null, null), (int)Registry.Bytes(type, T * sa.B * sa.H));
                 return;
             }
 
             var dhOut = Registry.Make(type, T * sa.B * sa.H, 88, -1, 1); var dcLast = Registry.Make(type, sa.B * sa.H, 89, -1, 1);
             var (wdx, _, _, _, _, _) = RecurrentCase.LstmSequenceBackwardReference(sa, T, V(x, T * sa.B * sa.D), V(h0, sa.B * sa.H), V(c0, sa.B * sa.H), V(w, GH * sa.D), V(u, GH * sa.H), V(b, GH), V(dhOut, T * sa.B * sa.H), V(dcLast, sa.B * sa.H));
             var dh0 = new byte[h0.Length]; var dc0 = new byte[c0.Length]; var dw = new byte[w.Length]; var du = new byte[u.Length]; var db = new byte[b.Length];
-            Measure(device, name, type, seqShape, wdx, (s, dx) => s.LstmSequence(device, type, sa, T, x, h0, c0, w, u, b, dhOut, dcLast, dx, dh0, dc0, dw, du, db), x.Length);
+            Measure(device, name, type, seqShape, Works.Recurrent(sa, T, type, true), wdx, (s, dx) => s.LstmSequence(device, type, sa, T, x, h0, c0, w, u, b, dhOut, dcLast, dx, dh0, dc0, dw, du, db), x.Length);
             return;
         }
 
@@ -627,11 +639,11 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         string shape = $"B{a.B} D{a.D} H{a.H}";
         if (backward)
         {
-            Measure(device, name, type, shape, k.WantDx!, (s, dx) => s.Recurrent(device, type, a, k.X, k.H, k.C, k.W, k.U, k.Bias, k.BiasH, k.DhOut!, k.DcOut, dx, k.Dh, k.Dc, k.Dw, k.Du, k.Db, k.Dbh), k.X.Length);
+            Measure(device, name, type, shape, Works.Recurrent(a, 1, type, true), k.WantDx!, (s, dx) => s.Recurrent(device, type, a, k.X, k.H, k.C, k.W, k.U, k.Bias, k.BiasH, k.DhOut!, k.DcOut, dx, k.Dh, k.Dc, k.Dw, k.Du, k.Db, k.Dbh), k.X.Length);
             return;
         }
 
-        Measure(device, name, type, shape, k.WantH, (s, hOut) => s.Recurrent(device, type, a, k.X, k.H, k.C, k.W, k.U, k.Bias, k.BiasH, hOut, k.COut, null, null, null, null, null, null, null), k.H.Length);
+        Measure(device, name, type, shape, Works.Recurrent(a, 1, type, false), k.WantH, (s, hOut) => s.Recurrent(device, type, a, k.X, k.H, k.C, k.W, k.U, k.Bias, k.BiasH, hOut, k.COut, null, null, null, null, null, null, null), k.H.Length);
     }
 
     // A convolution of a 64 × 128 × 128 image by 128 filters of 3 × 3 (pad 1); the backward pair (dx scored, dw computed too).
@@ -646,12 +658,12 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var dy = Registry.Make(type, (int)a.YValues, 63, -1, 1);
             var (wantX, _, _) = a.ReferenceBackward(Registry.Values(type, x, (int)a.XValues), Registry.Values(type, w, (int)a.WValues), Registry.Values(type, dy, (int)a.YValues));
             var dw = new byte[w.Length];
-            Measure(device, name, type, shape, wantX, (s, dx) => s.Conv(device, type, a, x, w, dy, dx, dw), x.Length);
+            Measure(device, name, type, shape, Works.Conv(a, type, true), wantX, (s, dx) => s.Conv(device, type, a, x, w, dy, dx, dw), x.Length);
             return;
         }
 
         var want = a.Reference(Registry.Values(type, x, (int)a.XValues), Registry.Values(type, w, (int)a.WValues));
-        Measure(device, name, type, shape, want, (s, y) => s.Conv(device, type, a, x, w, y, null, null), (int)Registry.Bytes(type, a.YValues));
+        Measure(device, name, type, shape, Works.Conv(a, type, false), want, (s, y) => s.Conv(device, type, a, x, w, y, null, null), (int)Registry.Bytes(type, a.YValues));
     }
 
     // An optimizer step over 16M parameters (the moments in lane storage); p scored against float64 (m, v updated too).
@@ -670,7 +682,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         var v = vv is null ? null : LaneBytes(size, vv);
         var pv = Registry.Values(type, p, n);
         a.Reference(pv, Registry.Values(type, g, n), (double[])mv.Clone(), vv is null ? null : (double[])vv.Clone());
-        Measure(device, "optimizer:" + name, type, $"{n}", pv, (s, o) => { p.CopyTo(o, 0); return s.Optimizer(device, type, a, o, g, (byte[])m.Clone(), v is null ? null : (byte[])v.Clone(), n); }, p.Length);
+        Measure(device, "optimizer:" + name, type, $"{n}", Works.Optimizer(a, type, n, size, false), pv, (s, o) => { p.CopyTo(o, 0); return s.Optimizer(device, type, a, o, g, (byte[])m.Clone(), v is null ? null : (byte[])v.Clone(), n); }, p.Length);
     }
 
     // An adamw step across 64 tensors under one clipping: optimizer:adamw's 16M parameters as 64 tensors (each a whole
@@ -697,7 +709,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         double sum = 0;
         foreach (double x in gv) sum += x * x;
         a.Reference(pv, gv, mv, vv, a.Factor(sum));
-        Measure(device, "optimizer_many", type, $"{Tensors} x {per}", pv, (s, o) => { p.CopyTo(o, 0); return s.OptimizerMany(device, type, a, o, g, (byte[])m.Clone(), (byte[])v.Clone(), counts); }, p.Length);
+        Measure(device, "optimizer_many", type, $"{Tensors} x {per}", Works.Optimizer(a, type, n, size, true), pv, (s, o) => { p.CopyTo(o, 0); return s.OptimizerMany(device, type, a, o, g, (byte[])m.Clone(), (byte[])v.Clone(), counts); }, p.Length);
     }
 
     private static byte[] LaneBytes(int size, double[] values)
@@ -733,13 +745,13 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var (wantQ, _, _) = a.ReferenceBackward(qv, kv, vv, Registry.Values(type, dO, (int)a.QValues));
             var dk = new byte[k.Length];
             var dv = new byte[v.Length];
-            Measure(device, name, type, shape, wantQ, (s, dq) => s.AttentionBackward(device, type, a, q, k, v, dO, dq, dk, dv), q.Length);
+            Measure(device, name, type, shape, Works.Attention(a, type, true), wantQ, (s, dq) => s.AttentionBackward(device, type, a, q, k, v, dO, dq, dk, dv), q.Length);
             return;
         }
 
         var want = a.Reference(qv, kv, vv);
-        if (name.StartsWith("attention_fused", StringComparison.Ordinal)) { Measure(device, name, type, shape, want, (s, o) => s.AttentionFused(device, type, a, q, k, v, o), q.Length); return; }
-        Measure(device, name, type, shape, want, (s, o) => s.Attention(device, type, a, q, k, v, o, name == "attention_decode"), q.Length);
+        if (name.StartsWith("attention_fused", StringComparison.Ordinal)) { Measure(device, name, type, shape, Works.Attention(a, type, false), want, (s, o) => s.AttentionFused(device, type, a, q, k, v, o), q.Length); return; }
+        Measure(device, name, type, shape, Works.Attention(a, type, false), want, (s, o) => s.Attention(device, type, a, q, k, v, o, name == "attention_decode"), q.Length);
     }
 
     // A device's memory by a range (uint8's row: bytes have no type): a map row's 16M bytes but the first and last three,
@@ -755,7 +767,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         var want = new double[n];
         if (op == "copy") Array.Copy(values, offset, want, offset, n - 2 * offset);
         else if (op == "clear") { values.CopyTo(want, 0); Array.Clear(want, offset, n - 2 * offset); }
-        Measure(device, name, type, $"{n} bytes", want, (s, o) =>
+        Measure(device, name, type, $"{n} bytes", new Work(op == "copy" ? 2.0 * (n - 2 * offset) : op == "clear" ? n - 2 * offset : n, 0), want, (s, o) =>
         {
             if (op == "clear") source.CopyTo(o, 0); else Array.Clear(o);
             return s.Memory(device, op, source, o, offset);
@@ -777,7 +789,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var history = new int[rows * capacity];
             for (int i = 0; i < history.Length; i++) history[i] = i % 4 == 3 ? history[i - 1] : random.Next(cols);
             var want = a.Reference(Registry.Values(type, x, rows * cols), history, length);
-            Measure(device, name, type, $"{rows}x{cols} last 64 of {capacity}", want, (s, y) => s.Penalize(device, type, a, x, history, length, y), (int)Registry.Bytes(type, rows * cols));
+            Measure(device, name, type, $"{rows}x{cols} last 64 of {capacity}", new Work(2 * Work.B(type, (long)rows * cols) + 4.0 * rows * a.Tokens(length), 3.0 * rows * a.Tokens(length)), want, (s, y) => s.Penalize(device, type, a, x, history, length, y), (int)Registry.Bytes(type, rows * cols));
             return;
         }
 
@@ -795,7 +807,8 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var xv = Registry.Values(type, x, rows * cols);
             var (want, _) = a.Reference(xv, step);
             var probability = new byte[rows * 8];                                // the float lane's storage, at most 8 bytes a row
-            MeasureIndices(device, name, type, $"{rows}x{cols}", want, (s, picks) => s.SampleFiltered(device, type, a, x, step, picks, probability),
+            int laneBytes = (Registry.IsFloat(type) ? Registry.Bits(type) == 64 : Registry.Bits(type) > 16) ? 8 : 4;   // ProbabilityValues' lane
+            MeasureIndices(device, name, type, $"{rows}x{cols}", new Work(Work.B(type, (long)rows * cols) + 4.0 * rows + (double)laneBytes * rows, (name == "sample_plain" ? 5.0 : 6.0) * rows * cols), want, (s, picks) => s.SampleFiltered(device, type, a, x, step, picks, probability),
                 score: (s, picks) => PickScore(device, name, type, s.Name, a, xv, step, want, picks, ProbabilityValues(type, probability, rows)));
         }
     }
@@ -866,7 +879,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             double excluded = Registry.WithFloat(type, new Excluded());
             var want = new double[rows * cap];
             for (int i = 0; i < want.Length; i++) want[i] = CacheView.Sees(at, i / cap, i % cap, 0) ? 0 : excluded;
-            Measure(device, name, type, $"{rows}x{cap}", want, (s, mask) => s.DecoderMask(device, type, rows, cap, 0, at, mask), (int)Registry.Bytes(type, want.Length));
+            Measure(device, name, type, $"{rows}x{cap}", new Work(Work.B(type, want.Length), want.Length), want, (s, mask) => s.DecoderMask(device, type, rows, cap, 0, at, mask), (int)Registry.Bytes(type, want.Length));
             return;
         }
 
@@ -881,14 +894,14 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             {
                 var want = new double[view.Values];
                 for (int h = 0; h < heads; h++) Array.Copy(x, (long)h * steps * d, want, ((long)h * cap + at) * d, (long)steps * d);
-                Measure(device, name, type, shape, want, (s, cache) => s.CacheWrite(device, type, own, view, steps, at, source, cache), (int)Registry.Bytes(own, view.Values), own);
+                Measure(device, name, type, shape, new Work(Work.B(type, n) + Work.B(own, n), 0), want, (s, cache) => s.CacheWrite(device, type, own, view, steps, at, source, cache), (int)Registry.Bytes(own, view.Values), own);
                 return;
             }
 
             var w = ScaledWeight.PerRow(heads * steps, d);
             var codes = new byte[Registry.Bytes("int8", w.Values)];
             var (wantScales, _) = w.QuantizeReference(x, -128, 127, false);
-            Measure(device, name, type, $"{heads * steps}x{d} int8", wantScales, (s, scales) => s.Quantize(device, type, "int8", w, source, codes, scales), (int)Registry.Bytes(type, w.Scales));
+            Measure(device, name, type, $"{heads * steps}x{d} int8", new Work(Work.B(type, n) + Work.B("int8", w.Values) + Work.B(type, w.Scales), 3.0 * n), wantScales, (s, scales) => s.Quantize(device, type, "int8", w, source, codes, scales), (int)Registry.Bytes(type, w.Scales));
             return;
         }
 
@@ -898,7 +911,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         var k = Registry.Make(own, keys, 42, -1, 1);
         var v = Registry.Make(own, keys, 43, -1, 1);
         var wantO = CacheRule.AtPosition(a, position).Reference(Registry.Values(type, q, (int)a.QValues), Registry.Values(own, k, keys), Registry.Values(own, v, keys));
-        Measure(device, name, type, $"{a.Heads}h {a.Lq}x{a.Lk} d{a.D}", wantO, (s, o) => s.AttentionCached(device, type, own, a, position, q, k, v, o), q.Length);
+        Measure(device, name, type, $"{a.Heads}h {a.Lq}x{a.Lk} d{a.D}", Works.Attention(a, type, false, own), wantO, (s, o) => s.AttentionCached(device, type, own, a, position, q, k, v, o), q.Length);
     }
 
     // A mixture of experts. route_topk (the float types: its weights are probabilities): 4096 tokens' 8 first of 64
@@ -916,7 +929,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var p = Registry.Make(type, tokens * experts, 111, 0, 1);
             var want = Experts.RouteTopKReference(Registry.Values(type, p, tokens * experts), tokens, experts, k, true).Weights;
             int[] offsets = new int[experts + 1], tokenOfRow = new int[tokens * k], slotRow = new int[tokens * k];
-            Measure(device, name, type, $"{tokens}x{experts} k{k}", want, (s, w) => s.RouteTopK(device, type, p, tokens, experts, k, true, w, offsets, tokenOfRow, slotRow), (int)Registry.Bytes(type, tokens * k));
+            Measure(device, name, type, $"{tokens}x{experts} k{k}", new Work(Work.B(type, (long)tokens * experts) + Work.B(type, tokens * k) + 4.0 * (experts + 1) + 8.0 * tokens * k, (double)tokens * experts + 2.0 * tokens * k), want, (s, w) => s.RouteTopK(device, type, p, tokens, experts, k, true, w, offsets, tokenOfRow, slotRow), (int)Registry.Bytes(type, tokens * k));
             return;
         }
 
@@ -934,7 +947,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         string shape = $"{groups}x {v.Rows}x{v.N}x{v.K}";
         if (name == "expert_matmul")
         {
-            Measure(device, name, type, shape, Held(g), (s, y) => s.ExpertProducts(device, type, v, null, x, offsets2, gw, gb, null, null, y), (int)Registry.Bytes(type, v.YValues));
+            Measure(device, name, type, shape, new Work(Work.B(type, v.XValues) + Work.B(type, v.WeightValues) + Work.B(type, v.BiasValues) + Work.B(type, v.YValues) + 4.0 * (groups + 1), 2.0 * v.Rows * v.N * v.K + v.YValues), Held(g), (s, y) => s.ExpertProducts(device, type, v, null, x, offsets2, gw, gb, null, null, y), (int)Registry.Bytes(type, v.YValues));
             return;
         }
 
@@ -944,7 +957,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         var want2 = new double[g.Length];
         for (int i = 0; i < g.Length; i++) want2[i] = gate.Reference(g[i], u[i], 0, 0, 0);
         want2 = Held(want2);
-        Measure(device, name, type, shape + " " + gate.Name, want2, (s, y) => s.ExpertProducts(device, type, v, gate.Name, x, offsets2, gw, gb, uw, ub, y), (int)Registry.Bytes(type, v.YValues));
+        Measure(device, name, type, shape + " " + gate.Name, new Work(Work.B(type, v.XValues) + 2 * (Work.B(type, v.WeightValues) + Work.B(type, v.BiasValues)) + Work.B(type, v.YValues) + 4.0 * (groups + 1), 4.0 * v.Rows * v.N * v.K + 8.0 * v.YValues), want2, (s, y) => s.ExpertProducts(device, type, v, gate.Name, x, offsets2, gw, gb, uw, ub, y), (int)Registry.Bytes(type, v.YValues));
     }
 
     // The score a decoder's mask excludes by, as the type stores it (CacheView.Excluded).
@@ -968,7 +981,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             byte[] q = Registry.Make(type, nq, 41, -1, 1), k = Registry.Make(type, nk, 42, -1, 1), v = Registry.Make(type, nk, 43, -1, 1);
             var wantHeads = h.Reference(AttentionLayout.ToHeads(Registry.Values(type, q, nq), qo, a.Heads, a.Lq, a.D),
                 AttentionLayout.ToHeads(Registry.Values(type, k, nk), kv, a.Heads, a.Lk, a.D), AttentionLayout.ToHeads(Registry.Values(type, v, nk), kv, a.Heads, a.Lk, a.D));
-            Measure(device, name, type, $"{a.Heads}h {a.Lq}x{a.Lk} d{a.D}", AttentionLayout.FromHeads(wantHeads, qo, a.Heads, a.Lq, a.D), (s, o) => s.AttentionStepsFirst(device, type, a, q, k, v, o), q.Length);
+            Measure(device, name, type, $"{a.Heads}h {a.Lq}x{a.Lk} d{a.D}", Works.Attention(a, type, false), AttentionLayout.FromHeads(wantHeads, qo, a.Heads, a.Lq, a.D), (s, o) => s.AttentionStepsFirst(device, type, a, q, k, v, o), q.Length);
             return;
         }
 
@@ -991,7 +1004,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         var a2 = new RopeArgs(rows, d, heads, steps, half, false);
         var want = new double[n];
         RowOps.RopeReference(Registry.Values(type, x, n), cos, sin, positions, a2, want);
-        Measure(device, name, type, $"{rows}x{d}", want, (s, y) => s.Rope(device, type, a2, x, cosBytes, sinBytes, positions, y), x.Length);
+        Measure(device, name, type, $"{rows}x{d}", Works.Rope(a2, type, wide ? 8 : 4), want, (s, y) => s.Rope(device, type, a2, x, cosBytes, sinBytes, positions, y), x.Length);
     }
 
     // Products on views at the core product's size: transposed operands, 16 batches of a quarter size, the backward pair (dA and dB; dA scored).
@@ -1006,7 +1019,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var ba = Registry.Make(type, s * s, 31, -1, 1);
             var bb = Registry.Make(type, s * s, 32, -1, 1);
             var bwant = blockView.Reference(Registry.Values(type, ba, s * s), Registry.Values(type, bb, s * s));
-            Measure(device, name, type, $"{s}x{s}x{s} Bᵀ", bwant, (subject, c) => subject.MatMulBlocks(device, type, s, s, s, ba, bb, c), (int)Registry.Bytes(type, s * s));
+            Measure(device, name, type, $"{s}x{s}x{s} Bᵀ", Works.Product(type, (long)s * s, (long)s * s, (long)s * s, (double)s * s * s), bwant, (subject, c) => subject.MatMulBlocks(device, type, s, s, s, ba, bb, c), (int)Registry.Bytes(type, s * s));
             return;
         }
 
@@ -1017,7 +1030,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var dc = Registry.Make(type, s * s, 33, -1, 1);
             var reference = new ProductView(s, s, s, false, true).Reference(Registry.Values(type, dc, s * s), Registry.Values(type, b, s * s));
             var db = new byte[a.Length];
-            Measure(device, name, type, $"{s}x{s}x{s} (dA, dB)", reference, (subject, da) => subject.MatMulBackward(device, type, a, b, dc, da, db, s, s, s), a.Length);
+            Measure(device, name, type, $"{s}x{s}x{s} (dA, dB)", new Work(5 * Work.B(type, (long)s * s), 4.0 * s * s * s), reference, (subject, da) => subject.MatMulBackward(device, type, a, b, dc, da, db, s, s, s), a.Length);
             return;
         }
 
@@ -1032,7 +1045,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         var bv = Registry.Make(type, (int)v.ValuesB, 32, -1, 1);
         var want = v.Reference(Registry.Values(type, av, (int)v.ValuesA), Registry.Values(type, bv, (int)v.ValuesB));
         string shape = v.Batch > 1 ? $"{v.Batch} x {v.M}x{v.N}x{v.K}" : $"{v.M}x{v.N}x{v.K}{(v.TransA ? " Aᵀ" : "")}{(v.TransB ? " Bᵀ" : "")}";
-        Measure(device, name, type, shape, want, (subject, c) => subject.MatMulView(device, type, v, av, bv, c), (int)Registry.Bytes(type, v.ValuesC));
+        Measure(device, name, type, shape, Works.Product(type, v.ValuesA, v.ValuesB, v.ValuesC, (double)v.Batch * v.M * v.N * v.K), want, (subject, c) => subject.MatMulView(device, type, v, av, bv, c), (int)Registry.Bytes(type, v.ValuesC));
     }
 
     // A layout operation at a realistic shape (16M outputs for the moves; a 64 × 128 × 128 image, 3 × 3 kernel for the
@@ -1042,7 +1055,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         if (!LayoutArgs.Applies(name, Registry.IsFloat(type))) return;
         var k = LayoutCases.Bench(name, type);
         var reference = LayoutArgs.Reference(name, Registry.Values(type, k.X, k.InputCount), k.Index, k.P, k.Count, k.X2 is null ? null : Registry.Values(type, k.X2, k.SecondCount));
-        Measure(device, "layout:" + name, type, LayoutCases.Shape(k), reference, (s, o) => s.Layout(device, type, k.With(o)), (int)Registry.Bytes(type, k.Count));
+        Measure(device, "layout:" + name, type, LayoutCases.Shape(k), Works.Layout(name, k, type), reference, (s, o) => s.Layout(device, type, k.With(o)), (int)Registry.Bytes(type, k.Count));
     }
 
     // A row operation at the bench's shape (float types only: the row family computes in a float lane); the parameter
@@ -1058,36 +1071,27 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var dgamma = new double[Cols];
             var dbeta = new double[Cols];
             RowOps.NormParamsReference(Registry.Values(type, x, Rows * Cols), Registry.Values(type, dy, Rows * Cols), Rows, Cols, 1e-5, centered, dgamma, dbeta);
-            MeasureLanes(device, name, type, $"{Rows}x{Cols}", [.. dgamma, .. dbeta], (s, o) => s.NormParamsBwd(device, type, x, dy, o, Rows, Cols, 1e-5, centered), 2 * Cols);
+            MeasureLanes(device, name, type, $"{Rows}x{Cols}", new Work(2 * Work.B(type, (long)Rows * Cols) + 16.0 * Cols, (centered ? 8.0 : 6.0) * Rows * Cols), [.. dgamma, .. dbeta], (s, o) => s.NormParamsBwd(device, type, x, dy, o, Rows, Cols, 1e-5, centered), 2 * Cols);
             return;
         }
 
         var op = RowOps.Find(name[4..]);
         var k = RowCase.Make(op, type, Rows, Cols, positions: false);
         var y2 = op.SecondOut ? new byte[k.X.Length] : null;
-        Measure(device, name, type, $"{Rows}x{Cols}", k.Y, (s, y) => s.RowOp(device, op, type, k.X, k.X2, k.G, k.Bt, k.S, k.Pos, y, y2, Rows, Cols, op.A, op.B), k.X.Length);
+        Measure(device, name, type, $"{Rows}x{Cols}", Works.Row(op, k, type, Rows, Cols), k.Y, (s, y) => s.RowOp(device, op, type, k.X, k.X2, k.G, k.Bt, k.S, k.Pos, y, y2, Rows, Cols, op.A, op.B), k.X.Length);
     }
 
     // A reduction's result comes back as lane values: decoded by the lane the subject names.
-    private void MeasureLanes(Device device, string op, string type, string shape, double[] reference, Func<IBenchSubject, byte[], IBenchRun?> prepare, int count)
+    private void MeasureLanes(Device device, string op, string type, string shape, Work work, double[] reference, Func<IBenchSubject, byte[], IBenchRun?> prepare, int count)
     {
-        var cells = new List<Cell?>();
-        foreach (var subject in subjects)
+        var outputs = new Dictionary<IBenchSubject, byte[]>();
+        Record(device, op, type, shape, work, s => prepare(s, outputs[s] = new byte[count * 8]), (subject, run) =>
         {
-            var output = new byte[count * 8];
-            using var run = prepare(subject, output);
-            if (run is null) { cells.Add(null); continue; }
-            if (TimeOrRefused(device, subject, run) is not { } ms) { cells.Add(null); continue; }
-            run.Collect();
-            var got = LaneValues.Decode(run.Lane, output, count);
+            var got = LaneValues.Decode(run.Lane, outputs[subject], count);
             double worst = 0;
             for (int i = 0; i < count; i++) worst = Math.Max(worst, Math.Abs(got[i] - reference[i]));
-            cells.Add(new Cell(subject.Name, run.Lane, ms, worst));
-        }
-
-        var row = new Row(device, op, type, shape, cells);
-        _rows.Add(row);
-        Console.WriteLine(Line(row));
+            return worst;
+        });
     }
 
 
@@ -1098,27 +1102,89 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         byte[]? y = op.Inputs >= 2 ? Registry.Make(type, MapCount, 12, op.YRange.Low, op.YRange.High) : null;
         byte[]? z = op.Inputs >= 3 ? Registry.Make(type, MapCount, 13, op.YRange.Low, op.YRange.High) : null;
         var reference = References.Map(type, op, x, y, z, MapCount);
-        Measure(device, "map:" + op.Name, type, $"{MapCount}", reference, (s, o) => s.Map(device, op, type, x, y, z, o, MapCount, op.A, op.B), (int)Registry.Bytes(type, MapCount));
+        Measure(device, "map:" + op.Name, type, $"{MapCount}", Works.Map(op, type, MapCount), reference, (s, o) => s.Map(device, op, type, x, y, z, o, MapCount, op.A, op.B), (int)Registry.Bytes(type, MapCount));
     }
 
     // scored: the type the output is stored as where it is not the row's (a cache of another type).
-    private void Measure(Device device, string op, string type, string shape, double[] reference, Func<IBenchSubject, byte[], IBenchRun?> prepare, int outputBytes, string? scored = null)
+    private void Measure(Device device, string op, string type, string shape, Work work, double[] reference, Func<IBenchSubject, byte[], IBenchRun?> prepare, int outputBytes, string? scored = null)
     {
-        var cells = new List<Cell?>();
-        foreach (var subject in subjects)
-        {
-            var output = new byte[outputBytes];
-            using var run = prepare(subject, output);
-            if (run is null) { cells.Add(null); continue; }
-            if (TimeOrRefused(device, subject, run) is not { } ms) { cells.Add(null); continue; }
-            run.Collect();
-            cells.Add(new Cell(subject.Name, run.Lane, ms, Err(scored ?? type, output, reference)));
-        }
-
-        var row = new Row(device, op, type, shape, cells);
-        _rows.Add(row);
-        Console.WriteLine(Line(row));
+        var outputs = new Dictionary<IBenchSubject, byte[]>();
+        Record(device, op, type, shape, work, s => prepare(s, outputs[s] = new byte[outputBytes]), (subject, _) => Err(scored ?? type, outputs[subject], reference));
     }
+
+    // Every subject's run prepared, then timed --repeat times over with the subjects in turn (a drift of the machine falls
+    // on every subject alike), each subject's median kept; then two more runs each, untimed, for the memory it held (what
+    // it took from the runtime on the host, HostMeter, with what the subject counts of its kept buffers and its device
+    // buffers); then each collected and scored.
+    private void Record(Device device, string op, string type, string shape, Work work, Func<IBenchSubject, IBenchRun?> prepare, Func<IBenchSubject, IBenchRun, double> score)
+    {
+        int count = subjects.Count;
+        var runs = new IBenchRun?[count];
+        var times = new List<double>[count];
+        var clocks = new string?[count];
+        try
+        {
+            for (int i = 0; i < count; i++)
+            {
+                times[i] = [];
+                runs[i] = prepare(subjects[i]);
+            }
+
+            for (int rep = 0; rep < options.Repeat; rep++)
+                for (int i = 0; i < count; i++)
+                {
+                    if (runs[i] is not { } run || (rep > 0 && times[i].Count == 0)) continue;
+                    if (TimeOrRefused(device, subjects[i], run) is not { } ms) continue;
+                    times[i].Add(ms);
+                    if (device == Device.Cuda && GpuClock.Now() is { } now && (clocks[i] is null || GpuClock.Mhz(now) < GpuClock.Mhz(clocks[i]))) clocks[i] = now;
+                }
+
+            var cells = new List<Cell?>();
+            for (int i = 0; i < count; i++)
+            {
+                if (runs[i] is not { } run || times[i].Count == 0) { cells.Add(null); continue; }
+                long host = _meter.Measure(Scoped(device, subjects[i], run));
+                var own = run.Held;
+                run.Collect();
+                var t = times[i];
+                t.Sort();
+                double median = t[t.Count / 2];
+                cells.Add(new Cell(subjects[i].Name, run.Lane, median, score(subjects[i], run), new Held(host + (own?.Host ?? 0), own?.Device), (t[^1] - t[0]) / median, clocks[i]));
+            }
+
+            var row = new Row(device, op, type, shape, work, cells);
+            _rows.Add(row);
+            Console.WriteLine(Line(row));
+        }
+        finally
+        {
+            foreach (var run in runs) run?.Dispose();
+        }
+    }
+
+    // The row's bound on its device (the limits measured before its rows), in the lane Adad reports for it (its first word:
+    // "f32 (blocks through lane storage)" is f32), else the type's float lane or s32.
+    private (double Ms, string By)? Bound(Row r)
+    {
+        if (!Limits.TryGetValue(r.Device, out var limits) || double.IsNaN(limits.Copy)) return null;
+        string lane = r.Cells.FirstOrDefault(c => c?.Subject == "adad")?.Lane ?? "";
+        int end = lane.IndexOfAny([' ', ';', '(']);
+        if (end >= 0) lane = lane[..end];
+        if (limits.Ops(lane) is null) lane = r.Type == "float64" ? "f64" : Registry.IsFloat(r.Type) ? "f32" : "s32";
+        return r.Work.Bound(limits, lane);
+    }
+
+    // A cell's rate in the bound's unit (bytes a second where the copy binds, operations a second where a lane does) and
+    // the fraction of the bound it sits at.
+    private static (string Rate, string Of) Reached(Row r, Cell c, (double Ms, string By) bound)
+    {
+        double seconds = c.Ms / 1e3;
+        string rate = bound.By == "copy" ? Work.Size(r.Work.Bytes / seconds, "B/s") : Work.Size(r.Work.Ops / seconds, "op/s");
+        return (rate, string.Create(CultureInfo.InvariantCulture, $"{100 * bound.Ms / c.Ms:0.#} %"));
+    }
+
+    private static string HeldText(Held h, Device device) =>
+        device == Device.Cpu ? Work.Size(h.Host, "B") : $"{Work.Size(h.Host, "B")} + {(h.Device is { } d ? Work.Size(d, "B") : "?")}";
 
     private static double Err(string type, byte[] got, double[] reference)
     {
@@ -1139,7 +1205,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
     // a blank cell, the refusal said once.
     private static double? TimeOrRefused(Device device, IBenchSubject subject, IBenchRun run)
     {
-        try { return Time(Scoped(device, subject, run)); }
+        try { return Time(Scoped(device, subject, run), device == Device.Cpu ? 0 : GpuWarmMs); }
         catch (NotSupportedException e)
         {
             if (s_refused.Add(e.Message)) Console.WriteLine($"  {subject.Name} on {device.ToString().ToLowerInvariant()}: {e.Message}");
@@ -1152,14 +1218,21 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
     private static Action Scoped(Device device, IBenchSubject subject, IBenchRun run) =>
         device == Device.Cuda && subject is AdadSubject ? () => { using var scope = Devices.Ops.Scope(); run.Run(); } : run.Run;
 
-    // Median wall time (ms) of the steady state: warmed until settled (Measure.Faster's rule: on until the runtime has
-    // compiled nothing and the run has not got 2 % faster for three runs in a row; at most 24 warm runs and 2 s of them —
-    // a row timed first in a run otherwise measured code the runtime had not yet compiled to its final tier, 50 ms
-    // against 19), then at least 7 runs and 300 ms of them (at most 201 runs; past 3 runs, at most 3 s), so a millisecond
-    // operation is timed over hundreds of runs and none by a handful.
-    public static double Time(Action run)
+    // A GPU's warm floor: the driver lowers a GPU's performance state when it sits idle (between rows the host computes
+    // references and checks), and with it the memory clock (half of it in a middle state, measured by sampling the driver
+    // during runs); the runs then took twice their time, at random, row by row. Half a second of continuous runs brings
+    // the state back up before the settle test (the driver was seen taking 0.4 s).
+    private const double GpuWarmMs = 500;
+
+    // Median wall time (ms) of the steady state: on a GPU first floorMs of continuous runs (GpuWarmMs), then warmed until
+    // settled (Measure.Faster's rule: on until the runtime has compiled nothing and the run has not got 2 % faster for
+    // three runs in a row; at most 24 warm runs and 2 s of them — a row timed first in a run otherwise measured code the
+    // runtime had not yet compiled to its final tier, 50 ms against 19), then at least 7 runs and 300 ms of them (at most
+    // 201 runs; past 3 runs, at most 3 s), so a millisecond operation is timed over hundreds of runs and none by a handful.
+    public static double Time(Action run, double floorMs = 0)
     {
         run();
+        for (long t0 = Stopwatch.GetTimestamp(); Stopwatch.GetElapsedTime(t0).TotalMilliseconds < floorMs;) run();
         double best = double.MaxValue, warm = 0;
         for (int i = 0, still = 0; i < 24 && warm < 2000 && still < 3; i++)
         {
@@ -1204,6 +1277,24 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
 
         sb.Append("  err");
         foreach (var c in r.Cells) sb.Append(c is null ? " —" : string.Create(CultureInfo.InvariantCulture, $" {c.Err:0.##e+0}"));
+        sb.Append($"  | {Work.Size(r.Work.Bytes, "B")} {Work.Size(r.Work.Ops, "op")}");
+        var bound = Bound(r);
+        if (bound is { } b) sb.Append(string.Create(CultureInfo.InvariantCulture, $" bound {b.Ms:0.000} ms ({b.By})"));
+        foreach (var c in r.Cells)
+        {
+            if (c is null) continue;
+            sb.Append($" | {c.Subject}");
+            if (bound is { } bb)
+            {
+                var (rate, of) = Reached(r, c, bb);
+                sb.Append($" {rate} {of}");
+            }
+
+            sb.Append($" held {HeldText(c.Held, r.Device)}");
+            if (options.Repeat > 1) sb.Append(string.Create(CultureInfo.InvariantCulture, $" spread {100 * c.Spread:0} %"));
+            if (c.Clock is not null) sb.Append($" clock {c.Clock}");
+        }
+
         return sb.ToString();
     }
 
@@ -1213,14 +1304,22 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         sb.AppendLine("# Qiyas bench");
         sb.AppendLine();
         sb.AppendLine(string.Create(CultureInfo.InvariantCulture,
-            $"{DateTime.Now:yyyy-MM-dd HH:mm}. Median wall time (ms); `×` = {_baseline} ÷ subject (above 1: faster than {_baseline}). `err` = largest |result − float64 math on the same stored inputs|. `lane` = what the subject computed in.{(CoolDownSeconds > 0 ? $" Timed after {CoolDownSeconds} s idle following the gates (the processor's boost budget recovered)." : "")}"));
+            $"{DateTime.Now:yyyy-MM-dd HH:mm}. Median wall time (ms){(options.Repeat > 1 ? $" of {options.Repeat} readings, the subjects in turn" : "")}; `×` = {_baseline} ÷ subject (above 1: faster than {_baseline}). `err` = largest |result − float64 math on the same stored inputs|. `lane` = what the subject computed in.{(CoolDownSeconds > 0 ? $" Timed after {CoolDownSeconds} s idle following the gates (the processor's boost budget recovered)." : "")}"));
+        sb.AppendLine();
+        sb.AppendLine("The readout: `bytes` and `ops` are what the row's operation moves and computes by its own definition (every operand read once and every result written once at its stored width; each arithmetic operation or elementary function one, a multiply-add two); `bound` is the time those take at this device's limits, measured at the start of this run (the larger of the bytes at the copy bandwidth and the operations at the lane's peak; `by` names which); each subject's `rate` is what it reached in the bound's unit and `of bound` the bound ÷ its time; `held` a bound on the working memory its run held beyond its operands (host: the pooled buffers out at once at their peak, every other allocation as if all were live together, and the subject's kept buffers, each thread's peak summed; + device on a GPU, the subject's buffers at their peak; ? where the subject cannot tell).");
+        sb.AppendLine();
+        foreach (var l in Limits.Values) sb.AppendLine($"Limits measured: {l.Short()} (MA/s: multiply-adds a second).");
         sb.AppendLine();
         var names = subjects.Select(s => s.Name).ToList();
         sb.Append("| device | operation | type | shape |");
         foreach (var n in names) sb.Append($" {n} ms | {n} × | {n} lane | {n} err |");
+        sb.Append(" bytes | ops | bound | by |");
+        foreach (var n in names) sb.Append($" {n} rate | {n} of bound | {n} held |");
         sb.AppendLine();
         sb.Append("|---|---|---|---|");
         foreach (var _ in names) sb.Append("---:|---:|---|---:|");
+        sb.Append("---:|---:|---:|---|");
+        foreach (var _ in names) sb.Append("---:|---:|---:|");
         sb.AppendLine();
         foreach (var r in _rows)
         {
@@ -1231,6 +1330,15 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
                 if (c is null) { sb.Append(" — | — | — | — |"); continue; }
                 string x = baseMs is { } bm && c.Subject != _baseline ? (bm / c.Ms).ToString("0.00", CultureInfo.InvariantCulture) : "—";
                 sb.Append(string.Create(CultureInfo.InvariantCulture, $" {c.Ms:0.000} | {x} | {c.Lane} | {c.Err:0.##e+0} |"));
+            }
+
+            var bound = Bound(r);
+            sb.Append($" {Work.Size(r.Work.Bytes, "B")} | {Work.Size(r.Work.Ops, "op")} | {(bound is { } b ? string.Create(CultureInfo.InvariantCulture, $"{b.Ms:0.000} ms") : "—")} | {bound?.By ?? "—"} |");
+            foreach (var c in r.Cells)
+            {
+                if (c is null || bound is not { } bb) { sb.Append(c is null ? " — | — | — |" : $" — | — | {HeldText(c.Held, r.Device)} |"); continue; }
+                var (rate, of) = Reached(r, c, bb);
+                sb.Append($" {rate} | {of} | {HeldText(c.Held, r.Device)} |");
             }
 
             sb.AppendLine();

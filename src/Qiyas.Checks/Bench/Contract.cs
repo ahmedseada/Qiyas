@@ -12,7 +12,9 @@
 //   - inputs and outputs are stored bytes of the named type (Registry.Names), values packed as the type packs them;
 //   - Run is what is timed: it must include the device synchronization that makes the result ready;
 //   - Collect writes the result into the output bytes the subject was given; Dispose frees what Prepare took;
-//   - Lane says what the subject computed in (a lane, a kernel name) and is shown beside its time.
+//   - Lane says what the subject computed in (a lane, a kernel name) and is shown beside its time;
+//   - Held says the working memory the last Run held beyond the operands it was given, as the subject's own allocators
+//     count it (the harness adds what the run took from the runtime on the host: Qiyas.Bench's HostMeter).
 namespace Qiyas.Bench;
 
 public enum Device
@@ -22,6 +24,11 @@ public enum Device
     Vulkan,
 }
 
+/// <summary>The working memory a run held at its peak beyond the operands it was given (bytes): Host, the kept buffers the
+/// subject lends a run (a workspace the runtime does not see allocated or rented); Device, the device buffers the run had at
+/// once (null on the CPU, or where the subject cannot tell).</summary>
+public readonly record struct Held(long Host, long? Device);
+
 /// <summary>One prepared operation.</summary>
 public interface IBenchRun : IDisposable
 {
@@ -30,6 +37,9 @@ public interface IBenchRun : IDisposable
     void Collect();
 
     string Lane { get; }
+
+    /// <summary>What the last Run held at its peak (counted from that Run's start); null where the subject cannot tell.</summary>
+    Held? Held => null;
 }
 
 /// <summary>An implementation under measurement.</summary>
@@ -223,13 +233,15 @@ public static class LaneValues
 }
 
 /// <summary>An IBenchRun from delegates.</summary>
-public sealed class BenchRun(Action run, Action? collect = null, Action? dispose = null, Func<string>? lane = null) : IBenchRun
+public sealed class BenchRun(Action run, Action? collect = null, Action? dispose = null, Func<string>? lane = null, Func<Held>? held = null) : IBenchRun
 {
     public void Run() => run();
 
     public void Collect() => collect?.Invoke();
 
     public string Lane => lane?.Invoke() ?? "";
+
+    public Held? Held => held?.Invoke();
 
     public void Dispose() => dispose?.Invoke();
 }
