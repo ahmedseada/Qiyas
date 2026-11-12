@@ -69,6 +69,10 @@ public sealed class PtxBuilder
     /// <summary>The compute capability the kernel is for (major·10 + minor); 0 where not given (the portable forms).</summary>
     public int Capability { get; }
 
+    /// <summary>Divisors with their invariant-division constants in registers (Ptx.DivU): a register holding a kernel
+    /// parameter, its magic number and its two shifts.</summary>
+    public Dictionary<string, (string Magic, string Shift1, string Shift2)> Divisors { get; } = [];
+
     public string R() => $"%r{_r++}";
     public string RD() => $"%rd{_rd++}";
     public string F() => $"%f{_f++}";
@@ -595,6 +599,56 @@ internal static class Codec
 internal static partial class Ptx
 {
     private static string Header(Gpu gpu) => gpu.Target;
+
+    /// <summary>The invariant-division constants of an unsigned 32-bit divisor d (Granlund and Montgomery, "Division by
+    /// invariant integers using multiplication", fig. 4.1): q = (t + ((n − t) >> s1)) >> s2 with t = mulhi(n, m), exact for
+    /// every n below 2^32 and d ≥ 1; the shifts packed as s1 | s2 &lt;&lt; 8. d = 0 gives (0, 0) (no quotient defined).</summary>
+    public static (uint Magic, uint Shifts) DivisionConstants(uint d)
+    {
+        if (d == 0) return (0, 0);
+        int l = d == 1 ? 0 : 32 - System.Numerics.BitOperations.LeadingZeroCount(d - 1);
+        uint m = (uint)((1UL << 32) * ((1UL << l) - d) / d + 1);
+        int s1 = Math.Min(l, 1), s2 = Math.Max(l - 1, 0);
+        return (m, (uint)(s1 | (s2 << 8)));
+    }
+
+    /// <summary>Loads parameter <paramref name="magic"/> and <paramref name="shifts"/> (DivisionConstants of the divisor in
+    /// <paramref name="divisor"/>) and registers them, so DivU and RemU by that register multiply in place of dividing.</summary>
+    internal static void RegisterDivisor(PtxBuilder b, string divisor, string magic, string shifts)
+    {
+        string m = b.R(), sh = b.R(), s1 = b.R(), s2 = b.R();
+        b.L($"ld.param.u32 {m}, [{magic}];");
+        b.L($"ld.param.u32 {sh}, [{shifts}];");
+        b.L($"and.b32 {s1}, {sh}, 255;");
+        b.L($"shr.u32 {s2}, {sh}, 8;");
+        b.Divisors[divisor] = (m, s1, s2);
+    }
+
+    /// <summary>q = n / d (unsigned): by d's invariant-division constants where the builder holds them (RegisterDivisor:
+    /// a multiply-high, a subtract, two shifts and an add, where div.u32 is some twenty instructions on the device's
+    /// quarter-rate conversion and reciprocal pipes), else div.u32. q may be n.</summary>
+    internal static void DivU(PtxBuilder b, string q, string n, string d)
+    {
+        if (!b.Divisors.TryGetValue(d, out var c)) { b.L($"div.u32 {q}, {n}, {d};"); return; }
+        if (!n.StartsWith('%')) { string nr = b.R(); b.L($"mov.u32 {nr}, {n};"); n = nr; }
+        string t = b.R(), u = b.R();
+        b.L($"mul.hi.u32 {t}, {n}, {c.Magic};");
+        b.L($"sub.u32 {u}, {n}, {t};");
+        b.L($"shr.b32 {u}, {u}, {c.Shift1};");
+        b.L($"add.u32 {u}, {u}, {t};");
+        b.L($"shr.b32 {q}, {u}, {c.Shift2};");
+    }
+
+    /// <summary>r = n mod d (unsigned), by DivU's quotient where d's constants are held, else rem.u32. r may be n.</summary>
+    internal static void RemU(PtxBuilder b, string r, string n, string d)
+    {
+        if (!b.Divisors.ContainsKey(d)) { b.L($"rem.u32 {r}, {n}, {d};"); return; }
+        if (!n.StartsWith('%')) { string nr = b.R(); b.L($"mov.u32 {nr}, {n};"); n = nr; }
+        string q = b.R(), qd = b.R();
+        DivU(b, q, n, d);
+        b.L($"mul.lo.u32 {qd}, {q}, {d};");
+        b.L($"sub.u32 {r}, {n}, {qd};");
+    }
 
     // The thread's global index in %r (returns the register).
     private static string GlobalIndex(PtxBuilder b)

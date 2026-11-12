@@ -16,7 +16,27 @@ internal static partial class Ptx
     public const int LayoutParamCount = LayoutArgs.KernelParams;
 
     private static readonly string LayoutParams = ".param .u64 p_x, .param .u64 p_x2, .param .u64 p_idx, .param .u64 p_aux, .param .u64 p_out, .param .u32 p_count, .param .u32 p_rows, .param .u32 p_cols, "
-        + string.Join(", ", Enumerable.Range(0, LayoutParamCount).Select(k => $".param .u32 p_p{k}"));
+        + string.Join(", ", Enumerable.Range(0, LayoutParamCount).Select(k => $".param .u32 p_p{k}"))
+        + ", " + string.Join(", ", Enumerable.Range(0, LayoutParamCount).Select(k => $".param .u32 p_m{k}, .param .u32 p_n{k}")) + ", .param .u32 p_mc, .param .u32 p_nc";
+
+    /// <summary>The arguments a layout kernel takes after its 8 + LayoutParamCount: each integer's invariant-division
+    /// constants (magic, shifts), then cols' (DivisionConstants; the kernels divide by them, RegisterDivisor).</summary>
+    public const int LayoutDivisorArgs = 2 * LayoutParamCount + 2;
+
+    /// <summary>Fills a layout launch's division constants from its integers (args[8 …]) and cols (args[7]).</summary>
+    public static void LayoutDivisors(ulong[] args)
+    {
+        for (int k = 0; k < LayoutParamCount; k++)
+        {
+            var (m, s) = DivisionConstants((uint)args[8 + k]);
+            args[8 + LayoutParamCount + 2 * k] = m;
+            args[8 + LayoutParamCount + 2 * k + 1] = s;
+        }
+
+        var (mc, sc) = DivisionConstants((uint)args[7]);
+        args[8 + 3 * LayoutParamCount] = mc;
+        args[8 + 3 * LayoutParamCount + 1] = sc;
+    }
 
     public static string Layout(Gpu gpu, Fmt f, Lane lane, string name, out string entry) => Layout(gpu, f, lane, name, false, out entry);
 
@@ -38,8 +58,10 @@ internal static partial class Ptx
         b.L($"mad.lo.u32 {word}, {bid}, 256, {tid};");
         string x = Param64(b, "p_x"), x2 = Param64(b, "p_x2"), idx = Param64(b, "p_idx"), aux = Param64(b, "p_aux"), outp = Param64(b, "p_out");
         string count = Param32(b, "p_count"), cols = Param32(b, "p_cols");
+        RegisterDivisor(b, cols, "p_mc", "p_nc");
         var p = new string[LayoutParamCount];
         for (int k = 0; k < LayoutParamCount; k++) p[k] = Param32(b, $"p_p{k}");
+        for (int k = 0; k < LayoutParamCount; k++) RegisterDivisor(b, p[k], $"p_m{k}", $"p_n{k}");
         string words = b.R(), pw = b.P();
         if (f.WordBits == 64) b.L($"mov.u32 {words}, {count};");
         else { b.L($"add.u32 {words}, {count}, {f.Per - 1};"); b.L($"div.u32 {words}, {words}, {f.Per};"); }
@@ -56,7 +78,7 @@ internal static partial class Ptx
             b.L($"mad.lo.u32 {v}, {word}, {f.Per}, {i};");
             b.L($"setp.lt.u32 {pv}, {v}, {count};");
             b.L($"min.u32 {v}, {v}, {last};");                        // a word's values past the count take the last value's addresses (dropped)
-            b.L($"div.u32 {r}, {v}, {cols};");
+            DivU(b, r, v, cols);
             b.L($"mul.lo.u32 {t}, {r}, {cols};");
             b.L($"sub.u32 {c}, {v}, {t};");
             string value = LayoutValue(b, inFmt ?? f, lane, name, x, x2, idx, aux, p, cols, v, r, c, i);
@@ -85,13 +107,15 @@ internal static partial class Ptx
         var b = new PtxBuilder(gpu);
         string x = Param64(b, "p_x"), x2 = Param64(b, "p_x2"), idx = Param64(b, "p_idx"), aux = Param64(b, "p_aux"), outp = Param64(b, "p_out");
         string count = Param32(b, "p_count"), cols = Param32(b, "p_cols");
+        RegisterDivisor(b, cols, "p_mc", "p_nc");
         var p = new string[LayoutParamCount];
         for (int k = 0; k < LayoutParamCount; k++) p[k] = Param32(b, $"p_p{k}");
+        for (int k = 0; k < LayoutParamCount; k++) RegisterDivisor(b, p[k], $"p_m{k}", $"p_n{k}");
         int tag = 0;
         string Value(string at, string _)
         {
             string r = b.R(), c = b.R(), t = b.R();
-            b.L($"div.u32 {r}, {at}, {cols};");
+            DivU(b, r, at, cols);
             b.L($"mul.lo.u32 {t}, {r}, {cols};");
             b.L($"sub.u32 {c}, {at}, {t};");
             return LayoutValue(b, inFmt ?? f, lane, name, x, x2, idx, aux, p, cols, at, r, c, tag++);     // its own labels a value
@@ -118,8 +142,10 @@ internal static partial class Ptx
         b.L($"mad.lo.u32 {at}, {bid}, 256, {tid};");
         string x = Param64(b, "p_x"), x2 = Param64(b, "p_x2"), idx = Param64(b, "p_idx"), aux = Param64(b, "p_aux"), outp = Param64(b, "p_out");
         string count = Param32(b, "p_count"), cols = Param32(b, "p_cols");
+        RegisterDivisor(b, cols, "p_mc", "p_nc");
         var p = new string[LayoutParamCount];
         for (int k = 0; k < LayoutParamCount; k++) p[k] = Param32(b, $"p_p{k}");
+        for (int k = 0; k < LayoutParamCount; k++) RegisterDivisor(b, p[k], $"p_m{k}", $"p_n{k}");
         // Every launched thread runs to the shuffles (a warp's lanes all take part); past the count a thread computes the
         // last value (dropped) and past the last word stores nothing.
         string words = b.R(), word = b.R(), slot = b.R(), last = b.R(), v = b.R(), pv = b.P(), pw = b.P(), r = b.R(), c = b.R(), t = b.R();
@@ -130,7 +156,7 @@ internal static partial class Ptx
         b.L($"sub.u32 {last}, {count}, 1;");
         b.L($"setp.lt.u32 {pv}, {at}, {count};");
         b.L($"min.u32 {v}, {at}, {last};");
-        b.L($"div.u32 {r}, {v}, {cols};");
+        DivU(b, r, v, cols);
         b.L($"mul.lo.u32 {t}, {r}, {cols};");
         b.L($"sub.u32 {c}, {v}, {t};");
         var natural = f.Natural;
@@ -178,14 +204,15 @@ internal static partial class Ptx
         string x2 = Param64(b, "p_x2"), outp = Param64(b, "p_out"), count = Param32(b, "p_count");
         var p = new string[LayoutParamCount];
         for (int k = 0; k < LayoutParamCount; k++) p[k] = Param32(b, $"p_p{k}");
+        for (int k = 0; k < LayoutParamCount; k++) RegisterDivisor(b, p[k], $"p_m{k}", $"p_n{k}");
         b.L($"setp.ge.u32 {pd}, {i}, {count};");
         b.L($"@{pd} bra DONE;");
         string H = p[1], W = p[2], OH = adaptive ? p[3] : p[11], OW = adaptive ? p[4] : p[12];      // a pool's OH OW: LayoutArgs.KernelP
         string ow = b.R(), oh = b.R(), ch = b.R(), t = b.R(), h0 = b.R(), kh = b.R(), w0 = b.R(), kw = b.R();
-        b.L($"rem.u32 {ow}, {i}, {OW};");
-        b.L($"div.u32 {t}, {i}, {OW};");
-        b.L($"rem.u32 {oh}, {t}, {OH};");
-        b.L($"div.u32 {ch}, {t}, {OH};");
+        RemU(b, ow, i, OW);
+        DivU(b, t, i, OW);
+        RemU(b, oh, t, OH);
+        DivU(b, ch, t, OH);
         if (adaptive)
         {
             // [floor(i*n/o), ceil((i + 1)*n/o)) along each axis.
@@ -193,12 +220,12 @@ internal static partial class Ptx
             {
                 string e = b.R();
                 b.L($"mul.lo.u32 {start}, {o}, {n};");
-                b.L($"div.u32 {start}, {start}, {outs};");
+                DivU(b, start, start, outs);
                 b.L($"add.u32 {e}, {o}, 1;");
                 b.L($"mul.lo.u32 {e}, {e}, {n};");
                 b.L($"add.u32 {e}, {e}, {outs};");
                 b.L($"sub.u32 {e}, {e}, 1;");
-                b.L($"div.u32 {e}, {e}, {outs};");
+                DivU(b, e, e, outs);
                 b.L($"sub.u32 {len}, {e}, {start};");
             }
 
@@ -277,8 +304,8 @@ internal static partial class Ptx
             for (int d = n - 2; d >= 1; d--)
             {
                 string i = b.R();
-                b.L($"rem.u32 {i}, {t}, {p[d]};");
-                b.L($"div.u32 {t}, {t}, {p[d]};");
+                RemU(b, i, t, p[d]);
+                DivU(b, t, t, p[d]);
                 b.L($"mad.lo.u32 {src}, {i}, {p[n + d]}, {src};");
             }
 
@@ -346,12 +373,12 @@ internal static partial class Ptx
                 // sh sw top left bottom right dh dw OH OW, LayoutArgs.KernelP).
                 string kw = p[4], kh = p[3], H = p[1], W = p[2], ow = b.R(), oh = b.R(), bb = b.R(), a = b.R(), ch = b.R(), t = b.R(), ih = b.R(), iw = b.R(), pin = b.P(), p2 = b.P(), src = b.R(), ow2 = b.R();
                 string OW = p[14];
-                b.L($"rem.u32 {ow}, {c}, {OW};");
-                b.L($"div.u32 {oh}, {c}, {OW};");
-                b.L($"rem.u32 {bb}, {r}, {kw};");
-                b.L($"div.u32 {t}, {r}, {kw};");
-                b.L($"rem.u32 {a}, {t}, {kh};");
-                b.L($"div.u32 {ch}, {t}, {kh};");
+                RemU(b, ow, c, OW);
+                DivU(b, oh, c, OW);
+                RemU(b, bb, r, kw);
+                DivU(b, t, r, kw);
+                RemU(b, a, t, kh);
+                DivU(b, ch, t, kh);
                 b.L($"mul.lo.u32 {ih}, {oh}, {p[5]};");
                 b.L($"sub.u32 {ih}, {ih}, {p[7]};");
                 b.L($"mad.lo.u32 {ih}, {a}, {p[11]}, {ih};");
@@ -374,8 +401,8 @@ internal static partial class Ptx
                 string H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], top = p[7], left = p[8], dh = p[11], dw = p[12];
                 string OW = p[14], OH = p[13];
                 string ih = b.R(), ch = b.R(), acc = Zero(), a = b.R(), bb = b.R(), th = b.R(), tw = b.R(), oh = b.R(), ow = b.R(), rem = b.R(), pa = b.P(), pb = b.P(), pc = b.P(), src = b.R(), plane = b.R(), rowIdx = b.R();
-                b.L($"rem.u32 {ih}, {r}, {H};");
-                b.L($"div.u32 {ch}, {r}, {H};");
+                RemU(b, ih, r, H);
+                DivU(b, ch, r, H);
                 b.L($"mul.lo.u32 {plane}, {OH}, {OW};");
                 b.L($"mov.u32 {a}, 0;");
                 b.Label($"CA{tag}");
@@ -386,10 +413,10 @@ internal static partial class Ptx
                 b.L($"sub.s32 {th}, {th}, {rem};");                      // may go negative: a signed test
                 b.L($"setp.lt.s32 {pb}, {th}, 0;");
                 b.L($"@{pb} bra CA{tag}_NEXT;");
-                b.L($"rem.u32 {rem}, {th}, {sh};");
+                RemU(b, rem, th, sh);
                 b.L($"setp.ne.u32 {pb}, {rem}, 0;");
                 b.L($"@{pb} bra CA{tag}_NEXT;");
-                b.L($"div.u32 {oh}, {th}, {sh};");
+                DivU(b, oh, th, sh);
                 b.L($"setp.ge.u32 {pb}, {oh}, {OH};");
                 b.L($"@{pb} bra CA{tag}_NEXT;");
                 b.L($"mov.u32 {bb}, 0;");
@@ -401,10 +428,10 @@ internal static partial class Ptx
                 b.L($"sub.s32 {tw}, {tw}, {rem};");
                 b.L($"setp.lt.s32 {pc}, {tw}, 0;");
                 b.L($"@{pc} bra CB{tag}_NEXT;");
-                b.L($"rem.u32 {rem}, {tw}, {sw};");
+                RemU(b, rem, tw, sw);
                 b.L($"setp.ne.u32 {pc}, {rem}, 0;");
                 b.L($"@{pc} bra CB{tag}_NEXT;");
-                b.L($"div.u32 {ow}, {tw}, {sw};");
+                DivU(b, ow, tw, sw);
                 b.L($"setp.ge.u32 {pc}, {ow}, {OW};");
                 b.L($"@{pc} bra CB{tag}_NEXT;");
                 // column row index = (ch·kh + a)·kw + bb; column = oh·OW + ow
@@ -430,8 +457,8 @@ internal static partial class Ptx
             {
                 // r = ch·OH + oh, c = ow; p: C H W OH OW αh βh δh αw βw δw: ih the position nearest (oh·αh + βh) / δh (NearestAxis), iw likewise.
                 string H = p[1], W = p[2], OH = p[3], oh = b.R(), ch = b.R(), src = b.R();
-                b.L($"rem.u32 {oh}, {r}, {OH};");
-                b.L($"div.u32 {ch}, {r}, {OH};");
+                RemU(b, oh, r, OH);
+                DivU(b, ch, r, OH);
                 string ih = NearestAxis(b, oh, H, p[5], p[6], p[7]), iw = NearestAxis(b, c, W, p[8], p[9], p[10]);
                 b.L($"mad.lo.u32 {src}, {ch}, {H}, {ih};");
                 b.L($"mad.lo.u32 {src}, {src}, {W}, {iw};");
@@ -445,8 +472,8 @@ internal static partial class Ptx
                 // the position (oh, then ow ascending; LayoutArgs.InterpolateSources), each dy by its weight: acc = fma(dy, wy·wx, acc).
                 bool bilinear = name == "interpolate_bilinear_bwd";
                 string H = p[1], W = p[2], OH = p[3], OW = p[4], ih = b.R(), ch = b.R(), acc = lane.NewReg(b);
-                b.L($"rem.u32 {ih}, {r}, {H};");
-                b.L($"div.u32 {ch}, {r}, {H};");
+                RemU(b, ih, r, H);
+                DivU(b, ch, r, H);
                 var (h0, h1) = SourceRange(b, bilinear, ih, H, OH, p[5], p[6], p[7]);
                 var (w0, w1) = SourceRange(b, bilinear, c, W, OW, p[8], p[9], p[10]);
                 b.L($"mov.{lane.Reg} {acc}, {lane.Zero};");
@@ -482,8 +509,8 @@ internal static partial class Ptx
             {
                 // p: C H W OH OW αh βh δh αw βw δw: each axis's two rows and weight exactly (BilinearAxis).
                 string H = p[1], W = p[2], OH = p[3], oh = b.R(), ch = b.R();
-                b.L($"rem.u32 {oh}, {r}, {OH};");
-                b.L($"div.u32 {ch}, {r}, {OH};");
+                RemU(b, oh, r, OH);
+                DivU(b, ch, r, OH);
                 var (y0, y1, fy, gy) = BilinearAxis(b, lane, oh, H, p[5], p[6], p[7]);
                 var (x0, x1, fx, gx) = BilinearAxis(b, lane, c, W, p[8], p[9], p[10]);
                 string Pixel(string yy, string xx) { string s = b.R(); b.L($"mad.lo.u32 {s}, {ch}, {H}, {yy};"); b.L($"mad.lo.u32 {s}, {s}, {W}, {xx};"); return Load(s); }
@@ -527,8 +554,8 @@ internal static partial class Ptx
                 string dh = conv ? p[11] : "1", dw = conv ? p[12] : "1";
                 string OH = conv ? p[13] : p[11], oh = b.R(), ch = b.R(), a = b.R(), bb = b.R(), ih = b.R(), iw = b.R(), pa = b.P(), pb = b.P(), src = b.R(), n = b.R();
                 string acc = lane.NewReg(b);
-                b.L($"rem.u32 {oh}, {r}, {OH};");
-                b.L($"div.u32 {ch}, {r}, {OH};");
+                RemU(b, oh, r, OH);
+                DivU(b, ch, r, OH);
                 b.L($"mov.{lane.Reg} {acc}, {(max ? ReduceIdentity(lane, "max") : lane.Zero)};");
                 b.L($"mov.u32 {n}, 0;");
                 b.L($"mov.u32 {a}, 0;");
@@ -586,8 +613,8 @@ internal static partial class Ptx
                 string H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], top = p[7], left = p[8];
                 string OH = p[11], OW = p[12];
                 string ih = b.R(), ch = b.R(), acc = lane.NewReg(b), a = b.R(), bb = b.R(), th = b.R(), tw = b.R(), oh = b.R(), ow = b.R(), rem = b.R(), pa = b.P(), pb = b.P(), dyIdx = b.R(), me = b.R();
-                b.L($"rem.u32 {ih}, {r}, {H};");
-                b.L($"div.u32 {ch}, {r}, {H};");
+                RemU(b, ih, r, H);
+                DivU(b, ch, r, H);
                 b.L($"mad.lo.u32 {me}, {ch}, {H}, {ih};");
                 b.L($"mad.lo.u32 {me}, {me}, {W}, {c};");
                 b.L($"mov.{lane.Reg} {acc}, {lane.Zero};");
@@ -599,10 +626,10 @@ internal static partial class Ptx
                 b.L($"sub.s32 {th}, {th}, {a};");
                 b.L($"setp.lt.s32 {pa}, {th}, 0;");
                 b.L($"@{pa} bra BA{tag}_NEXT;");
-                b.L($"rem.u32 {rem}, {th}, {sh};");
+                RemU(b, rem, th, sh);
                 b.L($"setp.ne.u32 {pa}, {rem}, 0;");
                 b.L($"@{pa} bra BA{tag}_NEXT;");
-                b.L($"div.u32 {oh}, {th}, {sh};");
+                DivU(b, oh, th, sh);
                 b.L($"setp.ge.u32 {pa}, {oh}, {OH};");
                 b.L($"@{pa} bra BA{tag}_NEXT;");
                 b.L($"mov.u32 {bb}, 0;");
@@ -613,10 +640,10 @@ internal static partial class Ptx
                 b.L($"sub.s32 {tw}, {tw}, {bb};");
                 b.L($"setp.lt.s32 {pb}, {tw}, 0;");
                 b.L($"@{pb} bra BB{tag}_NEXT;");
-                b.L($"rem.u32 {rem}, {tw}, {sw};");
+                RemU(b, rem, tw, sw);
                 b.L($"setp.ne.u32 {pb}, {rem}, 0;");
                 b.L($"@{pb} bra BB{tag}_NEXT;");
-                b.L($"div.u32 {ow}, {tw}, {sw};");
+                DivU(b, ow, tw, sw);
                 b.L($"setp.ge.u32 {pb}, {ow}, {OW};");
                 b.L($"@{pb} bra BB{tag}_NEXT;");
                 b.L($"mad.lo.u32 {dyIdx}, {ch}, {OH}, {oh};");
@@ -656,8 +683,8 @@ internal static partial class Ptx
                 // Output (ch, ih, iw = c), r = ch·H + ih: over the output rows and columns whose window holds the pixel.
                 bool max = name == "adaptive_maxpool_bwd";
                 string H = p[1], W = p[2], OH = p[3], OW = p[4], ih = b.R(), ch = b.R(), acc = lane.NewReg(b), oh = b.R(), ow = b.R(), h0 = b.R(), h1 = b.R(), w0 = b.R(), w1 = b.R(), t = b.R(), pa = b.P(), pb = b.P(), me = b.R();
-                b.L($"rem.u32 {ih}, {r}, {H};");
-                b.L($"div.u32 {ch}, {r}, {H};");
+                RemU(b, ih, r, H);
+                DivU(b, ch, r, H);
                 b.L($"mad.lo.u32 {me}, {ch}, {H}, {ih};");
                 b.L($"mad.lo.u32 {me}, {me}, {W}, {c};");
                 b.L($"mov.{lane.Reg} {acc}, {lane.Zero};");
@@ -665,8 +692,8 @@ internal static partial class Ptx
                 b.Label($"DA{tag}");
                 b.L($"setp.ge.u32 {pa}, {oh}, {OH};");
                 b.L($"@{pa} bra DA{tag}_END;");
-                b.L($"mul.lo.u32 {h0}, {oh}, {H};"); b.L($"div.u32 {h0}, {h0}, {OH};");
-                b.L($"add.u32 {t}, {oh}, 1;"); b.L($"mul.lo.u32 {t}, {t}, {H};"); b.L($"add.u32 {t}, {t}, {OH};"); b.L($"sub.u32 {t}, {t}, 1;"); b.L($"div.u32 {h1}, {t}, {OH};");
+                b.L($"mul.lo.u32 {h0}, {oh}, {H};"); DivU(b, h0, h0, OH);
+                b.L($"add.u32 {t}, {oh}, 1;"); b.L($"mul.lo.u32 {t}, {t}, {H};"); b.L($"add.u32 {t}, {t}, {OH};"); b.L($"sub.u32 {t}, {t}, 1;"); DivU(b, h1, t, OH);
                 b.L($"setp.lt.u32 {pa}, {ih}, {h0};");
                 b.L($"@{pa} bra DA{tag}_NEXT;");
                 b.L($"setp.ge.u32 {pa}, {ih}, {h1};");
@@ -675,8 +702,8 @@ internal static partial class Ptx
                 b.Label($"DB{tag}");
                 b.L($"setp.ge.u32 {pb}, {ow}, {OW};");
                 b.L($"@{pb} bra DB{tag}_END;");
-                b.L($"mul.lo.u32 {w0}, {ow}, {W};"); b.L($"div.u32 {w0}, {w0}, {OW};");
-                b.L($"add.u32 {t}, {ow}, 1;"); b.L($"mul.lo.u32 {t}, {t}, {W};"); b.L($"add.u32 {t}, {t}, {OW};"); b.L($"sub.u32 {t}, {t}, 1;"); b.L($"div.u32 {w1}, {t}, {OW};");
+                b.L($"mul.lo.u32 {w0}, {ow}, {W};"); DivU(b, w0, w0, OW);
+                b.L($"add.u32 {t}, {ow}, 1;"); b.L($"mul.lo.u32 {t}, {t}, {W};"); b.L($"add.u32 {t}, {t}, {OW};"); b.L($"sub.u32 {t}, {t}, 1;"); DivU(b, w1, t, OW);
                 b.L($"setp.lt.u32 {pb}, {c}, {w0};");
                 b.L($"@{pb} bra DB{tag}_NEXT;");
                 b.L($"setp.ge.u32 {pb}, {c}, {w1};");
@@ -718,23 +745,23 @@ internal static partial class Ptx
                 bool max = name == "adaptive_maxpool";
                 string H = p[1], W = p[2], OH = p[3], OW = p[4], oh = b.R(), ch = b.R(), h0 = b.R(), h1 = b.R(), w0 = b.R(), w1 = b.R(), ih = b.R(), iw = b.R(), pa = b.P(), pb = b.P(), src = b.R(), t = b.R();
                 string acc = lane.NewReg(b);
-                b.L($"rem.u32 {oh}, {r}, {OH};");
-                b.L($"div.u32 {ch}, {r}, {OH};");
+                RemU(b, oh, r, OH);
+                DivU(b, ch, r, OH);
                 // [⌊i·n/o⌋, ⌈(i + 1)·n/o⌉)
                 b.L($"mul.lo.u32 {h0}, {oh}, {H};");
-                b.L($"div.u32 {h0}, {h0}, {OH};");
+                DivU(b, h0, h0, OH);
                 b.L($"add.u32 {t}, {oh}, 1;");
                 b.L($"mul.lo.u32 {t}, {t}, {H};");
                 b.L($"add.u32 {t}, {t}, {OH};");
                 b.L($"sub.u32 {t}, {t}, 1;");
-                b.L($"div.u32 {h1}, {t}, {OH};");
+                DivU(b, h1, t, OH);
                 b.L($"mul.lo.u32 {w0}, {c}, {W};");
-                b.L($"div.u32 {w0}, {w0}, {OW};");
+                DivU(b, w0, w0, OW);
                 b.L($"add.u32 {t}, {c}, 1;");
                 b.L($"mul.lo.u32 {t}, {t}, {W};");
                 b.L($"add.u32 {t}, {t}, {OW};");
                 b.L($"sub.u32 {t}, {t}, 1;");
-                b.L($"div.u32 {w1}, {t}, {OW};");
+                DivU(b, w1, t, OW);
                 b.L($"mov.{lane.Reg} {acc}, {(max ? ReduceIdentity(lane, "max") : lane.Zero)};");
                 b.L($"mov.u32 {ih}, {h0};");
                 b.Label($"AH{tag}");
@@ -776,7 +803,7 @@ internal static partial class Ptx
         string t = b.R(), i0 = b.R(), i1 = b.R(), last = b.R(), rem = b.R(), past = b.P();
         b.L($"mad.lo.s32 {t}, {o}, {alpha}, {beta};");
         b.L($"max.s32 {t}, {t}, 0;");
-        b.L($"div.u32 {i0}, {t}, {delta};");
+        DivU(b, i0, t, delta);
         b.L($"mul.lo.u32 {rem}, {i0}, {delta};");
         b.L($"sub.u32 {rem}, {t}, {rem};");
         b.L($"sub.u32 {last}, {inp}, 1;");
@@ -802,7 +829,7 @@ internal static partial class Ptx
         b.L($"add.s32 {i}, {i}, {delta};");
         b.L($"max.s32 {i}, {i}, 0;");
         b.L($"shl.b32 {d2}, {delta}, 1;");
-        b.L($"div.u32 {i}, {i}, {d2};");
+        DivU(b, i, i, d2);
         b.L($"sub.u32 {last}, {inp}, 1;");
         b.L($"min.u32 {i}, {i}, {last};");
         return i;

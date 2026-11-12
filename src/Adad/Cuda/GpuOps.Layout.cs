@@ -63,7 +63,7 @@ public sealed partial class GpuOps
                 }
             }
 
-            var args = new ulong[8 + Ptx.LayoutParamCount];
+            var args = new ulong[8 + Ptx.LayoutParamCount + Ptx.LayoutDivisorArgs];
             for (int i = 0; i < Ptx.LayoutParamCount; i++) args[8 + i] = Gpu.U(i < k.P.Length ? k.P[i] : 0);
             if (k.Name is "maxpool_bwd" or "adaptive_maxpool_bwd")
             {
@@ -73,10 +73,12 @@ public sealed partial class GpuOps
                 aux = gpu.Rent(Math.Max(1, windows) * 4L);
                 var argmax = gpu.Cached($"layout_argmax:{k.Name}:{f.Name}:{lane.Name}", (out string e) => Ptx.LayoutWindowArgmax(gpu, f, lane, k.Name, out e));
                 args[1] = x2; args[4] = aux; args[5] = Gpu.U(windows);
+                Ptx.LayoutDivisors(args);
                 if (windows > 0) Gpu.Launch(argmax, Grid(windows, 256), 1, 256, 1, 0, args);
             }
 
             args[0] = x; args[1] = x2; args[2] = idx; args[3] = aux; args[4] = output; args[5] = Gpu.U(k.Count); args[6] = Gpu.U(rows); args[7] = Gpu.U(cols);
+            Ptx.LayoutDivisors(args);
             if (f.IsBlock)
             {
                 var fb = gpu.Cached($"layout_blocks:{kn}:{f.Name}:{inFmt?.Name}", (out string e) => Ptx.LayoutBlocks(gpu, f, kn, out e, inFmt));
