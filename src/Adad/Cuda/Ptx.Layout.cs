@@ -17,11 +17,13 @@ internal static partial class Ptx
 
     private static readonly string LayoutParams = ".param .u64 p_x, .param .u64 p_x2, .param .u64 p_idx, .param .u64 p_aux, .param .u64 p_out, .param .u32 p_count, .param .u32 p_rows, .param .u32 p_cols, "
         + string.Join(", ", Enumerable.Range(0, LayoutParamCount).Select(k => $".param .u32 p_p{k}"))
-        + ", " + string.Join(", ", Enumerable.Range(0, LayoutParamCount).Select(k => $".param .u32 p_m{k}, .param .u32 p_n{k}")) + ", .param .u32 p_mc, .param .u32 p_nc";
+        + ", " + string.Join(", ", Enumerable.Range(0, LayoutParamCount).Select(k => $".param .u32 p_m{k}, .param .u32 p_n{k}")) + ", .param .u32 p_mc, .param .u32 p_nc, "
+        + string.Join(", ", Enumerable.Range(0, LayoutParamCount).Select(k => $".param .u64 p_r{k}, .param .u32 p_s{k}"));
 
     /// <summary>The arguments a layout kernel takes after its 8 + LayoutParamCount: each integer's invariant-division
-    /// constants (magic, shifts), then cols' (DivisionConstants; the kernels divide by them, RegisterDivisor).</summary>
-    public const int LayoutDivisorArgs = 2 * LayoutParamCount + 2;
+    /// constants (magic, shifts), then cols' (DivisionConstants; the kernels divide by them, RegisterDivisor), then each
+    /// integer's reciprocals (ReciprocalBits: f64, f32; the float lanes divide by them, RegisterReciprocal).</summary>
+    public const int LayoutDivisorArgs = 4 * LayoutParamCount + 2;
 
     /// <summary>Fills a layout launch's division constants from its integers (args[8 …]) and cols (args[7]).</summary>
     public static void LayoutDivisors(ulong[] args)
@@ -36,6 +38,12 @@ internal static partial class Ptx
         var (mc, sc) = DivisionConstants((uint)args[7]);
         args[8 + 3 * LayoutParamCount] = mc;
         args[8 + 3 * LayoutParamCount + 1] = sc;
+        for (int k = 0; k < LayoutParamCount; k++)
+        {
+            var (d, f) = ReciprocalBits((uint)args[8 + k]);
+            args[10 + 3 * LayoutParamCount + 2 * k] = d;
+            args[10 + 3 * LayoutParamCount + 2 * k + 1] = f;
+        }
     }
 
     public static string Layout(Gpu gpu, Fmt f, Lane lane, string name, out string entry) => Layout(gpu, f, lane, name, false, out entry);
@@ -62,6 +70,7 @@ internal static partial class Ptx
         var p = new string[LayoutParamCount];
         for (int k = 0; k < LayoutParamCount; k++) p[k] = Param32(b, $"p_p{k}");
         for (int k = 0; k < LayoutParamCount; k++) RegisterDivisor(b, p[k], $"p_m{k}", $"p_n{k}");
+        for (int k = 0; k < LayoutParamCount; k++) RegisterReciprocal(b, p[k], $"p_r{k}", $"p_s{k}");
         string words = b.R(), pw = b.P();
         if (f.WordBits == 64) b.L($"mov.u32 {words}, {count};");
         else { b.L($"add.u32 {words}, {count}, {f.Per - 1};"); b.L($"div.u32 {words}, {words}, {f.Per};"); }
@@ -111,6 +120,7 @@ internal static partial class Ptx
         var p = new string[LayoutParamCount];
         for (int k = 0; k < LayoutParamCount; k++) p[k] = Param32(b, $"p_p{k}");
         for (int k = 0; k < LayoutParamCount; k++) RegisterDivisor(b, p[k], $"p_m{k}", $"p_n{k}");
+        for (int k = 0; k < LayoutParamCount; k++) RegisterReciprocal(b, p[k], $"p_r{k}", $"p_s{k}");
         int tag = 0;
         string Value(string at, string _)
         {
@@ -146,6 +156,7 @@ internal static partial class Ptx
         var p = new string[LayoutParamCount];
         for (int k = 0; k < LayoutParamCount; k++) p[k] = Param32(b, $"p_p{k}");
         for (int k = 0; k < LayoutParamCount; k++) RegisterDivisor(b, p[k], $"p_m{k}", $"p_n{k}");
+        for (int k = 0; k < LayoutParamCount; k++) RegisterReciprocal(b, p[k], $"p_r{k}", $"p_s{k}");
         // Every launched thread runs to the shuffles (a warp's lanes all take part); past the count a thread computes the
         // last value (dropped) and past the last word stores nothing.
         string words = b.R(), word = b.R(), slot = b.R(), last = b.R(), v = b.R(), pv = b.P(), pw = b.P(), r = b.R(), c = b.R(), t = b.R();
@@ -205,6 +216,7 @@ internal static partial class Ptx
         var p = new string[LayoutParamCount];
         for (int k = 0; k < LayoutParamCount; k++) p[k] = Param32(b, $"p_p{k}");
         for (int k = 0; k < LayoutParamCount; k++) RegisterDivisor(b, p[k], $"p_m{k}", $"p_n{k}");
+        for (int k = 0; k < LayoutParamCount; k++) RegisterReciprocal(b, p[k], $"p_r{k}", $"p_s{k}");
         b.L($"setp.ge.u32 {pd}, {i}, {count};");
         b.L($"@{pd} bra DONE;");
         string H = p[1], W = p[2], OH = adaptive ? p[3] : p[11], OW = adaptive ? p[4] : p[12];      // a pool's OH OW: LayoutArgs.KernelP
@@ -425,6 +437,7 @@ internal static partial class Ptx
         var p = new string[LayoutParamCount];
         for (int k = 0; k < LayoutParamCount; k++) p[k] = Param32(b, $"p_p{k}");
         for (int k = 0; k < LayoutParamCount; k++) RegisterDivisor(b, p[k], $"p_m{k}", $"p_n{k}");
+        for (int k = 0; k < LayoutParamCount; k++) RegisterReciprocal(b, p[k], $"p_r{k}", $"p_s{k}");
         string words = b.R(), pw = b.P(), last = b.R();
         if (f.WordBits == 64 || f.Per == 1) b.L($"mov.u32 {words}, {count};");
         else { b.L($"add.u32 {words}, {count}, {f.Per - 1};"); b.L($"div.u32 {words}, {words}, {f.Per};"); }
@@ -475,6 +488,7 @@ internal static partial class Ptx
         var p = new string[LayoutParamCount];
         for (int k = 0; k < LayoutParamCount; k++) p[k] = Param32(b, $"p_p{k}");
         for (int k = 0; k < LayoutParamCount; k++) RegisterDivisor(b, p[k], $"p_m{k}", $"p_n{k}");
+        for (int k = 0; k < LayoutParamCount; k++) RegisterReciprocal(b, p[k], $"p_r{k}", $"p_s{k}");
         b.L($"setp.ge.u32 {pd}, {w}, {count};");
         b.L($"@{pd} bra DONE;");
         var (_, at) = AdaptiveWindowWarp(b, f, lane, x2, p, w, wl, true, "AA");
@@ -1004,7 +1018,8 @@ internal static partial class Ptx
 
     // One axis of a bilinear resize: (i0, i1, fraction) for output index o over `inp` input and `outp` output pixels.
     // A bilinear axis as integers (LayoutArgs.BilinearAt): t = max(o·α + β, 0), i0 = t / δ; past the input's
-    // last position both rows the last and the weight 0; f = (t − i0·δ) / δ in the lane (one rounding), g = 1 − f.
+    // last position both rows the last and the weight 0; f = (t − i0·δ) / δ in the lane (one rounding: DivRn by δ's
+    // reciprocal), g = 1 − f.
     private static (string I0, string I1, string F, string G) BilinearAxis(PtxBuilder b, Lane lane, string o, string inp, string alpha, string beta, string delta)
     {
         string t = b.R(), i0 = b.R(), i1 = b.R(), last = b.R(), rem = b.R(), past = b.P();
@@ -1022,7 +1037,7 @@ internal static partial class Ptx
         string rf = lane.NewReg(b), df = lane.NewReg(b), f = lane.NewReg(b), g = lane.NewReg(b);
         b.L($"cvt.rn.{lane.Op}.u32 {rf}, {rem};");
         b.L($"cvt.rn.{lane.Op}.u32 {df}, {delta};");
-        b.L($"div.rn.{lane.Op} {f}, {rf}, {df};");
+        DivRn(b, lane, f, rf, df, delta);
         b.L($"sub.rn.{lane.Op} {g}, {lane.Literal(1)}, {f};");
         return (i0, i1, f, g);
     }

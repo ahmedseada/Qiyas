@@ -73,6 +73,9 @@ public sealed class PtxBuilder
     /// parameter, its magic number and its two shifts.</summary>
     public Dictionary<string, (string Magic, string Shift1, string Shift2)> Divisors { get; } = [];
 
+    /// <summary>The integer registers whose reciprocals the kernel holds in each float lane (Ptx.RegisterReciprocal: f64, f32).</summary>
+    public Dictionary<string, (string F64, string F32)> Reciprocals { get; } = [];
+
     public string R() => $"%r{_r++}";
     public string RD() => $"%rd{_rd++}";
     public string F() => $"%f{_f++}";
@@ -622,6 +625,36 @@ internal static partial class Ptx
         b.L($"and.b32 {s1}, {sh}, 255;");
         b.L($"shr.u32 {s2}, {sh}, 8;");
         b.Divisors[divisor] = (m, s1, s2);
+    }
+
+    /// <summary>An integer's reciprocal in each float lane as the bits a parameter carries: RN(1/d) in f64, and RN(1/RN(d))
+    /// in f32 (d rounded to f32 first, as cvt.rn.f32.u32 does); 0 for d = 0.</summary>
+    public static (ulong F64, uint F32) ReciprocalBits(uint d) =>
+        d == 0 ? (0, 0) : ((ulong)BitConverter.DoubleToInt64Bits(1.0 / d), BitConverter.SingleToUInt32Bits(1f / (float)d));
+
+    /// <summary>Loads parameters <paramref name="f64"/> and <paramref name="f32"/> (ReciprocalBits of the integer in
+    /// <paramref name="divisor"/>) and registers them, so DivRn by that integer multiplies in place of dividing.</summary>
+    internal static void RegisterReciprocal(PtxBuilder b, string divisor, string f64, string f32)
+    {
+        string d = b.FD(), f = b.F();
+        b.L($"ld.param.f64 {d}, [{f64}];");
+        b.L($"ld.param.f32 {f}, [{f32}];");
+        b.Reciprocals[divisor] = (d, f);
+    }
+
+    /// <summary>q = a / d rounded once in the lane (f32 or f64), d the lane value of the integer in register
+    /// <paramref name="integer"/>. Where the builder holds that integer's reciprocal y = RN(1/d) (RegisterReciprocal):
+    /// q₀ = RN(a·y), r = a − q₀·d (exact, by one fma), q = RN(q₀ + r·y) — the correctly rounded quotient for a normal
+    /// or zero a and a normal d (Markstein: y within half an ulp of 1/d, q₀ within one ulp of a/d), so the same bits as
+    /// div.rn, three multiply-adds in place of its dozen and its branch to the slow path. Else div.rn.</summary>
+    internal static void DivRn(PtxBuilder b, Lane lane, string q, string a, string d, string integer)
+    {
+        if (!lane.IsFloat || !b.Reciprocals.TryGetValue(integer, out var y)) { b.L($"div.rn.{lane.Op} {q}, {a}, {d};"); return; }
+        string yr = lane.Wide ? y.F64 : y.F32, q0 = lane.NewReg(b), nq = lane.NewReg(b), r = lane.NewReg(b);
+        b.L($"mul.rn.{lane.Op} {q0}, {a}, {yr};");
+        b.L($"neg.{lane.Op} {nq}, {q0};");
+        b.L($"fma.rn.{lane.Op} {r}, {nq}, {d}, {a};");
+        b.L($"fma.rn.{lane.Op} {q}, {r}, {yr}, {q0};");
     }
 
     /// <summary>q = n / d (unsigned): by d's invariant-division constants where the builder holds them (RegisterDivisor:
