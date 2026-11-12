@@ -10,7 +10,7 @@
 // columns gathered from the image where it is stored; the gradients lane values (the type's own storage for float32 and
 // float64, else stored as the type once after; a block format's by its encoder). A block format's forward is fused: its
 // composition would encode the columns as blocks (each window's values quantized again).
-// Images, groups, the bottom and right pads, a bias and an activation (the float types) take the general path (Conv.cs),
+// Images, groups, a bias and an activation (the float types) take the general path (Conv.cs),
 // CUDA's: the columns of every image's channels into lane storage, a product an image and group into the lane's sums, then
 // y = act(sums + bias[f]) stored once (Kernels.ProductStore.cs); its backward: dcols = w_gᵀ·dy_g, dx = col2im(dcols); dy and
 // the columns side by side over the images in the lane, dw_g = dy_g·cols_gᵀ, db = dy's rows times ones, stored once.
@@ -25,17 +25,16 @@ public sealed partial class VulkanOps
 
     private readonly Dictionary<string, bool> _convFused = [];
 
-    private static Fmt ConvFormat<TN>(string what) where TN : struct, IAdad<TN> => Fmt.Of<TN>();
-
     /// <summary>y = act(conv(x, w) + bias) (ConvArgs.Single without a bias: the one-image path); returns the product's lane.</summary>
     public string Conv<TN>(ConvArgs a, ulong x, ulong w, ulong bias, ulong y) where TN : struct, IAdad<TN>
     {
         a.Validate();
         if (a.Single && bias == 0) return Conv<TN>(a, x, w, y);
         var f = Fmt.Of<TN>();
-        if (!f.IsFloat) throw new NotSupportedException($"conv: images, groups, uneven pads, a bias or an activation take a float type, not {f.Name}");
+        if (!f.IsFloat) throw new NotSupportedException($"conv: images, groups, a bias or an activation take a float type, not {f.Name}");
         var lane = RowLane(f);
         if (a.YValues == 0) return lane.Name;
+        a.ColumnsFit();
         var lf = LaneFormat(lane);
         var rented = new List<ulong>();
         ulong Rent(long bytes) { ulong p = vk.Rent(Math.Max(16, bytes)); rented.Add(p); return p; }
@@ -69,6 +68,7 @@ public sealed partial class VulkanOps
     {
         a.Validate();
         if (a.Single && db == 0) return ConvBackward<TN>(a, x, w, dy, dx, dw);
+        a.ColumnsFit();
         var f = Fmt.Of<TN>();
         var lane = RowLane(f);
         var lf = LaneFormat(lane);
@@ -109,14 +109,15 @@ public sealed partial class VulkanOps
     /// <summary>y = conv(x, w) of one image of one group; returns the product's lane.</summary>
     public string Conv<TN>(ConvArgs a, ulong x, ulong w, ulong y) where TN : struct, IAdad<TN>
     {
-        var f = ConvFormat<TN>("conv");
-        if (FusedConv == false || a.XValues > int.MaxValue || a.WValues > int.MaxValue || a.YValues > int.MaxValue) return ConvComposed<TN>(a, x, w, y);
+        var f = Fmt.Of<TN>();
+        if (FusedConv == false) return ConvComposed<TN>(a, x, w, y);
         // The columns' values are the image's and 0 (padding): the image's range, with 0, bounds them.
         var (wLo, wHi) = Range<TN>(w, (int)a.WValues);
         var (xLo, xHi) = Range<TN>(x, (int)a.XValues);
         var lane = SumLane(f, new Bounds(wLo, wHi, Math.Min(xLo, 0), Math.Max(xHi, 0), a.Rows));
-        if (FusedConv == true || f.IsBlock) return ConvFused(f, a, x, w, y, lane);
-        string key = $"{f.Name}:{a.C}x{a.H}x{a.W}>{a.OC}:{a.Kh}x{a.Kw}:s{a.Sh}x{a.Sw}:p{a.Ph}x{a.Pw}:d{a.Dh}x{a.Dw}";
+        // The composition's columns past 2^31 values: fused.
+        if (FusedConv == true || f.IsBlock || a.ColValues > int.MaxValue) return ConvFused(f, a, x, w, y, lane);
+        string key = $"{f.Name}: {a.Shape}";
         if (!_convFused.TryGetValue(key, out bool fused))
         {
             ulong scratch = vk.Rent(f.Words(a.YValues) * (f.WordBits / 8) + 64);
@@ -132,9 +133,10 @@ public sealed partial class VulkanOps
     }
 
     /// <summary>y = conv(x, w) by the composition: im2col (the columns as the type), then the product.</summary>
-    public string ConvComposed<TN>(ConvArgs a, ulong x, ulong w, ulong y) where TN : struct, IAdad<TN>
+    private string ConvComposed<TN>(ConvArgs a, ulong x, ulong w, ulong y) where TN : struct, IAdad<TN>
     {
-        var f = ConvFormat<TN>("conv (composed)");
+        a.ColumnsFit();
+        var f = Fmt.Of<TN>();
         ulong cols = vk.Rent(Math.Max(1, f.Words((long)a.Rows * a.Cols)) * (f.WordBits / 8));
         try
         {
@@ -174,18 +176,19 @@ public sealed partial class VulkanOps
     {
         if (m == 0 || n == 0) return;
         var fn = vk.Cached($"matmul_conv:{fa.Name}:{fb.Name}:{lane.Name}:{transB}", () => VkKernels.MatMulConv(vk, fa, fb, lane, transB));
-        var args = new ulong[12];
+        // The im2col parameters (ConvArgs.P, every pad among them) two a slot.
+        var p = conv.P;
+        var args = new ulong[6 + (p.Length + 1) / 2];
         args[0] = a; args[1] = x; args[2] = c;
         args[3] = Vulkan.U(m); args[4] = Vulkan.U(n); args[5] = Vulkan.U(k);
-        var p = conv.P;
-        for (int j = 0; j < 6; j++) args[6 + j] = (uint)p[2 * j] | (ulong)(uint)p[2 * j + 1] << 32;
+        for (int j = 0; 2 * j < p.Length; j++) args[6 + j] = (uint)p[2 * j] | (2 * j + 1 < p.Length ? (ulong)(uint)p[2 * j + 1] << 32 : 0);
         vk.Launch(fn, Groups(n, VkKernels.TileN), (uint)((m + VkKernels.TileM - 1) / VkKernels.TileM), args);
     }
 
     /// <summary>dx and dw from dy in the type's float lane; returns the lane's name.</summary>
     public string ConvBackward<TN>(ConvArgs a, ulong x, ulong w, ulong dy, ulong dx, ulong dw) where TN : struct, IFloatAdad<TN>
     {
-        var f = ConvFormat<TN>("conv backward");
+        var f = Fmt.Of<TN>();
         var lane = RowLane(f);
         bool own = Own(f);
         var rented = new List<ulong>();

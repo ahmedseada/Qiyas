@@ -412,17 +412,17 @@ internal sealed partial class Kernels
     }
 
     // Row p = (c, kh, kw) of the convolution's columns from the image (C × H × W): dst[oh·OW + ow] =
-    // x[c][oh·sh − ph + kh·dh][ow·sw − pw + kw·dw], 0 off the image; an image row read in place (lanes) or loaded once.
+    // x[c][oh·sh − PadTop + kh·dh][ow·sw − PadLeft + kw·dw], 0 off the image; an image row read in place (lanes) or loaded once.
     private static void ImageRow<TN, TIn>(byte[] x, ReadOnlySpan<TIn> stored, TIn[]? line, ConvArgs a, int p, Span<TIn> dst)
         where TN : struct, IAdad<TN, TIn> where TIn : unmanaged
     {
         int khw = a.Kh * a.Kw, c = p / khw, kh = p % khw / a.Kw, kw = p % a.Kw;
         var (oh1, ow1) = a.Out;
-        int shift = kw * a.Dw - a.Pw;                                           // iw = ow·sw + shift
+        int shift = kw * a.Dw - a.PadLeft;                                      // iw = ow·sw + shift
         for (int oh = 0; oh < oh1; oh++)
         {
             var row = dst.Slice(oh * ow1, ow1);
-            int ih = oh * a.Sh - a.Ph + kh * a.Dh;
+            int ih = oh * a.Sh - a.PadTop + kh * a.Dh;
             if ((uint)ih >= (uint)a.H) { row.Clear(); continue; }
             ReadOnlySpan<TIn> src;
             if (!stored.IsEmpty) src = stored.Slice((c * a.H + ih) * a.W, a.W);
@@ -451,13 +451,13 @@ internal sealed partial class Kernels
     {
         int khw = a.Kh * a.Kw, c = p / khw, kh = p % khw / a.Kw, kw = p % a.Kw;
         int ow1 = a.Out.OW;
-        int shift = kw * a.Dw - a.Pw;                                           // iw = ow·sw + shift
+        int shift = kw * a.Dw - a.PadLeft;                                      // iw = ow·sw + shift
         for (int q = from, end = from + dst.Length; q < end;)
         {
             int oh = q / ow1, ow0 = q % ow1, ow2 = Math.Min(ow1, ow0 + (end - q));
             var row = dst.Slice(q - from, ow2 - ow0);
             q += ow2 - ow0;
-            int ih = oh * a.Sh - a.Ph + kh * a.Dh;
+            int ih = oh * a.Sh - a.PadTop + kh * a.Dh;
             if ((uint)ih >= (uint)a.H) { row.Clear(); continue; }
             ReadOnlySpan<TIn> src;
             if (!stored.IsEmpty) src = stored.Slice((c * a.H + ih) * a.W, a.W);

@@ -637,7 +637,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
     // A convolution of a 64 × 128 × 128 image by 128 filters of 3 × 3 (pad 1); the backward pair (dx scored, dw computed too).
     private void ConvRow(Device device, string type, string name)
     {
-        var a = new ConvArgs(Prime(64), Prime(128), Prime(128), Prime(128), 3, 3, 1, 1, 1, 1);
+        var a = new ConvArgs(Prime(64), Prime(128), Prime(128), Prime(128), 3, 3) { PadTop = 1, PadLeft = 1, PadBottom = 1, PadRight = 1 };
         var x = Registry.Make(type, (int)a.XValues, 61, -1, 1);
         var w = Registry.Make(type, (int)a.WValues, 62, -1, 1);
         string shape = $"{a.C}x{a.H}x{a.W} by {a.OC} of {a.Kh}x{a.Kw}";

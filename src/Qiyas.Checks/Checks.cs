@@ -819,9 +819,21 @@ internal static partial class Checks
 
     // ---------------------------------------------------------------- convolution on odd shapes
 
-    /// <summary>Every type: a 3 × 7 × 9 image by 5 filters of 3 × 2 at stride 2 × 1, pad 1, dilation 1; and 2 × 5 × 5 by 3 of 3 × 3
-    /// dilated 2; forward and the backward pair against float64 within the products' rounding. Then the fused forward on
-    /// five shapes, and on the CPU the backward with dw's columns read from the image on the same five.</summary>
+    // The one-image shapes: 3 × 7 × 9 by 5 filters of 3 × 2 at strides 2 × 1, pad 1; 2 × 5 × 5 by 3 of 3 × 3 dilated 2, pad 1;
+    // 3 × 6 × 7 by 4 of 3 × 3 at stride 2, pads 0 above, 2 left, 1 below, 0 right (the bottom pad adds a window, the left
+    // one moves them).
+    private static ConvArgs Padded(ConvArgs a, int top, int left, int bottom, int right) => a with { PadTop = top, PadLeft = left, PadBottom = bottom, PadRight = right };
+
+    private static readonly ConvArgs[] OneImageConvs =
+    [
+        Padded(new ConvArgs(3, 7, 9, 5, 3, 2) { Sh = 2 }, 1, 1, 1, 1),
+        Padded(new ConvArgs(2, 5, 5, 3, 3, 3) { Dh = 2, Dw = 2 }, 1, 1, 1, 1),
+        Padded(new ConvArgs(3, 6, 7, 4, 3, 3) { Sh = 2, Sw = 2 }, 0, 2, 1, 0),
+    ];
+
+    /// <summary>Every type: the one-image shapes above, forward and the backward pair against float64 within the products'
+    /// rounding. Then the fused forward on those and three more, and on the CPU the backward with dw's columns read from
+    /// the image on the same; and the shapes the operation does not take refused.</summary>
     // blocks: false where the device refuses the block formats (said so, not proved).
     public static bool Convs(IDevice<ulong, ulong>? ops, string device = "device", bool blocks = true)
     {
@@ -830,22 +842,22 @@ internal static partial class Checks
         foreach (var type in Bench.Registry.Names)
         {
             if (!blocks && Bench.Registry.IsBlock(type)) continue;
-            foreach (var a in new[] { new ConvArgs(3, 7, 9, 5, 3, 2, 2, 1, 1, 1), new ConvArgs(2, 5, 5, 3, 3, 3, 1, 1, 1, 1, 2, 2) })
+            foreach (var a in OneImageConvs)
             {
                 var x = Bench.Registry.Make(type, (int)a.XValues, 61, -1, 1);
                 var w = Bench.Registry.Make(type, (int)a.WValues, 62, -1, 1);
                 var y = new byte[Bench.Registry.Bytes(type, a.YValues)];
                 var want = a.Reference(Bench.Registry.Values(type, x, (int)a.XValues), Bench.Registry.Values(type, w, (int)a.WValues));
-                Bench.Registry.With(type, new ConvRun(ops, a, x, w, y, null, null));
-                ok &= Close(type, $"conv {a.Kh}x{a.Kw} s{a.Sh}", where, y, want, (int)a.YValues, a.Rows);
+                Bench.Registry.With(type, new ConvRun(ops, a, x, w, y));
+                ok &= Close(type, $"conv {a.Kh}x{a.Kw} s{a.Sh} p{a.PadTop}{a.PadLeft}{a.PadBottom}{a.PadRight}", where, y, want, (int)a.YValues, a.Rows);
                 if (!Bench.Registry.IsFloat(type)) continue;                 // the backward needs the float lane's storage
                 var dy = Bench.Registry.Make(type, (int)a.YValues, 63, -1, 1);
                 var (wantX, wantW, _) = a.ReferenceBackward(Bench.Registry.Values(type, x, (int)a.XValues), Bench.Registry.Values(type, w, (int)a.WValues), Bench.Registry.Values(type, dy, (int)a.YValues));
                 var dx = new byte[x.Length];
                 var dw = new byte[w.Length];
                 Bench.Registry.WithFloat(type, new ConvBackwardRun(ops, a, x, w, dy, dx, dw));
-                ok &= Close(type, $"conv_bwd dx {a.Kh}x{a.Kw}", where, dx, wantX, (int)a.XValues, a.OC * a.Kh * a.Kw);
-                ok &= Close(type, $"conv_bwd dw {a.Kh}x{a.Kw}", where, dw, wantW, (int)a.WValues, a.Cols);
+                ok &= Close(type, $"conv_bwd dx {a.Kh}x{a.Kw} p{a.PadTop}{a.PadLeft}{a.PadBottom}{a.PadRight}", where, dx, wantX, (int)a.XValues, a.OC * a.Kh * a.Kw);
+                ok &= Close(type, $"conv_bwd dw {a.Kh}x{a.Kw} p{a.PadTop}{a.PadLeft}{a.PadBottom}{a.PadRight}", where, dw, wantW, (int)a.WValues, a.Cols);
             }
         }
 
@@ -853,14 +865,21 @@ internal static partial class Checks
         // composition through the same kernel (the same packed values): the composition itself on the CPU and on the
         // device's tensor and dot routes; on the device's plain float lanes im2col then the same plain kernel (the plain
         // composition may take another kernel); the integer lanes are exact either way. Block formats: the composition
-        // re-encodes the columns into blocks, the fused path reads the image's values: rounding only. Shapes: the two
+        // re-encodes the columns into blocks, the fused path reads the image's values: rounding only. Shapes: the three
         // above, a 3 × 3 at 16 × 20 × 20 → 32 (padded tiles), 1 × 1 at 128 × 16 × 16 → 128 (whole tiles), and a strided,
         // dilated one with an even width (sub-byte types in place). Vulkan: the fused path and the composition are the same
         // tile loop over the same values, equal bit for bit.
+        ConvArgs[] fusedShapes =
+        [
+            .. OneImageConvs,
+            Padded(new ConvArgs(16, 20, 20, 32, 3, 3), 1, 1, 1, 1),
+            new ConvArgs(128, 16, 16, 128, 1, 1),
+            Padded(new ConvArgs(4, 9, 12, 6, 3, 3) { Sh = 2, Sw = 2, Dh = 2, Dw = 2 }, 1, 1, 1, 1),
+        ];
         foreach (var type in Bench.Registry.Names)
         {
             if (!blocks && Bench.Registry.IsBlock(type)) continue;
-            foreach (var a in new[] { new ConvArgs(3, 7, 9, 5, 3, 2, 2, 1, 1, 1), new ConvArgs(2, 5, 5, 3, 3, 3, 1, 1, 1, 1, 2, 2), new ConvArgs(16, 20, 20, 32, 3, 3, 1, 1, 1, 1), new ConvArgs(128, 16, 16, 128, 1, 1), new ConvArgs(4, 9, 12, 6, 3, 3, 2, 2, 1, 1, 2, 2) })
+            foreach (var a in fusedShapes)
             {
                 var x = Bench.Registry.Make(type, (int)a.XValues, 64, -1, 1);
                 var w = Bench.Registry.Make(type, (int)a.WValues, 65, -1, 1);
@@ -869,7 +888,7 @@ internal static partial class Checks
                 var composed = new byte[fused.Length];
                 var run = new ConvModeRun(ops, a, x, w, fused, composed);
                 Bench.Registry.With(type, run);
-                string name = $"conv fused {a.C}x{a.H}x{a.W}>{a.OC} {a.Kh}x{a.Kw} s{a.Sh} d{a.Dh}";
+                string name = $"conv fused {a.C}x{a.H}x{a.W}>{a.OC} {a.Kh}x{a.Kw} s{a.Sh} d{a.Dh} p{a.PadTop}{a.PadLeft}{a.PadBottom}{a.PadRight}";
                 ok &= Close(type, name, where, fused, want, (int)a.YValues, a.Rows);
                 if (!Bench.Registry.IsBlock(type) && !fused.AsSpan().SequenceEqual(composed))
                 {
@@ -884,7 +903,7 @@ internal static partial class Checks
                 var (_, wantW, _) = a.ReferenceBackward(Bench.Registry.Values(type, x, (int)a.XValues), Bench.Registry.Values(type, w, (int)a.WValues), Bench.Registry.Values(type, dy, (int)a.YValues));
                 byte[] dxF = new byte[x.Length], dwF = new byte[w.Length], dxC = new byte[x.Length], dwC = new byte[w.Length];
                 Bench.Registry.WithFloat(type, new ConvBackwardModeRun(a, x, w, dy, dxF, dwF, dxC, dwC));
-                string back = $"conv_bwd fused {a.C}x{a.H}x{a.W}>{a.OC} {a.Kh}x{a.Kw} s{a.Sh} d{a.Dh}";
+                string back = $"conv_bwd fused {a.C}x{a.H}x{a.W}>{a.OC} {a.Kh}x{a.Kw} s{a.Sh} d{a.Dh} p{a.PadTop}{a.PadLeft}{a.PadBottom}{a.PadRight}";
                 ok &= Close(type, back, where, dwF, wantW, (int)a.WValues, a.Cols);
                 if (!dxF.AsSpan().SequenceEqual(dxC) || !dwF.AsSpan().SequenceEqual(dwC))
                 {
@@ -894,8 +913,28 @@ internal static partial class Checks
             }
         }
 
+        // Shapes the operation does not take, refused before anything is read: a negative pad on each side, a stride, a
+        // dilation or a filter extent below 1, groups that do not divide the channels; the forward and the backward.
+        var fits = new ConvArgs(2, 5, 5, 2, 3, 3);
+        foreach (var bad in new[] { fits with { PadTop = -1 }, fits with { PadLeft = -1 }, fits with { PadBottom = -1 }, fits with { PadRight = -1 }, fits with { Sh = 0 }, fits with { Sw = 0 }, fits with { Dh = 0 }, fits with { Dw = 0 }, new ConvArgs(2, 5, 5, 2, 0, 3), fits with { Groups = 3 } })
+        {
+            foreach (bool backward in new[] { false, true })
+            {
+                bool refused = false;
+                try
+                {
+                    if (ops is null && !backward) CpuDevice.Device.Conv<Float32>(bad, [], [], null, []);
+                    else if (ops is null) CpuDevice.Device.ConvBackward<Float32>(bad, [], [], [], [], [], null);
+                    else if (!backward) ops.Conv<Float32>(bad, 0, 0, 0, 0);
+                    else ops.ConvBackward<Float32>(bad, 0, 0, 0, 0, 0, 0);
+                }
+                catch (ArgumentException) { refused = true; }
+                if (!refused) { Console.WriteLine($"check conv{(backward ? "_bwd" : "")} refusal {where,-6} FAILS: {bad.Shape} was not refused"); ok = false; }
+            }
+        }
+
         ok &= ConvGeneral(ops, where, blocks);
-        if (ok) Console.WriteLine($"check convolution            {where,-6} every type{(blocks ? "" : " but the block formats")}: forward and the backward pair within the products' rounding; the fused forward equal to the composition through the same kernel{(ops is null ? ", and the backward with dw's columns from the image" : "")}; every float type over images, groups, uneven pads, a bias and an activation, and their backward (dx, dw, db)");
+        if (ok) Console.WriteLine($"check convolution            {where,-6} every type{(blocks ? "" : " but the block formats")}: forward and the backward pair within the products' rounding, uneven pads among them; the fused forward equal to the composition through the same kernel{(ops is null ? ", and the backward with dw's columns from the image" : "")}; every float type over images, groups, uneven pads, a bias and an activation, and their backward (dx, dw, db); a negative pad, a stride, dilation or filter extent below 1, and groups not dividing the channels refused");
         return ok;
     }
 
@@ -961,7 +1000,7 @@ internal static partial class Checks
         }
     }
 
-    private sealed class ConvRun(IDevice<ulong, ulong>? ops, ConvArgs a, byte[] x, byte[] w, byte[] y, byte[]? dx, byte[]? dw) : Bench.ITypeVisitor<bool>
+    private sealed class ConvRun(IDevice<ulong, ulong>? ops, ConvArgs a, byte[] x, byte[] w, byte[] y) : Bench.ITypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IAdad<TN, float>
         {

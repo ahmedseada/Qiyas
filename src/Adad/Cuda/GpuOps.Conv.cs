@@ -11,7 +11,7 @@
 //                               per shape and type by Measure.Faster, the decision in --report.
 // The backward is the composition (im2col and col2im around the products), on the type's own tensors: the columns of
 // dw's product gathered from the image by the product kernel (transposed), dx's columns an f32 intermediate.
-// Images, groups, the bottom and right pads, a bias and an activation (the float types) take the general path (Conv.cs):
+// Images, groups, a bias and an activation (the float types) take the general path (Conv.cs):
 // the columns of every image's channels into lane storage (im2col reading the image where it is stored), a stored-mode
 // product a group over the images into the lane's sums, then Ptx.ProductStore: y = act(sums + bias[f]) stored once. Its
 // backward: dcols = w_gᵀ·dy_g, dx = col2im(dcols); dy and the columns side by side over the images in the lane (exact
@@ -38,9 +38,10 @@ public sealed partial class GpuOps
         a.Validate();
         if (a.Single && bias == 0) return Conv<TN>(a, x, w, y);
         var f = Fmt.Of<TN>();
-        if (!f.IsFloat) throw new NotSupportedException($"conv: images, groups, uneven pads, a bias or an activation take a float type, not {f.Name}");
+        if (!f.IsFloat) throw new NotSupportedException($"conv: images, groups, a bias or an activation take a float type, not {f.Name}");
         var lane = RowLane(f);
         if (a.YValues == 0) return lane.Name;
+        a.ColumnsFit();
         var lf = LaneFormat(lane);
         var rented = new List<ulong>();
         ulong Rent(long bytes) { ulong p = gpu.Rent(Math.Max(16, bytes)); rented.Add(p); return p; }
@@ -82,6 +83,7 @@ public sealed partial class GpuOps
     {
         a.Validate();
         if (a.Single && db == 0) return ConvBackward<TN>(a, x, w, dy, dx, dw);
+        a.ColumnsFit();
         var f = Fmt.Of<TN>();
         var lane = RowLane(f);
         var lf = LaneFormat(lane);
@@ -122,7 +124,7 @@ public sealed partial class GpuOps
     /// <summary>y = conv(x, w) of one image of one group; returns the product's lane.</summary>
     public string Conv<TN>(ConvArgs a, ulong x, ulong w, ulong y) where TN : struct, IAdad<TN>
     {
-        if (FusedConv == false || a.XValues > int.MaxValue || a.WValues > int.MaxValue) return ConvComposed<TN>(a, x, w, y);
+        if (FusedConv == false) return ConvComposed<TN>(a, x, w, y);
         var f = Fmt.Of<TN>();
         // The columns' values are the image's and 0 (padding): the image's range, with 0, bounds them.
         var ((wLo, wHi), (xLo, xHi)) = RangePair<TN>(w, (int)a.WValues, x, (int)a.XValues);
@@ -132,8 +134,9 @@ public sealed partial class GpuOps
             return ConvPacked<TN>(a, x, w, y, laneName);
         var lane = LaneOf(laneName);
         // A block format's composition would encode the columns as blocks (each window's values quantized again): fused.
-        if (FusedConv == true || f.IsBlock) return ConvPlain<TN>(a, x, w, y, lane);
-        string key = $"{f.Name}:{a.C}x{a.H}x{a.W}>{a.OC}:{a.Kh}x{a.Kw}:s{a.Sh}x{a.Sw}:p{a.Ph}x{a.Pw}:d{a.Dh}x{a.Dw}";
+        // The composition's columns past 2^31 values: fused.
+        if (FusedConv == true || f.IsBlock || a.ColValues > int.MaxValue) return ConvPlain<TN>(a, x, w, y, lane);
+        string key = $"{f.Name}: {a.Shape}";
         if (!_convFused.TryGetValue(key, out bool fused))
         {
             ulong scratch = gpu.Rent(f.Words(a.YValues) * (f.WordBits / 8) + 64);
@@ -150,8 +153,9 @@ public sealed partial class GpuOps
     }
 
     /// <summary>y = conv(x, w) by the composition: im2col, then the product.</summary>
-    public string ConvComposed<TN>(ConvArgs a, ulong x, ulong w, ulong y) where TN : struct, IAdad<TN>
+    private string ConvComposed<TN>(ConvArgs a, ulong x, ulong w, ulong y) where TN : struct, IAdad<TN>
     {
+        a.ColumnsFit();
         var f = Fmt.Of<TN>();
         ulong cols = gpu.Rent(f.Words((long)a.Rows * a.Cols) * (f.WordBits / 8));
         try
@@ -165,7 +169,7 @@ public sealed partial class GpuOps
         }
     }
 
-    private static ulong[] ConvArgsOf(ConvArgs a) => [Gpu.U(a.H), Gpu.U(a.W), Gpu.U(a.Kh), Gpu.U(a.Kw), Gpu.U(a.Sh), Gpu.U(a.Sw), Gpu.U(a.Ph), Gpu.U(a.Pw), Gpu.U(a.Dh), Gpu.U(a.Dw), Gpu.U(a.Out.OW)];
+    private static ulong[] ConvArgsOf(ConvArgs a) => [Gpu.U(a.H), Gpu.U(a.W), Gpu.U(a.Kh), Gpu.U(a.Kw), Gpu.U(a.Sh), Gpu.U(a.Sw), Gpu.U(a.PadTop), Gpu.U(a.PadLeft), Gpu.U(a.Dh), Gpu.U(a.Dw), Gpu.U(a.Out.OW)];
 
     // The tensor / dot route with B packed from the image: the composition's steps (MatMul, MatMulPadded) with the columns'
     // packing reading the image: the same packed values, kernel, padding and C path, so the same result.

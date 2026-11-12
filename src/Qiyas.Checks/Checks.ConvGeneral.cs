@@ -1,9 +1,9 @@
 // Copyright (c) 2026 Ahmed Seada
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
-// The convolution's general path (Conv.cs) on every device against its float64 reference: images, groups (a depthwise
-// multiplier among them), the bottom and right pads, a bias and an activation, every float type (the block formats among
-// them); the backward's dx, dw and db over the same shapes. Within the lane's rounding of each value's sums (and the
+// The convolution's general path (Conv.cs) on every device against its float64 reference: images, groups (a group a
+// channel, two filters each, among them), uneven pads, a bias and an activation, every float type (the block formats
+// among them); the backward's dx, dw and db over the same shapes. Within the lane's rounding of each value's sums (and the
 // activation's own rounding) plus the type's step.
 namespace Qiyas;
 
@@ -11,12 +11,13 @@ internal static partial class Checks
 {
     private static readonly (string Name, ConvArgs Args, bool Bias)[] GeneralConvs =
     [
-        ("2 images 3x7x9>4 3x3 s2 p1 relu", new ConvArgs(3, 7, 9, 4, 3, 3, 2, 2, 1, 1) { N = 2, Act = "relu" }, true),
-        ("groups 3 6x6x5>6 3x2 pads 1,0,2,1 silu", new ConvArgs(6, 6, 5, 6, 3, 2, 1, 1, 1, 0) { Groups = 3, PadBottom = 2, PadRight = 1, Act = "silu" }, true),
-        ("3 images depthwise x2 4x5x5>8 3x3 d2 p2 gelu", new ConvArgs(4, 5, 5, 8, 3, 3, 1, 1, 2, 2, 2, 2) { N = 3, Groups = 4, Act = "gelu" }, false),
+        ("2 images 3x7x9>4 3x3 s2 p1 relu", Padded(new ConvArgs(3, 7, 9, 4, 3, 3) { Sh = 2, Sw = 2, N = 2, Act = "relu" }, 1, 1, 1, 1), true),
+        ("groups 3 6x6x5>6 3x2 pads 1,0,2,1 silu", Padded(new ConvArgs(6, 6, 5, 6, 3, 2) { Groups = 3, Act = "silu" }, 1, 0, 2, 1), true),
+        ("3 images a channel a group x2 4x5x5>8 3x3 d2 p2 gelu", Padded(new ConvArgs(4, 5, 5, 8, 3, 3) { Dh = 2, Dw = 2, N = 3, Groups = 4, Act = "gelu" }, 2, 2, 2, 2), false),
         ("2 images groups 2 4x8x6>6 1x1 bias", new ConvArgs(4, 8, 6, 6, 1, 1) { N = 2, Groups = 2 }, true),
-        ("3x5x5>2 3x3 p1 bias sigmoid", new ConvArgs(3, 5, 5, 2, 3, 3, 1, 1, 1, 1) { Act = "sigmoid" }, true),
+        ("3x5x5>2 3x3 p1 bias sigmoid", Padded(new ConvArgs(3, 5, 5, 2, 3, 3) { Act = "sigmoid" }, 1, 1, 1, 1), true),
         ("2 images 2x4x4>3 2x2 pad right 2 tanh", new ConvArgs(2, 4, 4, 3, 2, 2) { N = 2, PadRight = 2, Act = "tanh" }, false),
+        ("3x6x7>4 3x3 s2 pads 0,2,1,0 bias", Padded(new ConvArgs(3, 6, 7, 4, 3, 3) { Sh = 2, Sw = 2 }, 0, 2, 1, 0), true),
     ];
 
     private static bool ConvGeneral(IDevice<ulong, ulong>? ops, string where, bool blocks)

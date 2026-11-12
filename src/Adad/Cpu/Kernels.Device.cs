@@ -239,7 +239,6 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
 
     string IConvolution<byte[]>.Conv<TN>(ConvArgs a, byte[] x, byte[] w, byte[]? bias, byte[] y) => Conv<TN>(a, x, w, bias, y);
 
-    string IConvolution<byte[]>.ConvComposed<TN>(ConvArgs a, byte[] x, byte[] w, byte[] y) => ConvComposed<TN>(a, x, w, y);
 
     string IConvolution<byte[]>.ConvBackward<TN>(ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dx, byte[] dw, byte[]? db) => ConvBackward<TN>(a, x, w, dy, dx, dw, db);
 

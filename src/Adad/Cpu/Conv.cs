@@ -1,9 +1,9 @@
 // Copyright (c) 2026 Ahmed Seada
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
-// Convolution as the composition of Adad's own operations: the image to columns (im2col, exact in any type), the
-// product with the weights (the product kernel: tensor and dot lanes by the bounds), and back (col2im for the input's
-// gradient). One image at a time (C × H × W; the weights OC × C·kh·kw; the output OC × OH × OW):
+// The convolution (Abstraction/Conv.cs) as the composition of Adad's own operations: the image to columns (im2col, exact
+// in any type), the product with the weights (the product kernel: tensor and dot lanes by the bounds), and back (col2im
+// for the input's gradient). One image of one group (C × H × W; the weights OC × C·Kh·Kw; the output OC × OH × OW):
 //
 //   conv           y = w · im2col(x)
 //   conv_bwd_x     dx = col2im(wᵀ · dy)
@@ -15,7 +15,7 @@
 // dx; on the CPU dw's columns are read from the image the same way (the transposed packing, a k-range of a row a task).
 // The depthwise convolution is a layout operation (Layout.cs: a gather with weights).
 //
-// Images, groups, the bottom and right pads, a bias and an activation (ConvArgs; the float types) take the general path:
+// Images, groups, a bias and an activation (ConvArgs; the float types) take the general path:
 // the columns of every image's channels into the float lane's storage (exact), each image's and group's product with the
 // group's weights into the lane's sums, then y = act(sums + bias[f]) stored as the type once (Epilogue.cs ProductStore). Its backward:
 // dcols = w_gᵀ·dy_g in the lane, dx = col2im(dcols); dy and the columns laid side by side over the images (exact moves into
@@ -47,7 +47,7 @@ internal sealed partial class Kernels
         if (!a.Single || bias is not null)
         {
             var general = new MixedVisitor<ConvGeneralCall>(new ConvGeneralCall(a, x, w, bias, y));
-            if (!TN.TryFloat(ref general)) throw new NotSupportedException($"conv: images, groups, uneven pads, a bias or an activation take a float type, not {TN.Name}");
+            if (!TN.TryFloat(ref general)) throw new NotSupportedException($"conv: images, groups, a bias or an activation take a float type, not {TN.Name}");
             return general.Lane;
         }
 
@@ -71,7 +71,7 @@ internal sealed partial class Kernels
     }
 
     /// <summary>y = conv(x, w) by the composition: im2col, then the product.</summary>
-    public static string ConvComposed<TN>(ConvArgs a, byte[] x, byte[] w, byte[] y) where TN : struct, IAdad<TN>
+    private static string ConvComposed<TN>(ConvArgs a, byte[] x, byte[] w, byte[] y) where TN : struct, IAdad<TN>
     {
         var cols = new byte[BytesOf<TN>((long)a.Rows * a.Cols)];
         Layout<TN>(new LayoutArgs { Name = "im2col", X = x, P = a.P, Output = cols, Count = a.Rows * a.Cols, InputCount = (int)a.XValues });
@@ -95,6 +95,7 @@ internal sealed partial class Kernels
         public string Run<TN, TS, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
         {
             if (a.YValues == 0) return TL.Name;
+            a.ColumnsFit();
             int size = System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>(), G = a.Groups;
             var cols = new byte[a.ColValues * size];
             var sums = new byte[a.YValues * size];
@@ -113,6 +114,7 @@ internal sealed partial class Kernels
     {
         public string Run<TN, TS, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
         {
+            a.ColumnsFit();
             int size = System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>(), G = a.Groups, R = a.Rows, P = a.Cols, NP = a.N * a.Cols;
             var cols = new byte[a.ColValues * size];
             var dcols = new byte[a.ColValues * size];
