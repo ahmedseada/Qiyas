@@ -422,7 +422,7 @@ internal static partial class Ptx
 
             case "interpolate_nearest":
             {
-                // r = ch·OH + oh, c = ow; p: C H W OH OW αh βh δh αw βw δw: ih = min((oh·αh + βh) / δh, H − 1), iw likewise.
+                // r = ch·OH + oh, c = ow; p: C H W OH OW αh βh δh αw βw δw: ih the position nearest (oh·αh + βh) / δh (NearestAxis), iw likewise.
                 string H = p[1], W = p[2], OH = p[3], oh = b.R(), ch = b.R(), src = b.R();
                 b.L($"rem.u32 {oh}, {r}, {OH};");
                 b.L($"div.u32 {ch}, {r}, {OH};");
@@ -793,7 +793,7 @@ internal static partial class Ptx
     }
 
     // One axis of a bilinear resize: (i0, i1, fraction) for output index o over `inp` input and `outp` output pixels.
-    // An interpolation axis as integers (LayoutArgs.InterpolateAxis): t = max(o·α + β, 0), i0 = t / δ; past the input's
+    // A bilinear axis as integers (LayoutArgs.BilinearAt): t = max(o·α + β, 0), i0 = t / δ; past the input's
     // last position both rows the last and the weight 0; f = (t − i0·δ) / δ in the lane (one rounding), g = 1 − f.
     private static (string I0, string I1, string F, string G) BilinearAxis(PtxBuilder b, Lane lane, string o, string inp, string alpha, string beta, string delta)
     {
@@ -817,12 +817,16 @@ internal static partial class Ptx
         return (i0, i1, f, g);
     }
 
-    // A nearest axis: min((o·α + β) / δ, in − 1).
+    // A nearest axis (LayoutArgs.NearestAt): min(max(2(o·α + β) + δ, 0) / 2δ, in − 1), signed (β may be negative).
     private static string NearestAxis(PtxBuilder b, string o, string inp, string alpha, string beta, string delta)
     {
-        string i = b.R(), last = b.R();
-        b.L($"mad.lo.u32 {i}, {o}, {alpha}, {beta};");
-        b.L($"div.u32 {i}, {i}, {delta};");
+        string i = b.R(), d2 = b.R(), last = b.R();
+        b.L($"mad.lo.s32 {i}, {o}, {alpha}, {beta};");
+        b.L($"shl.b32 {i}, {i}, 1;");
+        b.L($"add.s32 {i}, {i}, {delta};");
+        b.L($"max.s32 {i}, {i}, 0;");
+        b.L($"shl.b32 {d2}, {delta}, 1;");
+        b.L($"div.u32 {i}, {i}, {d2};");
         b.L($"sub.u32 {last}, {inp}, 1;");
         b.L($"min.u32 {i}, {i}, {last};");
         return i;
@@ -852,21 +856,24 @@ internal static partial class Ptx
         string a1 = b.R();
         b.L($"selp.u32 {a1}, 1, {alpha}, {pa};");
         alpha = a1;
-        if (bilinear)
+        if (!bilinear)
         {
-            b.L($"sub.s32 {n}, {i}, 1;");
-            b.L($"mul.lo.s32 {n}, {n}, {delta};");
-            b.L($"sub.s32 {n}, {n}, {beta};");
-            string c0 = CeilDiv(n);
-            b.L($"setp.le.u32 {pz}, {i}, 1;");
-            b.L($"selp.b32 {lo}, 0, {c0}, {pz};");
+            // nearest: the floor of the map (2α, 2β + δ, 2δ)
+            string a2 = b.R(), b2 = b.R(), d2 = b.R();
+            b.L($"shl.b32 {a2}, {alpha}, 1;");
+            b.L($"shl.b32 {b2}, {beta}, 1;");
+            b.L($"add.s32 {b2}, {b2}, {delta};");
+            b.L($"shl.b32 {d2}, {delta}, 1;");
+            alpha = a2; beta = b2; delta = d2;
         }
-        else
-        {
-            b.L($"mul.lo.s32 {n}, {i}, {delta};");
-            b.L($"sub.s32 {n}, {n}, {beta};");
-            b.L($"mov.b32 {lo}, {CeilDiv(n)};");
-        }
+
+        // The first output reading position i (its first position i − 1 or i for bilinear, i for nearest), 0 for the first.
+        b.L($"sub.s32 {n}, {i}, {(bilinear ? 1 : 0)};");
+        b.L($"mul.lo.s32 {n}, {n}, {delta};");
+        b.L($"sub.s32 {n}, {n}, {beta};");
+        string c0 = CeilDiv(n);
+        b.L($"setp.le.u32 {pz}, {i}, {(bilinear ? 1 : 0)};");
+        b.L($"selp.b32 {lo}, 0, {c0}, {pz};");
 
         b.L($"add.s32 {m}, {i}, 1;");
         b.L($"mul.lo.s32 {m}, {m}, {delta};");

@@ -206,7 +206,7 @@ internal static partial class VkKernels
         return b.Select(p[12] != 0, d, inside);
     }
 
-    // An interpolation axis as integers (LayoutArgs.InterpolateAxis): t = max(o·α + β, 0) (β may be negative), i0 = t / δ;
+    // A bilinear axis as integers (LayoutArgs.BilinearAt): t = max(o·α + β, 0) (β may be negative), i0 = t / δ;
     // past the input's last position both rows the last and the weight 0; f = (t − i0·δ) / δ in the lane, g = 1 − f.
     private static (V I0, V I1, V F, V G) BilinearAxis(Spv b, K k, V o, V inp, V alpha, V beta, V delta)
     {
@@ -221,8 +221,13 @@ internal static partial class VkKernels
         return (i0, i1, f, b.C(k, 1) - f);
     }
 
-    // A nearest axis: min((o·α + β) / δ, in − 1).
-    private static V NearestAxis(V o, V inp, V alpha, V beta, V delta) => o.B.Min((o * alpha + beta) / delta, inp - 1);
+    // A nearest axis (LayoutArgs.NearestAt): min(max(2(o·α + β) + δ, 0) / 2δ, in − 1), signed (β may be negative).
+    private static V NearestAxis(V o, V inp, V alpha, V beta, V delta)
+    {
+        var b = o.B;
+        var t = b.Bitcast(b.Max(b.Bitcast(((o * alpha + beta) << 1) + delta, K.S32), b.S(0)), K.U32);
+        return b.Min(t / (delta << 1), inp - 1);
+    }
 
     // The outputs [lo, end) whose source rows include input row i (LayoutArgs.InterpolateSources, its hi + 1).
     private static (V Lo, V End) SourceRange(Spv b, bool bilinear, V i, V inp, V outp, V alpha, V beta, V delta)
@@ -231,7 +236,8 @@ internal static partial class VkKernels
         var a1 = b.Select(none, b.U(1), alpha);
         // ⌈n / α⌉ of a signed n, 0 where n ≤ 0 (the range starts at 0, or is empty).
         V CeilPos(V n) => b.Select(b.Bitcast(n, K.S32) > b.S(0), (n + a1 - 1) / a1, b.U(0));
-        var lo = bilinear ? b.Select(i <= 1, b.U(0), CeilPos((i - 1) * delta - beta)) : CeilPos(i * delta - beta);
+        if (!bilinear) { a1 = a1 << 1; beta = (beta << 1) + delta; delta = delta << 1; }    // nearest: the floor of the map (2α, 2β + δ, 2δ)
+        var lo = bilinear ? b.Select(i <= 1, b.U(0), CeilPos((i - 1) * delta - beta)) : b.Select(i == 0, b.U(0), CeilPos(i * delta - beta));
         var end = b.Min(b.Select(i == inp - 1, outp, CeilPos((i + 1) * delta - beta)), outp);
         return (b.Select(none, b.U(0), lo), b.Select(none, outp, end));
     }
@@ -337,7 +343,7 @@ internal static partial class VkKernels
 
             case "interpolate_nearest":
             {
-                // r = ch·OH + oh, c = ow; p: C H W OH OW αh βh δh αw βw δw: ih = min((oh·αh + βh) / δh, H − 1), iw likewise.
+                // r = ch·OH + oh, c = ow; p: C H W OH OW αh βh δh αw βw δw: ih the position nearest (oh·αh + βh) / δh (NearestAxis), iw likewise.
                 V H = p[1], W = p[2], OH = p[3];
                 var oh = r % OH;
                 var ch = r / OH;

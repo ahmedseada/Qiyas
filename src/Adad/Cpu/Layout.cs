@@ -12,9 +12,9 @@
 //              order (deterministic on both devices)
 //   im2col     x (C × H × W) to columns ((C·kh·kw) × (OH·OW)) for a kernel kh × kw, strides, pads, dilations;
 //   col2im     the reverse sum (each input pixel gathers its column entries in kernel order: exact order)
-//   interpolate   x (C × H × W) resized to (C × OH × OW), nearest or bilinear, its source positions exact in integers
-//              (half-pixel, align-corners or asymmetric coordinates, the scales given or in/out); its backward gathers
-//              each input position's outputs (LayoutArgs.InterpolateSources) with their weights
+//   interpolate   x (C × H × W) resized to (C × OH × OW), nearest or bilinear, along each axis the source coordinate
+//              s = (o·α + β) / δ exact in integers (LayoutArgs.NearestAt, BilinearAt); its backward gathers each input
+//              position's outputs (LayoutArgs.InterpolateSources) with their weights
 //   shift      output[r][c] = x[r][c − k] inside the row, 0 outside (k may be negative)
 //   pad2d      rows × cols into rows × newCols: the row's values then zeros (the operands of a product whose shape the
 //              product kernels' vector loads cannot take as stored)
@@ -536,7 +536,7 @@ internal sealed partial class Kernels
 
                         case "interpolate_nearest":
                         {
-                            // p: C H W OH OW αh βh δh αw βw δw (LayoutArgs.InterpolateAxis).
+                            // p: C H W OH OW αh βh δh αw βw δw (LayoutArgs.NearestAt).
                             int H = p[1], W = p[2], OH = p[3], OW = p[4];
                             int oh = r % OH, c = r / OH;
                             int ih = LayoutArgs.NearestAt(oh, H, p[5], p[6], p[7]);

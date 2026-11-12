@@ -47,7 +47,7 @@ public static class LayoutCases
         "scatter_add_rows" => $"{k.P[0]} into {k.P[2]}x{k.P[1]}",
         "im2col" or "col2im" => $"{k.P[0]}x{k.P[1]}x{k.P[2]} k{k.P[3]}x{k.P[4]}",
         "interpolate_nearest" or "interpolate_bilinear" or "interpolate_nearest_bwd" or "interpolate_bilinear_bwd" =>
-            $"{k.P[0]}x{k.P[1]}x{k.P[2]} to {k.P[3]}x{k.P[4]}{(k.P.Length > 5 ? $" mode {k.P[5]}" : "")}{(k.P.Length > 9 ? $" scale {k.P[6]}/{k.P[7]}, {k.P[8]}/{k.P[9]}" : "")}",
+            $"{k.P[0]}x{k.P[1]}x{k.P[2]} to {k.P[3]}x{k.P[4]}{(IsCentres(k.P) ? "" : $" maps ({k.P[5]}, {k.P[6]}, {k.P[7]}), ({k.P[8]}, {k.P[9]}, {k.P[10]})")}",
         "shift" => $"{k.P[0]}x{k.P[1]} by {k.P[2]}",
         "pad2d" => $"{k.P[0]}x{k.P[1]} to {k.P[2]}",
         "maxpool" or "avgpool" or "maxpool_bwd" or "avgpool_bwd" or "depthwise_conv" =>
@@ -57,6 +57,14 @@ public static class LayoutCases
     };
 
     private static int ConvCols(int[] p) { var (oh, ow) = LayoutArgs.ConvOut(p); return p[0] * p[3] * p[4] * oh * ow; }
+
+    // An interpolation C H W OH OW with a map an axis.
+    private static int[] Resize(int c, int h, int w, int oh, int ow, (int A, int B, int D) mh, (int A, int B, int D) mw) => [c, h, w, oh, ow, mh.A, mh.B, mh.D, mw.A, mw.B, mw.D];
+
+    // The resize by the centre maps at in/out (LayoutArgs.CentreMap).
+    private static int[] Centres(int c, int h, int w, int oh, int ow) => Resize(c, h, w, oh, ow, LayoutArgs.CentreMap(h, oh), LayoutArgs.CentreMap(w, ow));
+
+    private static bool IsCentres(int[] p) => p.AsSpan().SequenceEqual(Centres(p[0], p[1], p[2], p[3], p[4]));
 
     // The pools' gate shapes: C H W kh kw sh sw ph pw [dh dw ceil countIncludePad] — ceil mode (a last window past the input
     // and its pad), the pads counted by the divisor, both.
@@ -94,6 +102,9 @@ public static class LayoutCases
                 yield return Permuted(type, [2, 3, 2, 3, 2], [3, 0, 4, 2, 1], 55);
                 yield return Permuted(type, [2, 2, 2, 2, 2, 2, 2], [6, 5, 4, 3, 2, 1, 0], 56);
                 yield return Permuted(type, [2, 3, 1, 4, 5, 1, 2, 3], [4, 5, 6, 7, 0, 1, 2, 3], 57);
+                // Negative strides: a row reversed, and a transposition with its columns reversed (the tiled copy).
+                yield return Make(name, type, 9, null, [9, -1, 8], 9, 58);
+                yield return Make(name, type, 35, null, [5, 7, 1, -5, 30], 35, 59);
                 break;
             case "one_hot":
                 yield return Make(name, type, 1, Indices(37, 17, 64), [37, 17], 37 * 17, 64);
@@ -127,12 +138,18 @@ public static class LayoutCases
             case "interpolate_nearest_bwd":
             case "interpolate_bilinear_bwd":
             {
-                // Half-pixel (the default, and by given scales: 2 exactly, 3/2 where in/out is 5/7), align corners (bilinear),
-                // asymmetric (PyTorch's nearest), down and up.
-                bool bilinear = name.StartsWith("interpolate_bilinear", StringComparison.Ordinal), backward = name.EndsWith("_bwd", StringComparison.Ordinal);
-                var shapes = new List<int[]> { new[] { 3, 7, 9, 5, 11 }, new[] { 2, 7, 9, 13, 4 }, new[] { 1, 4, 6, 8, 12 },
-                    new[] { 1, 4, 6, 8, 12, 0, 1, 2, 1, 2 }, new[] { 1, 5, 5, 7, 7, 0, 2, 3, 2, 3 }, new[] { 2, 7, 9, 13, 4, 2 }, new[] { 2, 5, 5, 7, 7, 2, 2, 3, 2, 3 } };
-                if (bilinear) { shapes.Add([3, 7, 9, 5, 11, 1]); shapes.Add([2, 4, 6, 9, 1, 1]); }
+                // Maps: the centres at in/out, down and up, and at given scales (1/2 exactly; 2/3 where in/out is 5/7); the origins
+                // (s = o·scale); the corners (s = o·(in − 1)/(out − 1), and a constant α = 0 for an axis of one output); ties for
+                // nearest (s = 2o + ½); a map before the input's start (held at 0) and one past its end (held at the last).
+                bool backward = name.EndsWith("_bwd", StringComparison.Ordinal);
+                var shapes = new List<int[]>
+                {
+                    Centres(3, 7, 9, 5, 11), Centres(2, 7, 9, 13, 4), Centres(1, 4, 6, 8, 12),
+                    Resize(1, 4, 6, 8, 12, LayoutArgs.CentreMap(1, 2), LayoutArgs.CentreMap(1, 2)), Resize(1, 5, 5, 7, 7, LayoutArgs.CentreMap(2, 3), LayoutArgs.CentreMap(2, 3)),
+                    Resize(2, 7, 9, 13, 4, (7, 0, 13), (9, 0, 4)), Resize(2, 5, 5, 7, 7, (2, 0, 3), (2, 0, 3)),
+                    Resize(3, 7, 9, 5, 11, (6, 0, 4), (8, 0, 10)), Resize(2, 4, 6, 9, 1, (3, 0, 8), (0, 0, 1)),
+                    Centres(1, 8, 8, 4, 4), Resize(2, 6, 7, 5, 6, (3, -5, 2), (5, 3, 2)),
+                };
                 int seed = 72;
                 foreach (var p in shapes)
                 {
@@ -196,10 +213,10 @@ public static class LayoutCases
         "scatter_add_rows" => Make(name, type, 4096 * 4096, Indices(4096, 4096, 85), [4096, 4096, 4096], 4096 * 4096, 85),
         "im2col" => Make(name, type, 64 * 128 * 128, null, [64, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 0], ConvCols([64, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 0]), 86),
         "col2im" => Make(name, type, ConvCols([64, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 0]), null, [64, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 0], 64 * 128 * 128, 87),
-        "interpolate_nearest" => Make(name, type, 16 * 512 * 512, null, [16, 512, 512, 1024, 1024], 16 * 1024 * 1024, 88),
-        "interpolate_bilinear" => Make(name, type, 16 * 512 * 512, null, [16, 512, 512, 1024, 1024], 16 * 1024 * 1024, 89),
-        "interpolate_nearest_bwd" => Make(name, type, 16 * 1024 * 1024, null, [16, 512, 512, 1024, 1024], 16 * 512 * 512, 88),
-        "interpolate_bilinear_bwd" => Make(name, type, 16 * 1024 * 1024, null, [16, 512, 512, 1024, 1024], 16 * 512 * 512, 89),
+        "interpolate_nearest" => Make(name, type, 16 * 512 * 512, null, Centres(16, 512, 512, 1024, 1024), 16 * 1024 * 1024, 88),
+        "interpolate_bilinear" => Make(name, type, 16 * 512 * 512, null, Centres(16, 512, 512, 1024, 1024), 16 * 1024 * 1024, 89),
+        "interpolate_nearest_bwd" => Make(name, type, 16 * 1024 * 1024, null, Centres(16, 512, 512, 1024, 1024), 16 * 512 * 512, 88),
+        "interpolate_bilinear_bwd" => Make(name, type, 16 * 1024 * 1024, null, Centres(16, 512, 512, 1024, 1024), 16 * 512 * 512, 89),
         "shift" => Make(name, type, 4096 * 4096, null, [4096, 4096, 3], 4096 * 4096, 90),
         "pad2d" => Make(name, type, 4096 * 4093, null, [4096, 4093, 4096], 4096 * 4096, 91),
         // 64 channels of 256 × 256: 2 × 2 windows at stride 2 (the common pool), 3 × 3 depthwise at stride 1
