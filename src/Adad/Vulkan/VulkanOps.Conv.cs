@@ -5,11 +5,12 @@
 // kernel with its B tile gathered from the image, Kernels.Products.cs MatMulConv; no columns in memory) or the
 // composition (im2col, then the product) where this device measures that faster, once per shape and type; both the same
 // tile loop over the same values, so the same result. The lane is the product's by the bounds of the weights and the
-// image's values with 0 (the padding). The backward in the type's float lane, on the type's own tensors: dcols = wᵀ·dy
-// (an intermediate: lane storage) with w and dy read where they are stored, dx = col2im(dcols); dw = dy · colsᵀ with the
-// columns gathered from the image where it is stored; the gradients lane values (the type's own storage for float32 and
-// float64, else stored as the type once after; a block format's by its encoder). A block format's forward is fused: its
-// composition would encode the columns as blocks (each window's values quantized again).
+// image's values with 0 (the padding). The backward on the type's own tensors, every type: dcols = wᵀ·dy (an intermediate:
+// lane storage) with w and dy read where they are stored, dx = col2im(dcols) stored as the type once; dw = dy · colsᵀ with
+// the columns gathered from the image where it is stored, the lane's values (the type's own storage where the lane's is,
+// else stored as the type once after; a block format's by its encoder). dx's sums and dw's (and db's) each in the lane
+// SumLane gives for their bounds: a float type's float lane, an integer type's exact one (BackwardLanes). A block
+// format's forward is fused: its composition would encode the columns as blocks (each window's values quantized again).
 // Images, groups, a bias and an activation (the float types) take the general path (Conv.cs),
 // CUDA's: the columns of every image's channels into lane storage, a product an image and group into the lane's sums, then
 // y = act(sums + bias[f]) stored once (Kernels.ProductStore.cs); its backward: dcols = w_gᵀ·dy_g, dx = col2im(dcols); dy and
@@ -35,7 +36,7 @@ public sealed partial class VulkanOps
         var lane = RowLane(f);
         if (a.YValues == 0) return lane.Name;
         a.ColumnsFit();
-        var lf = LaneFormat(lane);
+        var lf = VkKernels.LaneFormat(lane);
         var rented = new List<ulong>();
         ulong Rent(long bytes) { ulong p = vk.Rent(Math.Max(16, bytes)); rented.Add(p); return p; }
         try
@@ -53,57 +54,88 @@ public sealed partial class VulkanOps
         return lane.Name;
     }
 
-    // The float lane's own format.
-    private static Fmt LaneFormat(Lane lane) => lane.Wide ? new Fmt("float64", 64, true, true) : new Fmt("float32", 32, true, true);
-
     // A layout into lane storage (the lane's own type), its input read as inFmt where it is stored (null: lane storage too).
     private void LaneLayout(Lane lane, LayoutArgs k, ulong x, ulong output, Fmt? inFmt)
     {
-        if (lane.Wide) Layout<Float64>(k, x, 0, output, 0, inFmt);
-        else Layout<Float32>(k, x, 0, output, 0, inFmt);
+        if (lane == Lane.F32) Layout<Float32>(k, x, 0, output, 0, inFmt);
+        else if (lane == Lane.F64) Layout<Float64>(k, x, 0, output, 0, inFmt);
+        else if (lane == Lane.S32) Layout<Adad.Abstraction.Int32>(k, x, 0, output, 0, inFmt);
+        else if (lane == Lane.U32) Layout<Adad.Abstraction.UInt32>(k, x, 0, output, 0, inFmt);
+        else if (lane == Lane.S64) Layout<Adad.Abstraction.Int64>(k, x, 0, output, 0, inFmt);
+        else Layout<Adad.Abstraction.UInt64>(k, x, 0, output, 0, inFmt);
     }
 
-    /// <summary>The general backward (dx, dw, db: see the file's note); returns the lane's name.</summary>
-    public string ConvBackward<TN>(ConvArgs a, ulong x, ulong w, ulong dy, ulong dx, ulong dw, ulong db) where TN : struct, IFloatAdad<TN>
+    // count ones in the lane's storage.
+    private static byte[] LaneOnes(Lane lane, int count)
+    {
+        var one = new double[count];
+        Array.Fill(one, 1.0);
+        if (lane == Lane.F32) return Stored.StoreValues<Float32>(one);
+        if (lane == Lane.F64) return Stored.StoreValues<Float64>(one);
+        var bytes = new byte[(long)count * lane.Size];
+        if (lane.Size == 4) System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(bytes.AsSpan()).Fill(1);
+        else System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(bytes.AsSpan()).Fill(1);
+        return bytes;
+    }
+
+    /// <summary>The backward's lanes (SumLane by the bounds): dx's (w·dy: OCg·Kh·Kw terms a value at most) and dw's and db's
+    /// (dy·x and dy·1 over the images' positions); a float type's float lane for both.</summary>
+    private (Lane DX, Lane DW) BackwardLanes<TN>(ConvArgs a, ulong x, ulong w, ulong dy) where TN : struct, IAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        if (f.IsFloat) return (RowLane(f), RowLane(f));
+        var (wLo, wHi) = Range<TN>(w, (int)a.WValues);
+        var (xLo, xHi) = Range<TN>(x, (int)a.XValues);
+        var (dLo, dHi) = Range<TN>(dy, (int)a.YValues);
+        return (SumLane(f, new Bounds(wLo, wHi, dLo, dHi, (long)a.OCg * a.Kh * a.Kw)),
+                SumLane(f, new Bounds(dLo, dHi, Math.Min(xLo, 0), Math.Max(xHi, 1), (long)a.N * a.Cols)));
+    }
+
+    // The lane names a backward returns: dx's, and dw's after it where it differs.
+    private static string LanesName(Lane dx, Lane dw) => dx == dw ? dx.Name : $"{dx.Name}; dw in {dw.Name}";
+
+    // Whether the lane's values are the type's own storage (a product writes them in place).
+    private static bool Direct(Fmt f, Lane lane) => !f.IsBlock && f.Natural.Name == lane.Name && f.Bits == lane.Size * 8;
+
+    /// <summary>The general backward (dx, dw, db: see the file's note); returns the lanes' names.</summary>
+    public string ConvBackward<TN>(ConvArgs a, ulong x, ulong w, ulong dy, ulong dx, ulong dw, ulong db) where TN : struct, IAdad<TN>
     {
         a.Validate();
         if (a.Single && db == 0) return ConvBackward<TN>(a, x, w, dy, dx, dw);
         a.ColumnsFit();
         var f = Fmt.Of<TN>();
-        var lane = RowLane(f);
-        var lf = LaneFormat(lane);
+        var (lx, lw) = BackwardLanes<TN>(a, x, w, dy);
+        Fmt fx = VkKernels.LaneFormat(lx), fw = VkKernels.LaneFormat(lw);
         int G = a.Groups, R = a.Rows, P = a.Cols, NP = a.N * a.Cols;
         var rented = new List<ulong>();
         ulong Rent(long bytes) { ulong p = vk.Rent(Math.Max(16, bytes)); rented.Add(p); return p; }
         try
         {
-            ulong cols = Rent(a.ColValues * lane.Size), dcols = Rent(a.ColValues * lane.Size), dyp = Rent((long)a.OC * NP * lane.Size), colsp = Rent(a.ColValues * lane.Size);
-            ulong ldw = Rent(a.WValues * lane.Size);
-            LaneLayout(lane, new LayoutArgs { Name = "im2col", X = [], P = a.ImagesP, Output = [], Count = (int)a.ColValues, InputCount = (int)a.XValues }, x, cols, f);
+            ulong cols = Rent(a.ColValues * lw.Size), dcols = Rent(a.ColValues * lx.Size), dyp = Rent((long)a.OC * NP * lw.Size), colsp = Rent(a.ColValues * lw.Size);
+            ulong ldw = Rent(a.WValues * lw.Size);
+            LaneLayout(lw, new LayoutArgs { Name = "im2col", X = [], P = a.ImagesP, Output = [], Count = (int)a.ColValues, InputCount = (int)a.XValues }, x, cols, f);
             for (int n = 0; n < a.N; n++)
                 for (int g = 0; g < G; g++)
-                    Product(new ProductView(R, P, a.OCg, true, false), lane, w, f, (long)g * a.OCg * R, dy, f, ((long)n * a.OC + g * a.OCg) * P,
-                        dcols + (ulong)((long)(n * G + g) * R * P * lane.Size));                                                                  // w_gᵀ · dy_g
-            Layout<TN>(new LayoutArgs { Name = "col2im", X = [], P = a.ImagesP, Output = [], Count = (int)a.XValues, InputCount = (int)a.ColValues }, dcols, 0, dx, 0, lf);
-            LaneLayout(lane, new LayoutArgs { Name = "strided", X = [], P = [1, a.OC, a.N, P, 0, P, a.OC * P, 1, 0], Output = [], Count = a.OC * NP, InputCount = (int)a.YValues }, dy, dyp, f);
-            LaneLayout(lane, new LayoutArgs { Name = "strided", X = [], P = [1, G * R, a.N, P, 0, P, G * R * P, 1, 0], Output = [], Count = (int)a.ColValues, InputCount = (int)a.ColValues }, cols, colsp, null);
+                    Product(new ProductView(R, P, a.OCg, true, false), lx, w, f, (long)g * a.OCg * R, dy, f, ((long)n * a.OC + g * a.OCg) * P,
+                        dcols + (ulong)((long)(n * G + g) * R * P * lx.Size));                                                                    // w_gᵀ · dy_g
+            Layout<TN>(new LayoutArgs { Name = "col2im", X = [], P = a.ImagesP, Output = [], Count = (int)a.XValues, InputCount = (int)a.ColValues }, dcols, 0, dx, 0, fx);
+            LaneLayout(lw, new LayoutArgs { Name = "strided", X = [], P = [1, a.OC, a.N, P, 0, P, a.OC * P, 1, 0], Output = [], Count = a.OC * NP, InputCount = (int)a.YValues }, dy, dyp, f);
+            LaneLayout(lw, new LayoutArgs { Name = "strided", X = [], P = [1, G * R, a.N, P, 0, P, G * R * P, 1, 0], Output = [], Count = (int)a.ColValues, InputCount = (int)a.ColValues }, cols, colsp, null);
             for (int g = 0; g < G; g++)
-                Product(new ProductView(a.OCg, R, NP, false, true), lane, dyp, lf, (long)g * a.OCg * NP, colsp, lf, (long)g * R * NP, ldw + (ulong)((long)g * a.OCg * R * lane.Size));   // dy_g · cols_gᵀ
-            Back(f, lane, ldw, dw, a.WValues);
+                Product(new ProductView(a.OCg, R, NP, false, true), lw, dyp, fw, (long)g * a.OCg * NP, colsp, fw, (long)g * R * NP, ldw + (ulong)((long)g * a.OCg * R * lw.Size));   // dy_g · cols_gᵀ
+            Back(f, lw, ldw, dw, a.WValues);
             if (db != 0)
             {
                 // Each channel's Σ dy: its row of dy (every image's positions) times ones.
-                ulong ones = Rent((long)NP * lane.Size), ldb = Rent((long)a.OC * lane.Size);
-                var one = new double[NP];
-                Array.Fill(one, 1.0);
-                vk.Upload<byte>(lane.Wide ? Stored.StoreValues<Float64>(one) : Stored.StoreValues<Float32>(one), ones);
-                Product(new ProductView(a.OC, 1, NP, false, false), lane, dyp, lf, 0, ones, lf, 0, ldb);
-                Back(f, lane, ldb, db, a.OC);
+                ulong ones = Rent((long)NP * lw.Size), ldb = Rent((long)a.OC * lw.Size);
+                vk.Upload<byte>(LaneOnes(lw, NP), ones);
+                Product(new ProductView(a.OC, 1, NP, false, false), lw, dyp, fw, 0, ones, fw, 0, ldb);
+                Back(f, lw, ldb, db, a.OC);
             }
         }
         finally { foreach (var p in rented) vk.Return(p); }
 
-        return lane.Name;
+        return LanesName(lx, lw);
     }
 
     /// <summary>y = conv(x, w) of one image of one group; returns the product's lane.</summary>
@@ -185,31 +217,25 @@ public sealed partial class VulkanOps
         vk.Launch(fn, Groups(n, VkKernels.TileN), (uint)((m + VkKernels.TileM - 1) / VkKernels.TileM), args);
     }
 
-    /// <summary>dx and dw from dy in the type's float lane; returns the lane's name.</summary>
-    public string ConvBackward<TN>(ConvArgs a, ulong x, ulong w, ulong dy, ulong dx, ulong dw) where TN : struct, IFloatAdad<TN>
+    /// <summary>dx and dw from dy (one image of one group) in the backward's lanes (BackwardLanes); returns their names.</summary>
+    public string ConvBackward<TN>(ConvArgs a, ulong x, ulong w, ulong dy, ulong dx, ulong dw) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        var lane = RowLane(f);
-        bool own = Own(f);
+        var (lx, lw) = BackwardLanes<TN>(a, x, w, dy);
+        bool direct = Direct(f, lw);
         var rented = new List<ulong>();
         try
         {
             ulong Rent(long bytes) { ulong p = vk.Rent(bytes); rented.Add(p); return p; }
-            ulong dcols = Rent(Math.Max(1, (long)a.Rows * a.Cols) * lane.Size);
-            ulong ldx = own ? dx : Rent(Math.Max(1, a.XValues) * lane.Size), ldw = own ? dw : Rent(Math.Max(1, a.WValues) * lane.Size);
-            // dcols = wᵀ·dy (an intermediate), dx = col2im(dcols) in the lane.
-            Product(new ProductView(a.Rows, a.Cols, a.OC, true, false), lane, w, f, 0, dy, f, 0, dcols);
-            var col2im = new LayoutArgs { Name = "col2im", X = [], P = a.P, Output = [], Count = (int)a.XValues, InputCount = a.Rows * a.Cols };
-            if (lane.Wide) Layout<Float64>(col2im, dcols, 0, ldx, 0); else Layout<Float32>(col2im, dcols, 0, ldx, 0);
-            // dw = dy · colsᵀ, the columns gathered from the image where it is stored.
-            ConvProduct(f, f, lane, dy, x, ldw, a.OC, a.Rows, a.Cols, a, transB: true);
-            if (!own)
-            {
-                Back(f, lane, ldx, dx, a.XValues);
-                Back(f, lane, ldw, dw, a.WValues);
-            }
-
-            return lane.Name;
+            ulong dcols = Rent(Math.Max(1, (long)a.Rows * a.Cols) * lx.Size);
+            ulong ldw = direct ? dw : Rent(Math.Max(1, a.WValues) * lw.Size);
+            // dcols = wᵀ·dy (an intermediate) in dx's lane; dx = col2im(dcols), its sums in that lane, stored as the type once.
+            Product(new ProductView(a.Rows, a.Cols, a.OC, true, false), lx, w, f, 0, dy, f, 0, dcols);
+            Layout<TN>(new LayoutArgs { Name = "col2im", X = [], P = a.P, Output = [], Count = (int)a.XValues, InputCount = a.Rows * a.Cols }, dcols, 0, dx, 0, VkKernels.LaneFormat(lx));
+            // dw = dy · colsᵀ in dw's lane, the columns gathered from the image where it is stored.
+            ConvProduct(f, f, lw, dy, x, ldw, a.OC, a.Rows, a.Cols, a, transB: true);
+            if (!direct) Back(f, lw, ldw, dw, a.WValues);
+            return LanesName(lx, lw);
         }
         finally
         {

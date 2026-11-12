@@ -3,8 +3,9 @@
 
 // The convolution's general path (Conv.cs) on every device against its float64 reference: images, groups (a group a
 // channel, two filters each, among them), uneven pads, a bias and an activation, every float type (the block formats
-// among them); the backward's dx, dw and db over the same shapes. Within the lane's rounding of each value's sums (and the
-// activation's own rounding) plus the type's step.
+// among them); the backward's dx, dw and db over the same shapes, every type. Within the lane's rounding of each value's
+// sums (and the activation's own rounding) plus the type's step; an integer type's backward exactly (its lanes exact, each
+// gradient its one rounding: the type's own conversion).
 namespace Qiyas;
 
 internal static partial class Checks
@@ -25,23 +26,27 @@ internal static partial class Checks
         bool ok = true;
         foreach (var type in Bench.Registry.Names)
         {
-            if (!Bench.Registry.IsFloat(type) || (!blocks && Bench.Registry.IsBlock(type))) continue;
+            if (!blocks && Bench.Registry.IsBlock(type)) continue;
+            bool floats = Bench.Registry.IsFloat(type);
             foreach (var (name, a, hasBias) in GeneralConvs)
             {
                 var x = Bench.Registry.Make(type, (int)a.XValues, 67, -1, 1);
                 var w = Bench.Registry.Make(type, (int)a.WValues, 68, -1, 1);
-                var bias = hasBias ? Bench.Registry.Make(type, a.OC, 69, -1, 1) : null;
                 var xv = Bench.Registry.Values(type, x, (int)a.XValues);
                 var wv = Bench.Registry.Values(type, w, (int)a.WValues);
-                var bv = bias is null ? null : Bench.Registry.Values(type, bias, a.OC);
-                var want = a.Reference(xv, wv, bv);
-                var pre = (a with { Act = null }).Reference(xv, wv, bv);
-                var scale = a.Scale(xv, wv, bv);
-                var y = new byte[Bench.Registry.Bytes(type, a.YValues)];
-                Bench.Registry.WithFloat(type, new ConvGeneralRun(ops, a, x, w, bias, y));
-                // The sums' rounding through the activation (its slope at most 1.2), and the activation's own.
-                double worst = Excess(type, $"conv {name}", y, want, i => 1.25 * (a.Rows + 2) * scale[i] + 64 * (Math.Abs(want[i]) + Math.Abs(pre[i])), 1);
-                if (worst > 0) { Console.WriteLine($"check conv {name,-48} {where,-6} {type,-12} DIFFERS by {worst:0.##}"); ok = false; }
+                if (floats)
+                {
+                    var bias = hasBias ? Bench.Registry.Make(type, a.OC, 69, -1, 1) : null;
+                    var bv = bias is null ? null : Bench.Registry.Values(type, bias, a.OC);
+                    var want = a.Reference(xv, wv, bv);
+                    var pre = (a with { Act = null }).Reference(xv, wv, bv);
+                    var scale = a.Scale(xv, wv, bv);
+                    var y = new byte[Bench.Registry.Bytes(type, a.YValues)];
+                    Bench.Registry.WithFloat(type, new ConvGeneralRun(ops, a, x, w, bias, y));
+                    // The sums' rounding through the activation (its slope at most 1.2), and the activation's own.
+                    double worst = Excess(type, $"conv {name}", y, want, i => 1.25 * (a.Rows + 2) * scale[i] + 64 * (Math.Abs(want[i]) + Math.Abs(pre[i])), 1);
+                    if (worst > 0) { Console.WriteLine($"check conv {name,-48} {where,-6} {type,-12} DIFFERS by {worst:0.##}"); ok = false; }
+                }
 
                 // The backward: dy the gradient of the sums plus the bias.
                 var dy = Bench.Registry.Make(type, (int)a.YValues, 70, -1, 1);
@@ -49,10 +54,16 @@ internal static partial class Checks
                 var (wantX, wantW, wantB) = a.ReferenceBackward(xv, wv, dyv);
                 var (sx, sw, sb) = a.ReferenceBackward(xv.Select(Math.Abs).ToArray(), wv.Select(Math.Abs).ToArray(), dyv.Select(Math.Abs).ToArray());
                 byte[] dx = new byte[x.Length], dw = new byte[w.Length], db = new byte[Bench.Registry.Bytes(type, a.OC)];
-                Bench.Registry.WithFloat(type, new ConvGeneralBackwardRun(ops, a, x, w, dy, dx, dw, db));
+                Bench.Registry.With(type, new ConvGeneralBackwardRun(ops, a, x, w, dy, dx, dw, db));
                 int kx = a.OCg * a.Kh * a.Kw + 2, kw = a.N * a.Cols + 2;
                 foreach (var (what, got, reference, s, k) in new[] { ("dx", dx, wantX, sx, kx), ("dw", dw, wantW, sw, kw), ("db", db, wantB, sb, kw) })
                 {
+                    if (!floats)
+                    {
+                        ok &= Close(type, $"conv_bwd {what} {name}", where, got, reference, reference.Length);
+                        continue;
+                    }
+
                     double bad = Excess(type, $"conv_bwd {what} {name}", got, reference, i => k * s[i], 1);
                     if (bad > 0) { Console.WriteLine($"check conv_bwd {what} {name,-44} {where,-6} {type,-12} DIFFERS by {bad:0.##}"); ok = false; }
                 }
@@ -74,9 +85,9 @@ internal static partial class Checks
         }
     }
 
-    private sealed class ConvGeneralBackwardRun(IDevice<ulong, ulong>? ops, ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dx, byte[] dw, byte[] db) : Bench.IFloatTypeVisitor<string>
+    private sealed class ConvGeneralBackwardRun(IDevice<ulong, ulong>? ops, ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dx, byte[] dw, byte[] db) : Bench.ITypeVisitor<string>
     {
-        public string Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        public string Visit<TN>() where TN : struct, IAdad<TN, float>
         {
             if (ops is null) return CpuDevice.Device.ConvBackward<TN>(a, x, w, dy, dx, dw, db);
             using var st = new Staged(ops);

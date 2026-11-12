@@ -643,7 +643,6 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         string shape = $"{a.C}x{a.H}x{a.W} by {a.OC} of {a.Kh}x{a.Kw}";
         if (name == "conv_bwd")
         {
-            if (!Registry.IsFloat(type)) return;
             var dy = Registry.Make(type, (int)a.YValues, 63, -1, 1);
             var (wantX, _, _) = a.ReferenceBackward(Registry.Values(type, x, (int)a.XValues), Registry.Values(type, w, (int)a.WValues), Registry.Values(type, dy, (int)a.YValues));
             var dw = new byte[w.Length];

@@ -10,12 +10,15 @@
 //                               product: Gemm2, the sliced float64 route) where this device measures that faster, once
 //                               per shape and type by Measure.Faster, the decision in --report.
 // The backward is the composition (im2col and col2im around the products), on the type's own tensors: the columns of
-// dw's product gathered from the image by the product kernel (transposed), dx's columns an f32 intermediate.
+// dw's product gathered from the image by the product kernel (transposed), dx's columns an intermediate in lane storage.
+// Every type: dx's sums (w·dy, OCg·Kh·Kw terms a value) and dw's (dy·x over the images' positions; db's dy's alone) each in
+// the lane SumLane gives for their bounds (a float type's float lane; an integer type's exact one), each output stored as
+// the type once (BackwardLanes).
 // Images, groups, a bias and an activation (the float types) take the general path (Conv.cs):
 // the columns of every image's channels into lane storage (im2col reading the image where it is stored), a stored-mode
 // product a group over the images into the lane's sums, then Ptx.ProductStore: y = act(sums + bias[f]) stored once. Its
-// backward: dcols = w_gᵀ·dy_g, dx = col2im(dcols); dy and the columns side by side over the images in the lane (exact
-// moves), dw_g = dy_g·cols_gᵀ, db = dy's rows times ones; dw and db stored as the type once.
+// backward (every type): dcols = w_gᵀ·dy_g, dx = col2im(dcols); dy and the columns side by side over the images in the
+// lane (exact moves), dw_g = dy_g·cols_gᵀ, db = dy's rows times ones; dw and db stored as the type once.
 using Adad.Abstraction;
 // The integer types by their names here, not System's.
 using Int32 = Adad.Abstraction.Int32;
@@ -42,7 +45,7 @@ public sealed partial class GpuOps
         var lane = RowLane(f);
         if (a.YValues == 0) return lane.Name;
         a.ColumnsFit();
-        var lf = LaneFormat(lane);
+        var lf = Ptx.LaneFormat(lane);
         var rented = new List<ulong>();
         ulong Rent(long bytes) { ulong p = gpu.Rent(Math.Max(16, bytes)); rented.Add(p); return p; }
         try
@@ -68,57 +71,84 @@ public sealed partial class GpuOps
         else Gpu.Launch(fn, Grid(f.Words(count), 256), 1, 256, 1, 0, args);
     }
 
-    // The float lane's own format.
-    private static Fmt LaneFormat(Lane lane) => lane.Wide ? new Fmt("float64", 64, true, true) : new Fmt("float32", 32, true, true);
-
     // A layout into lane storage (the lane's own type), its input read as inFmt where it is stored (null: lane storage too).
     private void LaneLayout(Lane lane, LayoutArgs k, ulong x, ulong output, Fmt? inFmt)
     {
-        if (lane.Wide) Layout<Float64>(k, x, 0, output, 0, inFmt);
-        else Layout<Float32>(k, x, 0, output, 0, inFmt);
+        if (lane == Lane.F32) Layout<Float32>(k, x, 0, output, 0, inFmt);
+        else if (lane == Lane.F64) Layout<Float64>(k, x, 0, output, 0, inFmt);
+        else if (lane == Lane.S32) Layout<Int32>(k, x, 0, output, 0, inFmt);
+        else if (lane == Lane.U32) Layout<UInt32>(k, x, 0, output, 0, inFmt);
+        else if (lane == Lane.S64) Layout<Int64>(k, x, 0, output, 0, inFmt);
+        else Layout<UInt64>(k, x, 0, output, 0, inFmt);
     }
 
-    /// <summary>The general backward (dx, dw, db: see the file's note); returns the lane's name.</summary>
+    // count ones in the lane's storage.
+    private static byte[] LaneOnes(Lane lane, int count)
+    {
+        var one = new double[count];
+        Array.Fill(one, 1.0);
+        if (lane == Lane.F32) return Stored.StoreValues<Float32>(one);
+        if (lane == Lane.F64) return Stored.StoreValues<Float64>(one);
+        var bytes = new byte[(long)count * lane.Size];
+        if (lane.Size == 4) System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(bytes.AsSpan()).Fill(1);
+        else System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(bytes.AsSpan()).Fill(1);
+        return bytes;
+    }
+
+    /// <summary>The backward's lanes (SumLane by the bounds): dx's (w·dy: OCg·Kh·Kw terms a value at most) and dw's and db's
+    /// (dy·x and dy·1 over the images' positions); a float type's float lane for both.</summary>
+    private (Lane DX, Lane DW) BackwardLanes<TN>(ConvArgs a, ulong x, ulong w, ulong dy) where TN : struct, IAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        if (f.IsFloat) return (RowLane(f), RowLane(f));
+        var ((wLo, wHi), (xLo, xHi)) = RangePair<TN>(w, (int)a.WValues, x, (int)a.XValues);
+        var (dLo, dHi) = Range<TN>(dy, (int)a.YValues);
+        return (SumLane(f, new Bounds(wLo, wHi, dLo, dHi, (long)a.OCg * a.Kh * a.Kw)),
+                SumLane(f, new Bounds(dLo, dHi, Math.Min(xLo, 0), Math.Max(xHi, 1), (long)a.N * a.Cols)));
+    }
+
+    // The lane names a backward returns: dx's, and dw's after it where it differs.
+    private static string LanesName(Lane dx, Lane dw) => dx == dw ? dx.Name : $"{dx.Name}; dw in {dw.Name}";
+
+    /// <summary>The general backward (dx, dw, db: see the file's note); returns the lanes' names.</summary>
     public string ConvBackward<TN>(ConvArgs a, ulong x, ulong w, ulong dy, ulong dx, ulong dw, ulong db) where TN : struct, IAdad<TN>
     {
         a.Validate();
         if (a.Single && db == 0) return ConvBackward<TN>(a, x, w, dy, dx, dw);
         a.ColumnsFit();
         var f = Fmt.Of<TN>();
-        var lane = RowLane(f);
-        var lf = LaneFormat(lane);
+        var (lx, lw) = BackwardLanes<TN>(a, x, w, dy);
+        Fmt fx = Ptx.LaneFormat(lx), fw = Ptx.LaneFormat(lw);
         int G = a.Groups, R = a.Rows, P = a.Cols, NP = a.N * a.Cols;
         var rented = new List<ulong>();
         ulong Rent(long bytes) { ulong p = gpu.Rent(Math.Max(16, bytes)); rented.Add(p); return p; }
         try
         {
-            ulong cols = Rent(a.ColValues * lane.Size), dcols = Rent(a.ColValues * lane.Size), dyp = Rent((long)a.OC * NP * lane.Size), colsp = Rent(a.ColValues * lane.Size);
-            ulong ldw = Rent(a.WValues * lane.Size);
-            LaneLayout(lane, new LayoutArgs { Name = "im2col", X = [], P = a.ImagesP, Output = [], Count = (int)a.ColValues, InputCount = (int)a.XValues }, x, cols, f);
+            ulong cols = Rent(a.ColValues * lw.Size), dcols = Rent(a.ColValues * lx.Size), dyp = Rent((long)a.OC * NP * lw.Size), colsp = Rent(a.ColValues * lw.Size);
+            ulong ldw = Rent(a.WValues * lw.Size);
+            LaneLayout(lw, new LayoutArgs { Name = "im2col", X = [], P = a.ImagesP, Output = [], Count = (int)a.ColValues, InputCount = (int)a.XValues }, x, cols, f);
             for (int g = 0; g < G; g++)
-                ProductStored(new ProductView(R, P, a.OCg, true, false, a.N, 0, (long)a.OC * P, (long)G * R * P), lane,
-                    w, f, (long)g * a.OCg * R, dy, f, (long)g * a.OCg * P, dcols + (ulong)((long)g * R * P * lane.Size), null);                  // w_gᵀ · dy_g
-            Layout<TN>(new LayoutArgs { Name = "col2im", X = [], P = a.ImagesP, Output = [], Count = (int)a.XValues, InputCount = (int)a.ColValues }, dcols, 0, dx, 0, lf);
-            LaneLayout(lane, new LayoutArgs { Name = "strided", X = [], P = [1, a.OC, a.N, P, 0, P, a.OC * P, 1, 0], Output = [], Count = a.OC * NP, InputCount = (int)a.YValues }, dy, dyp, f);
-            LaneLayout(lane, new LayoutArgs { Name = "strided", X = [], P = [1, G * R, a.N, P, 0, P, G * R * P, 1, 0], Output = [], Count = (int)a.ColValues, InputCount = (int)a.ColValues }, cols, colsp, null);
+                ProductStored(new ProductView(R, P, a.OCg, true, false, a.N, 0, (long)a.OC * P, (long)G * R * P), lx,
+                    w, f, (long)g * a.OCg * R, dy, f, (long)g * a.OCg * P, dcols + (ulong)((long)g * R * P * lx.Size), null);                  // w_gᵀ · dy_g
+            Layout<TN>(new LayoutArgs { Name = "col2im", X = [], P = a.ImagesP, Output = [], Count = (int)a.XValues, InputCount = (int)a.ColValues }, dcols, 0, dx, 0, fx);
+            LaneLayout(lw, new LayoutArgs { Name = "strided", X = [], P = [1, a.OC, a.N, P, 0, P, a.OC * P, 1, 0], Output = [], Count = a.OC * NP, InputCount = (int)a.YValues }, dy, dyp, f);
+            LaneLayout(lw, new LayoutArgs { Name = "strided", X = [], P = [1, G * R, a.N, P, 0, P, G * R * P, 1, 0], Output = [], Count = (int)a.ColValues, InputCount = (int)a.ColValues }, cols, colsp, null);
             for (int g = 0; g < G; g++)
-                ProductStored(new ProductView(a.OCg, R, NP, false, true), lane, dyp, lf, (long)g * a.OCg * NP, colsp, lf, (long)g * R * NP,
-                    ldw + (ulong)((long)g * a.OCg * R * lane.Size), null);                                                                    // dy_g · cols_gᵀ
-            Back(f, lane, ldw, dw, a.WValues);
+                ProductStored(new ProductView(a.OCg, R, NP, false, true), lw, dyp, fw, (long)g * a.OCg * NP, colsp, fw, (long)g * R * NP,
+                    ldw + (ulong)((long)g * a.OCg * R * lw.Size), null);                                                                    // dy_g · cols_gᵀ
+            Back(f, lw, ldw, dw, a.WValues);
             if (db != 0)
             {
                 // Each channel's Σ dy: its row of dy (every image's positions) times ones.
-                ulong ones = Rent((long)NP * lane.Size), ldb = Rent((long)a.OC * lane.Size);
-                var one = new double[NP];
-                Array.Fill(one, 1.0);
-                Gpu.Upload<byte>(lane.Wide ? Stored.StoreValues<Float64>(one) : Stored.StoreValues<Float32>(one), ones);
-                ProductStored(new ProductView(a.OC, 1, NP, false, false), lane, dyp, lf, 0, ones, lf, 0, ldb, null);
-                Back(f, lane, ldb, db, a.OC);
+                ulong ones = Rent((long)NP * lw.Size), ldb = Rent((long)a.OC * lw.Size);
+                Gpu.Upload<byte>(LaneOnes(lw, NP), ones);
+                ProductStored(new ProductView(a.OC, 1, NP, false, false), lw, dyp, fw, 0, ones, fw, 0, ldb, null);
+                Back(f, lw, ldb, db, a.OC);
             }
         }
         finally { foreach (var p in rented) gpu.Return(p); }
 
-        return lane.Name;
+        return LanesName(lx, lw);
     }
 
     /// <summary>y = conv(x, w) of one image of one group; returns the product's lane.</summary>
@@ -267,42 +297,41 @@ public sealed partial class GpuOps
         finally { foreach (var p in rented) gpu.Return(p); }
     }
 
-    /// <summary>dx and dw from dy in the type's float lane; returns the lane's name.</summary>
+    /// <summary>dx and dw from dy (one image of one group) in the backward's lanes (BackwardLanes); returns their names.</summary>
     public string ConvBackward<TN>(ConvArgs a, ulong x, ulong w, ulong dy, ulong dx, ulong dw) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        var lane = RowLane(f);
-        if (f.Is("float64")) { ConvBackwardIn<Float64>(a, x, w, dy, dx, dw); return lane.Name; }
-        if (f.Is("float32")) { ConvBackwardIn<Float32>(a, x, w, dy, dx, dw); return lane.Name; }
-        ConvBackwardStored<TN>(a, x, w, dy, dx, dw);
-        return lane.Name;
+        // The type's storage its float lane's own: the composition on the type's tensors.
+        if (f.Is("float64")) { ConvBackwardIn<Float64>(a, x, w, dy, dx, dw); return Lane.F64.Name; }
+        if (f.Is("float32")) { ConvBackwardIn<Float32>(a, x, w, dy, dx, dw); return Lane.F32.Name; }
+        var (lx, lw) = BackwardLanes<TN>(a, x, w, dy);
+        ConvBackwardStored<TN>(a, x, w, dy, dx, dw, lx, lw);
+        return LanesName(lx, lw);
     }
 
-    // The backward on the type's own tensors (f32 lane), none widened in memory: dcols = wᵀ·dy (an intermediate: f32 lane
-    // storage) with w and dy read where they are stored, dx = col2im(dcols) stored as the type; dw = dy · colsᵀ with the
+    // The backward on the type's own tensors, none widened in memory: dcols = wᵀ·dy (an intermediate in dx's lane storage)
+    // with w and dy read where they are stored, dx = col2im(dcols) stored as the type; dw = dy · colsᵀ in dw's lane with the
     // columns gathered from the image where it is stored (Ptx.Gemm's conv mode, transposed), stored as the type or as the
     // lane's sums encoded after.
-    private void ConvBackwardStored<TN>(ConvArgs a, ulong x, ulong w, ulong dy, ulong dx, ulong dw) where TN : struct, IAdad<TN>
+    private void ConvBackwardStored<TN>(ConvArgs a, ulong x, ulong w, ulong dy, ulong dx, ulong dw, Lane lx, Lane lane) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        var lane = Lane.F32;
-        var f32 = Fmt.Of<Float32>();
         bool typed = StoredC(f);
-        ulong dcols = gpu.Rent((long)a.Rows * a.Cols * 4), ldw = typed ? dw : gpu.Rent(a.WValues * 4);
+        ulong dcols = gpu.Rent(Math.Max(16, (long)a.Rows * a.Cols * lx.Size)), ldw = typed ? dw : gpu.Rent(Math.Max(16, a.WValues * lane.Size));
         try
         {
-            ProductStored(new ProductView(a.Rows, a.Cols, a.OC, true, false), lane, w, f, 0, dy, f, 0, dcols, null);
-            Layout<TN>(new LayoutArgs { Name = "col2im", X = [], P = a.P, Output = [], Count = (int)a.XValues, InputCount = a.Rows * a.Cols }, dcols, 0, dx, 0, f32);
+            ProductStored(new ProductView(a.Rows, a.Cols, a.OC, true, false), lx, w, f, 0, dy, f, 0, dcols, null);
+            Layout<TN>(new LayoutArgs { Name = "col2im", X = [], P = a.P, Output = [], Count = (int)a.XValues, InputCount = a.Rows * a.Cols }, dcols, 0, dx, 0, Ptx.LaneFormat(lx));
             var view = new ProductView(a.OC, a.Rows, a.Cols, false, true);
-            int micro = a.OC >= 128 && a.Rows >= 128 ? 8 : 4, tile = micro * 16;
+            int micro = !lane.Wide && a.OC >= 128 && a.Rows >= 128 ? 8 : 4, tile = micro * 16;
             bool runsA = f.IsBlock && a.Cols % micro == 0;                                // dy's rows as runs of their blocks
             uint mb = Grid(a.OC, tile);
             if (ProductSplit(view, lane, tile, ldw, typed ? f : null, out int slices, out int sliceBlocks))
             {
                 // Split-k (the columns are long, dw small): the slices' partial dw joined in order, then stored as the type.
                 var st = new Ptx.GemmStored(f, f, null);
-                var fs = gpu.Cached($"gemmconvt_stored:{f.Name}:{micro}:{runsA}:k", (out string e) => Ptx.Gemm(gpu, lane, micro, out e, conv: true, stored: st, transB: true, runsA: runsA, split: true));
-                ulong parts = gpu.Rent((long)slices * a.WValues * 4), joined = typed ? gpu.Rent(a.WValues * 4) : ldw;
+                var fs = gpu.Cached($"gemmconvt_stored:{f.Name}:{lane.Name}:{micro}:{runsA}:k", (out string e) => Ptx.Gemm(gpu, lane, micro, out e, conv: true, stored: st, transB: true, runsA: runsA, split: true));
+                ulong parts = gpu.Rent((long)slices * a.WValues * lane.Size), joined = typed ? gpu.Rent(a.WValues * lane.Size) : ldw;
                 try
                 {
                     Gpu.Launch(fs, Grid(a.Rows, tile), mb * (uint)slices, Ptx.GemmThreads, 1, 0, [dy, x, parts, Gpu.U(a.OC), Gpu.U(a.Rows), Gpu.U(a.Cols), .. ConvArgsOf(a), 0, 0, mb, Gpu.U(sliceBlocks)]);
@@ -319,7 +348,7 @@ public sealed partial class GpuOps
             else
             {
                 var stored = new Ptx.GemmStored(f, f, typed ? f : null);
-                var fn = gpu.Cached($"gemmconvt_stored:{f.Name}:{micro}:{runsA}", (out string e) => Ptx.Gemm(gpu, lane, micro, out e, conv: true, stored: stored, transB: true, runsA: runsA));
+                var fn = gpu.Cached($"gemmconvt_stored:{f.Name}:{lane.Name}:{micro}:{runsA}", (out string e) => Ptx.Gemm(gpu, lane, micro, out e, conv: true, stored: stored, transB: true, runsA: runsA));
                 Gpu.Launch(fn, Grid(a.Rows, tile), mb, Ptx.GemmThreads, 1, 0, [dy, x, ldw, Gpu.U(a.OC), Gpu.U(a.Rows), Gpu.U(a.Cols), .. ConvArgsOf(a), 0, 0]);
                 if (!typed) Back(f, lane, ldw, dw, a.WValues);
             }

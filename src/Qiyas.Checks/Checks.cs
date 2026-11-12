@@ -850,12 +850,11 @@ internal static partial class Checks
                 var want = a.Reference(Bench.Registry.Values(type, x, (int)a.XValues), Bench.Registry.Values(type, w, (int)a.WValues));
                 Bench.Registry.With(type, new ConvRun(ops, a, x, w, y));
                 ok &= Close(type, $"conv {a.Kh}x{a.Kw} s{a.Sh} p{a.PadTop}{a.PadLeft}{a.PadBottom}{a.PadRight}", where, y, want, (int)a.YValues, a.Rows);
-                if (!Bench.Registry.IsFloat(type)) continue;                 // the backward needs the float lane's storage
                 var dy = Bench.Registry.Make(type, (int)a.YValues, 63, -1, 1);
                 var (wantX, wantW, _) = a.ReferenceBackward(Bench.Registry.Values(type, x, (int)a.XValues), Bench.Registry.Values(type, w, (int)a.WValues), Bench.Registry.Values(type, dy, (int)a.YValues));
                 var dx = new byte[x.Length];
                 var dw = new byte[w.Length];
-                Bench.Registry.WithFloat(type, new ConvBackwardRun(ops, a, x, w, dy, dx, dw));
+                Bench.Registry.With(type, new ConvBackwardRun(ops, a, x, w, dy, dx, dw));
                 ok &= Close(type, $"conv_bwd dx {a.Kh}x{a.Kw} p{a.PadTop}{a.PadLeft}{a.PadBottom}{a.PadRight}", where, dx, wantX, (int)a.XValues, a.OC * a.Kh * a.Kw);
                 ok &= Close(type, $"conv_bwd dw {a.Kh}x{a.Kw} p{a.PadTop}{a.PadLeft}{a.PadBottom}{a.PadRight}", where, dw, wantW, (int)a.WValues, a.Cols);
             }
@@ -898,11 +897,11 @@ internal static partial class Checks
 
                 // The CPU's backward: dw with the columns read from the image (forced on) against float64, and dx and dw
                 // equal bit for bit to the composition's (the columns written, then the same kernel).
-                if (ops is not null || !Bench.Registry.IsFloat(type)) continue;
+                if (ops is not null) continue;
                 var dy = Bench.Registry.Make(type, (int)a.YValues, 66, -1, 1);
                 var (_, wantW, _) = a.ReferenceBackward(Bench.Registry.Values(type, x, (int)a.XValues), Bench.Registry.Values(type, w, (int)a.WValues), Bench.Registry.Values(type, dy, (int)a.YValues));
                 byte[] dxF = new byte[x.Length], dwF = new byte[w.Length], dxC = new byte[x.Length], dwC = new byte[w.Length];
-                Bench.Registry.WithFloat(type, new ConvBackwardModeRun(a, x, w, dy, dxF, dwF, dxC, dwC));
+                Bench.Registry.With(type, new ConvBackwardModeRun(a, x, w, dy, dxF, dwF, dxC, dwC));
                 string back = $"conv_bwd fused {a.C}x{a.H}x{a.W}>{a.OC} {a.Kh}x{a.Kw} s{a.Sh} d{a.Dh} p{a.PadTop}{a.PadLeft}{a.PadBottom}{a.PadRight}";
                 ok &= Close(type, back, where, dwF, wantW, (int)a.WValues, a.Cols);
                 if (!dxF.AsSpan().SequenceEqual(dxC) || !dwF.AsSpan().SequenceEqual(dwC))
@@ -934,7 +933,7 @@ internal static partial class Checks
         }
 
         ok &= ConvGeneral(ops, where, blocks);
-        if (ok) Console.WriteLine($"check convolution            {where,-6} every type{(blocks ? "" : " but the block formats")}: forward and the backward pair within the products' rounding, uneven pads among them; the fused forward equal to the composition through the same kernel{(ops is null ? ", and the backward with dw's columns from the image" : "")}; every float type over images, groups, uneven pads, a bias and an activation, and their backward (dx, dw, db); a negative pad, a stride, dilation or filter extent below 1, and groups not dividing the channels refused");
+        if (ok) Console.WriteLine($"check convolution            {where,-6} every type{(blocks ? "" : " but the block formats")}: forward and the backward pair within the products' rounding (an integer type's exactly), uneven pads among them; the fused forward equal to the composition through the same kernel{(ops is null ? ", and the backward with dw's columns from the image" : "")}; every float type over images, groups, uneven pads, a bias and an activation; every type's backward over them (dx, dw, db); a negative pad, a stride, dilation or filter extent below 1, and groups not dividing the channels refused");
         return ok;
     }
 
@@ -987,9 +986,9 @@ internal static partial class Checks
     }
 
     // The CPU's backward with dw's columns read from the image (into dxF, dwF), then by the composition (into dxC, dwC).
-    private sealed class ConvBackwardModeRun(ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dxF, byte[] dwF, byte[] dxC, byte[] dwC) : Bench.IFloatTypeVisitor<bool>
+    private sealed class ConvBackwardModeRun(ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dxF, byte[] dwF, byte[] dxC, byte[] dwC) : Bench.ITypeVisitor<bool>
     {
-        public bool Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        public bool Visit<TN>() where TN : struct, IAdad<TN, float>
         {
             Kernels.FusedConv = null;
             Kernels.ConvBackward<TN>(a, x, w, dy, dxF, dwF);
@@ -1015,9 +1014,9 @@ internal static partial class Checks
         }
     }
 
-    private sealed class ConvBackwardRun(IDevice<ulong, ulong>? ops, ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dx, byte[] dw) : Bench.IFloatTypeVisitor<bool>
+    private sealed class ConvBackwardRun(IDevice<ulong, ulong>? ops, ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dx, byte[] dw) : Bench.ITypeVisitor<bool>
     {
-        public bool Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        public bool Visit<TN>() where TN : struct, IAdad<TN, float>
         {
             if (ops is null) { Kernels.ConvBackward<TN>(a, x, w, dy, dx, dw); return true; }
             ulong dX = ops.Rent(x.Length + 16), dW = ops.Rent(w.Length + 16), dY = ops.Rent(dy.Length + 16), gx = ops.Rent(dx.Length + 16), gw = ops.Rent(dw.Length + 16);

@@ -609,7 +609,7 @@ public sealed class AdadSubject : IBenchSubject
     }
 
     public IBenchRun? Conv(Device device, string type, ConvArgs a, byte[] x, byte[] w, byte[] y, byte[]? dx, byte[]? dw) =>
-        dx is null ? Registry.With(type, new ConvVisitor(device, a, x, w, y)) : Registry.IsFloat(type) ? Registry.WithFloat(type, new ConvBackwardVisitor(device, a, x, w, y, dx, dw!)) : null;
+        dx is null ? Registry.With(type, new ConvVisitor(device, a, x, w, y)) : Registry.With(type, new ConvBackwardVisitor(device, a, x, w, y, dx, dw!));
 
     private sealed class ConvVisitor(Device device, ConvArgs a, byte[] x, byte[] w, byte[] y) : ITypeVisitor<IBenchRun?>, INumberRun
     {
@@ -622,11 +622,11 @@ public sealed class AdadSubject : IBenchSubject
         }
     }
 
-    private sealed class ConvBackwardVisitor(Device device, ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dx, byte[] dw) : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+    private sealed class ConvBackwardVisitor(Device device, ConvArgs a, byte[] x, byte[] w, byte[] dy, byte[] dx, byte[] dw) : ITypeVisitor<IBenchRun?>, INumberRun
     {
-        public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, ConvBackwardVisitor>(device, this);
+        public IBenchRun? Visit<TN>() where TN : struct, IAdad<TN, float> => On<TN, ConvBackwardVisitor>(device, this);
 
-        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IAdad<TN, float>
         {
             TB dX = s.In(x), dW = s.In(w), dY = s.In(dy), gx = s.Out(dx), gw = s.Out(dw);
             return s.Run(() => s.D.ConvBackward<TN>(a, dX, dW, dY, gx, gw, default));

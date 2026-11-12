@@ -13,6 +13,8 @@ public interface IConvolution<TBuffer>
     string Conv<TN>(ConvArgs a, TBuffer x, TBuffer w, TBuffer? bias, TBuffer y) where TN : struct, IAdad<TN>;
 
     /// <summary>dx, dw and db (OC values, or none) from dy, the gradient of the sums plus the bias (the activation's backward
-    /// is the caller's: Map's formula backward).</summary>
-    string ConvBackward<TN>(ConvArgs a, TBuffer x, TBuffer w, TBuffer dy, TBuffer dx, TBuffer dw, TBuffer? db) where TN : struct, IFloatAdad<TN>;
+    /// is the caller's: Map's formula backward), every type: dx's sums (w·dy) and dw's and db's (dy·x, dy over the images'
+    /// positions) each in the lane the number gives for their bounds (a float type's float lane, an integer type's exact
+    /// one), each gradient stored as the type once. Returns the lanes' names (dx's; dw's after it where it differs).</summary>
+    string ConvBackward<TN>(ConvArgs a, TBuffer x, TBuffer w, TBuffer dy, TBuffer dx, TBuffer dw, TBuffer? db) where TN : struct, IAdad<TN>;
 }
