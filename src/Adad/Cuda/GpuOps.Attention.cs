@@ -270,9 +270,13 @@ public sealed partial class GpuOps
             ulong lo = f.IsBlock ? gpu.Rent(a.QValues * 4) : o;
             if (f.IsBlock) rented.Add(lo);
             ulong limits = Limits(a, rented), starts = Starts(a, rented);
+            ulong scale = lane.Wide ? Gpu.D(a.Scale) : Gpu.F((float)a.Scale);
+            if (!f.IsBlock && DecodeSplit(f, lane, dCap, null, a.Heads * a.Lq, a.Lk, lo, null, [q, k, v], [limits, starts, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), scale], []))
+                return lane.Name;
+
             bool runs = f.IsBlock && a.D % 8 == 0;                              // a block format's keys in runs of 8 values
             var fn = gpu.Cached($"attention_decode:{f.Name}:{dCap}{(runs ? ":runs" : "")}", (out string e) => Ptx.AttentionDecode(gpu, f, lane, dCap, out e, f.IsBlock ? Fmt.Of<Float32>() : null, null, runs));
-            Gpu.Launch(fn, (uint)(a.Heads * a.Lq), 1, Ptx.DecodeThreads, 1, 0, q, k, v, lo, limits, starts, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), lane.Wide ? Gpu.D(a.Scale) : Gpu.F((float)a.Scale));
+            Gpu.Launch(fn, (uint)(a.Heads * a.Lq), 1, Ptx.DecodeThreads, 1, 0, q, k, v, lo, limits, starts, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), scale);
             if (!f.IsBlock) return lane.Name;
             Back(f, lane, lo, o, a.QValues);
             return "f32 (blocks in place)";
@@ -281,6 +285,35 @@ public sealed partial class GpuOps
         {
             foreach (var p in rented) gpu.Return(p);
         }
+    }
+
+    /// <summary>The split decode (Ptx.AttentionDecodeSplit, then Ptx.DecodeCombine): blocks (head, query) rows × the splits
+    /// that fill the device with warps (its multiprocessors × the threads each holds, a warp a part), no part under 16 keys.
+    /// args: q, k, v; rest: the kernel's parameters after p_ws (limits, starts, lq, lk, d, scale); over: the cache's.
+    /// False (nothing launched) past a head capacity of 256 (a lane's dimensions in registers: 1024 took 255 of them in
+    /// f32) or where the device does not take the kernel at 256 threads: the block-a-query kernel then.</summary>
+    private bool DecodeSplit(Fmt f, Lane lane, int dCap, Ptx.DecodeCache? cache, int blocks, int lk, ulong o, Fmt? outFmt, ulong[] qkv, ulong[] rest, ulong[] over)
+    {
+        if (dCap > 256) return false;
+        var fn = gpu.Cached($"attention_decode_split:{f.Name}:{dCap}:{cache?.Key}", (out string e) => Ptx.AttentionDecodeSplit(gpu, f, lane, dCap, out e, cache));
+        if (Gpu.MaxThreads(fn) < Ptx.DecodeThreads) return false;
+        if (blocks == 0) return true;
+        long warps = (long)gpu.Multiprocessors * gpu.ThreadsPerMultiprocessor / 32;
+        int splits = (int)Math.Clamp((warps + blocks * 8L - 1) / (blocks * 8L), 1, Math.Max(1, lk / (8 * 16)));
+        int parts = splits * 8;
+        ulong ws = gpu.Rent((long)blocks * parts * Ptx.DecodePartialLanes(dCap) * lane.Size);
+        try
+        {
+            Gpu.Launch(fn, (uint)blocks, (uint)splits, Ptx.DecodeThreads, 1, 0, [.. qkv, ws, .. rest, Gpu.U(splits), .. over]);
+            var join = gpu.Cached($"attention_decode_combine:{f.Name}:{dCap}:{outFmt?.Name}", (out string e) => Ptx.DecodeCombine(gpu, f, lane, dCap, out e, outFmt));
+            Gpu.Launch(join, (uint)blocks, 1, Ptx.DecodeThreads, 1, 0, ws, o, Gpu.U(parts), rest[4]);
+        }
+        finally
+        {
+            gpu.Return(ws);
+        }
+
+        return true;
     }
 
     // ---- backward: the fused kernels (Ptx.AttentionBackward.cs), or the composition
