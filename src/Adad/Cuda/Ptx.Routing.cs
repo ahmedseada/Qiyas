@@ -90,6 +90,192 @@ internal static partial class Ptx
         return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_indices, .param .u32 p_cols, .param .u32 p_k", ReduceBytes + 256 * 4 + 256 * 16);
     }
 
+    /// <summary>The capacities of the one-pass top-k (TopKRowsHeld): a thread's first-ranked held in registers.</summary>
+    public static readonly int[] TopKHeld = [8, 16, 32];
+
+    /// <summary>TopKRows in one pass over the row (k at most held): each thread keeps its held first-ranked (value, column)
+    /// in registers, sorted in Adad's order (Routing.Precedes), over its columns (tid, tid + 256, …): a value enters where it
+    /// ranks strictly above a held one (conditional swaps down the list), so of equal values the earlier column stays
+    /// above. Then k rounds: the block's first of the threads' heads (larger, then the lower column) by warp shuffles and
+    /// one more warp, its column stored, its thread's list moved up one. The same columns in the same order as the k
+    /// passes, the row read once (the passes read it k times, and checked every taken column a value).</summary>
+    public static string TopKRowsHeld(Gpu gpu, Fmt f, Lane lane, int held, out string entry)
+    {
+        entry = $"topk_rows_held{held}_{f.Name}_{lane.Name}";
+        var b = new PtxBuilder(gpu);
+        string tid = b.R(), row = b.R(), warp = b.R(), wl = b.R();
+        b.L($"mov.u32 {tid}, %tid.x;");
+        b.L($"mov.u32 {row}, %ctaid.x;");
+        b.L($"shr.u32 {warp}, {tid}, 5;");
+        b.L($"and.b32 {wl}, {tid}, 31;");
+        string x = Param64(b, "p_x"), indices = Param64(b, "p_indices"), cols = Param32(b, "p_cols"), k = Param32(b, "p_k");
+        string start = b.R(), smem = b.R(), sel = lane.IsFloat ? lane.Op : lane.Reg;
+        b.L($"mul.lo.u32 {start}, {row}, {cols};");
+        b.L($"mov.u32 {smem}, smem;");
+        const string Empty = "0xFFFFFFFF";
+        var kv = new string[held];
+        var kc = new string[held];
+        for (int j = 0; j < held; j++)
+        {
+            kv[j] = lane.NewReg(b);
+            kc[j] = b.R();
+            b.L($"mov.{lane.Reg} {kv[j]}, {ReduceIdentity(lane, "max")};");
+            b.L($"mov.u32 {kc[j]}, {Empty};");
+        }
+
+        // The scan: four values a pass loaded before any enters (loads in flight), entered in column order.
+        const int Unroll = 4;
+        string c = b.R(), pEnd = b.P(), last = b.R();
+        b.L($"sub.u32 {last}, {cols}, 1;");
+        b.L($"mov.u32 {c}, {tid};");
+        b.Label("SCAN");
+        b.L($"setp.ge.u32 {pEnd}, {c}, {cols};");
+        b.L($"@{pEnd} bra SCAN_END;");
+        var vs = new string[Unroll];
+        var cs = new string[Unroll];
+        var ins = new string[Unroll];
+        for (int u = 0; u < Unroll; u++)
+        {
+            string at = b.R(), idx = b.R();
+            cs[u] = b.R();
+            b.L($"add.u32 {cs[u]}, {c}, {u * 256};");
+            ins[u] = b.P();
+            b.L($"setp.lt.u32 {ins[u]}, {cs[u]}, {cols};");
+            b.L($"min.u32 {at}, {cs[u]}, {last};");
+            b.L($"add.u32 {idx}, {start}, {at};");
+            vs[u] = Codec.UnpackAt(b, f, x, idx, lane);
+        }
+
+        for (int u = 0; u < Unroll; u++)
+        {
+            // Enters when inside the row and the list's last is empty or ranked below the value.
+            string pIn = b.P(), skip = $"ENTER{u}_END";
+            b.L($"setp.eq.u32 {pIn}, {kc[held - 1]}, {Empty};");
+            string pAb = RankAbove(b, lane, vs[u], kv[held - 1]);
+            b.L($"or.pred {pIn}, {pIn}, {pAb};");
+            b.L($"and.pred {pIn}, {pIn}, {ins[u]};");
+            b.L($"@!{pIn} bra {skip};");
+            string cv = lane.NewReg(b), cc = b.R();
+            b.L($"mov.{lane.Reg} {cv}, {vs[u]};");
+            b.L($"mov.u32 {cc}, {cs[u]};");
+            for (int j = 0; j < held; j++)
+            {
+                string pE = b.P(), tv = lane.NewReg(b), tc = b.R();
+                b.L($"setp.eq.u32 {pE}, {kc[j]}, {Empty};");
+                string pA = RankAbove(b, lane, cv, kv[j]);
+                b.L($"or.pred {pE}, {pE}, {pA};");
+                b.L($"mov.{lane.Reg} {tv}, {kv[j]};");
+                b.L($"mov.u32 {tc}, {kc[j]};");
+                b.L($"selp.{sel} {kv[j]}, {cv}, {kv[j]}, {pE};");
+                b.L($"selp.u32 {kc[j]}, {cc}, {kc[j]}, {pE};");
+                b.L($"selp.{sel} {cv}, {tv}, {cv}, {pE};");
+                b.L($"selp.u32 {cc}, {tc}, {cc}, {pE};");
+            }
+
+            b.Label(skip);
+        }
+
+        b.L($"add.u32 {c}, {c}, {Unroll * 256};");
+        b.L("bra SCAN;");
+        b.Label("SCAN_END");
+
+        // (v, col) against (ov, oc): the first in Adad's order, the lower column on a tie, an empty column last.
+        void Better(string v, string col, string ov, string oc)
+        {
+            var (pGt, pEq) = Rank(b, lane, ov, v);
+            string pLt = b.P(), pTake = b.P(), pMine = b.P(), pOther = b.P();
+            b.L($"setp.lt.u32 {pLt}, {oc}, {col};");
+            b.L($"and.pred {pEq}, {pEq}, {pLt};");
+            b.L($"or.pred {pTake}, {pGt}, {pEq};");
+            b.L($"setp.eq.u32 {pMine}, {col}, {Empty};");
+            b.L($"or.pred {pTake}, {pTake}, {pMine};");
+            b.L($"setp.ne.u32 {pOther}, {oc}, {Empty};");
+            b.L($"and.pred {pTake}, {pTake}, {pOther};");
+            b.L($"selp.{sel} {v}, {ov}, {v}, {pTake};");
+            b.L($"selp.u32 {col}, {oc}, {col}, {pTake};");
+        }
+
+        void WarpBest(string v, string col)
+        {
+            for (int off = 16; off >= 1; off /= 2)
+            {
+                string ov = lane.NewReg(b), oc = b.R();
+                if (lane.Wide)
+                {
+                    string lo = b.R(), hi = b.R(), lo2 = b.R(), hi2 = b.R();
+                    b.L($"mov.b64 {{{lo}, {hi}}}, {v};");
+                    b.L($"shfl.sync.bfly.b32 {lo2}, {lo}, {off}, 0x1f, 0xffffffff;");
+                    b.L($"shfl.sync.bfly.b32 {hi2}, {hi}, {off}, 0x1f, 0xffffffff;");
+                    b.L($"mov.b64 {ov}, {{{lo2}, {hi2}}};");
+                }
+                else
+                {
+                    string bits = b.R(), bits2 = b.R();
+                    b.L($"mov.b32 {bits}, {v};");
+                    b.L($"shfl.sync.bfly.b32 {bits2}, {bits}, {off}, 0x1f, 0xffffffff;");
+                    b.L($"mov.b32 {ov}, {bits2};");
+                }
+
+                b.L($"shfl.sync.bfly.b32 {oc}, {col}, {off}, 0x1f, 0xffffffff;");
+                Better(v, col, ov, oc);
+            }
+        }
+
+        // The rounds: shared slots 16 bytes a warp (value, column), the round's winner's column past the eight.
+        string r = b.R(), pR = b.P();
+        b.L($"mov.u32 {r}, 0;");
+        b.Label("ROUND");
+        b.L($"setp.ge.u32 {pR}, {r}, {k};");
+        b.L($"@{pR} bra ROUND_END;");
+        string hv = lane.NewReg(b), hc = b.R(), slot = b.R(), p0 = b.P(), pw = b.P();
+        b.L($"mov.{lane.Reg} {hv}, {kv[0]};");
+        b.L($"mov.u32 {hc}, {kc[0]};");
+        WarpBest(hv, hc);
+        b.L($"mad.lo.u32 {slot}, {warp}, 16, {smem};");
+        b.L($"setp.ne.u32 {p0}, {wl}, 0;");
+        b.L($"@!{p0} st.shared.{lane.Mem} [{slot}], {hv};");
+        b.L($"@!{p0} st.shared.u32 [{slot}+8], {hc};");
+        b.L("bar.sync 0;");
+        b.L($"setp.ne.u32 {pw}, {warp}, 0;");
+        b.L($"@{pw} bra ROUND_WAIT;");
+        {
+            string mine = b.R(), pl = b.P(), wv = lane.NewReg(b), wc = b.R();
+            b.L($"mov.{lane.Reg} {wv}, {ReduceIdentity(lane, "max")};");
+            b.L($"mov.u32 {wc}, {Empty};");
+            b.L($"setp.lt.u32 {pl}, {wl}, 8;");
+            b.L($"mad.lo.u32 {mine}, {wl}, 16, {smem};");
+            b.L($"@{pl} ld.shared.{lane.Mem} {wv}, [{mine}];");
+            b.L($"@{pl} ld.shared.u32 {wc}, [{mine}+8];");
+            WarpBest(wv, wc);
+            string oIdx = b.R(), oAddr = b.RD();
+            b.L($"@!{p0} st.shared.u32 [{smem}+{8 * 16}], {wc};");
+            b.L($"mad.lo.u32 {oIdx}, {row}, {k}, {r};");
+            b.L($"mul.wide.u32 {oAddr}, {oIdx}, 4;");
+            b.L($"add.u64 {oAddr}, {indices}, {oAddr};");
+            b.L($"@!{p0} st.global.s32 [{oAddr}], {wc};");
+        }
+
+        b.Label("ROUND_WAIT");
+        b.L("bar.sync 0;");
+        string winner = b.R(), pPop = b.P();
+        b.L($"ld.shared.u32 {winner}, [{smem}+{8 * 16}];");
+        b.L($"setp.eq.u32 {pPop}, {winner}, {kc[0]};");
+        b.L($"@!{pPop} bra POP_END;");
+        for (int j = 0; j + 1 < held; j++)
+        {
+            b.L($"mov.{lane.Reg} {kv[j]}, {kv[j + 1]};");
+            b.L($"mov.u32 {kc[j]}, {kc[j + 1]};");
+        }
+
+        b.L($"mov.u32 {kc[held - 1]}, {Empty};");
+        b.Label("POP_END");
+        b.L($"add.u32 {r}, {r}, 1;");
+        b.L("bra ROUND;");
+        b.Label("ROUND_END");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_indices, .param .u32 p_cols, .param .u32 p_k", 9 * 16);
+    }
+
     /// <summary>Adad's order on two lane values (Routing.Order): whether a ranks above c (larger, or a
     /// NaN against a number) and whether they rank the same (equal, −0 and +0 among them, or two NaNs).</summary>
     internal static (string Above, string Same) Rank(PtxBuilder b, Lane lane, string a, string c)

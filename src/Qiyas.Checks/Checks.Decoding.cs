@@ -36,7 +36,7 @@ internal static partial class Checks
     private static bool LogSoftmaxTopKs(IDevice<ulong, ulong>? ops, string where, string type)
     {
         bool ok = true;
-        foreach (var (rows, cols, k) in new[] { (7, 53, 5), (3, 601, 16), (37, 29, 1), (2, 4, 4) })
+        foreach (var (rows, cols, k) in new[] { (7, 53, 5), (3, 601, 16), (37, 29, 1), (2, 4, 4), (3, 601, 24), (2, 300, 40) })
         {
             string what = $"log_softmax_topk {rows}x{cols} k {k}";
             var x = Bench.Registry.Make(type, rows * cols, 91, -4, 4);
