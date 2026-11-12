@@ -10,8 +10,9 @@ public interface IConvolution<TBuffer>
     /// <summary>y = the epilogue's y of the convolution's sums (ProductEpilogue over ConvArgs.Output: N products of OC × OH·OW;
     /// the bias, t.Bias, a value an output channel; β·y, a second product over the same view, an activation or a gradient
     /// through one, a residual, the sums kept), every term in the lane and y rounded to the type once. One image of one group
-    /// with no term (ConvArgs.Single) fused, no columns in memory, every type; images, groups or any term the float types,
-    /// the sums in the float lane.</summary>
+    /// with no term (ConvArgs.Single) fused, no columns in memory; images, groups or any term the general path. Every type:
+    /// a float type's sums in its float lane, any other type's in the exact lane for the bounds of every value the store
+    /// makes (ProductEpilogue.ValidateType: its formulas the integer ones, β and the parameters integers).</summary>
     string Conv<TN>(ConvArgs a, ProductEpilogue e, TBuffer x, TBuffer w, TBuffer y, ProductTerms<TBuffer> t) where TN : struct, IAdad<TN>;
 
     /// <summary>dx, dw and db (OC values, or none) from dy, the gradient of the sums plus the bias (the activation's backward

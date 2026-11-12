@@ -15,10 +15,12 @@
 // dx; on the CPU dw's columns are read from the image the same way (the transposed packing, a k-range of a row a task).
 // The depthwise convolution is a layout operation (Layout.cs: a gather with weights).
 //
-// Images, groups or any term of the product's epilogue (ConvArgs.Output; the float types) take the general path: the
-// columns of every image's channels into the float lane's storage (exact), each image's and group's product with the
-// group's weights into the lane's sums, then the epilogue's store over the output, the bias a value an output channel, y
-// stored as the type once (Epilogue.cs EpilogueStore). Its backward:
+// Images, groups or any term of the product's epilogue (ConvArgs.Output) take the general path: the columns of every
+// image's channels into the lane's storage (exact), each image's and group's product with the group's weights into the
+// lane's sums, then the epilogue's store over the output, the bias a value an output channel, y stored as the type once
+// (Epilogue.cs). A float type's lane is its float lane; any other type's the one TN.Sum gives for the bounds of every value
+// the store makes (ConvArgs.IntegerSums), the columns and the sums the lane's own type, the products and the store's terms
+// in its plain lane (ILane.Kept's TS and TP). Its backward:
 // dcols = w_gᵀ·dy_g in the lane, dx = col2im(dcols); dy and the columns laid side by side over the images (exact moves into
 // the lane), dw_g = dy_g · cols_gᵀ in one product a group, stored once; db the lane's sums of dy's rows.
 //
@@ -53,9 +55,19 @@ internal sealed partial class Kernels
         a.Validate();
         var terms = t.Validate(e, a.Output);
         if (a.Single && terms == default) return Conv<TN>(a, x, w, y);
-        var general = new MixedVisitor<ConvGeneralCall>(new ConvGeneralCall(a, e, terms, x, w, y, t));
-        if (!TN.TryFloat(ref general)) throw new NotSupportedException($"conv: images, groups or an epilogue term take a float type, not {TN.Name}");
-        return general.Lane;
+        e.ValidateType(TN.Name, TN.IsFloat);
+        if (TN.IsFloat)
+        {
+            var general = new MixedVisitor<ConvGeneralCall>(new ConvGeneralCall(a, e, terms, x, w, y, t));
+            TN.TryFloat(ref general);
+            return general.Lane;
+        }
+
+        if (a.YValues == 0) return TN.Name;
+        var (bounds, _) = a.IntegerSums(e, terms, TN.Name, TN.Min < 0, (b, n) => TN.Range(b, (int)n), x, w, y, t);
+        var sum = new ConvSum(a, e, terms, x, w, y, t);
+        TN.Sum(ref sum, bounds);
+        return sum.Lane;
     }
 
     /// <summary>y = conv(x, w) of one image of one group; returns the product's lane.</summary>
@@ -236,6 +248,55 @@ internal sealed partial class Kernels
                         new Operands(AOff: g * a.OCg * a.Rows, BOff: (n * G + g) * a.Rows * a.Cols, COff: (n * a.OC + g * a.OCg) * a.Cols));
             EpilogueStore<TN, TS, TLane, TL>(a.Output, e, terms, t, sums, y, a.Cols, a.OC);
             return TL.Name;
+        }
+    }
+
+    // A type that is not float: the lane TN.Sum takes by the bounds, the columns and sums kept as the lane's own type.
+    private struct ConvSum(ConvArgs a, ProductEpilogue e, StoreTerms terms, byte[] x, byte[] w, byte[] y, ProductTerms<byte[]> t) : ISumVisitor
+    {
+        public string Lane = "";
+
+        public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
+        {
+            var kept = new ConvKept<TN, TLane, TLane, TL>(a, e, terms, x, w, y, t);
+            TL.Kept(ref kept);
+            Lane = TL.Name;
+        }
+
+        public void RunDot<TN, TIn, TAcc, TD>() where TN : struct, IAdad<TN, TIn>, IAdad<TN, TAcc> where TIn : unmanaged where TAcc : unmanaged where TD : struct, IDotLane<TD, TIn, TAcc>
+        {
+            var kept = new ConvKept<TN, TIn, TAcc, TD>(a, e, terms, x, w, y, t);
+            TD.Kept(ref kept);
+            Lane = TD.Name;
+        }
+    }
+
+    // The columns in the lane's own type TS, each image's and group's product in the plain lane TP into sums stored as TS,
+    // the second product's in TL (TN's operands read as TIn, summed in TAcc), then the store's terms in TP.
+    private readonly struct ConvKept<TN, TIn, TAcc, TL>(ConvArgs a, ProductEpilogue e, StoreTerms terms, byte[] x, byte[] w, byte[] y, ProductTerms<byte[]> t) : IKeptVisitor<TAcc>
+        where TN : struct, IAdad<TN, TIn>, IAdad<TN, TAcc> where TIn : unmanaged where TAcc : unmanaged where TL : struct, ILane<TL, TAcc>
+    {
+        public void Run<TS, TP>() where TS : struct, IAdad<TS, TAcc> where TP : struct, ILane<TP, TAcc>
+        {
+            a.ColumnsFit();
+            int size = System.Runtime.CompilerServices.Unsafe.SizeOf<TAcc>(), G = a.Groups;
+            var cols = new byte[a.ColValues * size];
+            var sums = new byte[a.YValues * size];
+            LayoutToLanes<TN, TAcc, TP>(new LayoutArgs { Name = "im2col", X = x, P = a.ImagesP, Output = cols, Count = (int)a.ColValues, InputCount = (int)a.XValues });
+            for (int n = 0; n < a.N; n++)
+                for (int g = 0; g < G; g++)
+                    MatMul<TN, TS, TS, TAcc, TAcc, TP>(w, cols, sums, a.OCg, a.Cols, a.Rows,
+                        new Operands(AOff: g * a.OCg * a.Rows, BOff: (n * G + g) * a.Rows * a.Cols, COff: (n * a.OC + g * a.OCg) * a.Cols));
+            byte[]? second = null;
+            if (terms.Second)
+            {
+                second = new byte[a.YValues * size];
+                ViewSums<TN, TS, TIn, TAcc, TL>(e.Second!, t.SecondA!, t.SecondB!, second);
+            }
+
+            var src = new StoreSources(sums, second, t.Bias, t.Residual, t.ActInputs, a.Cols, a.OC, e.ActA, e.Beta) { ActB = e.ActB, Before = y };
+            if (terms.Keep) ProductStoreAny<TN, TAcc, TP>(terms.KeepPass, src, t.Sums!, (int)a.YValues);
+            ProductStoreAny<TN, TAcc, TP>(terms, src, y, (int)a.YValues);
         }
     }
 

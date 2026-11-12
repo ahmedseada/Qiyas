@@ -18,7 +18,9 @@
 //
 // One image of one group with no epilogue term (Single) takes the fused forward; anything else the general path: the
 // columns of all the images' channels (im2col of N·C channels: image n group g's columns at rows (n·Groups + g)·Rows) in
-// the float lane's storage, each group's product of its weights with its columns in the lane, then the epilogue's store.
+// the lane's storage, each group's product of its weights with its columns in the lane, then the epilogue's store. A
+// float type's lane is its float lane; any other type's the lane its sums take by the bounds of every value the store
+// makes (IntegerSums: exact), so y is its one rounding (an integer type's saturating).
 // The backward is of the sums: dy is the gradient of the sums plus the bias (an activation's backward is the caller's, or
 // the epilogue's gradient term): dcols = w_gᵀ·dy_g, dx = col2im(dcols), dw_g = dy_g · cols_gᵀ over every image (the
 // images' columns and dy side by side), db = Σ dy over the images and positions.
@@ -110,6 +112,20 @@ public sealed record ConvArgs(int C, int H, int W, int OC, int Kh, int Kw)
     /// product's operands as its view stores them).</summary>
     public (double[] Y, double[] S) Reference(ProductEpilogue e, double[] x, double[] w, double[] y0, double[]? bias, double[]? residual, double[]? actInputs, double[]? a2, double[]? b2) =>
         e.Apply(Reference(x, w), Cols, OC, y0, bias, residual, actInputs, e.Second?.Reference(a2!, b2!));
+
+    /// <summary>The bounds a type that is not float takes its lane by (ProductEpilogue.IntegerSums over Output): k = Rows, the
+    /// weights' range and the image's with 0 (a pad's value), each term's operands' ranges; range(buffer, count) a buffer's
+    /// (low, high).</summary>
+    public (Bounds Bounds, bool Negative) IntegerSums<TBuffer>(ProductEpilogue e, StoreTerms terms, string type, bool signed,
+        Func<TBuffer, long, (double Lo, double Hi)> range, TBuffer x, TBuffer w, TBuffer y, ProductTerms<TBuffer> t)
+    {
+        var (xLo, xHi) = range(x, XValues);
+        var s = e.Second;
+        return e.IntegerSums(type, signed, Rows, range(w, WValues), (Math.Min(xLo, 0), Math.Max(xHi, 0)),
+            s is null ? null : range(t.SecondA!, s.ValuesA), s is null ? null : range(t.SecondB!, s.ValuesB),
+            terms.Bias ? range(t.Bias!, OC) : null, terms.Beta ? range(y, YValues) : null,
+            terms.Residual ? range(t.Residual!, YValues) : null, terms.Grad is not null ? range(t.ActInputs!, YValues) : null);
+    }
 
     /// <summary>Σ|w·x| of each output: the sums' error scale.</summary>
     public double[] Scale(double[] x, double[] w) => Reference(x.Select(Math.Abs).ToArray(), w.Select(Math.Abs).ToArray());

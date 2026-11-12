@@ -11,9 +11,10 @@
 // else stored as the type once after; a block format's by its encoder). dx's sums and dw's (and db's) each in the lane
 // SumLane gives for their bounds: a float type's float lane, an integer type's exact one (BackwardLanes). A block
 // format's forward is fused: its composition would encode the columns as blocks (each window's values quantized again).
-// Images, groups or any term of the product's epilogue (the float types) take the general path (Conv.cs), CUDA's: the
-// columns of every image's channels into lane storage, a product an image and group into the lane's sums, then the
-// epilogue's store over the output (EpilogueStore), y stored once; its backward: dcols = w_gᵀ·dy_g, dx = col2im(dcols); dy and
+// Images, groups or any term of the product's epilogue take the general path (Conv.cs), CUDA's: the columns of every
+// image's channels into lane storage, a product an image and group into the lane's sums, then the epilogue's store over
+// the output (EpilogueStore), y stored once; a float type's float lane, any other type's the exact one for the bounds of
+// every value the store makes (ConvLane); its backward: dcols = w_gᵀ·dy_g, dx = col2im(dcols); dy and
 // the columns side by side over the images in the lane, dw_g = dy_g·cols_gᵀ, db = dy's rows times ones, stored once.
 using Adad.Abstraction;
 
@@ -34,9 +35,9 @@ public sealed partial class VulkanOps
         var terms = t.Validate(e, a.Output);
         if (a.Single && terms == default) return Conv<TN>(a, x, w, y);
         var f = Fmt.Of<TN>();
-        if (!f.IsFloat) throw new NotSupportedException($"conv: images, groups or an epilogue term take a float type, not {f.Name}");
-        var lane = RowLane(f);
-        if (a.YValues == 0) return lane.Name;
+        e.ValidateType(f.Name, f.IsFloat);
+        if (a.YValues == 0) return f.IsFloat ? RowLane(f).Name : f.Natural.Name;
+        var lane = f.IsFloat ? RowLane(f) : ConvLane<TN>(a, e, terms, x, w, y, t);
         a.ColumnsFit();
         var lf = VkKernels.LaneFormat(lane);
         var rented = new List<ulong>();
@@ -54,6 +55,15 @@ public sealed partial class VulkanOps
         finally { foreach (var p in rented) vk.Return(p); }
 
         return lane.Name;
+    }
+
+    // A type that is not float: the lane its sums take by the bounds of every value the store makes (ConvArgs.IntegerSums);
+    // an unsigned type whose values may go negative F64's.
+    private Lane ConvLane<TN>(ConvArgs a, ProductEpilogue e, StoreTerms terms, ulong x, ulong w, ulong y, ProductTerms<ulong> t) where TN : struct, IAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        var (bounds, negative) = a.IntegerSums(e, terms, f.Name, f.Signed, (p, n) => Range<TN>(p, (int)n), x, w, y, t);
+        return negative && !f.Signed ? Lane.F64 : SumLane(f, bounds);
     }
 
     // A layout into lane storage (the lane's own type), its input read as inFmt where it is stored (null: lane storage too).
