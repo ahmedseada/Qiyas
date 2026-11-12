@@ -152,9 +152,11 @@ public sealed partial class GpuOps
             }
 
             if (kn.StartsWith("strided", StringComparison.Ordinal) && inFmt is null && StridedTransposed(f, lane, k.P, x, output)) return lane.Name;
-            if (k.Name == "adaptive_maxpool" && inFmt is null && Ptx.AdaptiveByWarp(k.P))
+            if (k.Name == "adaptive_maxpool" && inFmt is null && f.Bits > 1 && Ptx.AdaptiveByWarp(k.P))
             {
-                // Large windows: a warp each (the word's values' windows one after another), the order's max the same.
+                // Large windows: a warp each (the word's values' windows one after another), the order's max the same. Not
+                // bool: a warp a word walks its 32 values' windows in turn, too few warps for the device (64 × 256² to 7 × 7:
+                // 98 words; measured 0.056 ms against 0.042 by a thread a value), where int2's 16 a word gained (1.24×).
                 var fw = gpu.Cached($"layout_adaptive_max_warp:{f.Name}:{lane.Name}", (out string e) => Ptx.AdaptiveMaxWarp(gpu, f, lane, out e));
                 Gpu.Launch(fw, Grid(f.Words(k.Count) * 32L, 256), 1, 256, 1, 0, args);
                 return lane.Name;
