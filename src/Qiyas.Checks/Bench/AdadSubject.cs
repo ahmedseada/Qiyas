@@ -550,32 +550,39 @@ public sealed class AdadSubject : IBenchSubject
     public IBenchRun? Optimizer(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) =>
         Registry.IsFloat(type) ? Registry.WithFloat(type, new OptimizerVisitor(device, a, p, g, m, v, n)) : null;
 
-    // The step changes p, m, v: each run starts from the same state, copied on the device from the state staged once (the
-    // restore is timed, as a caller's would not be: it is named).
+    // The step changes p, m, v. A run is the step alone, from the state the runs before it left (its cost does not depend
+    // on the values; a step moves a parameter by about lr); Collect restores the staged state on the device, takes one
+    // step from it and reads p, m, v back, so the scored result is one step from the row's state.
     private sealed class OptimizerVisitor(Device device, OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) : IFloatTypeVisitor<IBenchRun?>, IFloatRun
     {
         public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, OptimizerVisitor>(device, this);
 
         public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
         {
-            TB sp = s.In(p), sm = s.In(m), dg = s.In(g), dp = s.Out(p), dm = s.Out(m);
-            TB? sv = s.InOrNone(v), dv = s.OutOrNone(v);
-            return s.Run(() =>
+            TB sp = s.In(p), sm = s.In(m), dg = s.In(g), dp = s.Rent(p.Length), dm = s.Rent(m.Length);
+            TB? sv = s.InOrNone(v), dv = v is null ? default : s.Rent(v.Length);
+            void Restore()
             {
                 s.D.Copy(sp, dp, p.Length);
                 s.D.Copy(sm, dm, m.Length);
                 if (v is not null) s.D.Copy(sv!, dv!, v.Length);
-                return s.D.Optimizer<TN>(a, dp, dg, dm, dv, n);
-            }, "; + restore of p, m, v");
+            }
+
+            Restore();
+            s.Then(() => { Restore(); s.D.Optimizer<TN>(a, dp, dg, dm, dv, n); s.D.Synchronize(); });
+            s.Collect(dp, p);
+            s.Collect(dm, m);
+            if (v is not null) s.Collect(dv!, v);
+            return s.Run(() => s.D.Optimizer<TN>(a, dp, dg, dm, dv, n));
         }
     }
 
     public IBenchRun? OptimizerMany(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[]? m, byte[]? v, int[] counts) =>
         Registry.IsFloat(type) ? Registry.WithFloat(type, new OptimizerManyVisitor(device, type, a, p, g, m, v, counts)) : null;
 
-    // As the one-tensor step: each run starts from the same state (the restore timed and named). On a device the tensors
-    // are the runs of one buffer each of p, g, m, v (addresses into it), the state restored by one copy a buffer; on the
-    // CPU, whose buffers are arrays, each tensor has its own arrays, restored from the state's and read back into p.
+    // As the one-tensor step: a run is the step alone, Collect restores the state, takes one step and reads p back. On a
+    // device the tensors are the runs of one buffer each of p, g, m, v (addresses into it), the state restored by one copy
+    // a buffer; on the CPU, whose buffers are arrays, each tensor has its own arrays, restored from the state's.
     private sealed class OptimizerManyVisitor(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[]? m, byte[]? v, int[] counts) : IFloatTypeVisitor<IBenchRun?>, IFloatRun
     {
         public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, OptimizerManyVisitor>(device, this);
@@ -589,17 +596,21 @@ public sealed class AdadSubject : IBenchSubject
             var list = new OptimizerTensor<TB>[tensors];
             if (typeof(TB) == typeof(ulong))
             {
-                TB sp = s.In(p), dg = s.In(g), dp = s.Out(p);
-                TB? sm = s.InOrNone(m), dm = s.OutOrNone(m), sv = s.InOrNone(v), dv = s.OutOrNone(v);
+                TB sp = s.In(p), dg = s.In(g), dp = s.Rent(p.Length);
+                TB? sm = s.InOrNone(m), dm = m is null ? default : s.Rent(m.Length), sv = s.InOrNone(v), dv = v is null ? default : s.Rent(v.Length);
                 TB At(TB? b, long bytes) => b is null ? default! : (TB)(object)((ulong)(object)b + (ulong)bytes);
                 for (int t = 0; t < tensors; t++) list[t] = new(At(dp, Bytes(at[t])), At(dg, Bytes(at[t])), m is null ? default : At(dm, at[t] * lane), v is null ? default : At(dv, at[t] * lane), counts[t]);
-                return s.Run(() =>
+                void Restore()
                 {
                     s.D.Copy(sp, dp, p.Length);
                     if (m is not null) s.D.Copy(sm!, dm!, m.Length);
                     if (v is not null) s.D.Copy(sv!, dv!, v.Length);
-                    return s.D.OptimizerMany<TN>(a, list, default);
-                }, "; + restore of p, m, v");
+                }
+
+                Restore();
+                s.Then(() => { Restore(); s.D.OptimizerMany<TN>(a, list, default); s.D.Synchronize(); });
+                s.Collect(dp, p);
+                return s.Run(() => s.D.OptimizerMany<TN>(a, list, default));
             }
 
             byte[] p0 = (byte[])p.Clone();
@@ -615,8 +626,7 @@ public sealed class AdadSubject : IBenchSubject
                 list[t] = new((TB)(object)pt[t], (TB)(object)gt[t], m is null ? default : (TB)(object)mt[t]!, v is null ? default : (TB)(object)vt[t]!, counts[t]);
             }
 
-            s.Then(() => { for (int t = 0; t < tensors; t++) pt[t].CopyTo(p, (int)Bytes(at[t])); });
-            return s.Run(() =>
+            void RestoreArrays()
             {
                 for (int t = 0; t < tensors; t++)
                 {
@@ -624,9 +634,16 @@ public sealed class AdadSubject : IBenchSubject
                     if (m is not null) Buffer.BlockCopy(m, (int)(at[t] * lane), mt[t]!, 0, counts[t] * lane);
                     if (v is not null) Buffer.BlockCopy(v, (int)(at[t] * lane), vt[t]!, 0, counts[t] * lane);
                 }
+            }
 
-                return s.D.OptimizerMany<TN>(a, list, default);
-            }, "; + restore of p, m, v");
+            RestoreArrays();
+            s.Then(() =>
+            {
+                RestoreArrays();
+                s.D.OptimizerMany<TN>(a, list, default);
+                for (int t = 0; t < tensors; t++) pt[t].CopyTo(p, (int)Bytes(at[t]));
+            });
+            return s.Run(() => s.D.OptimizerMany<TN>(a, list, default));
         }
     }
 
