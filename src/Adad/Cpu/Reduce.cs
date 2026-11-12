@@ -924,28 +924,43 @@ internal sealed partial class Kernels
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public readonly void Run(int first, int last)
         {
+            // A 64 × 64 tile on the stack (as every type but a 256-value block format takes it); a larger one from the pool.
+            if (bh * bw <= 4096)
+            {
+                Span<TLane> tile = stackalloc TLane[bh * bw];
+                Span<TLane> line = stackalloc TLane[bh];
+                Tiles(first, last, tile, line);
+                return;
+            }
+
             var pool = ArrayPool<TLane>.Shared;
-            var tile = pool.Rent(bh * bw);
-            var line = pool.Rent(bh);
+            var big = pool.Rent(bh * bw);
+            var row = pool.Rent(bh);
             try
             {
-                for (int t = first; t < last; t++)
-                {
-                    int r0 = t / colBlocks * bh, c0 = t % colBlocks * bw;
-                    int h = Math.Min(bh, rows - r0), wd = Math.Min(bw, cols - c0);
-                    for (int r = 0; r < h; r++) TN.Load(x, (r0 + r) * cols + c0, tile.AsSpan(r * bw, wd));
-                    // Output row c (= input column) holds input rows r0 .. r0 + h.
-                    for (int c = 0; c < wd; c++)
-                    {
-                        for (int r = 0; r < h; r++) line[r] = tile[r * bw + c];
-                        TN.Store(line.AsSpan(0, h), output, (c0 + c) * rows + r0);
-                    }
-                }
+                Tiles(first, last, big, row);
             }
             finally
             {
-                pool.Return(tile);
-                pool.Return(line);
+                pool.Return(big);
+                pool.Return(row);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private readonly void Tiles(int first, int last, Span<TLane> tile, Span<TLane> line)
+        {
+            for (int t = first; t < last; t++)
+            {
+                int r0 = t / colBlocks * bh, c0 = t % colBlocks * bw;
+                int h = Math.Min(bh, rows - r0), wd = Math.Min(bw, cols - c0);
+                for (int r = 0; r < h; r++) TN.Load(x, (r0 + r) * cols + c0, tile.Slice(r * bw, wd));
+                // Output row c (= input column) holds input rows r0 .. r0 + h.
+                for (int c = 0; c < wd; c++)
+                {
+                    for (int r = 0; r < h; r++) line[r] = tile[r * bw + c];
+                    TN.Store(line[..h], output, (c0 + c) * rows + r0);
+                }
             }
         }
     }
