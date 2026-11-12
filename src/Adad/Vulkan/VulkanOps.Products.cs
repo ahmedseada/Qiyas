@@ -62,15 +62,17 @@ public sealed partial class VulkanOps
         vk.Launch(back, Groups(f.Words(count), VkKernels.Threads), 1, lanes, c, Vulkan.U(count), Vulkan.U(period), Vulkan.U(span));
     }
 
-    /// <summary>C = the epilogue's y of op(A)·op(B) (ProductEpilogue): each batch's product into the float lane's sums (the
+    /// <summary>C = the epilogue's y of op(A)·op(B) (ProductEpilogue): each batch's product into the lane's sums (the
     /// operands read where they are stored), the second product's into sums of its own, then the store
-    /// (Kernels.ProductStore.cs; the sums kept first where they are); returns the lane's name.</summary>
-    public string MatMulEpilogue<TN>(ProductView v, ProductEpilogue e, ulong a, ulong b, ulong c, ProductTerms<ulong> t) where TN : struct, IFloatAdad<TN>
+    /// (Kernels.ProductStore.cs; the sums kept first where they are). A float type's lane is its float lane; another
+    /// type's its products' by the bounds of every value the store makes (EpilogueLane); returns the lane's name.</summary>
+    public string MatMulEpilogue<TN>(ProductView v, ProductEpilogue e, ulong a, ulong b, ulong c, ProductTerms<ulong> t) where TN : struct, IAdad<TN>
     {
         var terms = t.Validate(e, v);
         var f = Fmt.Of<TN>();
-        var lane = RowLane(f);
-        if (v.M == 0 || v.N == 0 || v.Batch == 0) return lane.Name;
+        e.ValidateType(f.Name, f.IsFloat);
+        if (v.M == 0 || v.N == 0 || v.Batch == 0) return f.IsFloat ? RowLane(f).Name : f.Natural.Name;
+        var lane = f.IsFloat ? RowLane(f) : EpilogueLane<TN>(v, e, terms, a, b, c, t);
         var rented = new List<ulong>();
         ulong Rent(long bytes) { ulong p = vk.Rent(Math.Max(16, bytes)); rented.Add(p); return p; }
         try
@@ -178,6 +180,19 @@ public sealed partial class VulkanOps
             Product(one, lane, a, f, i * v.StrideAOrDefault, b, f, i * v.StrideBOrDefault, sums + (ulong)(i * span * lane.Size));
     }
 
+    // A type that is not float: its products' lane by the bounds of every value the store makes (ProductEpilogue.IntegerSums,
+    // the ranges read on the device); an unsigned type whose values may fall below 0 takes the float64 lane (ExactSums).
+    private Lane EpilogueLane<TN>(ProductView v, ProductEpilogue e, StoreTerms terms, ulong a, ulong b, ulong c, ProductTerms<ulong> t) where TN : struct, IAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        (double, double) R(ulong x, long n) => Range<TN>(x, (int)n);
+        var w = e.Second;
+        var (bounds, negative) = e.IntegerSums(f.Name, f.Signed, v.K, R(a, v.ValuesA), R(b, v.ValuesB), w is null ? null : R(t.SecondA, w.ValuesA),
+            w is null ? null : R(t.SecondB, w.ValuesB), terms.Bias ? R(t.Bias, v.N) : null, terms.Beta ? R(c, v.ValuesC) : null,
+            terms.Residual ? R(t.Residual, v.ValuesC) : null, terms.Grad is not null ? R(t.ActInputs, v.ValuesC) : null);
+        return negative && !f.Signed ? Lane.F64 : SumLane(f, bounds);
+    }
+
     // After a product's sums (lane storage, the view's C contiguous): the second product's into sums of its own, then the
     // store (the sums kept first where they are).
     private void EpilogueStore(Fmt f, Lane lane, ProductView v, ProductEpilogue e, StoreTerms terms, ProductTerms<ulong> t, ulong sums, ulong c, int cols, int oc, Func<long, ulong> rent)
@@ -189,23 +204,26 @@ public sealed partial class VulkanOps
             ViewSums(e.Second!, lane, f, t.SecondA, t.SecondB, second);
         }
 
-        if (terms.Keep) ProductStore(f, lane, terms.KeepPass, sums, second, t.Bias, 0, 0, t.Sums, v.ValuesC, cols, oc, e.ActA, e.Beta);
-        ProductStore(f, lane, terms, sums, second, t.Bias, t.Residual, t.ActInputs, c, v.ValuesC, cols, oc, e.ActA, e.Beta);
+        if (terms.Keep) ProductStore(f, lane, terms.KeepPass, sums, second, t.Bias, 0, 0, t.Sums, v.ValuesC, cols, oc, e.ActA, e.Beta, e.ActB, before: c);
+        ProductStore(f, lane, terms, sums, second, t.Bias, t.Residual, t.ActInputs, c, v.ValuesC, cols, oc, e.ActA, e.Beta, e.ActB);
     }
 
     /// <summary>y (count values of f) = the store terms' value of the lane sums (Kernels.ProductStore.cs): the bias the
     /// channel (at / cols) mod oc's, an absent term's pointer 0.</summary>
-    private void ProductStore(Fmt f, Lane lane, StoreTerms t, ulong sums, ulong second, ulong bias, ulong residual, ulong actInputs, ulong y, long count, int cols, int oc, double actA, double beta)
+    private void ProductStore(Fmt f, Lane lane, StoreTerms t, ulong sums, ulong second, ulong bias, ulong residual, ulong actInputs, ulong y, long count, int cols, int oc,
+        double actA, double beta, double actB = 0, ulong before = 0)
     {
+        if (before == 0) before = y;
         if (f.IsBlock)
         {
             Encode(f, count, vk.Cached($"block_product_store:{f.Name}:{t.Key}", () => VkKernels.BlockProductStore(vk, f, t)), y,
-                sums, second, bias, residual, actInputs, y, Vulkan.U(cols), Vulkan.U(oc), Vulkan.F((float)actA), Vulkan.F((float)beta));
+                sums, second, bias, residual, actInputs, before, Vulkan.U(cols), Vulkan.U(oc), Vulkan.F((float)actA), Vulkan.F((float)actB), Vulkan.F((float)beta));
             return;
         }
 
         var k = vk.Cached($"product_store:{f.Name}:{lane.Name}:{t.Key}", () => VkKernels.ProductStore(vk, f, lane, t));
-        vk.Launch(k, Groups(f.Words(count), VkKernels.Threads), 1, sums, second, bias, residual, actInputs, y, Vulkan.U((int)count), Vulkan.U(cols), Vulkan.U(oc), Slot(lane, actA), Slot(lane, beta));
+        vk.Launch(k, Groups(f.Words(count), VkKernels.Threads), 1, sums, second, bias, residual, actInputs, y, before, Vulkan.U((int)count), Vulkan.U(cols), Vulkan.U(oc), Slot(lane, actA),
+            Slot(lane, actB), Slot(lane, beta));
     }
 
     /// <summary>dA = dC·Bᵀ and dB = Aᵀ·dC for C = A·B (A m × k, B k × n, dC m × n); returns dA's lane.</summary>

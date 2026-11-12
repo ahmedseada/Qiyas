@@ -85,10 +85,13 @@ public sealed record ProductEpilogue
     /// <summary>y's value before, times β, added to the sums (0: y not read).</summary>
     public double Beta { get; init; }
 
-    /// <summary>A one-input formula (Map.cs) applied to the sums, with ActA its parameter; null none.</summary>
+    /// <summary>A one-input formula (Map.cs) applied to the sums, with ActA and ActB its parameters (a and b: affine's
+    /// a·x + b, clamp's bounds); null none.</summary>
     public string? Act { get; init; }
 
     public double ActA { get; init; }
+
+    public double ActB { get; init; }
 
     /// <summary>A two-input backward formula grad(x, dy) (Map.cs: gelu_bwd, silu_bwd, …) taken as grad(aux, s); null none.</summary>
     public string? Grad { get; init; }
@@ -122,6 +125,107 @@ public sealed record ProductEpilogue
         if (w.ValuesA > int.MaxValue || w.ValuesB > int.MaxValue) throw new ArgumentException("matmul epilogue: a second product's operand past 2^31 values");
     }
 
+    /// <summary>Refuses what a type that is not float does not take: a formula only the float types run (MapOp.FloatOnly,
+    /// as Map refuses it), a β or a formula's parameter that is not an integer (an integer type's terms are its integers),
+    /// and a formula whose value at integers is not an integer (Integral: div).</summary>
+    public void ValidateType(string type, bool isFloat)
+    {
+        if (isFloat) return;
+        foreach (var name in new[] { Act, Grad })
+            if (name is not null && Ops.Find(name).FloatOnly) throw new NotSupportedException($"matmul epilogue: {name} is a float formula, and {type} is not a float type");
+        if (Beta != Math.Floor(Beta) || ActA != Math.Floor(ActA) || ActB != Math.Floor(ActB))
+            throw new ArgumentException($"matmul epilogue: {type} takes an integer β and parameters, not {Beta}, {ActA} and {ActB}");
+        foreach (var name in new[] { Act, Grad })
+            if (name is not null && !Integral(Ops.Find(name), ActA, ActB))
+                throw new NotSupportedException($"matmul epilogue: {name}'s value at integers is not always an integer, and {type} is not a float type");
+    }
+
+    /// <summary>Whether a formula's value at integers is a finite integer at every point of a grid (each input -3 to 3; a
+    /// and b its parameters): what a type that is not float takes where the lane is chosen by bounds, a float lane or an
+    /// integer one, either holding such a value exactly. div is not (1 / 2, 1 / 0): its integer form truncates, which a
+    /// float lane would not, and its quotient over a range crossing 0 has no bound.</summary>
+    public static bool Integral(MapOp op, double a, double b)
+    {
+        int ny = op.Inputs > 1 ? 3 : 0, nz = op.Inputs > 2 ? 3 : 0;
+        for (int x = -3; x <= 3; x++)
+            for (int y = -ny; y <= ny; y++)
+                for (int z = -nz; z <= nz; z++)
+                {
+                    double r = op.Reference(x, y, z, a, b);
+                    if (!double.IsFinite(r) || r != Math.Floor(r)) return false;
+                }
+
+        return true;
+    }
+
+    /// <summary>The lane an integer type's epilogue sums in, from the ranges of what it reads ((low, high) each; null where
+    /// its term is not taken): every value the store makes, from the products' sums to y before its one rounding, held
+    /// exactly (the type's store then saturates once); ExactSums by those values and the operands' ranges (the second
+    /// product's with the product's: a dot lane reads both).</summary>
+    public (Bounds Bounds, bool Negative) IntegerSums(string type, bool signed, int k, (double Lo, double Hi) a, (double Lo, double Hi) b,
+        (double Lo, double Hi)? a2, (double Lo, double Hi)? b2, (double Lo, double Hi)? bias, (double Lo, double Hi)? y0,
+        (double Lo, double Hi)? residual, (double Lo, double Hi)? actInputs)
+    {
+        static (double Lo, double Hi) Products(long k, (double Lo, double Hi) x, (double Lo, double Hi) y)
+        {
+            if (k == 0) return (0, 0);
+            double p = x.Lo * y.Lo, q = x.Lo * y.Hi, r = x.Hi * y.Lo, s = x.Hi * y.Hi;
+            return (k * Math.Min(Math.Min(p, q), Math.Min(r, s)), k * Math.Max(Math.Max(p, q), Math.Max(r, s)));
+        }
+
+        // The terms of s; each partial sum of them lies within [Σ min(low, 0), Σ max(high, 0)].
+        var terms = new List<(double Lo, double Hi)> { Products(k, a, b) };
+        if (Second is not null) terms.Add(Products(Second.K, a2!.Value, b2!.Value));
+        if (bias is { } bv) terms.Add(bv);
+        if (Beta != 0) terms.Add((Math.Min(Beta * y0!.Value.Lo, Beta * y0.Value.Hi), Math.Max(Beta * y0.Value.Lo, Beta * y0.Value.Hi)));
+        double sLo = 0, sHi = 0, lo = 0, hi = 0;
+        foreach (var (tl, th) in terms) { sLo += tl; sHi += th; lo += Math.Min(tl, 0); hi += Math.Max(th, 0); }
+
+        // The formula over s's range (its ends and 0; a gradient's with its inputs' ends and 0), then the residual.
+        var o = (Lo: sLo, Hi: sHi);
+        if ((Act ?? Grad) is { } name)
+        {
+            var f = Ops.Find(name);
+            double oLo = double.PositiveInfinity, oHi = double.NegativeInfinity;
+            foreach (double x in Grad is null ? [0.0] : new[] { actInputs!.Value.Lo, 0, actInputs.Value.Hi })
+                foreach (double s in new[] { sLo, 0, sHi })
+                {
+                    double r = Grad is null ? f.Reference(s, 0, 0, ActA, ActB) : f.Reference(x, s, 0, ActA, ActB);
+                    oLo = Math.Min(oLo, r);
+                    oHi = Math.Max(oHi, r);
+                }
+
+            o = (oLo, oHi);
+        }
+
+        var y = residual is { } rv ? (Lo: o.Lo + rv.Lo, Hi: o.Hi + rv.Hi) : o;
+        lo = Math.Min(lo, Math.Min(o.Lo, y.Lo));
+        hi = Math.Max(hi, Math.Max(o.Hi, y.Hi));
+        // An unsigned lane holds a negative β or parameter only by wrapping: a float lane takes them.
+        if (!signed && (Beta < 0 || ActA < 0 || ActB < 0)) lo = Math.Min(lo, -1);
+        return ExactSums("matmul epilogue", type, signed, lo, hi, (Math.Min(a.Lo, a2?.Lo ?? a.Lo), Math.Max(a.Hi, a2?.Hi ?? a.Hi)),
+            (Math.Min(b.Lo, b2?.Lo ?? b.Lo), Math.Max(b.Hi, b2?.Hi ?? b.Hi)));
+    }
+
+    /// <summary>A product's lane for a type that is not float, every value its store makes within [lo, hi] and its operands
+    /// within a and b (both products' together): Bounds with those ranges (at least 0 to 1, so a zero operand still
+    /// bounds the terms) and a count of terms whose Bound passes |lo| and |hi|; Negative: lo below 0, which an unsigned
+    /// type's own lanes do not hold: its Bounds then pass 2^32, past every unsigned dot and 32-bit lane, which leaves the
+    /// float64 lane (every device takes it), refused past 2^53, which it does not hold exactly.</summary>
+    public static (Bounds Bounds, bool Negative) ExactSums(string what, string type, bool signed, double lo, double hi, (double Lo, double Hi) a, (double Lo, double Hi) b)
+    {
+        double bound = Math.Max(-lo, hi);
+        if (!signed && lo < 0)
+        {
+            if (bound > Exact.Float64) throw new NotSupportedException($"{what}: {type}'s values reach {lo} and {hi}: below 0 and past 2^53, no lane holds them exactly");
+            return (new Bounds(-1, 1, -1, 1, (long)Math.Max(Math.Ceiling(bound), 4294967297.0)), true);
+        }
+
+        double aLo = a.Lo, aHi = Math.Max(a.Hi, 1), bLo = b.Lo, bHi = Math.Max(b.Hi, 1);
+        double per = Math.Max(-aLo, aHi) * Math.Max(-bLo, bHi);
+        return (new Bounds(aLo, aHi, bLo, bHi, (long)Math.Clamp(Math.Ceiling(bound / per), 1, long.MaxValue)), lo < 0);
+    }
+
     /// <summary>The float64 reference: y and the sums s it was made from (y0 y's values before; bias n values; residual and
     /// actInputs y's layout; a2 and b2 the second product's operands as its view stores them).</summary>
     public (double[] Y, double[] S) Reference(ProductView v, double[] a, double[] b, double[] y0, double[]? bias, double[]? residual, double[]? actInputs, double[]? a2, double[]? b2) =>
@@ -140,7 +244,7 @@ public sealed record ProductEpilogue
         {
             double t = p[i] + (second is null ? 0 : second[i]) + (bias is null ? 0 : bias[i / cols % oc]) + (Beta == 0 ? 0 : Beta * y0[i]);
             s[i] = t;
-            double o = act is not null ? act.Reference(t, 0, 0, ActA, 0) : grad is not null ? grad.Reference(actInputs![i], t, 0, ActA, 0) : t;
+            double o = act is not null ? act.Reference(t, 0, 0, ActA, ActB) : grad is not null ? grad.Reference(actInputs![i], t, 0, ActA, ActB) : t;
             y[i] = o + (residual is null ? 0 : residual[i]);
         }
 

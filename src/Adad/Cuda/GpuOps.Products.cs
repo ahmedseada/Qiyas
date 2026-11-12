@@ -87,15 +87,17 @@ public sealed partial class GpuOps
         return lane;
     }
 
-    /// <summary>C = the epilogue's y of op(A)·op(B) (ProductEpilogue): every batch's product into the float lane's sums
-    /// (the operands read where they are stored), the second product's into sums of its own, then the store
-    /// (Ptx.ProductStore; the sums kept first where they are); returns the lane's name.</summary>
-    public string MatMulEpilogue<TN>(ProductView v, ProductEpilogue e, ulong a, ulong b, ulong c, ProductTerms<ulong> t) where TN : struct, IFloatAdad<TN>
+    /// <summary>C = the epilogue's y of op(A)·op(B) (ProductEpilogue): every batch's product into the lane's sums (the
+    /// operands read where they are stored), the second product's into sums of its own, then the store (Ptx.ProductStore;
+    /// the sums kept first where they are). A float type's lane is its float lane; another type's its products' by the
+    /// bounds of every value the store makes (EpilogueLane); returns the lane's name.</summary>
+    public string MatMulEpilogue<TN>(ProductView v, ProductEpilogue e, ulong a, ulong b, ulong c, ProductTerms<ulong> t) where TN : struct, IAdad<TN>
     {
         var terms = t.Validate(e, v);
         var f = Fmt.Of<TN>();
-        var lane = RowLane(f);
-        if (v.M == 0 || v.N == 0 || v.Batch == 0) return lane.Name;
+        e.ValidateType(f.Name, f.IsFloat);
+        if (v.M == 0 || v.N == 0 || v.Batch == 0) return f.IsFloat ? RowLane(f).Name : f.Natural.Name;
+        var lane = f.IsFloat ? RowLane(f) : EpilogueLane<TN>(v, e, terms, a, b, c, t);
         ulong sums = gpu.Rent(Math.Max(16, v.ValuesC * lane.Size));
         try
         {
@@ -179,6 +181,19 @@ public sealed partial class GpuOps
 
     // After a product's sums (lane storage, the view's C contiguous): the second product's into sums of its own (every
     // batch's operands read where they are stored), then the store (the sums kept first where they are).
+    // A type that is not float: its products' lane by the bounds of every value the store makes (ProductEpilogue.IntegerSums,
+    // the ranges read on the device); an unsigned type whose values may fall below 0 takes the float64 lane (ExactSums).
+    private Lane EpilogueLane<TN>(ProductView v, ProductEpilogue e, StoreTerms terms, ulong a, ulong b, ulong c, ProductTerms<ulong> t) where TN : struct, IAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        (double, double) R(ulong x, long n) => Range<TN>(x, (int)n);
+        var w = e.Second;
+        var (bounds, negative) = e.IntegerSums(f.Name, f.Signed, v.K, R(a, v.ValuesA), R(b, v.ValuesB), w is null ? null : R(t.SecondA, w.ValuesA),
+            w is null ? null : R(t.SecondB, w.ValuesB), terms.Bias ? R(t.Bias, v.N) : null, terms.Beta ? R(c, v.ValuesC) : null,
+            terms.Residual ? R(t.Residual, v.ValuesC) : null, terms.Grad is not null ? R(t.ActInputs, v.ValuesC) : null);
+        return negative && !f.Signed ? Lane.F64 : SumLane(f, bounds);
+    }
+
     private void EpilogueStore(Fmt f, Lane lane, ProductView v, ProductEpilogue e, StoreTerms terms, ProductTerms<ulong> t, ulong sums, ulong c, int cols, int oc)
     {
         ulong second = 0;
@@ -190,8 +205,8 @@ public sealed partial class GpuOps
                 ProductStored(e.Second!, lane, t.SecondA, f, 0, t.SecondB, f, 0, second, null);
             }
 
-            if (terms.Keep) ProductStore(f, lane, terms.KeepPass, sums, second, t.Bias, 0, 0, t.Sums, v.ValuesC, cols, oc, e.ActA, e.Beta);
-            ProductStore(f, lane, terms, sums, second, t.Bias, t.Residual, t.ActInputs, c, v.ValuesC, cols, oc, e.ActA, e.Beta);
+            if (terms.Keep) ProductStore(f, lane, terms.KeepPass, sums, second, t.Bias, 0, 0, t.Sums, v.ValuesC, cols, oc, e.ActA, e.Beta, e.ActB, before: c);
+            ProductStore(f, lane, terms, sums, second, t.Bias, t.Residual, t.ActInputs, c, v.ValuesC, cols, oc, e.ActA, e.Beta, e.ActB);
         }
         finally
         {
@@ -200,13 +215,17 @@ public sealed partial class GpuOps
     }
 
     /// <summary>y (count values of f) = the store terms' value of the lane sums (Ptx.ProductStore): the bias the channel
-    /// (at / cols) mod oc's, an absent term's pointer 0.</summary>
-    private void ProductStore(Fmt f, Lane lane, StoreTerms t, ulong sums, ulong second, ulong bias, ulong residual, ulong actInputs, ulong y, long count, int cols, int oc, double actA, double beta)
+    /// (at / cols) mod oc's, an absent term's pointer 0; the formula's parameters and β as lane values.</summary>
+    private void ProductStore(Fmt f, Lane lane, StoreTerms t, ulong sums, ulong second, ulong bias, ulong residual, ulong actInputs, ulong y, long count, int cols, int oc,
+        double actA, double beta, double actB = 0, ulong before = 0)
     {
         var fn = gpu.Cached($"product_store:{f.Name}:{lane.Name}:{t.Key}", (out string e) => Ptx.ProductStore(gpu, f, lane, t, out e));
-        LaunchEach(fn, f, count, sums, second, bias, residual, actInputs, y, Gpu.U((int)count), Gpu.U(cols), Gpu.U(oc),
-            lane.Wide ? Gpu.D(actA) : Gpu.F((float)actA), lane.Wide ? Gpu.D(beta) : Gpu.F((float)beta));
+        LaunchEach(fn, f, count, sums, second, bias, residual, actInputs, y, before == 0 ? y : before, Gpu.U((int)count), Gpu.U(cols), Gpu.U(oc), LaneScalar(lane, actA), LaneScalar(lane, actB),
+            LaneScalar(lane, beta));
     }
+
+    // A scalar as a lane's value, a kernel's .{lane.Mem} parameter (an integer lane's: the integer, by its bits).
+    private static ulong LaneScalar(Lane lane, double v) => lane.IsFloat ? (lane.Wide ? Gpu.D(v) : Gpu.F((float)v)) : lane.Wide ? (ulong)(long)v : (uint)(int)(long)v;
 
     /// <summary>dA = dC·Bᵀ and dB = Aᵀ·dC for C = A·B (A m × k, B k × n, dC m × n); returns dA's lane.</summary>
     public string MatMulBackward<TN>(ulong a, ulong b, ulong dc, ulong da, ulong db, int m, int n, int k) where TN : struct, IAdad<TN>

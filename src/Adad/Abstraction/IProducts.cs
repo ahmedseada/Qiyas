@@ -14,7 +14,7 @@ public interface IProducts<TBuffer>
 
     /// <summary>C = the epilogue's y of op(A)·op(B) (ProductEpilogue: + op(A2)·op(B2) + bias + β·C, the sums kept, then the
     /// activation or a gradient through one, then + residual), every term in the float lane and C rounded to the type once.</summary>
-    string MatMulEpilogue<TN>(ProductView v, ProductEpilogue e, TBuffer a, TBuffer b, TBuffer c, ProductTerms<TBuffer> t) where TN : struct, IFloatAdad<TN>;
+    string MatMulEpilogue<TN>(ProductView v, ProductEpilogue e, TBuffer a, TBuffer b, TBuffer c, ProductTerms<TBuffer> t) where TN : struct, IAdad<TN>;
 
     /// <summary>y (m × N) = the epilogue's y of x (m × K) · Wᵀ (over ScaledWeight.View(m)), W the scaled weight's values made
     /// in the float lane as the product reads each code (codes TW, any type; scales and zeros stored as TN): no W in memory

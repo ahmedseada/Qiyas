@@ -13,16 +13,18 @@ namespace Adad.Cuda;
 internal static partial class Ptx
 {
     /// <summary>Params: sums (lane storage), the second product's sums (lane storage), bias (an output channel's, the channel
-    /// (at / cols) mod oc), residual, the activation's inputs (a gradient's x), y, n, cols, oc, the activation's parameter
-    /// and β (lane values). A term the store does not take has its pointer unread.</summary>
+    /// (at / cols) mod oc), residual, the activation's inputs (a gradient's x), y, y's values before (β's term: y, or the
+    /// product's y where the pass stores the sums kept), n, cols, oc, the formula's parameters a and b, and β (lane values).
+    /// A term the store does not take has its pointer unread.</summary>
     public static string ProductStore(Gpu gpu, Fmt f, Lane lane, StoreTerms t, out string entry)
     {
         entry = $"product_store_{f.Name}_{lane.Name}_{t.Key}";
         var b = new PtxBuilder();
-        string ps = Param64(b, "p_s"), pl = Param64(b, "p_l"), pb = Param64(b, "p_b"), pr = Param64(b, "p_r"), px = Param64(b, "p_x"), py = Param64(b, "p_y");
+        string ps = Param64(b, "p_s"), pl = Param64(b, "p_l"), pb = Param64(b, "p_b"), pr = Param64(b, "p_r"), px = Param64(b, "p_x"), py = Param64(b, "p_y"), pc = Param64(b, "p_c");
         string n = Param32(b, "p_n"), cols = Param32(b, "p_cols"), oc = Param32(b, "p_oc");
-        string pa = lane.NewReg(b), beta = lane.NewReg(b);
+        string pa = lane.NewReg(b), pab = lane.NewReg(b), beta = lane.NewReg(b);
         b.L($"ld.param.{lane.Mem} {pa}, [p_a];");
+        b.L($"ld.param.{lane.Mem} {pab}, [p_ab];");
         b.L($"ld.param.{lane.Mem} {beta}, [p_beta];");
         var e = new Emit(b, lane);
         string Value(string at)
@@ -30,9 +32,9 @@ internal static partial class Ptx
             string v = LoadLane(b, lane, ps, at);
             if (t.Second) v = e.Add(v, LoadLane(b, lane, pl, at));
             if (t.Bias) v = e.Add(v, Codec.UnpackAt(b, f, pb, Within(b, at, cols, oc), lane));
-            if (t.Beta) v = e.Fma(beta, Codec.UnpackAt(b, f, py, at, lane), v);
-            if (t.Grad is not null) v = Formula(b, lane, t.Grad, Codec.UnpackAt(b, f, px, at, lane), v, v, pa, pa);
-            else if (t.Act is not null) v = Formula(b, lane, t.Act, v, v, v, pa, pa);
+            if (t.Beta) v = e.Fma(beta, Codec.UnpackAt(b, f, pc, at, lane), v);
+            if (t.Grad is not null) v = Formula(b, lane, t.Grad, Codec.UnpackAt(b, f, px, at, lane), v, v, pa, pab);
+            else if (t.Act is not null) v = Formula(b, lane, t.Act, v, v, v, pa, pab);
             if (t.Residual) v = e.Add(v, Codec.UnpackAt(b, f, pr, at, lane));
             return v;
         }
@@ -41,12 +43,14 @@ internal static partial class Ptx
         b.Label("DONE");
         b.L("ret;");
         return b.Finish(Header(gpu), entry,
-            $".param .u64 p_s, .param .u64 p_l, .param .u64 p_b, .param .u64 p_r, .param .u64 p_x, .param .u64 p_y, .param .u32 p_n, .param .u32 p_cols, .param .u32 p_oc, .param .{lane.Mem} p_a, .param .{lane.Mem} p_beta", EachShared(f));
+            $".param .u64 p_s, .param .u64 p_l, .param .u64 p_b, .param .u64 p_r, .param .u64 p_x, .param .u64 p_y, .param .u64 p_c, .param .u32 p_n, .param .u32 p_cols, .param .u32 p_oc, .param .{lane.Mem} p_a, .param .{lane.Mem} p_ab, .param .{lane.Mem} p_beta", EachShared(f));
     }
 
     /// <summary>The n values of f at py from value(at) (a lane register; at a .u32 register below n), each rounded to the type
     /// once: a thread per stored word, or a warp (a CTA where BlockByCta) per block of a block format, whose source must be
-    /// straight-line code. Threads past the values go to DONE, which the caller places; the launch is GpuOps.LaunchEach's.</summary>
+    /// straight-line code. Threads past the values go to DONE, which the caller places; the launch is GpuOps.LaunchEach's.
+    /// A float type's value goes through its natural lane; an integer type's is packed from the lane itself (Codec.Pack
+    /// holds a wide or float lane's value to the type's range, where a narrowing first would cut it).</summary>
     internal static void StoreEach(PtxBuilder b, Fmt f, Lane lane, string py, string n, Func<string, string> value)
     {
         if (f.IsBlock)
@@ -71,10 +75,11 @@ internal static partial class Ptx
             b.L($"setp.lt.u32 {inside}, {at}, {n};");
             b.L($"min.u32 {at}, {at}, {last};");
             string v = value(at);
-            string stored = lane == natural ? v : Codec.Convert(b, lane, v, natural, f);
-            string kept = natural.NewReg(b);
-            b.L($"selp.{natural.Reg} {kept}, {stored}, {natural.Zero}, {inside};");
-            Codec.Pack(b, f, kept, natural, i, code);
+            var into = f.IsFloat ? natural : lane;
+            string stored = lane == into ? v : Codec.Convert(b, lane, v, into, f);
+            string kept = into.NewReg(b);
+            b.L($"selp.{into.Reg} {kept}, {stored}, {into.Zero}, {inside};");
+            Codec.Pack(b, f, kept, into, i, code);
         }
 
         string addr = b.RD();
