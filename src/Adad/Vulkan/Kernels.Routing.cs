@@ -15,7 +15,8 @@ internal static partial class VkKernels
 {
     public const int MaxTopK = 256;
 
-    /// <summary>indices[r][i] for i &lt; k (s32): the row's largest first, ties by the lower index. Arguments: x, indices, cols, k.</summary>
+    /// <summary>indices[r][i] for i &lt; k (s32): the row's k first in Adad's order (Routing.Precedes: larger first, a NaN
+    /// above every number, ties by the lower index). Arguments: x, indices, cols, k.</summary>
     public static SpvKernel TopKRows(Vulkan vk, Fmt f, Lane lane)
     {
         var lk = Kinds.Of(lane);
@@ -33,7 +34,8 @@ internal static partial class VkKernels
         var si = b.Shared(K.U32, ReduceThreads);
         b.For(b.U(0), k, i =>
         {
-            // This invocation's best over its columns not already taken.
+            // This invocation's first-ranked over its columns not already taken (its columns rise: an equal value keeps the
+            // earlier).
             var best = b.Local(Identity(b, lk, "max"));
             var bestAt = b.Local(none);
             b.For(tid, cols, b.U(ReduceThreads), c =>
@@ -43,13 +45,13 @@ internal static partial class VkKernels
                 b.If(!isTaken.V, () =>
                 {
                     var v = Codec.UnpackAt(b, f, x, start + c, lane);
-                    var take = (v > best.V) | (bestAt.V == none);
+                    var take = Rank(b, lane, v, best.V).Above | (bestAt.V == none);
                     best.V = b.Select(take, v, best.V);
                     bestAt.V = b.Select(take, c, bestAt.V);
                 });
             });
 
-            // The workgroup's best: the largest value, the lowest index among equals.
+            // The workgroup's first-ranked: Adad's order, the lowest index among equals.
             sv[tid] = best.V;
             si[tid] = bestAt.V;
             b.Barrier();
@@ -62,7 +64,8 @@ internal static partial class VkKernels
                     var mi = si[tid];
                     var ov = sv[tid + step];
                     var oi = si[tid + step];
-                    var take = ((ov > mv) | ((ov == mv) & (oi < mi)) | (mi == none)) & (oi != none);
+                    var (above, same) = Rank(b, lane, ov, mv);
+                    var take = (above | (same & (oi < mi)) | (mi == none)) & (oi != none);
                     sv[tid] = b.Select(take, ov, mv);
                     si[tid] = b.Select(take, oi, mi);
                 });
@@ -78,6 +81,15 @@ internal static partial class VkKernels
             b.Barrier();
         });
         return b.Build();
+    }
+
+    /// <summary>Adad's order on two lane values (Routing.Precedes without the columns): whether a ranks above c (larger, or a
+    /// NaN against a number) and whether they rank the same (equal, −0 and +0 among them, or two NaNs).</summary>
+    internal static (V Above, V Same) Rank(Spv b, Lane lane, V a, V c)
+    {
+        if (!lane.IsFloat) return (a > c, a == c);
+        V na = b.IsNan(a), nc = b.IsNan(c);
+        return ((a > c) | (na & !nc), (a == c) | (na & nc));
     }
 
     /// <summary>out[r·k + j] = x[r][index[r·k + j]] (s32 columns) over rows · k values, a thread per stored word: top-k's
@@ -128,23 +140,23 @@ internal static partial class VkKernels
     }
 
     /// <summary>The top-k's values as log-probabilities (IRouting.LogSoftmaxTopK), a workgroup a row: targets holds `count`
-    /// columns a row (TopK's: the first the row's largest; one below 0 or past the row: none). m = x at the first column;
-    /// Σ exp(x − m) over the row, each invocation four sums over its columns (a fixed order) joined by the workgroup's tree;
-    /// then an invocation a chosen column: (x[t] − m) − log Σ as a lane value at losses[row·count + j] (`none` for none).
-    /// Arguments: x, targets, losses, cols, count, none (lane).</summary>
+    /// columns a row (TopK's: the first the row's first-ranked, every one in the row). m = x at the first column; Σ exp(x − m)
+    /// over the row, each invocation four sums over its columns (a fixed order) joined by the workgroup's tree; then an
+    /// invocation a chosen column: (x[t] − m) − log Σ as a lane value at losses[row·count + j].
+    /// Arguments: x, targets, losses, cols, count.</summary>
     public static SpvKernel LogProbRows(Vulkan vk, Fmt f, Lane lane)
     {
         const int Sums = 4;
         var k = Kinds.Of(lane);
         var b = new Spv($"log_prob_rows_{f.Name}_{lane.Name}", ReduceThreads, vk.Controls);
         V x = b.Arg(0), targets = b.Arg(1), losses = b.Arg(2);
-        V cols = b.Arg(3, K.U32), count = b.Arg(4, K.U32), none = b.Arg(5, k);
+        V cols = b.Arg(3, K.U32), count = b.Arg(4, K.U32);
         var tid = b.LocalIdX;
         var row = b.GroupX;
         var start = row * cols;
         var last = cols - 1;
         var first = b.Load(K.U32, b.At(targets, row * count, 4));
-        var m = Codec.UnpackAt(b, f, x, start + b.Select(first < cols, first, b.U(0)), lane);
+        var m = Codec.UnpackAt(b, f, x, start + first, lane);
         var sums = new Var[Sums];
         for (int u = 0; u < Sums; u++) sums[u] = b.Local(b.C(k, 0));
         b.For(tid, cols, b.U(Sums * ReduceThreads), i =>
@@ -163,9 +175,8 @@ internal static partial class VkKernels
         {
             var at = row * count + j;
             var col = b.Load(K.U32, b.At(targets, at, 4));
-            var valid = col < cols;                                                   // −1 (no column) is past every row
-            var chosen = Codec.UnpackAt(b, f, x, start + b.Select(valid, col, b.U(0)), lane);
-            b.Store(b.At(losses, at, lane.Size), b.Select(valid, (chosen - m) - logSum, none));
+            var chosen = Codec.UnpackAt(b, f, x, start + col, lane);
+            b.Store(b.At(losses, at, lane.Size), (chosen - m) - logSum);
         });
         return b.Build();
     }

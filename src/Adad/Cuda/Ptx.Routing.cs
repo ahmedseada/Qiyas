@@ -1,18 +1,19 @@
 // Copyright (c) 2026 Ahmed Seada
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
-// The device's routing and sampling kernels (Routing.cs): a block per row for top-k (k passes of the block's argmax
-// over the values not yet taken) and for sampling (each thread's chunk summed, the chunks' prefix by the first thread,
-// the first crossing found per chunk and the least taken); pick as a thread per row.
+// The device's routing and sampling kernels (Routing.cs): a block per row for top-k (k passes of the block's first-ranked
+// in Adad's order over the columns not yet taken) and for sampling (each thread's chunk summed, the chunks' prefix by the
+// first thread, the first crossing found per chunk and the least taken); top-k's values and pick by a gather a thread a
+// stored word (a block format's block by its encoder), so no two threads store into one word.
 using Adad.Abstraction;
 
 namespace Adad.Cuda;
 
 internal static partial class Ptx
 {
-    /// <summary>values[r][i], indices[r][i] for i &lt; k: the row's largest first, ties by the lower index.</summary>
-    /// <summary>Top-k of each row: indices s32, values as the type (a block format's values gathered after, GatherRowsBlocks:
-    /// only the indices here).</summary>
+    /// <summary>The columns of each row's k first in Adad's order (Routing.Precedes: larger first, a NaN above every number,
+    /// equals by the lower column), s32: k passes of the block's first-ranked over the columns not yet taken; the values are
+    /// gathered after (GatherRows). Params: x, indices, cols, k.</summary>
     public static string TopKRows(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"topk_rows_{f.Name}_{lane.Name}";
@@ -20,7 +21,7 @@ internal static partial class Ptx
         string tid = b.R(), row = b.R();
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {row}, %ctaid.x;");
-        string x = Param64(b, "p_x"), values = Param64(b, "p_values"), indices = Param64(b, "p_indices"), cols = Param32(b, "p_cols"), k = Param32(b, "p_k");
+        string x = Param64(b, "p_x"), indices = Param64(b, "p_indices"), cols = Param32(b, "p_cols"), k = Param32(b, "p_k");
         string start = b.R(), i = b.R(), pK = b.P(), smem = b.R();
         b.L($"mul.lo.u32 {start}, {row}, {cols};");
         b.L($"mov.u32 {smem}, smem;");
@@ -28,7 +29,8 @@ internal static partial class Ptx
         b.Label("PASS");
         b.L($"setp.ge.u32 {pK}, {i}, {k};");
         b.L($"@{pK} bra PASS_END;");
-        // This thread's best over its columns not already taken (the taken indices in shared memory past the reduction's slots).
+        // This thread's first-ranked over its columns not already taken (the taken columns in shared memory past the
+        // reduction's slots); its columns rise, so an equal value keeps the earlier.
         string c = b.R(), pEnd = b.P(), best = lane.NewReg(b), bestAt = b.R();
         b.L($"mov.{lane.Reg} {best}, {ReduceIdentity(lane, "max")};");
         b.L($"mov.u32 {bestAt}, 0xFFFFFFFF;");
@@ -54,39 +56,29 @@ internal static partial class Ptx
         string idx = b.R();
         b.L($"add.u32 {idx}, {start}, {c};");
         string v = Codec.UnpackAt(b, f, x, idx, lane);
-        string pGt = b.P(), pFirst = b.P();
-        b.L($"setp.gt.{lane.Op} {pGt}, {v}, {best};");
+        var (pAbove, _) = Rank(b, lane, v, best);
+        string pFirst = b.P();
         b.L($"setp.eq.u32 {pFirst}, {bestAt}, 0xFFFFFFFF;");
-        b.L($"or.pred {pGt}, {pGt}, {pFirst};");
-        b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {best}, {v}, {best}, {pGt};");
-        b.L($"selp.u32 {bestAt}, {c}, {bestAt}, {pGt};");
+        b.L($"or.pred {pAbove}, {pAbove}, {pFirst};");
+        b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {best}, {v}, {best}, {pAbove};");
+        b.L($"selp.u32 {bestAt}, {c}, {bestAt}, {pAbove};");
         b.Label("COLS_NEXT");
         b.L($"add.u32 {c}, {c}, 256;");
         b.L("bra COLS;");
         b.Label("COLS_END");
-        // The block's best (value, index): the largest value, the lowest index among equals, through shared memory pairs.
-        var (bv, bi) = BlockArgmax(b, lane, tid, best, bestAt, smem);
+        // The block's first-ranked (value, column) through shared memory pairs.
+        var (_, bi) = BlockArgmax(b, lane, tid, best, bestAt, smem);
         string p0 = b.P();
         b.L($"setp.ne.u32 {p0}, {tid}, 0;");
         b.L($"@{p0} bra RECORD_END;");
         {
-            string tAddr2 = b.R(), oIdx = b.R(), vAddr = b.RD(), iAddr = b.RD();
+            string tAddr2 = b.R(), oIdx = b.R(), iAddr = b.RD();
             b.L($"mad.lo.u32 {tAddr2}, {i}, 4, {smem};");
             b.L($"st.shared.u32 [{tAddr2}+{ReduceBytes}], {bi};");
             b.L($"mad.lo.u32 {oIdx}, {row}, {k}, {i};");
             b.L($"mul.wide.u32 {iAddr}, {oIdx}, 4;");
             b.L($"add.u64 {iAddr}, {indices}, {iAddr};");
             b.L($"st.global.s32 [{iAddr}], {bi};");
-            if (!f.IsBlock)
-            {
-                // A pass that found no column (the index −1): the value 0, as Pick of no column.
-                string pNoCol = b.P(), kept = lane.NewReg(b);
-                b.L($"setp.eq.u32 {pNoCol}, {bi}, 0xFFFFFFFF;");
-                b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {kept}, {lane.Zero}, {bv}, {pNoCol};");
-                StoreAnyValue(b, f, lane, kept, values, oIdx);
-            }
-
-            _ = vAddr;
         }
 
         b.Label("RECORD_END");
@@ -95,16 +87,66 @@ internal static partial class Ptx
         b.L("bra PASS;");
         b.Label("PASS_END");
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_values, .param .u64 p_indices, .param .u32 p_cols, .param .u32 p_k", ReduceBytes + 256 * 4 + 256 * 16);
+        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_indices, .param .u32 p_cols, .param .u32 p_k", ReduceBytes + 256 * 4 + 256 * 16);
     }
 
-    // A lane value stored at value index idx of an array of format f: whole words for 32/64-bit formats, 16- and 8-bit stores
-    // as such, and sub-byte values OR-ed into their word (the output zeroed beforehand by the caller).
+    /// <summary>Adad's order on two lane values (Routing.Precedes without the columns): whether a ranks above c (larger, or a
+    /// NaN against a number) and whether they rank the same (equal, −0 and +0 among them, or two NaNs).</summary>
+    internal static (string Above, string Same) Rank(PtxBuilder b, Lane lane, string a, string c)
+    {
+        string above = b.P(), same = b.P();
+        b.L($"setp.gt.{lane.Op} {above}, {a}, {c};");
+        b.L($"setp.eq.{lane.Op} {same}, {a}, {c};");
+        if (lane.IsFloat)
+        {
+            string na = b.P(), nc = b.P(), t = b.P();
+            b.L($"testp.notanumber.{lane.Op} {na}, {a};");
+            b.L($"testp.notanumber.{lane.Op} {nc}, {c};");
+            b.L($"not.pred {t}, {nc};");
+            b.L($"and.pred {t}, {na}, {t};");
+            b.L($"or.pred {above}, {above}, {t};");
+            b.L($"and.pred {t}, {na}, {nc};");
+            b.L($"or.pred {same}, {same}, {t};");
+        }
+
+        return (above, same);
+    }
+
+    /// <summary>out[r·k + j] = x[r][index[r·k + j]] (s32 columns) over n = rows·k values of f, each stored word written by one
+    /// thread (a block format's block by its encoder) from the values read where they are stored: top-k's values, pick's
+    /// with k = 1. A column outside the row (below 0 is past it unsigned) reads nothing: 0. Params: x, index, out, n, cols, k.</summary>
+    public static string GatherRows(Gpu gpu, Fmt f, out string entry)
+    {
+        entry = $"gather_rows_{f.Name}";
+        var lane = f.IsBlock ? Lane.F32 : f.Natural;
+        var b = new PtxBuilder();
+        string x = Param64(b, "p_x"), index = Param64(b, "p_index"), po = Param64(b, "p_o"), n = Param32(b, "p_n"), cols = Param32(b, "p_cols"), k = Param32(b, "p_k");
+        StoreEach(b, f, lane, po, n, at =>
+        {
+            string r = b.R(), col = b.R(), ia = b.RD(), src = b.R(), pIn = b.P(), kept = lane.NewReg(b);
+            b.L($"div.u32 {r}, {at}, {k};");
+            b.L($"mul.wide.u32 {ia}, {at}, 4;");
+            b.L($"add.u64 {ia}, {index}, {ia};");
+            b.L($"ld.global.u32 {col}, [{ia}];");
+            b.L($"setp.lt.u32 {pIn}, {col}, {cols};");
+            b.L($"selp.u32 {col}, {col}, 0, {pIn};");
+            b.L($"mad.lo.u32 {src}, {r}, {cols}, {col};");
+            string v = Codec.UnpackAt(b, f, x, src, lane);
+            b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {kept}, {v}, {lane.Zero}, {pIn};");
+            return kept;
+        });
+        b.Label("DONE");
+        b.L("ret;");
+        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_index, .param .u64 p_o, .param .u32 p_n, .param .u32 p_cols, .param .u32 p_k", EachShared(f));
+    }
+
+    // A lane value stored at value index idx of an array of format f of 8 bits or more (a value a store: whole words for
+    // 32/64-bit formats, 16- and 8-bit stores as such).
     private static void StoreAnyValue(PtxBuilder b, Fmt f, Lane lane, string v, string ptr, string idx)
     {
+        if (f.Bits < 8) throw new NotSupportedException($"a value of {f.Name} shares its byte: stored a word at a time (StoreEach)");
         var natural = f.Natural;
         string stored = lane == natural ? v : Codec.Convert(b, lane, v, natural, f);
-        if (f.Bits >= 8)
         {
             string addr = b.RD();
             b.L($"mul.wide.u32 {addr}, {idx}, {f.Bits / 8};");
@@ -124,24 +166,12 @@ internal static partial class Ptx
                 b.L($"cvt.u16.u32 {h}, {code};");
                 b.L($"st.global.b{f.Bits} [{addr}], {h};");
             }
-
-            return;
         }
-
-        string code2 = b.R(), bits = b.R(), word = b.R(), shift = b.R(), shifted = b.R(), old = b.R(), wAddr = b.RD();
-        b.L($"mov.b32 {code2}, 0;");
-        Codec.Pack(b, f, stored, natural, 0, code2);
-        b.L($"mul.lo.u32 {bits}, {idx}, {f.Bits};");
-        b.L($"shr.u32 {word}, {bits}, 5;");
-        b.L($"and.b32 {shift}, {bits}, 31;");
-        b.L($"shl.b32 {shifted}, {code2}, {shift};");
-        b.L($"mul.wide.u32 {wAddr}, {word}, 4;");
-        b.L($"add.u64 {wAddr}, {ptr}, {wAddr};");
-        b.L($"atom.global.or.b32 {old}, [{wAddr}], {shifted};");
     }
 
-    // The block's (largest value, lowest index among equals) of each thread's pair: pairs in shared memory past the reduction's
-    // and the taken slots, a tree by the first thread's warp... kept simple: a serial pass by thread 0 over 256 pairs, then broadcast.
+    // The block's first-ranked of each thread's pair (value, column) in Adad's order (Rank; equals by the lower column):
+    // pairs in shared memory past the reduction's and the taken slots, a serial pass by thread 0 over 256 pairs, then
+    // broadcast.
     private static (string Value, string Index) BlockArgmax(PtxBuilder b, Lane lane, string tid, string v, string at, string smem)
     {
         int pairs = ReduceBytes + 256 * 4;
@@ -150,7 +180,7 @@ internal static partial class Ptx
         b.L($"st.shared.{lane.Mem} [{mine}+{pairs}], {v};");
         b.L($"st.shared.u32 [{mine}+{pairs + 8}], {at};");
         b.L("bar.sync 0;");
-        string p0 = b.P(), best = lane.NewReg(b), bestAt = b.R(), t = b.R(), pEnd = b.P(), addr = b.R(), ov = lane.NewReg(b), oa = b.R(), pGt = b.P(), pEq = b.P(), pLt = b.P(), pNone = b.P(), pTake = b.P();
+        string p0 = b.P(), best = lane.NewReg(b), bestAt = b.R(), t = b.R(), pEnd = b.P(), addr = b.R(), ov = lane.NewReg(b), oa = b.R(), pLt = b.P(), pNone = b.P(), pTake = b.P();
         b.L($"setp.ne.u32 {p0}, {tid}, 0;");
         b.L($"@{p0} bra ARG_SKIP;");
         b.L($"mov.{lane.Reg} {best}, {ReduceIdentity(lane, "max")};");
@@ -163,8 +193,7 @@ internal static partial class Ptx
         b.L($"ld.shared.{lane.Mem} {ov}, [{addr}+{pairs}];");
         b.L($"ld.shared.u32 {oa}, [{addr}+{pairs + 8}];");
         b.L($"setp.ne.u32 {pNone}, {oa}, 0xFFFFFFFF;");                          // a thread without a candidate
-        b.L($"setp.gt.{lane.Op} {pGt}, {ov}, {best};");
-        b.L($"setp.eq.{lane.Op} {pEq}, {ov}, {best};");
+        var (pGt, pEq) = Rank(b, lane, ov, best);
         b.L($"setp.lt.u32 {pLt}, {oa}, {bestAt};");
         b.L($"and.pred {pEq}, {pEq}, {pLt};");
         b.L($"or.pred {pTake}, {pGt}, {pEq};");
@@ -192,10 +221,10 @@ internal static partial class Ptx
     /// rescales the sum: one exp a value, e = exp(−|x − m|)), the threads' pairs joined by the same rule, then
     /// (m − x[t]) + log Σ.</summary>
     /// <summary>The top-k's values as log-probabilities (IRouting.LogSoftmaxTopK), a CTA a row: p_t holds p_k columns a row
-    /// (s32, TopK's: the first the row's largest; one below 0 or past the row: none). m = x at the first column; Σ exp(x − m)
-    /// over the row, each thread four sums over its columns (the exps independent of one another, a fixed order) joined by
-    /// the block's reduction; then a thread a chosen column: (x[t] − m) − log Σ as a lane value at p_out[row·k + j] (p_none
-    /// for none). Params: x, t, out, cols, k, none (lane).</summary>
+    /// (s32, TopK's: the first the row's first-ranked, every one in the row). m = x at the first column; Σ exp(x − m) over the
+    /// row, each thread four sums over its columns (the exps independent of one another, a fixed order) joined by the
+    /// block's reduction; then a thread a chosen column: (x[t] − m) − log Σ as a lane value at p_out[row·k + j].
+    /// Params: x, t, out, cols, k.</summary>
     public static string LogProbRows(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
         entry = $"log_prob_rows_{f.Name}_{lane.Name}";
@@ -205,17 +234,13 @@ internal static partial class Ptx
         b.L($"mov.u32 {tid}, %tid.x;");
         b.L($"mov.u32 {row}, %ctaid.x;");
         string x = Param64(b, "p_x"), tp = Param64(b, "p_t"), outp = Param64(b, "p_out"), cols = Param32(b, "p_cols"), k = Param32(b, "p_k");
-        string none = lane.NewReg(b);
-        b.L($"ld.param.{lane.Op} {none}, [p_none];");
-        string start = b.R(), last = b.R(), first = b.R(), fa = b.RD(), has = b.P(), at0 = b.R();
+        string start = b.R(), last = b.R(), first = b.R(), fa = b.RD(), at0 = b.R();
         b.L($"mul.lo.u32 {start}, {row}, {cols};");
         b.L($"sub.u32 {last}, {cols}, 1;");
         b.L($"mul.wide.u32 {fa}, {row}, {k};");
         b.L($"shl.b64 {fa}, {fa}, 2;");
         b.L($"add.u64 {fa}, {tp}, {fa};");
         b.L($"ld.global.u32 {first}, [{fa}];");
-        b.L($"setp.lt.u32 {has}, {first}, {cols};");
-        b.L($"selp.u32 {first}, {first}, 0, {has};");
         b.L($"add.u32 {at0}, {start}, {first};");
         string m = Codec.UnpackAt(b, f, x, at0, lane);
         var sums = new string[Sums];
@@ -249,7 +274,7 @@ internal static partial class Ptx
         b.L($"add.rn.{lane.Op} {mine}, {mine}, {other};");
         string total = BlockReduce(b, lane, tid, mine, "add", Threads);
         string logSum = Fn.Log(b, lane, total);
-        string j = b.R(), pK = b.P(), oi = b.R(), ia = b.RD(), col = b.R(), valid = b.P(), at = b.R(), oa = b.RD(), lp = lane.NewReg(b);
+        string j = b.R(), pK = b.P(), oi = b.R(), ia = b.RD(), col = b.R(), at = b.R(), oa = b.RD(), lp = lane.NewReg(b);
         b.L($"mov.u32 {j}, {tid};");
         b.Label("LP");
         b.L($"setp.ge.u32 {pK}, {j}, {k};");
@@ -258,13 +283,10 @@ internal static partial class Ptx
         b.L($"mul.wide.u32 {ia}, {oi}, 4;");
         b.L($"add.u64 {ia}, {tp}, {ia};");
         b.L($"ld.global.u32 {col}, [{ia}];");
-        b.L($"setp.lt.u32 {valid}, {col}, {cols};");                                   // −1 (no column) is past every row
-        b.L($"selp.u32 {col}, {col}, 0, {valid};");
         b.L($"add.u32 {at}, {start}, {col};");
         string xv = Codec.UnpackAt(b, f, x, at, lane);
         b.L($"sub.rn.{lane.Op} {lp}, {xv}, {m};");
         b.L($"sub.rn.{lane.Op} {lp}, {lp}, {logSum};");
-        b.L($"selp.{lane.Op} {lp}, {lp}, {none}, {valid};");
         b.L($"mul.wide.u32 {oa}, {oi}, {lane.Size};");
         b.L($"add.u64 {oa}, {outp}, {oa};");
         b.L($"st.global.{lane.Mem} [{oa}], {lp};");
@@ -272,7 +294,7 @@ internal static partial class Ptx
         b.L("bra LP;");
         b.Label("OUT");
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, $".param .u64 p_x, .param .u64 p_t, .param .u64 p_out, .param .u32 p_cols, .param .u32 p_k, .param .{lane.Op} p_none", ReduceBytes);
+        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_t, .param .u64 p_out, .param .u32 p_cols, .param .u32 p_k", ReduceBytes);
     }
 
     /// <summary>Each row's loss as the type; a block format's as f32 (one a row, the rows' result before its blocks are encoded);
@@ -412,33 +434,6 @@ internal static partial class Ptx
         return (rm, rs);
     }
 
-    /// <summary>out[r] = x[r][index[r]], a thread per row, stored as the type (value-wise).</summary>
-    public static string PickRows(Gpu gpu, Fmt f, Lane lane, out string entry)
-    {
-        entry = $"pick_rows_{f.Name}";
-        var b = new PtxBuilder();
-        string tid = b.R(), bid = b.R(), r = b.R(), x = Param64(b, "p_x"), idx = Param64(b, "p_idx"), outp = Param64(b, "p_out"), rows = Param32(b, "p_rows"), cols = Param32(b, "p_cols"), pEnd = b.P();
-        b.L($"mov.u32 {tid}, %tid.x;");
-        b.L($"mov.u32 {bid}, %ctaid.x;");
-        b.L($"mad.lo.u32 {r}, {bid}, 256, {tid};");
-        b.L($"setp.ge.u32 {pEnd}, {r}, {rows};");
-        b.L($"@{pEnd} bra DONE;");
-        string ia = b.RD(), col = b.R(), src = b.R(), pIn = b.P(), kept = lane.NewReg(b);
-        b.L($"mul.wide.u32 {ia}, {r}, 4;");
-        b.L($"add.u64 {ia}, {idx}, {ia};");
-        b.L($"ld.global.u32 {col}, [{ia}];");
-        // A column outside the row (below 0 is past it unsigned) reads the row's first value, dropped: 0.
-        b.L($"setp.lt.u32 {pIn}, {col}, {cols};");
-        b.L($"selp.u32 {col}, {col}, 0, {pIn};");
-        b.L($"mad.lo.u32 {src}, {r}, {cols}, {col};");
-        string v = Codec.UnpackAt(b, f, x, src, lane);
-        b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {kept}, {v}, {lane.Zero}, {pIn};");
-        StoreAnyValue(b, f, lane, kept, outp, r);
-        b.Label("DONE");
-        b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_idx, .param .u64 p_out, .param .u32 p_rows, .param .u32 p_cols");
-    }
-
     /// <summary>picks[r] = the first column whose running sum reaches u[r] · Σ row (the last column when none): a block per row.</summary>
     public static string SampleRows(Gpu gpu, Fmt f, Lane lane, out string entry)
     {
@@ -532,34 +527,5 @@ internal static partial class Ptx
         b.Label("DONE");
         b.L("ret;");
         return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_u, .param .u64 p_picks, .param .u32 p_cols", ReduceBytes + 256 * 8 + 16);
-    }
-
-    /// <summary>out[r][j] = x[r][index[r·k + j]] (s32 columns) over rows · k values of block format f: a warp per output block,
-    /// each value decoded where it is stored and the block encoded (top-k's values, pick's with k = 1). A column outside the
-    /// row (below 0 or past it) reads the row's first value, dropped: 0.</summary>
-    public static string GatherRowsBlocks(Gpu gpu, Fmt f, out string entry)
-    {
-        entry = $"gather_rows_{f.Name}_blocks";
-        var b = new PtxBuilder();
-        string x = Param64(b, "p_x"), index = Param64(b, "p_index"), po = Param64(b, "p_o"), rows = Param32(b, "p_rows"), cols = Param32(b, "p_cols"), k = Param32(b, "p_k"), n = b.R();
-        b.L($"mul.lo.u32 {n}, {rows}, {k};");
-        var w = BlockWarp(b, f, n);
-        EncodeBlock(b, f, po, w, n, at =>
-        {
-            string r = b.R(), col = b.R(), ia = b.RD(), src = b.R(), pIn = b.P(), kept = b.F();
-            b.L($"div.u32 {r}, {at}, {k};");
-            b.L($"mul.wide.u32 {ia}, {at}, 4;");
-            b.L($"add.u64 {ia}, {index}, {ia};");
-            b.L($"ld.global.u32 {col}, [{ia}];");
-            b.L($"setp.lt.u32 {pIn}, {col}, {cols};");
-            b.L($"selp.u32 {col}, {col}, 0, {pIn};");
-            b.L($"mad.lo.u32 {src}, {r}, {cols}, {col};");
-            string v = Codec.UnpackAt(b, f, x, src, Lane.F32);
-            b.L($"selp.f32 {kept}, {v}, {Lane.F32.Zero}, {pIn};");
-            return kept;
-        });
-        b.Label("DONE");
-        b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_x, .param .u64 p_index, .param .u64 p_o, .param .u32 p_rows, .param .u32 p_cols, .param .u32 p_k");
     }
 }

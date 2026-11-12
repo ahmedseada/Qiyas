@@ -8,27 +8,30 @@ namespace Adad.Cuda;
 
 public sealed partial class GpuOps
 {
-    /// <summary>top-k of each row: values as the type (rows × k), indices s32 (k at most cols); returns the lane's name.</summary>
+    /// <summary>top-k of each row in Adad's order: values as the type (rows × k), indices s32 (k at most cols); returns the
+    /// lane's name.</summary>
     public string TopK<TN>(ulong x, int rows, int cols, int k, ulong values, ulong indices) where TN : struct, IAdad<TN>
     {
         Routing.ValidateTopK(rows, cols, k);
         var f = Fmt.Of<TN>();
-        var lane = f.Natural;
-        if (f.IsBlock) lane = Lane.F32;                                           // a block format: its rows decoded in place, in f32
+        var lane = f.IsBlock ? Lane.F32 : f.Natural;                              // a block format: its rows decoded in place, in f32
+        string name = f.IsBlock ? "f32 (blocks in place)" : lane.Name;
         if (k > 256) throw new NotSupportedException($"top-k: k = {k} exceeds the kernel's passes (256); a partial sort is the step");
-        if (rows == 0 || k == 0) return f.IsBlock ? "f32 (blocks in place)" : lane.Name;
+        if (rows == 0 || k == 0) return name;
         var fn = gpu.Cached($"topk:{f.Name}", (out string e) => Ptx.TopKRows(gpu, f, lane, out e));
-        if (f.Bits < 8) Gpu.Clear(values, f.Words((long)rows * k) * 4);           // sub-byte values are OR-ed into their words
-        Gpu.Launch(fn, (uint)rows, 1, 256, 1, 0, x, values, indices, Gpu.U(cols), Gpu.U(k));
-        if (f.IsBlock)
-        {
-            // The values: each row's chosen columns gathered where they are stored and their blocks encoded.
-            var gather = gpu.Cached($"gather_rows_blocks:{f.Name}", (out string e) => Ptx.GatherRowsBlocks(gpu, f, out e));
-            Gpu.Launch(gather, BlockGrid(f, (long)rows * k), 1, 256, 1, 0, x, indices, values, Gpu.U(rows), Gpu.U(cols), Gpu.U(k));
-            return "f32 (blocks in place)";
-        }
+        Gpu.Launch(fn, (uint)rows, 1, 256, 1, 0, x, indices, Gpu.U(cols), Gpu.U(k));
+        GatherRows(f, x, indices, values, rows, cols, k);
+        return name;
+    }
 
-        return lane.Name;
+    // out[r·k + j] = x[r][index[r·k + j]] as the type: a thread a stored word (a block format's blocks by its encoder).
+    private void GatherRows(Fmt f, ulong x, ulong index, ulong output, int rows, int cols, int k)
+    {
+        long n = (long)rows * k;
+        if (n == 0) return;
+        if (n > uint.MaxValue) throw new NotSupportedException($"a gather of {n} values past 2^32");
+        var fn = gpu.Cached($"gather_rows:{f.Name}", (out string e) => Ptx.GatherRows(gpu, f, out e));
+        LaunchEach(fn, f, n, x, index, output, Gpu.U((int)n), Gpu.U(cols), Gpu.U(k));
     }
 
     /// <summary>The top-k of each row as log-probabilities (IRouting.LogSoftmaxTopK): TopK's indices, then Ptx.LogProbRows
@@ -41,16 +44,15 @@ public sealed partial class GpuOps
         var lane = RowLane(f);
         if (rows == 0 || k == 0) return lane.Name;
         if (k > 256) throw new NotSupportedException($"top-k: k = {k} exceeds the kernel's passes (256); a partial sort is the step");
-        // TopK's indices (its kernel alone: the values it leaves in `values` for a type of whole values are replaced below).
+        // TopK's indices.
         var top = gpu.Cached($"topk:{f.Name}", (out string e) => Ptx.TopKRows(gpu, f, f.IsBlock ? Lane.F32 : f.Natural, out e));
-        Gpu.Launch(top, (uint)rows, 1, 256, 1, 0, x, values, indices, Gpu.U(cols), Gpu.U(k));
+        Gpu.Launch(top, (uint)rows, 1, 256, 1, 0, x, indices, Gpu.U(cols), Gpu.U(k));
         bool own = f.Is("float32") || f.Is("float64");
         ulong lanes = own ? values : gpu.Rent(Math.Max(16, (long)rows * k * lane.Size));
         try
         {
             var fn = gpu.Cached($"log_probs:{f.Name}", (out string e) => Ptx.LogProbRows(gpu, f, lane, out e));
-            double none = f.IsBlock ? TN.Min : double.NegativeInfinity;                // a pass that found no column (no score in reach)
-            Gpu.Launch(fn, (uint)rows, 1, Ptx.ReduceThreads, 1, 0, x, indices, lanes, Gpu.U(cols), Gpu.U(k), lane.Wide ? Gpu.D(none) : Gpu.F((float)none));
+            Gpu.Launch(fn, (uint)rows, 1, Ptx.ReduceThreads, 1, 0, x, indices, lanes, Gpu.U(cols), Gpu.U(k));
             FromLane(f, lanes, values, (long)rows * k);
         }
         finally
@@ -61,22 +63,12 @@ public sealed partial class GpuOps
         return lane.Name;
     }
 
-    /// <summary>out[r] = x[r][index[r]] as the type.</summary>
+    /// <summary>out[r] = x[r][index[r]] as the type (a column outside the row: 0): TopK's gather with k = 1.</summary>
     public string Pick<TN>(ulong x, int rows, int cols, ulong index, ulong output) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.IsBlock)
-        {
-            // Each row's value gathered where it is stored, the blocks encoded.
-            var gather = gpu.Cached($"gather_rows_blocks:{f.Name}", (out string e) => Ptx.GatherRowsBlocks(gpu, f, out e));
-            Gpu.Launch(gather, BlockGrid(f, rows), 1, 256, 1, 0, x, index, output, Gpu.U(rows), Gpu.U(cols), Gpu.U(1));
-            return "f32 (blocks in place)";
-        }
-
-        var fn = gpu.Cached($"pick:{f.Name}", (out string e) => Ptx.PickRows(gpu, f, f.Natural, out e));
-        if (f.Bits < 8) Gpu.Clear(output, f.Words(rows) * 4);
-        Gpu.Launch(fn, Grid(rows, 256), 1, 256, 1, 0, x, index, output, Gpu.U(rows), Gpu.U(cols));
-        return f.Natural.Name;
+        GatherRows(f, x, index, output, rows, cols, 1);
+        return f.IsBlock ? "f32 (blocks in place)" : f.Natural.Name;
     }
 
 
@@ -101,7 +93,6 @@ public sealed partial class GpuOps
             return "f32 (blocks in place)";
         }
 
-        if (f.Bits < 8) Gpu.Clear(output, f.Words(rows) * 4);
         Gpu.Launch(fn, (uint)rows, 1, Ptx.ReduceThreads, 1, 0, x, targets, output, Gpu.U(cols), weights);
         return lane.Name;
     }

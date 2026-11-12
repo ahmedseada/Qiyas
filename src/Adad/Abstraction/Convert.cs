@@ -813,11 +813,24 @@ internal static class Widths
         _ => typeof(T) == typeof(long) ? Unsafe.As<T, long>(ref v) : (long)Math.Min(Unsafe.As<T, ulong>(ref v), long.MaxValue),
     };
 
-    /// <summary>Orders two lane values (floats by value, unsigned 64-bit values as unsigned): negative, zero or positive.</summary>
+    /// <summary>Orders two lane values by Adad's order (Routing.Precedes without the columns): floats by value, a NaN above
+    /// every number and two NaNs equal, −0 equal to +0; unsigned 64-bit values as unsigned. Negative, zero or positive.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int Compare<T>(T a, T b) where T : unmanaged
     {
-        if (typeof(T) == typeof(float)) return Unsafe.As<T, float>(ref a).CompareTo(Unsafe.As<T, float>(ref b));
-        if (typeof(T) == typeof(double)) return Unsafe.As<T, double>(ref a).CompareTo(Unsafe.As<T, double>(ref b));
+        if (typeof(T) == typeof(float))
+        {
+            // In the lane's own width (no widening a value): a scan's comparison inlined where it runs.
+            float x = Unsafe.As<T, float>(ref a), y = Unsafe.As<T, float>(ref b);
+            return x > y ? 1 : x < y ? -1 : x == y ? 0 : float.IsNaN(x) ? (float.IsNaN(y) ? 0 : 1) : -1;
+        }
+
+        if (typeof(T) == typeof(double))
+        {
+            double x = Unsafe.As<T, double>(ref a), y = Unsafe.As<T, double>(ref b);
+            return x > y ? 1 : x < y ? -1 : x == y ? 0 : double.IsNaN(x) ? (double.IsNaN(y) ? 0 : 1) : -1;
+        }
+
         if (typeof(T) == typeof(ulong)) return Unsafe.As<T, ulong>(ref a).CompareTo(Unsafe.As<T, ulong>(ref b));
         return AsLong(a).CompareTo(AsLong(b));
     }

@@ -426,7 +426,8 @@ internal static partial class Checks
 
     // ---------------------------------------------------------------- routing, sampling and the loss on odd shapes
 
-    /// <summary>Every type: top-k (k = 5 of 1001, ties included) exact; pick exact; sampling (float types) exact against
+    /// <summary>Every type: top-k (k = 5 of 1001, ties included) exact, its columns by Adad's order (and every float type's
+    /// rows of NaN, ±0, ±∞ and ties exactly, top-k's and log-softmax top-k's); pick exact; sampling (float types) exact against
     /// the float64 draw except where the lane's rounding of the running sum crosses the threshold (allowed: the next
     /// column); the route of 1001 indices into 7 buckets exact.</summary>
     // The bench's name of a device.
@@ -449,10 +450,10 @@ internal static partial class Checks
             var values = new byte[Bench.Registry.Bytes(type, rows * k)];
             var indices = new int[rows * k];
             Bench.Registry.With(type, new TopKRun(ops, x, rows, cols, k, values, indices, null, null, null, null));
-            // Ties (the narrow types have many): the values must match exactly; the indices where the values are distinct.
+            // Ties (the narrow types have many): the values and the columns exactly, an equal value by the lower column.
             ok &= Close(type, "topk values", where, values, wantV, rows * k);
             int bad = 0;
-            for (int i = 0; i < rows * k; i++) if (indices[i] != wantI[i] && xv[i / k * cols + indices[i]] != wantV[i]) bad++;
+            for (int i = 0; i < rows * k; i++) if (indices[i] != wantI[i]) bad++;
             if (bad > 0) { Console.WriteLine($"check topk indices  {where,-6} {type,-12} DIFFERS at {bad} places"); ok = false; }
             var index = Enumerable.Range(0, rows).Select(_ => random.Next(cols)).ToArray();
             var picked = new byte[Bench.Registry.Bytes(type, rows)];
@@ -470,11 +471,7 @@ internal static partial class Checks
                 Bench.Registry.With(type, new TopKRun(ops, px, pr, pc, pk, pvalues, pindices, null, null, null, null));
                 ok &= Close(type, "topk values of the whole row", where, pvalues, pv, pr * pk);
                 int pbad = 0;
-                for (int i = 0; i < pr * pk; i++)
-                {
-                    if (pindices[i] == pi[i]) continue;
-                    if ((uint)pindices[i] >= pc || pxv[i / pk * pc + pindices[i]] != pv[i]) pbad++;
-                }
+                for (int i = 0; i < pr * pk; i++) if (pindices[i] != pi[i]) pbad++;
 
                 if (pbad > 0) { Console.WriteLine($"check topk indices of the whole row {where,-6} {type,-12} DIFFERS at {pbad} places"); ok = false; }
                 bool refused = false;
@@ -489,6 +486,7 @@ internal static partial class Checks
 
             if (Bench.Registry.IsFloat(type))
             {
+                ok &= TopKOrder(ops, where, type);
                 var w = Bench.Registry.Make(type, rows * cols, 95, 0, 1);
                 var u = Bench.Registry.Make(type, rows, 96, 0, 1);
                 var wantS = Routing.SampleReference(Bench.Registry.Values(type, w, rows * cols), rows, cols, Bench.Registry.Values(type, u, rows));
@@ -551,7 +549,67 @@ internal static partial class Checks
 
         if (cuda is not null) cuda.TableCounts = null;
 
-        if (ok) Console.WriteLine($"check routing                {where,-6} every type{(blocks ? "" : " but the block formats")}: top-k (k = cols; k past the row refused), pick (a column outside the row: 0), sampling and the cross-entropy loss (float types; unweighted and with a weight a row, zeros among them) and the route as the references (also 1M into 64, 1 000 003 into 100 000, all into one, descending into 65 536)");
+        if (ok) Console.WriteLine($"check routing                {where,-6} every type{(blocks ? "" : " but the block formats")}: top-k in Adad's order (ties by the lower column; rows of NaN, ±0, ±inf and ties exactly, with log-softmax top-k; k = cols; k past the row refused), pick (a column outside the row: 0), sampling and the cross-entropy loss (float types; unweighted and with a weight a row, zeros among them) and the route as the references (also 1M into 64, 1 000 003 into 100 000, all into one, descending into 65 536)");
+        return ok;
+    }
+
+    // Adad's order where a row holds NaN, ±0, ±∞ and ties (a float type, the values as the type stores them: a format without
+    // infinities or NaN holds what its encoder makes of them): top-k's and log-softmax top-k's columns exactly the
+    // reference's (Routing.Precedes), top-k's values exactly the stored values at them (a NaN as a NaN; a block format's
+    // values re-encoded by their blocks, so its columns only), log-softmax top-k's NaN exactly where the reference has one.
+    private static bool TopKOrder(IDevice<ulong, ulong>? ops, string where, string type)
+    {
+        const int rows = 12, cols = 67, k = 13;
+        var r = new Random(41);
+        var v = new double[rows * cols];
+        for (int i = 0; i < v.Length; i++)
+        {
+            int row = i / cols, pick = r.Next(12);
+            // Rows 3j hold NaN; rows 3j + 1 infinities but no NaN; rows 3j + 2 only numbers; row 0 is every value NaN.
+            v[i] = row == 0 ? double.NaN : pick switch
+            {
+                0 => row % 3 == 0 ? double.NaN : 0.0,
+                1 => row % 3 == 1 ? double.PositiveInfinity : 1.5,
+                2 => row % 3 == 1 ? double.NegativeInfinity : -1.5,
+                3 => 0.0,
+                4 => -0.0,
+                5 or 6 => 1.5,
+                7 => -2.0,
+                _ => Math.Round(r.NextDouble() * 6 - 3, 1),
+            };
+        }
+
+        var x = Bench.Registry.Encode(type, v);
+        var xv = Bench.Registry.Values(type, x, rows * cols);
+        bool ok = true;
+        bool Same(double a, double b) => a.Equals(b) || (double.IsNaN(a) && double.IsNaN(b));
+        var (wantV, wantI) = Routing.TopKReference(xv, rows, cols, k);
+        var values = new byte[Bench.Registry.Bytes(type, rows * k)];
+        var indices = new int[rows * k];
+        Bench.Registry.With(type, new TopKRun(ops, x, rows, cols, k, values, indices, null, null, null, null));
+        var got = Bench.Registry.Values(type, values, rows * k);
+        int badI = 0, badV = 0;
+        for (int i = 0; i < rows * k; i++)
+        {
+            if (indices[i] != wantI[i]) badI++;
+            if (!Bench.Registry.IsBlock(type) && !Same(got[i], wantV[i])) badV++;
+        }
+
+        if (badI + badV > 0) { Console.WriteLine($"check topk order (NaN, ±0, ±inf, ties) {where,-6} {type,-12} DIFFERS: {badI} columns, {badV} values"); ok = false; }
+        var (wantL, wantLI) = Routing.LogSoftmaxTopKReference(xv, rows, cols, k);
+        var wantLs = Bench.Registry.Values(type, Bench.Registry.Encode(type, wantL), rows * k);
+        var lvalues = new byte[Bench.Registry.Bytes(type, rows * k)];
+        var lindices = new int[rows * k];
+        Bench.Registry.WithFloat(type, new LogTopKRun(ops, x, rows, cols, k, lvalues, lindices));
+        var gotL = Bench.Registry.Values(type, lvalues, rows * k);
+        badI = badV = 0;
+        for (int i = 0; i < rows * k; i++)
+        {
+            if (lindices[i] != wantLI[i]) badI++;
+            if (!Bench.Registry.IsBlock(type) && double.IsNaN(gotL[i]) != double.IsNaN(wantLs[i])) badV++;
+        }
+
+        if (badI + badV > 0) { Console.WriteLine($"check log_softmax_topk order (NaN, ±0, ±inf, ties) {where,-6} {type,-12} DIFFERS: {badI} columns, {badV} NaN places"); ok = false; }
         return ok;
     }
 

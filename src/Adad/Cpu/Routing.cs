@@ -3,7 +3,8 @@
 
 // Routing, sampling and losses: operations whose results are indices, or whose inputs are.
 //
-//   topk_rows       the k largest of each row (values as the type, indices s32), largest first; ties by the lower index
+//   topk_rows       the k first of each row in Adad's order (values as the type, indices s32): larger first, a NaN above
+//                   every number, ties by the lower index (Routing.Precedes; the lane's Widths.Compare)
 //   pick_rows       out[r] = x[r][index[r]] (a value per row: a loss from log-probabilities and targets)
 //   sample_rows     the index of the first column whose running sum of the row reaches u[r] · (the row's sum): sampling
 //                   from unnormalized weights with a uniform draw per row (ties and an empty row give the last column)
@@ -61,9 +62,10 @@ internal sealed partial class Kernels
                 for (int r = first; r < last; r++)
                 {
                     TN.Load(x, r * cols, row.AsSpan(0, cols));
-                    // One pass keeping the k largest in order (larger first, an equal value after the earlier ones): a value
-                    // enters only when strictly larger than the k-th, then moves past every kept value it is strictly larger
-                    // than. The comparison is a total order, so this is the k passes of first-largest exactly.
+                    // One pass keeping the k first in Adad's order (Widths.Compare: larger first, a NaN above every number;
+                    // an equal value after the earlier ones): a value enters only when it ranks strictly above the k-th, then
+                    // moves past every kept value it ranks strictly above. The order is total, so this is the k passes of
+                    // first-ranked exactly.
                     int taken = 0;
                     for (int c = 0; c < cols; c++)
                     {
@@ -87,7 +89,7 @@ internal sealed partial class Kernels
     }
 
     /// <summary>The top-k of each row as log-probabilities (IRouting.LogSoftmaxTopK): the row in the float lane, TopK's
-    /// selection, then each chosen value less the row's largest and less the log of the row's Σ exp(x − largest); stored as
+    /// selection, then each chosen value less the row's first-ranked and less the log of the row's Σ exp(x − it); stored as
     /// the type once. Returns the lane's name.</summary>
     public static string LogSoftmaxTopK<TN>(byte[] x, int rows, int cols, int k, byte[] values, int[] indices) where TN : struct, IFloatAdad<TN>
     {
@@ -135,7 +137,7 @@ internal sealed partial class Kernels
                 {
                     var xs = row.AsSpan(0, cols);
                     TN.Load(x, r * cols, xs);
-                    // TopK's pass: the k largest in order, an equal value after the earlier ones.
+                    // TopK's pass: the k first in Adad's order, an equal value after the earlier ones.
                     int taken = 0;
                     for (int c = 0; c < cols; c++)
                     {
@@ -146,16 +148,12 @@ internal sealed partial class Kernels
                         best[j] = v; bestAt[j] = c;
                     }
 
-                    // The row's largest (the first chosen) and the log of Σ exp(x − largest) (the row is the sum's scratch after
-                    // the selection).
-                    if (taken > 0)
-                    {
-                        TLane m = best[0];
-                        TLane logSum = TL.Log(new System.Numerics.Vector<TLane>(RowMath<TLane, TL>.ExpSum(xs, m, xs)))[0];
-                        for (int i = 0; i < taken; i++) best[i] = TL.Sub(TL.Sub(best[i], m), logSum);
-                    }
+                    // The row's first-ranked value (the first chosen) and the log of Σ exp(x − it) (the row is the sum's
+                    // scratch after the selection); k is at least 1 here and at most the row's columns.
+                    TLane m = best[0];
+                    TLane logSum = TL.Log(new System.Numerics.Vector<TLane>(RowMath<TLane, TL>.ExpSum(xs, m, xs)))[0];
+                    for (int i = 0; i < k; i++) best[i] = TL.Sub(TL.Sub(best[i], m), logSum);
 
-                    for (int i = taken; i < k; i++) { best[i] = lanes ? TL.From(TN.Min) : TL.NegativeInfinity; bestAt[i] = -1; }
                     if (lanes) best.AsSpan(0, k).CopyTo(MemoryMarshal.Cast<byte, TLane>(values.AsSpan()).Slice(r * k, k));
                     else TN.Store(best.AsSpan(0, k), values, r * k);
                     Array.Copy(bestAt, 0, indices, r * k, k);

@@ -10,7 +10,7 @@ namespace Adad.Vulkan;
 
 public sealed partial class VulkanOps
 {
-    /// <summary>top-k of each row: values as the type (rows × k), indices s32; returns the lane's name.</summary>
+    /// <summary>top-k of each row in Adad's order: values as the type (rows × k), indices s32; returns the lane's name.</summary>
     public string TopK<TN>(ulong x, int rows, int cols, int k, ulong values, ulong indices) where TN : struct, IAdad<TN>
     {
         Routing.ValidateTopK(rows, cols, k);
@@ -40,7 +40,7 @@ public sealed partial class VulkanOps
         try
         {
             var fn = vk.Cached($"log_probs:{f.Name}", () => VkKernels.LogProbRows(vk, f, lane));
-            vk.Launch(fn, (uint)rows, 1, x, indices, lanes, Vulkan.U(cols), Vulkan.U(k), Slot(lane, f.IsBlock ? TN.Min : double.NegativeInfinity));
+            vk.Launch(fn, (uint)rows, 1, x, indices, lanes, Vulkan.U(cols), Vulkan.U(k));
             if (!own) Back(f, lane, lanes, values, (long)rows * k);
         }
         finally

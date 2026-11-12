@@ -3,7 +3,7 @@
 
 // Decoding's operations on every device, every float type (the block formats among them):
 //   log_softmax_topk   the top-k of each row as log-probabilities (IRouting.LogSoftmaxTopK): the indices TopK's exactly
-//                      (largest first, an equal value by the lower index), each value within the type's step plus the
+//                      (Adad's order: larger first, an equal value by the lower index), each value within the type's step plus the
 //                      lane's rounding of the row's log-sum-exp of the float64 reference; rows wider than a block of
 //                      threads; k the whole row; and k past the row refused.
 //   history, penalize  the ring and the penalties of its window (Checks.Penalties.cs).

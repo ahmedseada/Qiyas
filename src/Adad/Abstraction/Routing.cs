@@ -18,14 +18,33 @@ public static class Routing
         if (rows < 0 || cols < 0 || k < 0 || k > cols) throw new ArgumentException($"top-k: the {k} largest of rows of {cols} values (k is at most the row's columns)");
     }
 
-    /// <summary>top-k of each row in float64: values and indices, largest first, ties by the lower index.</summary>
+    /// <summary>Adad's order of a row's values, the one top-k takes on every device: a at column ia ranks before b at column
+    /// ib when it is larger, a NaN ranking above every number; equal values (−0 and +0 among them, and two NaNs) by the lower
+    /// column. A total order: each column of a row has one rank.</summary>
+    public static bool Precedes(double a, int ia, double b, int ib)
+    {
+        bool na = double.IsNaN(a), nb = double.IsNaN(b);
+        if (na != nb) return na;
+        if (!na && a != b) return a > b;
+        return ia < ib;
+    }
+
+    // Row r's columns in Adad's order, the first k.
+    private static int[] Ranked(double[] x, int r, int cols, int k)
+    {
+        var order = Enumerable.Range(0, cols).ToArray();
+        Array.Sort(order, (i, j) => i == j ? 0 : Precedes(x[r * cols + i], i, x[r * cols + j], j) ? -1 : 1);
+        return order[..k];
+    }
+
+    /// <summary>top-k of each row in float64 by Adad's order (Precedes): values and indices, the first-ranked first.</summary>
     public static (double[] Values, int[] Indices) TopKReference(double[] x, int rows, int cols, int k)
     {
         var values = new double[rows * k];
         var indices = new int[rows * k];
         for (int r = 0; r < rows; r++)
         {
-            var order = Enumerable.Range(0, cols).OrderByDescending(c => x[r * cols + c]).ThenBy(c => c).Take(k).ToArray();
+            var order = Ranked(x, r, cols, k);
             for (int i = 0; i < k; i++)
             {
                 indices[r * k + i] = order[i];
@@ -36,8 +55,8 @@ public static class Routing
         return (values, indices);
     }
 
-    /// <summary>The top-k of each row as log-probabilities in float64 (IRouting.LogSoftmaxTopK): each value less its row's
-    /// log-sum-exp.</summary>
+    /// <summary>The top-k of each row as log-probabilities in float64 (IRouting.LogSoftmaxTopK): TopK's columns, each value
+    /// less its row's log-sum-exp (m the first-ranked value: a row holding a NaN gives NaNs).</summary>
     public static (double[] Values, int[] Indices) LogSoftmaxTopKReference(double[] x, int rows, int cols, int k)
     {
         var values = new double[rows * k];
@@ -47,7 +66,7 @@ public static class Routing
             double m = double.NegativeInfinity, sum = 0;
             for (int c = 0; c < cols; c++) m = Math.Max(m, x[r * cols + c]);
             for (int c = 0; c < cols; c++) sum += Math.Exp(x[r * cols + c] - m);
-            var order = Enumerable.Range(0, cols).OrderByDescending(c => x[r * cols + c]).ThenBy(c => c).Take(k).ToArray();
+            var order = Ranked(x, r, cols, k);
             for (int i = 0; i < k; i++)
             {
                 indices[r * k + i] = order[i];
