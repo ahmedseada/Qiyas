@@ -2185,6 +2185,17 @@ internal static partial class Checks
                 if (!Close(type, rep == 0 ? "transpose" : $"transpose (repetition {rep + 1})", where, output, References.Transpose(values, R, C), R * C)) { ok = false; break; }
             }
 
+            // Rows a multiple of every type's storage unit (512: two 256-value blocks), so the tiled path stores each output
+            // row in pieces of tasks of their own: each piece whole units of the type, repeated as above for a block format.
+            for (int rep = 0, reps = Bench.Registry.IsBlock(type) ? Stress : 1; rep < reps; rep++)
+            {
+                const int TR = 512, TC = 67;
+                var tall = Bench.Registry.Make(type, TR * TC, 44, -1, 1);
+                var output = new byte[tall.Length];
+                Bench.Registry.With(type, new TransposeRun(ops, tall, output, TR, TC));
+                if (!Close(type, rep == 0 ? "transpose 512x67" : $"transpose 512x67 (repetition {rep + 1})", where, output, References.Transpose(Bench.Registry.Values(type, tall, TR * TC), TR, TC), TR * TC)) { ok = false; break; }
+            }
+
             foreach (bool t in new[] { false, true })
             {
                 var x = Bench.Registry.Make(type, t ? R : C, 43, -1, 1);
