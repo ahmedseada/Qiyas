@@ -915,10 +915,19 @@ public sealed partial class GpuOps(Gpu gpu)
 
     private readonly Dictionary<string, bool> _slicedFaster = [];
 
+    /// <summary>The checks' override of SlicedFaster's measurement (true: the sliced product wherever it is eligible, so the
+    /// checks prove the routes that take it at their small shapes); null: measured.</summary>
+    public bool? SlicedChoice { get; set; }
+
     /// <summary>Whether the sliced product beats the plain float64 kernel at this shape (measured once per shape).</summary>
-    private bool SlicedFaster(int m, int n, int k, ulong a, ulong b, ulong c)
+    private bool SlicedFaster(int m, int n, int k, ulong a, ulong b, ulong c) => SlicedFaster(m, n, k, a, b, c, 1, 0, 0, 0);
+
+    /// <summary>SlicedFaster over `batches` products at the byte strides (MatMulSliced's batched form against the plain
+    /// float64 kernel a batch), measured once per shape and batch count.</summary>
+    private bool SlicedFaster(int m, int n, int k, ulong a, ulong b, ulong c, int batches, long sA, long sB, long sC)
     {
-        string key = $"{m}x{n}x{k}";
+        if (SlicedChoice is bool chosen) return chosen;
+        string key = $"{m}x{n}x{k}" + (batches > 1 ? $" x{batches}" : "");
         if (_slicedFaster.TryGetValue(key, out bool known)) return known;
         double Time(Action run)
         {
@@ -930,9 +939,9 @@ public sealed partial class GpuOps(Gpu gpu)
             return Stopwatch.GetElapsedTime(start).TotalMilliseconds / 3;
         }
 
-        double plain = Time(() => PlainF64(a, b, c, m, n, k));
+        double plain = Time(() => { for (int z = 0; z < batches; z++) PlainF64(a + (ulong)(sA * z), b + (ulong)(sB * z), c + (ulong)(sC * z), m, n, k); });
         bool refused = false;
-        double sliced = Time(() => { if (!MatMulSliced(a, b, c, m, n, k)) refused = true; });
+        double sliced = Time(() => { if (!MatMulSliced(a, b, c, m, n, k, batches, sA, sB, sC)) refused = true; });
         if (refused) { Note($"sliced float64 product refused at {key} (exponents beyond the slicing scale): the f64 lane"); return _slicedFaster[key] = false; }
         Note($"float64 product at {key}: f64 lane {plain:0.000} ms, sliced {sliced:0.000} ms: {(sliced < plain ? "sliced" : "f64 lane")}");
         return _slicedFaster[key] = sliced < plain;
@@ -947,13 +956,22 @@ public sealed partial class GpuOps(Gpu gpu)
 
     /// <summary>C = A·B for float64 operands through the 8-bit tensor instructions (see Ptx: sliced float64). False when the
     /// device has no 8-bit tensor kind or the data's exponents are beyond what the slicing scale takes: nothing was computed.</summary>
-    public bool MatMulSliced(ulong a, ulong b, ulong c, int m, int n, int k)
+    public bool MatMulSliced(ulong a, ulong b, ulong c, int m, int n, int k) => MatMulSliced(a, b, c, m, n, k, 1, 0, 0, 0);
+
+    /// <summary>MatMulSliced over `batches` products, batch z's A, B and C at z times the byte strides sA, sB, sC (0: the
+    /// batches share it): each batch sliced by its own rows' and columns' exponents (read back together: one wait), each
+    /// diagonal's 8-bit products of every batch in one launch (grid z), where a launch a batch leaves a small product's
+    /// few tiles alone on the device. Each batch's C as its own call gives. False (nothing computed) where any batch's
+    /// exponents are beyond the slicing scale.</summary>
+    public bool MatMulSliced(ulong a, ulong b, ulong c, int m, int n, int k, int batches, long sA, long sB, long sC)
     {
         if (!MmaSupported(Ptx.Kind.S8) && !MmaSupported(Ptx.Kind.S8K32)) return false;
         var kind = EightBitKind(true, k);
         int kpad = Ptx.Padded(k), rowLen = Ptx.Slices * kpad;
-        long mn = (long)m * n;
-        ulong e = gpu.Rent(m * 4L), f = gpu.Rent(n * 4L), sa = gpu.Rent((long)m * rowLen), stack = gpu.Rent((long)rowLen * n), bt = gpu.Rent((long)n * rowLen), d = gpu.Rent(Ptx.Diagonals * mn * 4);
+        long mn = (long)m * n, saBytes = (long)m * rowLen, btBytes = (long)n * rowLen, dBytes = Ptx.Diagonals * mn * 4;
+        ulong e = gpu.Rent(batches * m * 4L), f = gpu.Rent(batches * n * 4L), sa = gpu.Rent(batches * saBytes), stack = gpu.Rent((long)rowLen * n),
+            bt = gpu.Rent(batches * btBytes), d = gpu.Rent(batches * dBytes);
+        ulong At(ulong p, long stride, int z) => p + (ulong)(stride * z);
         try
         {
             var rowExp = gpu.Cached("rowexp_f64", (out string x) => Ptx.RowExponents(gpu, out x));
@@ -961,42 +979,62 @@ public sealed partial class GpuOps(Gpu gpu)
             var sliceRows = gpu.Cached("slice_rows_f64", (out string x) => Ptx.SliceRows(gpu, out x));
             var sliceCols = gpu.Cached("slice_cols_f64", (out string x) => Ptx.SliceColumns(gpu, out x));
             var combine = gpu.Cached("combine_f64x", (out string x) => Ptx.CombineSlices(gpu, out x));
-            Gpu.Launch(rowExp, (uint)m, 1, 256, 1, 0, a, e, Gpu.U(k));
-            Gpu.Launch(colExp, Grid(n, 256), 1, 256, 1, 0, b, f, Gpu.U(k), Gpu.U(n));
+            for (int z = 0; z < batches; z++)
+            {
+                Gpu.Launch(rowExp, (uint)m, 1, 256, 1, 0, At(a, sA, z), e + (ulong)(z * m * 4L), Gpu.U(k));
+                Gpu.Launch(colExp, Grid(n, 256), 1, 256, 1, 0, At(b, sB, z), f + (ulong)(z * n * 4L), Gpu.U(k), Gpu.U(n));
+            }
+
             // The exponents must keep every scale a normal float64 (the slicing scale 2^(64 − e), the result's 2^(e + f + shift − 72)).
-            var ea = new int[m];
-            var fa = new int[n];
+            var ea = new int[batches * m];
+            var fa = new int[batches * n];
             Gpu.Download<int>(e, ea);
             Gpu.Download<int>(f, fa);
             // A row or column of zeros has no exponent (far below any scale): it takes 0, any finite scale slicing it to zeros.
             bool zeroRows = false, zeroCols = false;
-            for (int i = 0; i < m; i++) if (ea[i] < -900) { ea[i] = 0; zeroRows = true; }
-            for (int i = 0; i < n; i++) if (fa[i] < -900) { fa[i] = 0; zeroCols = true; }
+            for (int i = 0; i < ea.Length; i++) if (ea[i] < -900) { ea[i] = 0; zeroRows = true; }
+            for (int i = 0; i < fa.Length; i++) if (fa[i] < -900) { fa[i] = 0; zeroCols = true; }
             if (zeroRows) Gpu.Upload<int>(ea, e);
             if (zeroCols) Gpu.Upload<int>(fa, f);
-            int eMin = ea.Min(), eMax = ea.Max(), fMin = fa.Min(), fMax = fa.Max();
-            if (eMax > 1086 || fMax > 1086 || eMin + fMin < -918 || eMax + fMax > 1057) return false;
-            if (kpad != k) Gpu.Clear(sa, (long)m * rowLen);
-            Gpu.Clear(stack, (long)rowLen * n);
-            Gpu.Launch(sliceRows, Grid((long)m * k, 256), 1, 256, 1, 0, a, e, sa, Gpu.U(m), Gpu.U(k), Gpu.U(kpad));
-            Gpu.Launch(sliceCols, Grid((long)k * n, 256), 1, 256, 1, 0, b, f, stack, Gpu.U(k), Gpu.U(n), Gpu.U(kpad));
+            for (int z = 0; z < batches; z++)
+            {
+                var eb = ea.AsSpan(z * m, m);
+                var fb = fa.AsSpan(z * n, n);
+                int eMin = int.MaxValue, eMax = int.MinValue, fMin = int.MaxValue, fMax = int.MinValue;
+                foreach (int x in eb) { eMin = Math.Min(eMin, x); eMax = Math.Max(eMax, x); }
+                foreach (int x in fb) { fMin = Math.Min(fMin, x); fMax = Math.Max(fMax, x); }
+                if (eMax > 1086 || fMax > 1086 || eMin + fMin < -918 || eMax + fMax > 1057) return false;
+            }
+
+            if (kpad != k) Gpu.Clear(sa, batches * saBytes);
             // The stacked digits of B (rowLen × n, signed bytes) transposed into packed rows Bt[j][0..rowLen).
             var int8 = new Fmt("int8", 8, false, true);
             var ft = gpu.Cached($"packt:{int8.Name}:{kind.Name}", (out string x) => Ptx.PackTransposed(gpu, int8, kind, out x));
-            Gpu.Launch(ft, Grid(n, 64), (uint)(rowLen / 32), 256, 1, 0, stack, bt, Gpu.U(n), Gpu.U(rowLen), Gpu.U(rowLen));
+            for (int z = 0; z < batches; z++)
+            {
+                ulong ez = e + (ulong)(z * m * 4L), fz = f + (ulong)(z * n * 4L);
+                Gpu.Clear(stack, (long)rowLen * n);
+                Gpu.Launch(sliceRows, Grid((long)m * k, 256), 1, 256, 1, 0, At(a, sA, z), ez, At(sa, saBytes, z), Gpu.U(m), Gpu.U(k), Gpu.U(kpad));
+                Gpu.Launch(sliceCols, Grid((long)k * n, 256), 1, 256, 1, 0, At(b, sB, z), fz, stack, Gpu.U(k), Gpu.U(n), Gpu.U(kpad));
+                Gpu.Launch(ft, Grid(n, 64), (uint)(rowLen / 32), 256, 1, 0, stack, At(bt, btBytes, z), Gpu.U(n), Gpu.U(rowLen), Gpu.U(rowLen));
+            }
+
             // One product per diagonal d: the digit pairs (t, u) with t + u = d. B's digits are stacked most significant last,
             // so for d below the slice count A's first d + 1 slices meet B's last d + 1; above it, A's last 15 − d meet B's first.
-            var fn = MmaFunction(kind, out uint shared, out int bn);
+            var fn = MmaFunction(kind, out uint shared, out int bn, batched: batches > 1);
             for (int diag = 0; diag < Ptx.Diagonals; diag++)
             {
                 int pairs = diag < Ptx.Slices ? diag + 1 : 2 * Ptx.Slices - 1 - diag, extent = pairs * kpad;
                 ulong pa = diag < Ptx.Slices ? sa : sa + (ulong)((diag - Ptx.Slices + 1) * kpad);
                 ulong pb = diag < Ptx.Slices ? bt + (ulong)((Ptx.Slices - 1 - diag) * kpad) : bt;
                 ulong pd = d + (ulong)(diag * mn * 4);
-                Gpu.Launch(fn, Grid(n, bn), Grid(m, 128), Ptx.GemmThreads, 1, shared, pa, pb, pd, Gpu.U(m), Gpu.U(n), Gpu.U(extent), Gpu.U(rowLen));
+                if (batches == 1) Gpu.Launch(fn, Grid(n, bn), Grid(m, 128), Ptx.GemmThreads, 1, shared, pa, pb, pd, Gpu.U(m), Gpu.U(n), Gpu.U(extent), Gpu.U(rowLen));
+                else Gpu.LaunchZ(fn, Grid(n, bn), Grid(m, 128), (uint)batches, Ptx.GemmThreads, 1, shared, pa, pb, pd, Gpu.U(m), Gpu.U(n), Gpu.U(extent), Gpu.U(rowLen),
+                    (ulong)saBytes, (ulong)btBytes, (ulong)dBytes);
             }
 
-            Gpu.Launch(combine, Grid(mn, 256), 1, 256, 1, 0, d, e, f, c, Gpu.U(m), Gpu.U(n));
+            for (int z = 0; z < batches; z++)
+                Gpu.Launch(combine, Grid(mn, 256), 1, 256, 1, 0, At(d, dBytes, z), e + (ulong)(z * m * 4L), f + (ulong)(z * n * 4L), At(c, sC, z), Gpu.U(m), Gpu.U(n));
             return true;
         }
         finally

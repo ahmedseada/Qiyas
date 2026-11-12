@@ -2908,6 +2908,7 @@ internal static partial class Checks
         ok &= Device<Int64, double>(ops, Lane.F64);
         ok &= Device<Int16, double>(ops, Lane.F64);
         ok &= Sliced(ops);
+        ok &= SlicedOps(ops);
         ok &= Maps(ops);
         ok &= Maps(ops, special: true);
         ok &= Elementwise(ops, "cuda");

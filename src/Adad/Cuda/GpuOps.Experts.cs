@@ -91,11 +91,53 @@ public sealed partial class GpuOps
         return negative && !f.Signed ? Lane.F64 : SumLane(f, bounds);
     }
 
+    // float64: every expert's rows of x times its weights by the sliced product (MatMulSliced's batched form: float64
+    // math to within an ulp, as MatMul takes it, every expert's diagonal products in one launch), where the device's
+    // proof covers it and it measures faster than the plain kernel an expert: each expert's rows copied into a slot of
+    // the most rows any expert has (rounded up to 8, zeros past its own), the sums copied back from the slots. The
+    // offsets read back first (a wait). False where not taken: the grouped kernel then takes every expert.
+    private bool ExpertsSliced(ExpertView v, Fmt f, Lane lane, ulong x, ulong offsets, ulong w, ulong sums)
+    {
+        if (!f.Is("float64") || lane != Lane.F64 || !SlicedProven || v.TransW || v.K == 0 || v.K % 8 != 0 || v.N % 8 != 0) return false;
+        var off = new int[v.Experts + 1];
+        Gpu.Download<int>(offsets, off);
+        int most = 0;
+        for (int g = 0; g < v.Experts; g++) most = Math.Max(most, (off[g + 1] - off[g] + 7) / 8 * 8);
+        if (most == 0) return false;
+        long slotA = (long)most * v.K * 8, slotC = (long)most * v.N * 8;
+        ulong pa = gpu.Rent(v.Experts * slotA), pc = gpu.Rent(v.Experts * slotC);
+        try
+        {
+            Gpu.Clear(pa, v.Experts * slotA);
+            for (int g = 0; g < v.Experts; g++)
+            {
+                int rows = off[g + 1] - off[g];
+                if (rows > 0) Gpu.Copy(x + (ulong)off[g] * (ulong)v.K * 8, pa + (ulong)(g * slotA), (long)rows * v.K * 8);
+            }
+
+            long sW = (long)v.K * v.N * 8;
+            if (!SlicedFaster(most, v.N, v.K, pa, w, pc, v.Experts, slotA, sW, slotC) || !MatMulSliced(pa, w, pc, most, v.N, v.K, v.Experts, slotA, sW, slotC)) return false;
+            for (int g = 0; g < v.Experts; g++)
+            {
+                int rows = off[g + 1] - off[g];
+                if (rows > 0) Gpu.Copy(pc + (ulong)(g * slotC), sums + (ulong)off[g] * (ulong)v.N * 8, (long)rows * v.N * 8);
+            }
+        }
+        finally
+        {
+            gpu.Return(pa);
+            gpu.Return(pc);
+        }
+
+        return true;
+    }
+
     // Every expert's rows of x times its weights into the lane's sums (Ptx.Gemm's grouped mode): the grid's y every
     // expert's tiles at most (⌈rows / tile⌉ + experts), each CTA its expert's from the tiles' prefix.
     private void ExpertProducts(ExpertView v, Fmt f, Lane lane, int micro, ulong x, ulong offsets, ulong tiles, ulong w, ulong sums)
     {
         if (v.Rows == 0 || v.N == 0) return;
+        if (ExpertsSliced(v, f, lane, x, offsets, w, sums)) return;
         int tile = micro * 16;
         bool runsA = f.IsBlock && v.K % micro == 0, runsB = f.IsBlock && (v.TransW ? v.K : v.N) % micro == 0 && (long)v.K * v.N % micro == 0;
         var stored = new Ptx.GemmStored(f, f, null);

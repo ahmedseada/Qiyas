@@ -54,6 +54,7 @@ public sealed partial class GpuOps
         // operands read where they are stored, transposed or at their offsets, by the product kernel itself.
         if (f.IsBlock) return MatMulStored<TN>(v, a, b, c, Lane.F32);
         if (MatMulBatched<TN>(v, a, b, c, out string batched)) return batched;
+        if (SlicedBatches<TN>(v, a, b, c)) return "f64x";
 
         long bytesA = f.Words((long)v.M * v.K) * (f.WordBits / 8), bytesB = f.Words((long)v.K * v.N) * (f.WordBits / 8), bytesC = f.Words((long)v.M * v.N) * (f.WordBits / 8);
         // A batch's operands read where they are stored (Aᵀ, Bᵀ, a batch's offset on the pointer) where the product's packing
@@ -109,6 +110,17 @@ public sealed partial class GpuOps
         }
 
         return lane;
+    }
+
+    /// <summary>float64 batches by the sliced product (MatMulSliced's batched form: float64 math to within an ulp, as MatMul
+    /// takes it, every batch's diagonal products in one launch), where the device's proof covers it and it measures faster
+    /// than the plain kernel a batch: the view not transposed, its batches' C apart, shapes in multiples of 8.</summary>
+    private bool SlicedBatches<TN>(ProductView v, ulong a, ulong b, ulong c) where TN : struct, IAdad<TN>
+    {
+        if (!Fmt.Of<TN>().Is("float64") || !SlicedProven || v.Batch < 2 || v.TransA || v.TransB || v.K == 0 || v.M % 8 != 0 || v.N % 8 != 0 || v.K % 8 != 0
+            || v.StrideCOrDefault < (long)v.M * v.N) return false;
+        long sA = v.StrideAOrDefault * 8, sB = v.StrideBOrDefault * 8, sC = v.StrideCOrDefault * 8;
+        return SlicedFaster(v.M, v.N, v.K, a, b, c, v.Batch, sA, sB, sC) && MatMulSliced(a, b, c, v.M, v.N, v.K, v.Batch, sA, sB, sC);
     }
 
     /// <summary>Every batch of the view in one launch (grid z the batches), each batch's A, B and C read and written where
@@ -187,12 +199,23 @@ public sealed partial class GpuOps
         ulong sums = gpu.Rent(Math.Max(16, v.ValuesC * lane.Size));
         try
         {
-            ProductStored(v, lane, a, f, 0, b, f, 0, sums, null);
+            ProductSums(v, lane, f, a, b, sums);
             EpilogueStore(f, lane, v, e, terms, t, sums, c, 1, v.N);
         }
         finally { gpu.Return(sums); }
 
         return lane.Name;
+    }
+
+    /// <summary>The lane sums of op(A)·op(B) (A and B of f, where they are stored) into `sums`: ProductStored, or for
+    /// float64 the sliced product (MatMulSliced: float64 math to within an ulp, the route MatMul takes) where the device's
+    /// proof covers it and it measures faster at this shape, on a single batch of operands as stored (not transposed;
+    /// m, n and k multiples of 8).</summary>
+    private void ProductSums(ProductView v, Lane lane, Fmt f, ulong a, ulong b, ulong sums)
+    {
+        if (f.Is("float64") && lane == Lane.F64 && SlicedProven && v.Batch == 1 && !v.TransA && !v.TransB && v.K > 0
+            && v.M % 8 == 0 && v.N % 8 == 0 && v.K % 8 == 0 && SlicedFaster(v.M, v.N, v.K, a, b, sums) && MatMulSliced(a, b, sums, v.M, v.N, v.K)) return;
+        ProductStored(v, lane, a, f, 0, b, f, 0, sums, null);
     }
 
     /// <summary>y = the epilogue's y of x · Wᵀ, W the scaled weight's values made in the lane as the stored GEMM reads each
@@ -288,7 +311,7 @@ public sealed partial class GpuOps
             if (terms.Second)
             {
                 second = gpu.Rent(Math.Max(16, v.ValuesC * lane.Size));
-                ProductStored(e.Second!, lane, t.SecondA, f, 0, t.SecondB, f, 0, second, null);
+                ProductSums(e.Second!, lane, f, t.SecondA, t.SecondB, second);
             }
 
             if (terms.Keep) ProductStore(f, lane, terms.KeepPass, sums, second, t.Bias, 0, 0, t.Sums, v.ValuesC, cols, oc, e.ActA, e.Beta, e.ActB, before: c);
