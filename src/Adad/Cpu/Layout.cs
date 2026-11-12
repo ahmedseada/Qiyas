@@ -995,12 +995,40 @@ internal sealed partial class Kernels
         }
 
         // col2im, input row r (c, ih): each pixel iw the sum of every (a, b, oh, ow) that maps onto it, in kernel order.
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        // At the final tier from the first call: a call is one row, too short for the runtime to replace its tier-0 loop
+        // mid-call, and in a short process its promotion could come after the timing or never (col2im float32 read 1.4 or
+        // 3.5 ms a process, the JIT's record showing this method at tier 0 where slow). A stride of 1 takes no division.
+        [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
         private static void Col2ImRow(Reader<TN, TLane> input, int[] p, int r, Span<TLane> o)
         {
             var (OH, OW) = LayoutArgs.ConvOut(p);
             int H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], top = p[7], left = p[8], dh = p[11], dw = p[12];
             int ih = r % H, c = r / H;
+            if (sh == 1 && sw == 1)
+            {
+                // The same terms in the same order: th = ih + top − a·dh and tw = iw + left − b·dw are the output's row
+                // and column themselves.
+                for (int iw = 0; iw < W; iw++)
+                {
+                    TLane acc = TL.Zero;
+                    for (int a = 0; a < kh; a++)
+                    {
+                        int th = ih + top - a * dh;
+                        if ((uint)th >= (uint)OH) continue;
+                        for (int b = 0; b < kw; b++)
+                        {
+                            int tw = iw + left - b * dw;
+                            if ((uint)tw >= (uint)OW) continue;
+                            acc = TL.Add(acc, input[((long)((c * kh + a) * kw + b) * (OH * OW)) + th * OW + tw]);
+                        }
+                    }
+
+                    o[iw] = acc;
+                }
+
+                return;
+            }
+
             for (int iw = 0; iw < W; iw++)
             {
                 TLane acc = TL.Zero;
