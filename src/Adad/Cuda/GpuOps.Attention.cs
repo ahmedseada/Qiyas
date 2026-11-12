@@ -75,6 +75,9 @@ public sealed partial class GpuOps
         return fused ? AttentionRows<TN>(a, q, k, v, o) : AttentionComposed<TN>(a, q, k, v, o);
     }
 
+    /// <summary>The gate's override: false takes the row kernel for float32 where the register-tiled rows would run.</summary>
+    internal bool? TiledRows;
+
     /// <summary>The fused kernel's largest head dimension.</summary>
     public const int FusedHeadMax = 128;
 
@@ -131,6 +134,20 @@ public sealed partial class GpuOps
                 var mfn = gpu.Cached($"attention_rows_mma:{f.Name}:{dCap}:{load}", (out string e) => Ptx.AttentionRowsMma(gpu, f, kind, dCap, load, out e));
                 Gpu.Launch(mfn, (uint)mBlocks, (uint)a.Heads, Ptx.MmaRowsThreads, 1, 0, q, k, v, o, mLimits, mStarts, mRanges, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D), Gpu.F((float)a.Scale));
                 return kind.Name + "mma";
+            }
+
+            // A float32 type: the register-tiled rows where the device takes them (Ptx.AttentionRowsTiled: d in fours, the
+            // tensors on 16 bytes for its vector loads and stores).
+            if (f.Is("float32") && a.D % 4 == 0 && (q | k | v | o) % 16 == 0 && TiledRows != false && Ptx.AttentionTiledShared(dCap) <= AttnSharedLimit
+                && AttnAccepts($"attention_rows_tiled:{dCap}", (out string e) => Ptx.AttentionRowsTiled(gpu, dCap, out e)))
+            {
+                int tBlocks = (a.Lq + Ptx.TiledBr - 1) / Ptx.TiledBr;
+                ulong tLimits = Limits(a, rented), tStarts = Starts(a, rented), tRanges = KeyRanges(a, Ptx.TiledBr, rented);
+                var tfn = gpu.Cached($"attention_rows_tiled:{dCap}", (out string e) => Ptx.AttentionRowsTiled(gpu, dCap, out e));
+                gpu.AllowShared(tfn, Ptx.AttentionTiledShared(dCap));
+                Gpu.Launch(tfn, (uint)tBlocks, (uint)a.Heads, 256, 1, Dynamic(Ptx.AttentionTiledShared(dCap)), q, k, v, o, tLimits, tStarts, tRanges, Gpu.U(a.Lq), Gpu.U(a.Lk), Gpu.U(a.D),
+                    Gpu.F((float)a.Scale));
+                return lane.Name;
             }
 
             var (br, _) = Ptx.AttentionTile(lane);
