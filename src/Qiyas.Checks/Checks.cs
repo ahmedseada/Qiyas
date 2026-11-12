@@ -1915,6 +1915,15 @@ internal static partial class Checks
                     (x, o) => Bench.Registry.WithFloat(type, new ArenaProduct(null, v, 0, 0, 0, x[0], x[1], o))));
             }
 
+            if (ops is null)
+            {
+                // The CPU packs Aᵀ in its workspace: that product's calls held to no allocation too (the same values and seeds).
+                var v = new ProductView(192, 160, 300, true, false);
+                var a = Bench.Registry.Make(type, 300 * 192, 71, -1, 1); var b = Bench.Registry.Make(type, 300 * 160, 72, -1, 1);
+                cases.Add(("matmul_tn", [a, b], (int)Bench.Registry.Bytes(type, 192 * 160), null,
+                    (x, o) => Bench.Registry.WithFloat(type, new ArenaProduct(null, v, 0, 0, 0, x[0], x[1], o))));
+            }
+
             if (ops is not null)
             {
                 var at = new AttentionArgs(2, 37, 53, 24, 0.2, true);
@@ -1993,7 +2002,7 @@ internal static partial class Checks
             }
         }
 
-        if (ok) Console.WriteLine($"check arena                  {where,-6} float16, float32: {(ops is null ? "the product and the LSTM step reach calls with no workspace allocation, the results unchanged" : "a transposed product, attention, an LSTM step: from the second scoped call no pool rent, no driver allocation, nothing past the region or unreturned, the region's high-water mark the peak alive at once, the results the pool's bit for bit")}");
+        if (ok) Console.WriteLine($"check arena                  {where,-6} float16, float32: {(ops is null ? "the products (A·Bᵀ and Aᵀ·B) and the LSTM step reach calls with no workspace allocation, the results unchanged" : "a transposed product, attention, an LSTM step: from the second scoped call no pool rent, no driver allocation, nothing past the region or unreturned, the region's high-water mark the peak alive at once, the results the pool's bit for bit")}");
         return ok;
     }
 
