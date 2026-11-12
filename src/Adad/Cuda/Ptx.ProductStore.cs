@@ -3,7 +3,7 @@
 
 // A product's store on CUDA (Products.cs ProductEpilogue; GpuOps.Products.cs, and the general convolution's, GpuOps.Conv.cs):
 // y = the store terms' value of the lane sums, a thread per stored word (a warp, or a CTA, per block of a block format):
-// the sums and the low-rank term's (lane values), the bias, β·y (y's value read by the thread, warp or CTA that writes its
+// the sums and a second product's (lane values), the bias, β·y (y's value read by the thread, warp or CTA that writes its
 // word or block, before it does), the activation or the gradient through one (the element-wise formula's, Ptx.Map.cs) and
 // the residual, every operand read where it is stored and every term in the lane, each value rounded to the type once.
 using Adad.Abstraction;
@@ -12,9 +12,9 @@ namespace Adad.Cuda;
 
 internal static partial class Ptx
 {
-    /// <summary>Params: sums (lane storage), the low-rank term's sums (lane storage), bias (an output channel's, the channel
-    /// (at / cols) mod oc), residual, the activation's inputs (aux), y, n, cols, oc, the activation's parameter and β (lane
-    /// values). A term the store does not take has its pointer unread.</summary>
+    /// <summary>Params: sums (lane storage), the second product's sums (lane storage), bias (an output channel's, the channel
+    /// (at / cols) mod oc), residual, the activation's inputs (a gradient's x), y, n, cols, oc, the activation's parameter
+    /// and β (lane values). A term the store does not take has its pointer unread.</summary>
     public static string ProductStore(Gpu gpu, Fmt f, Lane lane, StoreTerms t, out string entry)
     {
         entry = $"product_store_{f.Name}_{lane.Name}_{t.Key}";
@@ -28,7 +28,7 @@ internal static partial class Ptx
         string Value(string at)
         {
             string v = LoadLane(b, lane, ps, at);
-            if (t.Low) v = e.Add(v, LoadLane(b, lane, pl, at));
+            if (t.Second) v = e.Add(v, LoadLane(b, lane, pl, at));
             if (t.Bias) v = e.Add(v, Codec.UnpackAt(b, f, pb, Within(b, at, cols, oc), lane));
             if (t.Beta) v = e.Fma(beta, Codec.UnpackAt(b, f, py, at, lane), v);
             if (t.Grad is not null) v = Formula(b, lane, t.Grad, Codec.UnpackAt(b, f, px, at, lane), v, v, pa, pa);

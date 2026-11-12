@@ -88,8 +88,8 @@ public sealed partial class GpuOps
     }
 
     /// <summary>C = the epilogue's y of op(A)·op(B) (ProductEpilogue): every batch's product into the float lane's sums
-    /// (the operands read where they are stored), the low-rank term's into sums of its own, then the store
-    /// (Ptx.ProductStore; aux first where it is written); returns the lane's name.</summary>
+    /// (the operands read where they are stored), the second product's into sums of its own, then the store
+    /// (Ptx.ProductStore; the sums kept first where they are); returns the lane's name.</summary>
     public string MatMulEpilogue<TN>(ProductView v, ProductEpilogue e, ulong a, ulong b, ulong c, ProductTerms<ulong> t) where TN : struct, IFloatAdad<TN>
     {
         var terms = t.Validate(e, v);
@@ -177,34 +177,34 @@ public sealed partial class GpuOps
         return lane.Name;
     }
 
-    // After a product's sums (lane storage, the view's C contiguous): the low-rank term's into sums of its own, then the
-    // store (aux first where it is written).
+    // After a product's sums (lane storage, the view's C contiguous): the second product's into sums of its own (every
+    // batch's operands read where they are stored), then the store (the sums kept first where they are).
     private void EpilogueStore(Fmt f, Lane lane, ProductView v, ProductEpilogue e, StoreTerms terms, ProductTerms<ulong> t, ulong sums, ulong c)
     {
-        ulong low = 0;
+        ulong second = 0;
         try
         {
-            if (terms.Low)
+            if (terms.Second)
             {
-                low = gpu.Rent(Math.Max(16, (long)v.M * v.N * lane.Size));
-                ProductStored(new ProductView(v.M, v.N, e.Rank, false, e.TransV), lane, t.U, f, 0, t.V, f, 0, low, null);
+                second = gpu.Rent(Math.Max(16, v.ValuesC * lane.Size));
+                ProductStored(e.Second!, lane, t.SecondA, f, 0, t.SecondB, f, 0, second, null);
             }
 
-            if (terms.Aux) ProductStore(f, lane, terms.Input, sums, low, t.Bias, 0, 0, t.Aux, v.ValuesC, 1, v.N, e.ActA, e.Beta);
-            ProductStore(f, lane, terms, sums, low, t.Bias, t.Residual, t.Aux, c, v.ValuesC, 1, v.N, e.ActA, e.Beta);
+            if (terms.Keep) ProductStore(f, lane, terms.KeepPass, sums, second, t.Bias, 0, 0, t.Sums, v.ValuesC, 1, v.N, e.ActA, e.Beta);
+            ProductStore(f, lane, terms, sums, second, t.Bias, t.Residual, t.ActInputs, c, v.ValuesC, 1, v.N, e.ActA, e.Beta);
         }
         finally
         {
-            if (low != 0) gpu.Return(low);
+            if (second != 0) gpu.Return(second);
         }
     }
 
     /// <summary>y (count values of f) = the store terms' value of the lane sums (Ptx.ProductStore): the bias the channel
     /// (at / cols) mod oc's, an absent term's pointer 0.</summary>
-    private void ProductStore(Fmt f, Lane lane, StoreTerms t, ulong sums, ulong low, ulong bias, ulong residual, ulong aux, ulong y, long count, int cols, int oc, double actA, double beta)
+    private void ProductStore(Fmt f, Lane lane, StoreTerms t, ulong sums, ulong second, ulong bias, ulong residual, ulong actInputs, ulong y, long count, int cols, int oc, double actA, double beta)
     {
         var fn = gpu.Cached($"product_store:{f.Name}:{lane.Name}:{t.Key}", (out string e) => Ptx.ProductStore(gpu, f, lane, t, out e));
-        LaunchEach(fn, f, count, sums, low, bias, residual, aux, y, Gpu.U((int)count), Gpu.U(cols), Gpu.U(oc),
+        LaunchEach(fn, f, count, sums, second, bias, residual, actInputs, y, Gpu.U((int)count), Gpu.U(cols), Gpu.U(oc),
             lane.Wide ? Gpu.D(actA) : Gpu.F((float)actA), lane.Wide ? Gpu.D(beta) : Gpu.F((float)beta));
     }
 

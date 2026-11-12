@@ -11,8 +11,8 @@ namespace Adad.Vulkan;
 
 internal static partial class VkKernels
 {
-    /// <summary>Slots: sums (lane storage), the low-rank term's sums (lane storage), bias (the channel (at / cols) mod oc),
-    /// residual, the activation's inputs (aux), y, n, cols, oc, the activation's parameter and β (lane values).</summary>
+    /// <summary>Slots: sums (lane storage), the second product's sums (lane storage), bias (the channel (at / cols) mod oc),
+    /// residual, the activation's inputs (a gradient's x), y, n, cols, oc, the activation's parameter and β (lane values).</summary>
     public static SpvKernel ProductStore(Vulkan vk, Fmt f, Lane lane, StoreTerms t)
     {
         var k = Kinds.Of(lane);
@@ -47,8 +47,8 @@ internal static partial class VkKernels
         });
     }
 
-    /// <summary>The store into blocks (f32). Slots: sums, the low-rank term's sums, bias, residual, aux, y (its values
-    /// before), cols, oc, the activation's parameter and β (f32).</summary>
+    /// <summary>The store into blocks (f32). Slots: sums, the second product's sums, bias, residual, the activation's
+    /// inputs, y (its values before), cols, oc, the activation's parameter and β (f32).</summary>
     public static SpvKernel BlockProductStore(Vulkan vk, Fmt f, StoreTerms t) =>
         BlockEncoder(vk, f, $"product_store_{t.Key}", b =>
         {
@@ -57,15 +57,15 @@ internal static partial class VkKernels
             return (at, _) => StoreValue(b, f, Lane.F32, K.F32, t, new StorePointers(ps, pl, pb, pr, px, py, cols, oc, pa, beta), at);
         });
 
-    private readonly record struct StorePointers(V Sums, V Low, V Bias, V Residual, V Aux, V Y, V Cols, V OC, V A, V Beta);
+    private readonly record struct StorePointers(V Sums, V Second, V Bias, V Residual, V ActInputs, V Y, V Cols, V OC, V A, V Beta);
 
     private static V StoreValue(Spv b, Fmt f, Lane lane, K k, StoreTerms t, StorePointers p, V at)
     {
         var v = b.Load(k, b.At(p.Sums, at, lane.Size));
-        if (t.Low) v = v + b.Load(k, b.At(p.Low, at, lane.Size));
+        if (t.Second) v = v + b.Load(k, b.At(p.Second, at, lane.Size));
         if (t.Bias) v = v + Codec.UnpackAt(b, f, p.Bias, at / p.Cols % p.OC, lane);
         if (t.Beta) v = b.Fma(p.Beta, Codec.UnpackAt(b, f, p.Y, at, lane), v);
-        if (t.Grad is not null) v = Formula(b, k, t.Grad, Codec.UnpackAt(b, f, p.Aux, at, lane), v, v, p.A, p.A);
+        if (t.Grad is not null) v = Formula(b, k, t.Grad, Codec.UnpackAt(b, f, p.ActInputs, at, lane), v, v, p.A, p.A);
         else if (t.Act is not null) v = Formula(b, k, t.Act, v, v, v, p.A, p.A);
         if (t.Residual) v = v + Codec.UnpackAt(b, f, p.Residual, at, lane);
         return v;
