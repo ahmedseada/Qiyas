@@ -1319,7 +1319,7 @@ internal static partial class Checks
                 worst = Math.Max(worst, Math.Abs((up - down) / (2 * h) - g[i]));
             }
 
-            if (worst > 1e-7) { Console.WriteLine($"check ctc reference T{a.T} B{a.B} C{a.C}: the gradient differs from the loss's differences by {worst:R}"); ok = false; }
+            if (worst > 1e-7) { Console.WriteLine($"check ctc reference T{a.T} B{a.B} C{a.C}: DIFFERS: the gradient from the loss's differences by {worst:R}"); ok = false; }
         }
 
         // CUDA: the one-state kernel (every case's states fit a thread each), then the general kernel.
@@ -1351,7 +1351,7 @@ internal static partial class Checks
                     foreach (var l in new[] { loss, loss2 })
                     {
                         double got = Bench.Registry.Values(type, l, a.B)[1];
-                        if (!double.IsPositiveInfinity(got)) { Console.WriteLine($"check ctc no alignment {where,-6} {type,-12} loss {got:R}, not +∞"); ok = false; }
+                        if (!double.IsPositiveInfinity(got)) { Console.WriteLine($"check ctc no alignment {where,-6} {type,-12} DIFFERS: loss {got:R}, not +∞"); ok = false; }
                     }
                 }
 
@@ -1369,7 +1369,7 @@ internal static partial class Checks
                         }
                     }
 
-                    if (worst > 4 * (a.C + terms) * eps) { Console.WriteLine($"check ctc grad sum {where,-6} {type,-12} a frame's gradient sums to {worst:R}, not 0"); ok = false; }
+                    if (worst > 4 * (a.C + terms) * eps) { Console.WriteLine($"check ctc grad sum {where,-6} {type,-12} DIFFERS: a frame's gradient sums to {worst:R}, not 0"); ok = false; }
                 }
             }
         }
@@ -1855,10 +1855,10 @@ internal static partial class Checks
                         cpu(inputs, again);
                         var (_, g1, p1) = Workspace.Counts;
                         steady = g1 == g0 && p1 == p0;
-                        if (!again.AsSpan().SequenceEqual(first)) { Console.WriteLine($"check arena {name} {type} cpu: call {call + 2} differs from the first"); ok = false; break; }
+                        if (!again.AsSpan().SequenceEqual(first)) { Console.WriteLine($"check arena {name} {type} cpu: DIFFERS: call {call + 2} from the first"); ok = false; break; }
                     }
 
-                    if (!steady) { Console.WriteLine($"check arena {name} {type} cpu: still allocating after 8 calls"); ok = false; }
+                    if (!steady) { Console.WriteLine($"check arena {name} {type} cpu: FAILS: still allocating after 8 calls"); ok = false; }
                     continue;
                 }
 
@@ -1881,13 +1881,13 @@ internal static partial class Checks
                         var got = new byte[outBytes];
                         Adad.Cuda.Gpu.Synchronize();
                         Adad.Cuda.Gpu.Download<byte>(dout, got);
-                        if (!got.AsSpan().SequenceEqual(pooled)) { Console.WriteLine($"check arena {name} {type} device: scoped call {call + 1} differs from the pool's"); ok = false; }
-                        if (c1.Leaks != c0.Leaks || c1.Strays != c0.Strays) { Console.WriteLine($"check arena {name} {type} device: scoped call {call + 1} left {c1.Leaks - c0.Leaks} buffers unreturned, {c1.Strays - c0.Strays} returned late"); ok = false; }
+                        if (!got.AsSpan().SequenceEqual(pooled)) { Console.WriteLine($"check arena {name} {type} device: DIFFERS: scoped call {call + 1} from the pool's"); ok = false; }
+                        if (c1.Leaks != c0.Leaks || c1.Strays != c0.Strays) { Console.WriteLine($"check arena {name} {type} device: FAILS: scoped call {call + 1} left {c1.Leaks - c0.Leaks} buffers unreturned, {c1.Strays - c0.Strays} returned late"); ok = false; }
                         var (high, peak) = gpu.LastScope;
-                        if (call >= 1 && high != peak) { Console.WriteLine($"check arena {name} {type} device: scoped call {call + 1} reached {high} bytes of the region for {peak} alive at once (returned buffers not released)"); ok = false; }
+                        if (call >= 1 && high != peak) { Console.WriteLine($"check arena {name} {type} device: FAILS: scoped call {call + 1} reached {high} bytes of the region for {peak} alive at once (returned buffers not released)"); ok = false; }
                         if (call >= 1 && (c1.PoolRents != c0.PoolRents || c1.DriverAllocations != c0.DriverAllocations || c1.Overflows != c0.Overflows || c1.ArenaRents == c0.ArenaRents))
                         {
-                            Console.WriteLine($"check arena {name} {type} device: scoped call {call + 1}: {c1.ArenaRents - c0.ArenaRents} arena rents, {c1.PoolRents - c0.PoolRents} pool rents, {c1.DriverAllocations - c0.DriverAllocations} driver allocations, {c1.Overflows - c0.Overflows} past the region");
+                            Console.WriteLine($"check arena {name} {type} device: FAILS: scoped call {call + 1}: {c1.ArenaRents - c0.ArenaRents} arena rents, {c1.PoolRents - c0.PoolRents} pool rents, {c1.DriverAllocations - c0.DriverAllocations} driver allocations, {c1.Overflows - c0.Overflows} past the region");
                             ok = false;
                         }
                     }

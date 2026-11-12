@@ -117,7 +117,7 @@ internal static partial class Checks
                 }
             }
 
-            if (worst > 1e-7) { Console.WriteLine($"check box {Boxes.Name(overlap)} reference: the gradient differs from the loss's differences by {worst:R}"); ok = false; }
+            if (worst > 1e-7) { Console.WriteLine($"check box {Boxes.Name(overlap)} reference: DIFFERS: the gradient from the loss's differences by {worst:R}"); ok = false; }
         }
 
         return ok;
