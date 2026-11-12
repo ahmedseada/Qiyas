@@ -9,7 +9,8 @@
 //                     intermediates in the float lane's own type (float32 for the narrow floats, float64 for float64);
 //                     no input is widened whole (a block format's O: the lane's values, encoded once).
 //   attention_decode  one or a few queries against a long key cache: a fused kernel on the device (a block per query,
-//                     keys in chunks, the softmax online, K and V read once); the same per query on the CPU.
+//                     keys in chunks, the softmax online, K and V read once); on the CPU a head's rows over a part of
+//                     its keys at a time, K and V rows read once for them all, the parts of a row combined after.
 //   attention_bwd     dQ, dK, dV from dO: the composition (P recomputed; dV = Pᵀ·dO, dP = dO·Vᵀ, dS = softmax_bwd(P, dP),
 //                     dQ = scale·dS·K, dK = scale·dSᵀ·Q).
 //
@@ -353,6 +354,12 @@ internal sealed partial class Kernels
         return vis.Lane;
     }
 
+    // The keys go in parts of a fixed length, so a few long rows still give the team many pieces: a part's (max, Σ exp,
+    // context) per row, the parts of a row combined after (exp(m_p − M) rescales each). The length is a choice measured
+    // once: a part's K and V rows of a 128-wide head are 128 kB each in float32, well past a piece's overhead and inside
+    // the caches; it does not follow the thread count, so neither does the result.
+    private const int DecodePart = 256;
+
     private struct DecodeVisitor(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) : IFloatLaneVisitor
     {
         public string Lane = "";
@@ -360,56 +367,156 @@ internal sealed partial class Kernels
         public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
         {
             Lane = TL.Name;
-            Team.For(a.Heads * a.Lq, RowChunk<TN>(a.Heads * a.Lq, a.D, 1), a.KValues * 2, new DecodeBody<TN, TLane, TL>(a, q, k, v, o));
+            int rows = a.Heads * a.Lq, parts = Math.Max(1, (a.Lk + DecodePart - 1) / DecodePart);
+            var pool = ArrayPool<TLane>.Shared;
+            var ms = pool.Rent(rows * parts);
+            var sums = pool.Rent(rows * parts);
+            var accs = pool.Rent(rows * parts * a.D);
+            var keys = ArrayPool<int>.Shared.Rent(rows * parts);
+            try
+            {
+                Team.For(a.Heads * parts, 1, a.KValues * 2, new DecodeBody<TN, TLane, TL>(a, q, k, v, parts, ms, sums, accs, keys));
+                Team.For(rows, RowChunk<TN>(rows, a.D, rows / (Threads * 4)), (long)rows * parts * a.D * Unsafe.SizeOf<TLane>(),
+                    new DecodeJoin<TN, TLane, TL>(a, parts, ms, sums, accs, keys, o));
+            }
+            finally
+            {
+                pool.Return(ms); pool.Return(sums); pool.Return(accs); ArrayPool<int>.Shared.Return(keys);
+            }
         }
     }
 
-    private struct DecodeBody<TN, TLane, TL>(AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) : Team.IBody
+    // One head's rows over one part of its keys: each K row read once for all the head's rows (a group's query rows share
+    // it), the scores, each row's max and Σ exp over its keys in the part, then each V row read once into the rows' contexts.
+    private readonly struct DecodeBody<TN, TLane, TL>(AttentionArgs a, byte[] q, byte[] k, byte[] v, int parts, TLane[] ms, TLane[] sums, TLane[] accs, int[] keys) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
-        public readonly void Run(int first, int last)
+        public void Run(int first, int last)
         {
             var pool = ArrayPool<TLane>.Shared;
-            var qr = pool.Rent(a.D);
-            var kr = pool.Rent(a.D);
-            var acc = pool.Rent(a.D);
-            var s = pool.Rent(a.Lk);
+            int d = a.D, lq = a.Lq;
+            var qr = pool.Rent(lq * d);
+            var kr = pool.Rent(d);
+            var s = pool.Rent(lq * DecodePart);
+            var from = ArrayPool<int>.Shared.Rent(lq);
+            var to = ArrayPool<int>.Shared.Rent(lq);
             try
             {
                 TLane scale = TL.From(a.Scale);
-                for (int hi = first; hi < last; hi++)
+                bool direct = TN.Direct;
+                int w = Vector<TLane>.Count;
+                for (int item = first; item < last; item++)
                 {
-                    int h = hi / a.Lq, i = hi % a.Lq, limit = a.Limit(i), start = Math.Min(a.Start(i), limit);
-                    long qi = ((long)h * a.Lq + i) * a.D, kBase = (long)h * a.Lk * a.D;
-                    TN.Load(q, (int)qi, qr.AsSpan(0, a.D));
-                    TLane m = TL.NegativeInfinity;
-                    for (int j = start; j < limit; j++)
+                    int h = item / parts, p = item % parts, lo = p * DecodePart, hi = Math.Min(a.Lk, lo + DecodePart);
+                    long kBase = (long)h * a.Lk * d;
+                    int keysLo = hi, keysHi = lo;
+                    for (int i = 0; i < lq; i++)
                     {
-                        TN.Load(k, (int)(kBase + (long)j * a.D), kr.AsSpan(0, a.D));
-                        s[j] = TL.Mul(RowMath<TLane, TL>.Dot(qr.AsSpan(0, a.D), kr.AsSpan(0, a.D)), scale);
-                        m = TL.Max(m, s[j]);
+                        int limit = a.Limit(i), start = Math.Min(a.Start(i), limit);
+                        from[i] = Math.Max(lo, start); to[i] = Math.Min(hi, limit);
+                        if (from[i] < to[i]) { keysLo = Math.Min(keysLo, from[i]); keysHi = Math.Max(keysHi, to[i]); }
                     }
 
-                    TLane sum = limit <= start ? TL.Zero : RowMath<TLane, TL>.ExpSum(s.AsSpan(start, limit - start), m, s.AsSpan(start, limit - start));
-                    acc.AsSpan(0, a.D).Clear();
-                    for (int j = start; j < limit; j++)
+                    if (keysLo < keysHi) TN.Load(q, (int)((long)h * lq * d), qr.AsSpan(0, lq * d));
+                    for (int j = keysLo; j < keysHi; j++)
                     {
-                        TN.Load(v, (int)(kBase + (long)j * a.D), kr.AsSpan(0, a.D));
-                        var pj = new Vector<TLane>(s[j]);
-                        int w = Vector<TLane>.Count, t = 0;
-                        for (; t + w <= a.D; t += w) TL.Fma(new Vector<TLane>(kr.AsSpan(t)), pj, new Vector<TLane>(acc.AsSpan(t))).CopyTo(acc.AsSpan(t));
-                        for (; t < a.D; t++) acc[t] = TL.Fma(kr[t], s[j], acc[t]);
+                        var kj = Row(k, kBase + (long)j * d, d, direct, kr);
+                        for (int i = 0; i < lq; i++)
+                        {
+                            if (j >= from[i] && j < to[i]) s[i * DecodePart + j - lo] = TL.Mul(RowMath<TLane, TL>.Dot(qr.AsSpan(i * d, d), kj), scale);
+                        }
                     }
 
-                    TLane inv = limit <= start ? TL.Zero : TL.Div(TL.From(1), sum);
-                    RowMath<TLane, TL>.Scale(acc.AsSpan(0, a.D), TL.Zero, inv, acc.AsSpan(0, a.D));
-                    TN.Store(acc.AsSpan(0, a.D), o, (int)qi);
+                    for (int i = 0; i < lq; i++)
+                    {
+                        int at = (h * lq + i) * parts + p;
+                        accs.AsSpan(at * d, d).Clear();
+                        keys[at] = Math.Max(0, to[i] - from[i]);
+                        if (keys[at] == 0) { ms[at] = TL.NegativeInfinity; sums[at] = TL.Zero; continue; }
+                        var si = s.AsSpan(i * DecodePart + from[i] - lo, keys[at]);
+                        TLane m = TL.NegativeInfinity;
+                        foreach (var x in si) m = TL.Max(m, x);
+                        ms[at] = m;
+                        sums[at] = RowMath<TLane, TL>.ExpSum(si, m, si);
+                    }
+
+                    for (int j = keysLo; j < keysHi; j++)
+                    {
+                        var vj = Row(v, kBase + (long)j * d, d, direct, kr);
+                        for (int i = 0; i < lq; i++)
+                        {
+                            if (j < from[i] || j >= to[i]) continue;
+                            var acc = accs.AsSpan(((h * lq + i) * parts + p) * d, d);
+                            TLane pj = s[i * DecodePart + j - lo];
+                            var pv = new Vector<TLane>(pj);
+                            int t = 0;
+                            for (; t + w <= d; t += w) TL.Fma(new Vector<TLane>(vj[t..]), pv, new Vector<TLane>(acc[t..])).CopyTo(acc[t..]);
+                            for (; t < d; t++) acc[t] = TL.Fma(vj[t], pj, acc[t]);
+                        }
+                    }
                 }
             }
             finally
             {
-                pool.Return(qr); pool.Return(kr); pool.Return(acc); pool.Return(s);
+                pool.Return(qr); pool.Return(kr); pool.Return(s);
+                ArrayPool<int>.Shared.Return(from); ArrayPool<int>.Shared.Return(to);
             }
+        }
+
+        // A stored row of d values in the lane: in place when the type is its lane, else loaded into the scratch row.
+        private static ReadOnlySpan<TLane> Row(byte[] x, long at, int d, bool direct, TLane[] scratch)
+        {
+            if (direct) return MemoryMarshal.Cast<byte, TLane>(x.AsSpan()).Slice((int)at, d);
+            TN.Load(x, (int)at, scratch.AsSpan(0, d));
+            return scratch.AsSpan(0, d);
+        }
+    }
+
+    // A row's parts combined: M the largest max of the parts that hold keys, each part's sum and context scaled by
+    // exp(m_p − M) into the row's, the context divided by the sum (a row that sees no key: 0) and stored as the type.
+    // One part: exp(0) = 1, the single pass's result exactly.
+    private readonly struct DecodeJoin<TN, TLane, TL>(AttentionArgs a, int parts, TLane[] ms, TLane[] sums, TLane[] accs, int[] keys, byte[] o) : Team.IBody
+        where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    {
+        public void Run(int first, int last)
+        {
+            int d = a.D, w = Vector<TLane>.Count;
+            var acc = ArrayPool<TLane>.Shared.Rent(d);
+            try
+            {
+                for (int r = first; r < last; r++)
+                {
+                    var row = acc.AsSpan(0, d);
+                    row.Clear();
+                    TLane big = TL.NegativeInfinity, sum = TL.Zero;
+                    bool any = false;
+                    for (int p = 0; p < parts; p++)
+                    {
+                        int at = r * parts + p;
+                        if (keys[at] == 0) continue;
+                        big = any ? TL.Max(big, ms[at]) : ms[at];
+                        any = true;
+                    }
+
+                    for (int p = 0; any && p < parts; p++)
+                    {
+                        int at = r * parts + p;
+                        if (keys[at] == 0) continue;
+                        TLane c = TL.Exp(TL.Sub(ms[at], big));
+                        sum = TL.Fma(sums[at], c, sum);
+                        var part = accs.AsSpan(at * d, d);
+                        var cv = new Vector<TLane>(c);
+                        int t = 0;
+                        for (; t + w <= d; t += w) TL.Fma(new Vector<TLane>(part[t..]), cv, new Vector<TLane>(row[t..])).CopyTo(row[t..]);
+                        for (; t < d; t++) row[t] = TL.Fma(part[t], c, row[t]);
+                    }
+
+                    TLane inv = any ? TL.Div(TL.From(1), sum) : TL.Zero;
+                    RowMath<TLane, TL>.Scale(row, TL.Zero, inv, row);
+                    TN.Store(row, o, r * d);
+                }
+            }
+            finally { ArrayPool<TLane>.Shared.Return(acc); }
         }
     }
 }
