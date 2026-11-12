@@ -538,6 +538,7 @@ internal sealed partial class Kernels
             Span<TLane> tx = stackalloc TLane[Tile];
             Span<TLane> ty = stackalloc TLane[Tile];
             Span<TLane> tz = stackalloc TLane[Tile];
+            Span<byte> stored = stream ? stackalloc byte[(int)TN.Bytes(Tile)] : default;   // once: a stackalloc in the loop grows the stack each tile
             for (int at = first; at < last; at += Tile)
             {
                 int len = Math.Min(Tile, last - at);
@@ -554,7 +555,6 @@ internal sealed partial class Kernels
 
                 // The tile's stored bytes (a tile is whole storage units) made on the stack, then streamed.
                 int bytes = (int)TN.Bytes(len);
-                Span<byte> stored = stackalloc byte[(int)TN.Bytes(Tile)];
                 TN.Store(tx[..len], stored[..bytes], 0);
                 Streams.Copy(stored[..bytes], output.AsSpan((int)TN.Bytes(at), bytes));
             }

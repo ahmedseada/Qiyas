@@ -25,7 +25,10 @@ internal static unsafe class Streams
 
     /// <summary>Whether a pass moving this many bytes (read and written) streams its result past the caches: past 1.5 times
     /// them (above).</summary>
-    public static bool Past(long bytes) => CacheBytes > 0 && bytes > CacheBytes + CacheBytes / 2;
+    public static bool Past(long bytes) => Force ?? (CacheBytes > 0 && bytes > CacheBytes + CacheBytes / 2);
+
+    /// <summary>The gate's override: true streams every pass that can, false none, null by the bytes (above).</summary>
+    internal static bool? Force;
 
     /// <summary>dst = src: the whole aligned vectors of dst by non-temporal stores, its edges by plain ones.</summary>
     public static void Copy(ReadOnlySpan<byte> src, Span<byte> dst)

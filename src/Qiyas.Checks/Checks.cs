@@ -127,6 +127,7 @@ internal static partial class Checks
         ok &= ErfFour(new Random(74));
         ok &= Maps(null);
         ok &= Maps(null, special: true);
+        ok &= Streamed();
         ok &= Elementwise(null);
         ok &= Group2(null);
         ok &= Rows(null);
@@ -2769,6 +2770,69 @@ internal static partial class Checks
         if (op.Name.StartsWith("sigmoid_focal", StringComparison.Ordinal))
             foreach (var (a, b) in new[] { (0.25, 0.0), (0.0, 0.5), (1.0, 1.0), (-0.5, 2.0), (0.6, -0.5) })
                 yield return op with { A = a, B = b };
+    }
+
+    // The CPU's element-wise passes with their results streamed past the caches (Streams.Force: every pass streams, then
+    // none), at the bench's size (16M values: a team task's run of tiles as long as the bench's), every type: add, and the
+    // maps add and muladd (two and three inputs), the streamed results equal to the plain ones bit for bit. A buffer a tile
+    // that grew the worker's stack each tile (256 kB) overflowed it at this size; the run itself is the check of that.
+    public static bool Streamed()
+    {
+        const int N = 1 << 24;
+        bool ok = true;
+        var types = new List<string>();
+        foreach (var type in Bench.Registry.Names)
+        {
+            // Inputs: a 64k-value draw repeated (any values: the two runs are compared with each other).
+            byte[] Input(int seed)
+            {
+                var part = Bench.Registry.Make(type, 1 << 16, seed, -2, 2);
+                var all = new byte[Bench.Registry.Bytes(type, N)];
+                for (int at = 0; at < all.Length; at += part.Length) part.AsSpan(0, Math.Min(part.Length, all.Length - at)).CopyTo(all.AsSpan(at));
+                return all;
+            }
+
+            byte[] x = Input(91), y = Input(92), z = Input(93);
+            foreach (var name in new[] { "add", "map:add", "map:muladd" })
+            {
+                var outs = new byte[2][];
+                for (int pass = 0; pass < 2; pass++)
+                {
+                    Streams.Force = pass == 1;
+                    try
+                    {
+                        outs[pass] = new byte[Bench.Registry.Bytes(type, N)];
+                        if (name == "add") Bench.Registry.With(type, new CpuAdd(x, y, outs[pass], N));
+                        else
+                        {
+                            var op = Ops.Find(name[4..])!;
+                            Bench.Registry.With(type, new CpuMap(op, x, y, op.Inputs >= 3 ? z : null, outs[pass], N));
+                        }
+                    }
+                    finally { Streams.Force = null; }
+                }
+
+                if (!outs[0].AsSpan().SequenceEqual(outs[1]))
+                {
+                    Console.WriteLine($"check streamed {name,-12} cpu    {type,-12} DIFFERS: the streamed result from the plain one");
+                    ok = false;
+                }
+            }
+
+            types.Add(type);
+        }
+
+        if (ok) Console.WriteLine($"check streamed               cpu    {string.Join(", ", types)}: add, map add and muladd over 16M values streamed past the caches equal to their plain results bit for bit");
+        return ok;
+    }
+
+    private sealed class CpuAdd(byte[] a, byte[] b, byte[] c, int n) : Bench.ITypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IAdad<TN, float>
+        {
+            ((IElementwise<byte[]>)CpuDevice.Device).Add<TN>(a, b, c, n);
+            return true;
+        }
     }
 
     private sealed class CpuMap(MapOp op, byte[]? x, byte[]? y, byte[]? z, byte[] output, int n) : Bench.ITypeVisitor<bool>
