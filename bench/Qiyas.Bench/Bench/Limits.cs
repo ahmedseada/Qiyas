@@ -77,7 +77,8 @@ internal sealed class Limits(Device device, IReadOnlyList<(long Size, double Rat
     /// copy's (every byte at the copy's rate); the reads' (each byte read at the read rate, each written at what a copy
     /// leaves for it, 2/copy − 1/read a byte); the writes' (each byte written at the write rate, each read at 2/copy −
     /// 1/write). A copy reads as much as it writes, so every model gives a copy its measured time, a pure read the reads'
-    /// rate and a pure write the writes'; a row is held to the fastest of the three. The read and write curves are by the
+    /// rate and a pure write the writes'; a row is held to the fastest of the three, and never below its reads at the read
+    /// curve or its writes at the write curve. The read and write curves are by the
     /// bytes a row moves (a read of size s holds s), the copy's by half of them (a copy of size s holds 2s).</summary>
     public double MoveSeconds(double bytes, double? written)
     {
@@ -87,7 +88,10 @@ internal sealed class Limits(Device device, IReadOnlyList<(long Size, double Rat
         double read = RateAt(_reads, bytes), write = RateAt(_writes, bytes);
         double viaReads = r / read + w * Math.Max(0, 2 / c - 1 / read);
         double viaWrites = w / write + r * Math.Max(0, 2 / c - 1 / write);
-        return Math.Min(copy, Math.Min(viaReads, viaWrites));
+        // Neither the reads nor the writes go faster than their own curve at this size: near a cache's edge the copy's rate
+        // can be a cache's the reads and writes do not fit (the faster neighbour of bytes/2), and the models above would
+        // price the other side's bytes at almost nothing (a float32 fill of 67 MB read 0.004 ms where it writes at 0.085).
+        return Math.Max(Math.Max(r / read, w / write), Math.Min(copy, Math.Min(viaReads, viaWrites)));
     }
 
     /// <summary>Operations a second in the lane (two a multiply-add), or null where the lane was not measured.</summary>

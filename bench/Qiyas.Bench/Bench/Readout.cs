@@ -106,7 +106,8 @@ internal static class Works
     }
 
     /// <summary>The reduction of rows × cols along the axis into count lane values (8 bytes each).</summary>
-    public static Work Reduce(string op, string type, long values, int count) => new(B(type, values) + 8.0 * count, (op == "sumsq" ? 2 : 1) * (double)values);
+    public static Work Reduce(string op, string type, long values, int count) =>
+        new(B(type, values) + 8.0 * count, (op == "sumsq" ? 2 : 1) * (double)values) { Written = 8.0 * count };
 
     /// <summary>A layout operation: its input(s), index and output at the type; the operations its definition computes.</summary>
     public static Work Layout(string name, LayoutArgs k, string type)
