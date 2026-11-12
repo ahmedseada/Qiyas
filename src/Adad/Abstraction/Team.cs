@@ -126,6 +126,29 @@ internal static unsafe class Team
         return workers;
     }
 
+    // A worker asks the system not to throttle its execution speed. Windows' power throttling (EcoQoS) may run a thread it
+    // judges a background one on efficiency cores at low clocks: a team ran at one of two speeds a process (measured:
+    // products, convolutions, maps and norms 1.3-2x apart, the same build); opted out, one speed and the faster. THREAD_POWER_THROTTLING_STATE {Version 1, ControlMask EXECUTION_SPEED, StateMask 0}: the
+    // thread manages its own speed, unthrottled. Elsewhere nothing to ask. The caller's thread is the caller's: untouched.
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern bool SetThreadInformation(nint thread, int infoClass, ref ThrottlingState info, int size);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern nint GetCurrentThread();
+
+    private struct ThrottlingState { public uint Version, ControlMask, StateMask; }
+
+    private static void FullSpeed()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        try
+        {
+            var state = new ThrottlingState { Version = 1, ControlMask = 1, StateMask = 0 };
+            SetThreadInformation(GetCurrentThread(), 3, ref state, 12);           // ThreadPowerThrottling
+        }
+        catch (Exception e) when (e is EntryPointNotFoundException or DllNotFoundException) { }
+    }
+
     private sealed class Worker
     {
         private readonly ManualResetEventSlim _wake = new(false, 0);
@@ -154,6 +177,7 @@ internal static unsafe class Team
             int done = 0;
             t_inside = true;
             var thread = Thread.CurrentThread;
+            FullSpeed();
             while (true)
             {
                 // Waiting at a lower priority: when something else must run, the scheduler takes a spinner's core, not
