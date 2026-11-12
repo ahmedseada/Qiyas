@@ -862,63 +862,90 @@ internal sealed partial class Kernels
         public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
         {
             Lane = TL.Name;
+            // Tiles of bh input rows by bw input columns. An output row's piece (bh values) is whole storage units of the
+            // type, so no two tasks store into one byte or one block (a block format's 256-value blocks: 256 rows a tile);
+            // a block format's input rows are read in whole blocks where its columns allow (each block decoded once).
             const int B = 64;
-            int rowBlocks = (rows + B - 1) / B, colBlocks = (cols + B - 1) / B;
-            int per = TN.Granularity;
-            if (rows % per != 0)
+            int g = TN.Granularity, bh = Math.Max(B, (B + g - 1) / g * g), bw = cols % g == 0 ? bh : B;
+            int rowBlocks = (rows + bh - 1) / bh, colBlocks = (cols + bw - 1) / bw;
+            if (rows % g != 0)
             {
-                // Output rows that do not end on a byte: one thread owns whole output rows (all the row blocks of a column block).
-                Team.For(colBlocks, RowChunk<TN>(colBlocks, B * rows, 1), (long)rows * cols, new TransposeColumnsBody<TN, TLane>(x, output, rows, cols, B, rowBlocks));
+                // Output rows that do not start on whole storage units: one task owns whole output rows (all the row blocks
+                // of its column blocks, whole storage units by RowChunk); a block format's task gathers its rows whole and
+                // stores them once (a block stored in pieces would be re-encoded with each).
+                Team.For(colBlocks, RowChunk<TN>(colBlocks, bw * rows, 1), (long)rows * cols, new TransposeColumnsBody<TN, TLane>(x, output, rows, cols, bh, bw, rowBlocks, g > 8));
                 return;
             }
 
-            Team.For(rowBlocks * colBlocks, Math.Max(1, rowBlocks * colBlocks / (Threads * 4)), (long)rows * cols, new TransposeBody<TN, TLane>(x, output, rows, cols, B, colBlocks));
+            Team.For(rowBlocks * colBlocks, Math.Max(1, rowBlocks * colBlocks / (Threads * 4)), (long)rows * cols, new TransposeBody<TN, TLane>(x, output, rows, cols, bh, bw, colBlocks));
         }
     }
 
-    private struct TransposeColumnsBody<TN, TLane>(byte[] x, byte[] output, int rows, int cols, int block, int rowBlocks) : Team.IBody
+    private struct TransposeColumnsBody<TN, TLane>(byte[] x, byte[] output, int rows, int cols, int bh, int bw, int rowBlocks, bool whole) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
     {
         public readonly void Run(int first, int last)
         {
-            Span<TLane> tile = stackalloc TLane[block * block];
-            Span<TLane> line = stackalloc TLane[block];
-            for (int cb = first; cb < last; cb++)
+            var pool = ArrayPool<TLane>.Shared;
+            var tile = pool.Rent(bh * bw);
+            int c1 = Math.Min(cols, last * bw), span = (c1 - first * bw) * rows;
+            var line = pool.Rent(whole ? span : bh);                      // whole: the task's output rows, stored once
+            try
             {
-                int c0 = cb * block, wd = Math.Min(block, cols - c0);
-                for (int rb = 0; rb < rowBlocks; rb++)
+                for (int cb = first; cb < last; cb++)
                 {
-                    int r0 = rb * block, h = Math.Min(block, rows - r0);
-                    for (int r = 0; r < h; r++) TN.Load(x, (r0 + r) * cols + c0, tile.Slice(r * block, wd));
-                    for (int c = 0; c < wd; c++)
+                    int c0 = cb * bw, wd = Math.Min(bw, cols - c0);
+                    for (int rb = 0; rb < rowBlocks; rb++)
                     {
-                        for (int r = 0; r < h; r++) line[r] = tile[r * block + c];
-                        TN.Store(line[..h], output, (c0 + c) * rows + r0);
+                        int r0 = rb * bh, h = Math.Min(bh, rows - r0);
+                        for (int r = 0; r < h; r++) TN.Load(x, (r0 + r) * cols + c0, tile.AsSpan(r * bw, wd));
+                        for (int c = 0; c < wd; c++)
+                        {
+                            var dst = whole ? line.AsSpan((c0 + c - first * bw) * rows + r0, h) : line.AsSpan(0, h);
+                            for (int r = 0; r < h; r++) dst[r] = tile[r * bw + c];
+                            if (!whole) TN.Store(dst, output, (c0 + c) * rows + r0);
+                        }
                     }
                 }
+
+                if (whole) TN.Store(line.AsSpan(0, span), output, first * bw * rows);
+            }
+            finally
+            {
+                pool.Return(tile);
+                pool.Return(line);
             }
         }
     }
 
-    private struct TransposeBody<TN, TLane>(byte[] x, byte[] output, int rows, int cols, int block, int colBlocks) : Team.IBody
+    private struct TransposeBody<TN, TLane>(byte[] x, byte[] output, int rows, int cols, int bh, int bw, int colBlocks) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public readonly void Run(int first, int last)
         {
-            Span<TLane> tile = stackalloc TLane[block * block];
-            Span<TLane> line = stackalloc TLane[block];
-            for (int t = first; t < last; t++)
+            var pool = ArrayPool<TLane>.Shared;
+            var tile = pool.Rent(bh * bw);
+            var line = pool.Rent(bh);
+            try
             {
-                int r0 = t / colBlocks * block, c0 = t % colBlocks * block;
-                int h = Math.Min(block, rows - r0), wd = Math.Min(block, cols - c0);
-                for (int r = 0; r < h; r++) TN.Load(x, (r0 + r) * cols + c0, tile.Slice(r * block, wd));
-                // Output row c (= input column) holds input rows r0 .. r0 + h.
-                for (int c = 0; c < wd; c++)
+                for (int t = first; t < last; t++)
                 {
-                    for (int r = 0; r < h; r++) line[r] = tile[r * block + c];
-                    TN.Store(line[..h], output, (c0 + c) * rows + r0);
+                    int r0 = t / colBlocks * bh, c0 = t % colBlocks * bw;
+                    int h = Math.Min(bh, rows - r0), wd = Math.Min(bw, cols - c0);
+                    for (int r = 0; r < h; r++) TN.Load(x, (r0 + r) * cols + c0, tile.AsSpan(r * bw, wd));
+                    // Output row c (= input column) holds input rows r0 .. r0 + h.
+                    for (int c = 0; c < wd; c++)
+                    {
+                        for (int r = 0; r < h; r++) line[r] = tile[r * bw + c];
+                        TN.Store(line.AsSpan(0, h), output, (c0 + c) * rows + r0);
+                    }
                 }
+            }
+            finally
+            {
+                pool.Return(tile);
+                pool.Return(line);
             }
         }
     }
