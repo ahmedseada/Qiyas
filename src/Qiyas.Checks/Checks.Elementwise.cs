@@ -2,7 +2,8 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // The element-wise operations past the formulas, on the CPU against their references and on a device against the CPU:
-// dropout from a seed, the conversion between every pair of types (against an exact reference: the source's value, as
+// dropout from a seed (every type but bool, refused), the conversion between every pair of types (against an exact
+// reference: the source's value, as
 // a dyadic rational or an integer, rounded once into the target by the format's definition), and a float formula over a
 // row vector.
 using System.Numerics;
@@ -23,8 +24,10 @@ internal static partial class Checks
 
     // ---------------------------------------------------------------- dropout
 
-    /// <summary>Every float type at 1001 and 4099 values, with and without a residual: the CPU within the type's rounding of
-    /// keep(i) ? x/(1 − p) + r : r in float64, the device the CPU's values; and the draws' rate and independence.</summary>
+    /// <summary>Every type but bool at 1001 and 4099 values, with and without a residual: the CPU within the type's rounding of
+    /// keep(i) ? x/(1 − p) + r : r in float64 (an integer's kept value within half a step plus the float lane's rounding, a
+    /// dropped one the residual exactly as stored, 64-bit integers past 2^53), the device the CPU's values; the draws' rate
+    /// and independence.</summary>
     private static bool Dropouts(IDevice<ulong, ulong>? ops, string device)
     {
         bool ok = true;
@@ -84,14 +87,15 @@ internal static partial class Checks
 
         foreach (var type in Bench.Registry.Names)
         {
-            if (!Bench.Registry.IsFloat(type)) continue;
+            if (Bench.Registry.Bits(type) == 1) continue;
+            bool integer = !Bench.Registry.IsFloat(type), wide = integer && Bench.Registry.Bits(type) == 64;
             foreach (int n in new[] { 1001, 4099 })
                 foreach (bool residual in new[] { false, true })
                 {
-                    var x = Bench.Registry.Make(type, n, 71, -4, 4);
-                    var r = residual ? Bench.Registry.Make(type, n, 72, -2, 2) : null;
+                    var x = wide ? Wide64(type, n, 71) : Bench.Registry.Make(type, n, 71, -4, 4);
+                    var r = !residual ? null : wide ? Wide64(type, n, 72) : Bench.Registry.Make(type, n, 72, -2, 2);
                     var cpu = new byte[Bench.Registry.Bytes(type, n)];
-                    Bench.Registry.WithFloat(type, new DropoutRun(null, x, r, cpu, n, P, Seed));
+                    Bench.Registry.With(type, new DropoutRun(null, x, r, cpu, n, P, Seed));
                     string what = residual ? "dropout+residual" : "dropout";
                     if (ops is null)
                     {
@@ -108,25 +112,41 @@ internal static partial class Checks
                             terms[i] = Math.Abs(kept) + Math.Abs(rv?[i] ?? 0);
                         }
 
-                        // Within the type's step and two lane steps of the terms: s read into the lane, and the sum's rounding.
-                        double worst = Excess(type, what, cpu, want, i => terms[i], 2);
+                        // Within the type's step and two lane steps of the terms: s read into the lane, and the sum's rounding
+                        // (an integer's within half a step); a dropped value the residual as stored.
+                        double worst = integer ? IntegerExcess(type, cpu, want, i => terms[i], 2) : Excess(type, what, cpu, want, i => terms[i], 2);
                         if (worst > 0) { Console.WriteLine($"check {what} n={n,-12} {where,-6} {type,-12} DIFFERS by {worst:0.##} steps"); ok = false; }
+                        if (integer)
+                        {
+                            int size = Bench.Registry.Bits(type) / 8;
+                            var got = Bench.Registry.Values(type, cpu, n);
+                            for (int i = 0; i < n; i++)
+                            {
+                                if (Draws.Keep(key, (uint)i, thr)) continue;
+                                bool same = size > 0 && r is not null ? cpu.AsSpan(i * size, size).SequenceEqual(r.AsSpan(i * size, size)) : got[i] == (rv?[i] ?? 0);
+                                if (same) continue;
+                                Console.WriteLine($"check {what} n={n,-12} {where,-6} {type,-12} DIFFERS: dropped value {i} is not the residual as stored");
+                                ok = false;
+                                break;
+                            }
+                        }
+
                         continue;
                     }
 
                     var dev = new byte[cpu.Length];
-                    Bench.Registry.WithFloat(type, new DropoutRun(ops, x, r, dev, n, P, Seed));
+                    Bench.Registry.With(type, new DropoutRun(ops, x, r, dev, n, P, Seed));
                     ok &= SameValues(type, $"{what} n={n}", where, dev, cpu, n);
                 }
         }
 
-        if (ok) Console.WriteLine($"check dropout                {where,-6} every float type, 1001 and 4099 values, with and without a residual: {(ops is null ? "within the type's rounding of keep(i) ? x/(1 − p) + r : r; the draws' rate and independence" : "the CPU's values")}");
+        if (ok) Console.WriteLine($"check dropout                {where,-6} every type but bool, 1001 and 4099 values, with and without a residual: {(ops is null ? "within the type's rounding of keep(i) ? x/(1 − p) + r : r (a dropped integer the residual as stored, 64-bit integers past 2^53); the draws' rate and independence" : "the CPU's values")}");
         return ok;
     }
 
-    private sealed class DropoutRun(IDevice<ulong, ulong>? ops, byte[] x, byte[]? r, byte[] output, int n, double p, ulong seed) : Bench.IFloatTypeVisitor<bool>
+    private sealed class DropoutRun(IDevice<ulong, ulong>? ops, byte[] x, byte[]? r, byte[] output, int n, double p, ulong seed) : Bench.ITypeVisitor<bool>
     {
-        public bool Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        public bool Visit<TN>() where TN : struct, IAdad<TN, float>
         {
             if (ops is null) { CpuDevice.Device.Dropout<TN>(x, r, output, n, p, seed); return true; }
             ulong dx = ops.Rent(x.Length + 16), dr = r is null ? 0 : ops.Rent(r.Length + 16), dout = ops.Rent(output.Length + 16);

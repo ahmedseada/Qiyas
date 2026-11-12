@@ -8,7 +8,7 @@
 //                      threads; k the whole row; and k past the row refused.
 //   history, penalize  the ring and the penalties of its window, every type but bool (Checks.Penalties.cs).
 //   sample             the draw from the kept columns, every type but bool (Checks.Sampling.cs).
-//   bool               refused by the penalties and sampling (truth values, not scores).
+//   bool               refused by the penalties and sampling (truth values, not scores), and by dropout.
 //   order keys         Routing.OrderKey and the devices' OrderKey against Routing.Order, every type (Checks.Sampling.cs).
 namespace Qiyas;
 

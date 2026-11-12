@@ -483,28 +483,26 @@ internal sealed partial class Kernels
     // ---------------------------------------------------------------- dropout from a seed
 
     /// <summary>output = residual + x·(1/(1 − p)) where the seed's draw i keeps value i, the residual where it does not (no
-    /// residual: +0), in the type's float lane: a kept value with a residual is one fused multiply-add.</summary>
-    public static string Dropout<TN>(byte[] x, byte[]? residual, byte[] output, int n, double p, ulong seed) where TN : struct, IFloatAdad<TN>
+    /// residual: 0), every type but bool: a kept value in the type's float lane (a kept value with a residual one fused
+    /// multiply-add) stored by the type's own conversion, a dropped one the residual as it is stored.</summary>
+    public static string Dropout<TN>(byte[] x, byte[]? residual, byte[] output, int n, double p, ulong seed) where TN : struct, IAdad<TN>
     {
-        var v = new DropoutVisitor(x, residual, output, n, Draws.Key(seed), Draws.Threshold(p), 1 / (1 - p));
-        TN.Float(ref v);
-        return v.Lane;
+        if (TN.Bits == 1) throw new NotSupportedException($"dropout: {TN.Name} holds truth values, which 1/(1 − p) cannot scale");
+        return InFloatLane<TN, DropoutCall>(new DropoutCall(x, residual, output, n, Draws.Key(seed), Draws.Threshold(p), 1 / (1 - p)));
     }
 
-    private struct DropoutVisitor(byte[] x, byte[]? residual, byte[] output, int n, DrawKey key, uint threshold, double scale) : IFloatLaneVisitor
+    private readonly struct DropoutCall(byte[] x, byte[]? residual, byte[] output, int n, DrawKey key, uint threshold, double scale) : IFloatOf
     {
-        public string Lane = "";
-
-        public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+        public string Run<TN, TE, TLane, TL>() where TN : struct, IAdad<TN, TE> where TE : unmanaged where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
         {
-            Lane = TL.Name;
             int size = Math.Max(Tile, (n / (Threads * 4) + Tile - 1) / Tile * Tile);
-            Team.For(n, size, (long)n * 4, new DropoutBody<TN, TLane, TL>(x, residual, output, key, threshold, TL.From(scale)));
+            Team.For(n, size, (long)n * 4, new DropoutBody<TN, TE, TLane, TL>(x, residual, output, key, threshold, TL.From(scale)));
+            return TL.Name;
         }
     }
 
-    private readonly struct DropoutBody<TN, TLane, TL>(byte[] x, byte[]? residual, byte[] output, DrawKey key, uint threshold, TLane scale) : Team.IBody
-        where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    private readonly struct DropoutBody<TN, TE, TLane, TL>(byte[] x, byte[]? residual, byte[] output, DrawKey key, uint threshold, TLane scale) : Team.IBody
+        where TN : struct, IAdad<TN, TE> where TE : unmanaged where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public void Run(int first, int last)
@@ -512,15 +510,37 @@ internal sealed partial class Kernels
             Span<TLane> tx = stackalloc TLane[Tile];
             Span<TLane> tr = stackalloc TLane[Tile];
             Span<TLane> keep = stackalloc TLane[Tile];
+            bool own = typeof(TE) == typeof(TLane);
+            Span<TE> nx = own ? default : stackalloc TE[Tile];                   // an integer's values in its natural lane
+            Span<TE> nr = own ? default : stackalloc TE[Tile];
             int w = Vector<TLane>.Count;
             Span<TLane> px = stackalloc TLane[w], pr = stackalloc TLane[w], pk = stackalloc TLane[w];
             var s = new Vector<TLane>(scale);
             for (int at = first; at < last; at += Tile)
             {
                 int len = Math.Min(Tile, last - at);
-                TN.Load(x, at, tx[..len]);
-                if (residual is not null) TN.Load(residual, at, tr[..len]);
-                else tr[..len].Clear();
+                if (own)
+                {
+                    TN.Load(x, at, MemoryMarshal.Cast<TLane, TE>(tx[..len]));
+                    if (residual is not null) TN.Load(residual, at, MemoryMarshal.Cast<TLane, TE>(tr[..len]));
+                    else tr[..len].Clear();
+                }
+                else
+                {
+                    TN.Load(x, at, nx[..len]);
+                    Widths.Load<TE, TLane>(nx[..len], tx[..len]);
+                    if (residual is not null)
+                    {
+                        TN.Load(residual, at, nr[..len]);
+                        Widths.Load<TE, TLane>(nr[..len], tr[..len]);
+                    }
+                    else
+                    {
+                        nr[..len].Clear();
+                        tr[..len].Clear();
+                    }
+                }
+
                 TLane one = TL.From(1), zero = TL.From(0);
                 for (int i = 0; i < len; i++) keep[i] = Draws.Keep(key, (uint)(at + i), threshold) ? one : zero;
                 int l = 0;
@@ -543,7 +563,14 @@ internal sealed partial class Kernels
                     for (int i = l; i < len; i++) tx[i] = res[i - l];
                 }
 
-                TN.Store(tx[..len], output, at);
+                if (own) TN.Store(MemoryMarshal.Cast<TLane, TE>(tx[..len]), output, at);
+                else
+                {
+                    // A kept value by the type's conversion, a dropped one the residual as it is stored.
+                    Widths.Store<TLane, TE>(tx[..len], nx[..len]);
+                    for (int i = 0; i < len; i++) if (EqualityComparer<TLane>.Default.Equals(keep[i], zero)) nx[i] = nr[i];
+                    TN.Store(nx[..len], output, at);
+                }
             }
         }
     }

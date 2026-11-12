@@ -164,9 +164,10 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
 
     /// <summary>Dropout from the seed's draws (VkKernels.Dropout): a thread per word in the float lane, or a block format's
     /// blocks by their encoder (the residual and the output may be x).</summary>
-    public string Dropout<TN>(ulong x, ulong residual, ulong output, int n, double p, ulong seed) where TN : struct, IFloatAdad<TN>
+    public string Dropout<TN>(ulong x, ulong residual, ulong output, int n, double p, ulong seed) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
+        if (f.Bits == 1) throw new NotSupportedException($"dropout: {f.Name} holds truth values, which 1/(1 − p) cannot scale");
         var key = Draws.Key(seed);
         ulong thr = Draws.Threshold(p);
         double s = 1 / (1 - p);
@@ -178,7 +179,7 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
             return "f32 (blocks in place)";
         }
 
-        var lane = RowLane(f);
+        var lane = f.FloatLane;
         var k = vk.Cached($"dropout:{f.Name}:{res}", () => VkKernels.Dropout(vk, f, lane, res));
         vk.Launch(k, Groups(f.Words(n), VkKernels.Threads), 1, x, r, output, Vulkan.U(n), key.A, thr, Slot(lane, s), key.B);
         return lane.Name;

@@ -268,7 +268,7 @@ internal static partial class Checks
         }
     }
 
-    // bool holds truth values, not scores: the penalties and sampling refuse it.
+    // bool holds truth values: the penalties and sampling refuse it (not scores), and dropout (1/(1 − p) cannot scale one).
     private static bool BoolRefused(IDevice<ulong, ulong>? ops, string where)
     {
         bool ok = true;
@@ -277,6 +277,7 @@ internal static partial class Checks
         {
             ("penalize", () => Bench.Registry.With("bool", new PenalizeRun(ops, new PenaltyArgs(2, 32, 4, 4, 1.1, 0, 0), x, new int[8], 1, new byte[x.Length]))),
             ("sample", () => Bench.Registry.With("bool", new SampleFilteredRun(ops, new SamplingArgs(2, 32, 1, 32, 1, 0, 1), x, 0, new int[2], null))),
+            ("dropout", () => Bench.Registry.With("bool", new DropoutRun(ops, x, null, new byte[x.Length], 64, 0.25, 1))),
         };
         foreach (var (name, call) in calls)
         {

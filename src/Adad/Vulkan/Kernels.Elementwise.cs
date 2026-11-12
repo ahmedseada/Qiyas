@@ -30,7 +30,9 @@ internal static partial class VkKernels
         b.Select(bits >= thr, r is null ? x * s : b.Fma(x, s, r.Value), r ?? b.C(k, 0));
 
     /// <summary>output = residual + x·s where the seed's draw keeps a value, the residual where it does not, over n values of
-    /// f in its float lane: a thread per word. Slots: x, residual, output, n, key A, threshold, s, key B.</summary>
+    /// f in its float lane: a thread per word. An integer's kept value is stored by its conversion (rounded to nearest
+    /// even, held to its range), a dropped one the residual as stored. Slots: x, residual, output, n, key A, threshold, s,
+    /// key B.</summary>
     public static SpvKernel Dropout(Vulkan vk, Fmt f, Lane lane, bool residual)
     {
         var k = Kinds.Of(lane);
@@ -51,12 +53,24 @@ internal static partial class VkKernels
             var wx = b.Load(wk, b.At(px, gid, bytes));
             var wr = residual ? b.Load(wk, b.At(pr, gid, bytes)) : wx;
             var wo = b.CBits(wk, 0);
+            var natural = f.Natural;
+            var nk = Kinds.Of(natural);
             for (int i = 0; i < f.Per; i++)
             {
                 var x = Codec.Unpack(b, f, wx, i, lane);
-                V? r = residual ? Codec.Unpack(b, f, wr, i, lane) : null;
+                V? rn = residual ? Codec.Unpack(b, f, wr, i, natural) : null;
+                V? r = rn is null ? null : Codec.Convert(b, natural, rn.Value, lane);
                 var idx = gid * (double)f.Per + i;
-                wo = Codec.Pack(b, f, DropValue(b, k, x, r, s, Draw(key, kb, idx), thr), lane, i, wo);
+                var bits = Draw(key, kb, idx);
+                if (lane.Name == natural.Name)
+                {
+                    wo = Codec.Pack(b, f, DropValue(b, k, x, r, s, bits, thr), lane, i, wo);
+                    continue;
+                }
+
+                // An integer: the kept value by the type's conversion, the dropped one the residual as stored (0 without one).
+                var kept = Codec.Saturate(b, r is null ? x * s : b.Fma(x, s, r.Value), nk);
+                wo = Codec.Pack(b, f, b.Select(bits >= thr, kept, rn ?? b.C(nk, 0)), natural, i, wo);
             }
 
             b.Store(b.At(po, gid, bytes), wo);

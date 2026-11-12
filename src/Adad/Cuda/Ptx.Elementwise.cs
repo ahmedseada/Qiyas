@@ -59,7 +59,8 @@ internal static partial class Ptx
     // ---------------------------------------------------------------- dropout: a thread per word
 
     /// <summary>output = residual + x·s where the seed's draw keeps a value, the residual where it does not, over n values of
-    /// f in its float lane: a thread per word (the residual and the output may be x).</summary>
+    /// f in its float lane: a thread per word (the residual and the output may be x). An integer's kept value is stored by
+    /// its conversion (rounded to nearest even, held to its range), a dropped one the residual as stored.</summary>
     public static string Dropout(Gpu gpu, Fmt f, Lane lane, bool residual, out string entry)
     {
         entry = $"dropout_{f.Name}_{lane.Name}{(residual ? "_res" : "")}";
@@ -81,13 +82,28 @@ internal static partial class Ptx
         b.L($"ld.global.{wt} {wx}, [{ax}];");
         if (residual) b.L($"ld.global.{wt} {wr}, [{ar}];");
         if (f.WordBits == 32) b.L($"mov.b32 {wo}, 0;");
+        var natural = f.Natural;
         for (int i = 0; i < f.Per; i++)
         {
             string x = Codec.Unpack(b, f, wx, i, lane);
-            string? r = residual ? Codec.Unpack(b, f, wr, i, lane) : null;
+            string? rn = residual ? Codec.Unpack(b, f, wr, i, natural) : null;
+            string? r = rn is null ? null : Codec.Convert(b, natural, rn, lane, f);
             string idx = b.R();
             b.L($"mad.lo.u32 {idx}, {gid}, {f.Per}, {i};");
-            Codec.Pack(b, f, DropValue(b, lane, x, r, s, Draw(b, ka, kb, idx), thr), lane, i, wo);
+            string bits = Draw(b, ka, kb, idx);
+            if (lane == natural)
+            {
+                Codec.Pack(b, f, DropValue(b, lane, x, r, s, bits, thr), lane, i, wo);
+                continue;
+            }
+
+            // An integer: the kept value by the type's conversion, the dropped one the residual as stored (0 without one).
+            string kept = lane.NewReg(b), keep = b.P(), y = natural.NewReg(b);
+            b.L(r is null ? $"mul.rn.{lane.Op} {kept}, {x}, {s};" : $"fma.rn.{lane.Op} {kept}, {x}, {s}, {r};");
+            b.L($"setp.hs.u32 {keep}, {bits}, {thr};");
+            string keptN = Codec.Convert(b, lane, kept, natural, f);
+            b.L($"selp.{natural.Reg} {y}, {keptN}, {rn ?? natural.Zero}, {keep};");
+            Codec.Pack(b, f, y, natural, i, wo);
         }
 
         b.L($"st.global.{wt} [{ao}], {wo};");
