@@ -297,7 +297,7 @@ internal static partial class Checks
             Blocks.EncodeQ8_0(v.AsSpan(0, 32), back);
             float dEnc = (float)BitConverter.ToHalf(back.AsSpan(0, 2));
             Blocks.DecodeQ8_0(back, v);
-            for (int i = 0; i < 32; i++) if (Math.Abs(v[i] - 0.5f * (i - 16)) > 0.5f * dEnc + 1e-6f) { ok = false; Console.WriteLine($"check block q8_0 spec: round trip value {i} = {v[i]} (scale {dEnc})"); break; }
+            for (int i = 0; i < 32; i++) if (Off(Gap(v[i], 0.5f * (i - 16)), 0.5f * dEnc + 1e-6f)) { ok = false; Console.WriteLine($"check block q8_0 spec: round trip value {i} = {v[i]} (scale {dEnc})"); break; }
         }
 
         // Q4_0: d = 0.25; byte 2 + j holds value j in its low nibble and value j + 16 in its high nibble; value = d·(q − 8).
@@ -1089,7 +1089,8 @@ internal static partial class Checks
         {
             double got = size == 8 ? BitConverter.ToDouble(lanes, i * 8) : BitConverter.ToSingle(lanes, i * 4);
             double tol = 4 * eps * (Math.Abs(want[i]) + 1);
-            if (Math.Abs(got - want[i]) > tol) worst = Math.Max(worst, Math.Abs(got - want[i]) / tol);
+            double gap = Gap(got, want[i]);
+            if (Off(gap, tol)) worst = Math.Max(worst, Steps(gap, tol));
         }
 
         if (worst > 0) Console.WriteLine($"check {what,-28} {where,-6} {type,-12} DIFFERS by {worst:0.##} tolerances");
@@ -1762,7 +1763,7 @@ internal static partial class Checks
                 exact += c;
                 double value = values[r];
                 double step = Math.Pow(2, Math.Floor(Math.Log2(Math.Abs(exact))) - 23);
-                if (Math.Abs(value - exact) > step) { Console.WriteLine($"check {axis} {op} {type} device row {r}: {value:R} against {exact:R} ({Math.Abs(value - exact) / step:0.##} f32 steps, lane {lane})"); ok = false; }
+                if (Off(Gap(value, exact), step)) { Console.WriteLine($"check {axis} {op} {type} device row {r}: {value:R} against {exact:R} ({Steps(Gap(value, exact), step):0.##} f32 steps, lane {lane})"); ok = false; }
                 }
             }
         }
@@ -1977,7 +1978,7 @@ internal static partial class Checks
                     var g = Bench.LaneValues.Decode(lane, got, 2 * cols);
                     // The row statistic sums cols terms: its rounding, times the row's values, reaches every column sum.
                     double eps = lane == "f64" ? Math.Pow(2, -52) : Math.Pow(2, -23), tol = eps * scale * (8 + cols), worst = 0;
-                    for (int i = 0; i < 2 * cols; i++) { double want = i < cols ? dgamma[i] : dbeta[i - cols]; if (Math.Abs(g[i] - want) > tol) worst = Math.Max(worst, Math.Abs(g[i] - want) / tol); }
+                    for (int i = 0; i < 2 * cols; i++) { double want = i < cols ? dgamma[i] : dbeta[i - cols]; double gap = Gap(g[i], want); if (Off(gap, tol)) worst = Math.Max(worst, Steps(gap, tol)); }
                     if (worst > 0) { Console.WriteLine($"check norm_params_bwd:{(centered ? "layer" : "rms"),-6} {where,-6} {type,-12} DIFFERS by {worst:0.##} tolerances ({rows} x {cols}, lane {lane})"); ok = false; }
                 }
 
@@ -2089,7 +2090,8 @@ internal static partial class Checks
                         // A float sum differs from the float64 reference by the lane's rounding over its terms (any order).
                         double eps = lane == "f32" ? 5.97e-8 : 1.12e-16;
                         double tol = integer || op is "max" or "min" or "argmax" ? 0 : (Math.Abs(want[i]) + 1) * eps * terms;
-                        if (Math.Abs(g[i] - want[i]) > tol) worst = Math.Max(worst, Math.Abs(g[i] - want[i]));
+                        double gap = Gap(g[i], want[i]);
+                        if (Off(gap, tol)) worst = Math.Max(worst, gap);
                     }
 
                     if (worst > 0) { Console.WriteLine($"check {op}:{axis.ToString().ToLowerInvariant(),-6} {where,-6} {type,-12} DIFFERS by {worst:0.###e+0} (lane {lane}, {r} x {c})"); ok = false; }
@@ -2254,6 +2256,20 @@ internal static partial class Checks
         return r;
     }
 
+    // The distance of a result from its reference: 0 for equal values (equal infinities among them) and for two NaNs; +∞
+    // where one is a NaN and the other not, or one is infinite and the other not; else |got − want|. A NaN never passes as
+    // a small error, nor a finite value for an infinite one.
+    internal static double Gap(double got, double want) =>
+        double.IsNaN(got) || double.IsNaN(want) ? (double.IsNaN(got) && double.IsNaN(want) ? 0 : double.PositiveInfinity)
+        : got == want ? 0 : Math.Abs(got - want);
+
+    // Whether a gap is past its tolerance: an infinite gap always is (a tolerance taken from an infinite reference is
+    // infinite too).
+    internal static bool Off(double gap, double tol) => double.IsPositiveInfinity(gap) || gap > tol;
+
+    // A gap in units (+∞ stays +∞ whatever the unit).
+    internal static double Steps(double gap, double unit) => double.IsPositiveInfinity(gap) ? gap : gap / unit;
+
     // Stored output against a float64 reference rounded as the type rounds: integers exact, floats within one step of the type plus lane ulps.
     private static bool Close(string type, string what, string where, byte[] output, double[] reference, int n, int terms = 0)
     {
@@ -2289,15 +2305,15 @@ internal static partial class Checks
             if (blockMax is not null)
             {
                 double bstep = (blockMax[i / blockValues] == 0 ? 1 : blockMax[i / blockValues]) * Math.Pow(2, -mant);
-                double btol = 2 * bstep + 4 * Math.Abs(reference[i]) * Math.Pow(2, -laneMant);
-                if (Math.Abs(v - want) > btol)
+                double btol = 2 * bstep + 4 * Math.Abs(reference[i]) * Math.Pow(2, -laneMant), bgap = Gap(v, want);
+                if (Off(bgap, btol))
                 {
                     if (debug && worst == 0)
                     {
                         Console.WriteLine($"  {what} {type} [{i}] got {v:R} want {want:R} ref {reference[i]:R} block max {blockMax[i / blockValues]:R}");
                         for (int j = Math.Max(0, i - 12); j < Math.Min(n, i + 36); j++) Console.WriteLine($"    [{j}] got {got[j]:R} want {expected[j]:R}");
                     }
-                    worst = Math.Max(worst, Math.Abs(v - want) / bstep);
+                    worst = Math.Max(worst, Steps(bgap, bstep));
                 }
 
                 continue;
@@ -2306,10 +2322,11 @@ internal static partial class Checks
             double scale = reference[i] == 0 ? 1 : Math.Pow(2, Math.Floor(Math.Log2(Math.Abs(reference[i]))));
             // A matrix · vector result is a sum of `terms` products of magnitude at most 1 in the lane: its rounding is the sum's, not the result's.
             double tol = Math.Max(scale * Math.Pow(2, -mant), Bench.Registry.MinStep(type)) + 4 * scale * Math.Pow(2, -laneMant) + terms * Math.Pow(2, -laneMant) * 4;
-            if (Math.Abs(v - want) > tol)
+            double gap = Gap(v, want);
+            if (Off(gap, tol))
             {
                 if (Environment.GetEnvironmentVariable("QIYAS_MAP_DEBUG") == "1" && worst == 0) Console.WriteLine($"  {what} {type} [{i}] got {v:R} want {want:R} ref {reference[i]:R}");
-                worst = Math.Max(worst, Math.Abs(v - want) / (scale * Math.Pow(2, -mant)));
+                worst = Math.Max(worst, Steps(gap, scale * Math.Pow(2, -mant)));
             }
         }
 
@@ -2396,7 +2413,7 @@ internal static partial class Checks
                 double want = reference(x[i + l]);
                 float wantF = (float)want;
                 double ulp = Math.Abs(MathF.BitIncrement(Math.Abs(wantF)) - Math.Abs(wantF));
-                double err = wantF == 0 ? Math.Abs(y[l]) / float.Epsilon : Math.Abs(y[l] - want) / ulp;
+                double err = double.IsNaN(want) || double.IsNaN(y[l]) || double.IsInfinity(want) ? Gap(y[l], want) : wantF == 0 ? Math.Abs(y[l]) / float.Epsilon : Math.Abs(y[l] - want) / ulp;
                 if (err > worst) { worst = err; worstAt = i + l; }
             }
         }
@@ -2418,7 +2435,7 @@ internal static partial class Checks
             {
                 double want = reference(x[i + l]);
                 double ulp = Math.BitIncrement(Math.Abs(want)) - Math.Abs(want);
-                double err = want == 0 ? Math.Abs(y[l]) / double.Epsilon : Math.Abs(y[l] - want) / ulp;
+                double err = double.IsNaN(want) || double.IsNaN(y[l]) || double.IsInfinity(want) ? Gap(y[l], want) : want == 0 ? Math.Abs(y[l]) / double.Epsilon : Math.Abs(y[l] - want) / ulp;
                 if (err > worst) { worst = err; worstAt = i + l; }
             }
         }
@@ -2490,8 +2507,8 @@ internal static partial class Checks
                         double mag = op.ErrorScale(reference[i], xs?[i] ?? 0, ys?[i] ?? 0, zs?[i] ?? 0);
                         double scale = mag == 0 ? 1 : Math.Pow(2, Math.Floor(Math.Log2(mag)));
                         double stepType = scale * Math.Pow(2, -mant), stepLane = scale * Math.Pow(2, -laneMant);
-                        double tol = stepType + op.Ulps * stepLane;
-                        e = Math.Abs(v - want) <= tol ? 0 : Math.Abs(v - want) / stepType;
+                        double tol = stepType + op.Ulps * stepLane, gap = Gap(v, want);
+                        e = Off(gap, tol) ? Steps(gap, stepType) : 0;
                     }
 
                     if (e > worst)
@@ -2666,7 +2683,7 @@ internal static partial class Checks
 
                     double reference = hi + lo, value = got[i * N + j];
                     double ulp = reference == 0 ? double.Epsilon : Math.BitIncrement(Math.Abs(reference)) - Math.Abs(reference);
-                    double e = Math.Abs(value - reference) / ulp;
+                    double e = Steps(Gap(value, reference), ulp);
                     if (e > worst) { worst = e; worstAt = i * N + j; }
                 }
             }
@@ -2858,7 +2875,7 @@ internal static partial class Checks
                 double want = Math.Exp(x[i + l]);
                 float wantF = (float)want;
                 double ulp = Math.Abs(MathF.BitIncrement(Math.Abs(wantF)) - Math.Abs(wantF));
-                double err = wantF == 0 ? (y[l] == 0 ? 0 : 1) : Math.Abs(y[l] - want) / ulp;
+                double err = double.IsNaN(want) || double.IsNaN(y[l]) || double.IsInfinity(want) ? Gap(y[l], want) : wantF == 0 ? (y[l] == 0 ? 0 : 1) : Math.Abs(y[l] - want) / ulp;
                 if (err > worst) { worst = err; worstAt = i + l; }
             }
         }
@@ -2880,7 +2897,7 @@ internal static partial class Checks
             {
                 double want = Math.Exp(x[i + l]);
                 double ulp = Math.BitIncrement(Math.Abs(want)) - Math.Abs(want);
-                double err = want == 0 ? (y[l] == 0 ? 0 : 1) : double.IsInfinity(want) ? (y[l] == want ? 0 : 1) : Math.Abs(y[l] - want) / ulp;
+                double err = double.IsNaN(want) || double.IsNaN(y[l]) || double.IsInfinity(want) ? Gap(y[l], want) : want == 0 ? (y[l] == 0 ? 0 : 1) : Math.Abs(y[l] - want) / ulp;
                 if (err > worst) { worst = err; worstAt = i + l; }
             }
         }
