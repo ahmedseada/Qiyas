@@ -90,7 +90,7 @@ internal static partial class VkKernels
         dH = dH + dUnion * wp;
         var ix = b.Select(overlaps, ih * dInter, zero);
         var iy = b.Select(overlaps, iw * dInter, zero);
-        V Above(V p, V q) => b.Select(p > q, one, b.Select(p == q, half, zero));
+        V Above(V p, V q) => b.Select(VkKernels.Above(b, q, p), zero, one);                   // all unless q ranks above p (Adad's order)
         V Below(V p, V q) => Above(q, p);
         var g0 = -dW + dPx * half - ix * Above(x1, gx1) - dCw * Below(x1, gx1);
         var g1 = -dH + dPy * half - iy * Above(y1, gy1) - dCh * Below(y1, gy1);

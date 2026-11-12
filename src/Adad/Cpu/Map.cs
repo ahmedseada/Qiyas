@@ -37,6 +37,11 @@ internal static class MapOps
     private static Vector<T> C<T, TL>(double v) where T : unmanaged where TL : struct, ILane<TL, T> => new(TL.From(v));
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    // Whether p ranks above q in Adad's order (Routing.Order), lane by lane: larger, or a NaN against a number (an integer
+    // lane's p > q: no lane equals itself falsely there).
+    private static Vector<T> RanksAbove<T, TL>(Vector<T> p, Vector<T> q) where T : unmanaged where TL : struct, ILane<TL, T> =>
+        TL.Greater(p, q) | Vector.AndNot(TL.Equal(q, q), TL.Equal(p, p));
+
     private static Vector<T> Sign<T, TL>(Vector<T> x) where T : unmanaged where TL : struct, ILane<TL, T>
     {
         var one = C<T, TL>(1);
@@ -62,7 +67,9 @@ internal static class MapOps
     public struct Mul<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(x, y); }
     public struct Div<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Div(x, y); }
     public struct Max<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Max(x, y); }
-    public struct Min<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Min(x, y); }
+    // max and min by Adad's order: the first-ranked (the lane's max: IEEE maximum, a NaN where either is one) and the
+    // last-ranked (IEEE minimumNumber: the number where one is a NaN).
+    public struct Min<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => Vector.MinNumber(x, y); }
     public struct Axpy<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Fma(a, x, y); }
     public struct MulAdd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Fma(x, y, z); }
     public struct Where<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Equal(x, Vector<T>.Zero), z, y); }
@@ -71,10 +78,11 @@ internal static class MapOps
     public struct ReluBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(x, Vector<T>.Zero), y, Vector<T>.Zero); }
     public struct ClampBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(x, a) & TL.Greater(b, x), y, Vector<T>.Zero); }
     public struct WhereBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Equal(x, Vector<T>.Zero), Vector<T>.Zero, y); }
-    public struct MaxBwdX<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(y, x), Vector<T>.Zero, z); }
-    public struct MaxBwdY<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(y, x), z, Vector<T>.Zero); }
-    public struct MinBwdX<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(x, y), Vector<T>.Zero, z); }
-    public struct MinBwdY<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(x, y), z, Vector<T>.Zero); }
+    // The gradient of max and min to the operand they give (a tie to x).
+    public struct MaxBwdX<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(RanksAbove<T, TL>(y, x), Vector<T>.Zero, z); }
+    public struct MaxBwdY<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(RanksAbove<T, TL>(y, x), z, Vector<T>.Zero); }
+    public struct MinBwdX<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(RanksAbove<T, TL>(x, y), Vector<T>.Zero, z); }
+    public struct MinBwdY<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(RanksAbove<T, TL>(x, y), z, Vector<T>.Zero); }
     public struct GatedRelu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Max(x, Vector<T>.Zero), y); }
     public struct GatedReluBwdX<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(x, Vector<T>.Zero), TL.Mul(y, z), Vector<T>.Zero); }
     public struct GatedReluBwdY<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, ILane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Max(x, Vector<T>.Zero), z); }
@@ -143,7 +151,7 @@ internal static class MapOps
     public struct Silu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(x, TL.Sigmoid(x)); }
     public struct LeakyRelu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(x, Vector<T>.Zero), x, TL.Mul(a, x)); }
     public struct Pow<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => PowF<T, TL>(x, a); }
-    public struct Dropout<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Equal(y, Vector<T>.Zero), Vector<T>.Zero, TL.Mul(x, a)); }
+    public struct MaskScale<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Equal(y, Vector<T>.Zero), Vector<T>.Zero, TL.Mul(x, a)); }
     public struct GatedSilu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Mul(x, TL.Sigmoid(x)), y); }
     public struct GatedGelu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(GeluF<T, TL>(x), y); }
     public struct SqrtBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Div(y, TL.Mul(C<T, TL>(2), TL.Sqrt(x))); }
@@ -186,7 +194,8 @@ internal static class MapOps
         return TL.Select(TL.Greater(d, Vector<T>.Zero), TL.Div(TL.Mul(TL.Log(w), u), d), u);
     }
 
-    // The focal loss's parts (Abstraction/Map.cs): BCE, σ(x), σ(−x), 1 − p_t, (1 − p_t)^γ (1 where γ is 0), α_t.
+    // The focal loss's parts (Abstraction/Map.cs): BCE, σ(x), σ(−x), 1 − p_t, (1 − p_t)^γ (1 where γ is 0, 0^0 among them),
+    // α_t = α·t + (1 − α)·(1 − t).
     private static (Vector<T> Ce, Vector<T> S, Vector<T> Sn, Vector<T> Q, Vector<T> Qg, Vector<T> At) FocalParts<T, TL>(Vector<T> x, Vector<T> t, Vector<T> a, Vector<T> g)
         where T : unmanaged where TL : struct, IFloatLane<TL, T>
     {
@@ -196,8 +205,8 @@ internal static class MapOps
         var sn = TL.Sigmoid(TL.Neg(x));
         var u = TL.Sub(one, t);
         var q = TL.Add(TL.Mul(t, sn), TL.Mul(u, s));
-        var qg = TL.Select(TL.Greater(g, Vector<T>.Zero), PowF<T, TL>(q, g), one);
-        var at = TL.Select(TL.Greater(Vector<T>.Zero, a), one, TL.Add(TL.Mul(a, t), TL.Mul(TL.Sub(one, a), u)));
+        var qg = TL.Select(TL.Equal(g, Vector<T>.Zero), one, PowF<T, TL>(q, g));
+        var at = TL.Add(TL.Mul(a, t), TL.Mul(TL.Sub(one, a), u));
         return (ce, s, sn, q, qg, at);
     }
 
@@ -217,9 +226,10 @@ internal static class MapOps
             var f = FocalParts<T, TL>(x, y, a, b);
             var one = C<T, TL>(1);
             var d = TL.Sub(TL.Mul(TL.Sub(one, y), f.S), TL.Mul(y, f.Sn));
-            var live = TL.Greater(f.Q, Vector<T>.Zero) & TL.Greater(b, Vector<T>.Zero);
+            // γ·BCE·q^(γ−1)·(2t − 1)·σ(x)σ(−x), 0 where γ or q is 0 (its limit at q = 0 for γ > −1).
+            var dead = TL.Equal(f.Q, Vector<T>.Zero) | TL.Equal(b, Vector<T>.Zero);
             var second = TL.Mul(TL.Mul(TL.Mul(TL.Mul(b, f.Ce), TL.Div(f.Qg, f.Q)), TL.Sub(TL.Add(y, y), one)), TL.Mul(f.S, f.Sn));
-            second = TL.Select(live, second, Vector<T>.Zero);
+            second = TL.Select(dead, Vector<T>.Zero, second);
             return TL.Mul(TL.Mul(f.At, TL.Sub(TL.Mul(d, f.Qg), second)), z);
         }
     }
@@ -288,7 +298,7 @@ internal static class MapOps
             case "silu": use.Use<Silu<T, TL>>(); return true;
             case "leaky_relu": use.Use<LeakyRelu<T, TL>>(); return true;
             case "pow": use.Use<Pow<T, TL>>(); return true;
-            case "dropout": use.Use<Dropout<T, TL>>(); return true;
+            case "mask_scale": use.Use<MaskScale<T, TL>>(); return true;
             case "gated_silu": use.Use<GatedSilu<T, TL>>(); return true;
             case "gated_gelu": use.Use<GatedGelu<T, TL>>(); return true;
             case "sqrt_bwd": use.Use<SqrtBwd<T, TL>>(); return true;

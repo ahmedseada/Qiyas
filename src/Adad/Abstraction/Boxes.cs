@@ -28,8 +28,8 @@ public static class Boxes
     };
 
     /// <summary>A pair's loss in float64 from its predicted corners p and target t; with grad (4 values) the loss's derivative
-    /// with respect to p there (where the two sides of a minimum or a maximum tie, each takes half: of the derivatives the
-    /// sides and their mixtures give, the least), with gradScale the magnitude each component's terms add to (the scale the
+    /// with respect to p there (where the two sides of a minimum or a maximum tie, the predicted corner, the first operand,
+    /// takes it all: the side Adad's order gives, as Map's max_bwd and min_bwd and a max pool's backward), with gradScale the magnitude each component's terms add to (the scale the
     /// lane's rounding acts on). Returns the loss and its terms' magnitude.</summary>
     public static (double Loss, double Scale) Reference(BoxOverlap overlap, ReadOnlySpan<double> p, ReadOnlySpan<double> t, double eps, Span<double> grad = default, Span<double> gradScale = default)
     {
@@ -115,8 +115,9 @@ public static class Boxes
         return (loss, scale);
     }
 
-    /// <summary>The share of max(a, b)'s gradient a takes (min's: Below): all of it, none, or at a tie half.</summary>
-    public static double Above(double a, double b) => a > b ? 1 : a == b ? 0.5 : 0;
+    /// <summary>The share of max(a, b)'s gradient a takes (min's: Below): all of it where max gives a (unless b ranks above
+    /// a in Adad's order, Routing.Order: a tie to a), else none.</summary>
+    public static double Above(double a, double b) => Routing.Order(a, b) >= 0 ? 1 : 0;
 
-    public static double Below(double a, double b) => a < b ? 1 : a == b ? 0.5 : 0;
+    public static double Below(double a, double b) => Routing.Order(a, b) <= 0 ? 1 : 0;
 }

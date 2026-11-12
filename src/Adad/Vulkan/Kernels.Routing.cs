@@ -92,6 +92,9 @@ internal static partial class VkKernels
         return ((a > c) | (na & !nc), (a == c) | (na & nc));
     }
 
+    /// <summary>Whether a ranks above c in Adad's order (Rank's Above, from the values' kind).</summary>
+    internal static V Above(Spv b, V a, V c) => a.Kind.IsFloat() ? (a > c) | (b.IsNan(a) & !b.IsNan(c)) : a > c;
+
     /// <summary>The first-ranked of a and c in Adad's order (Rank): the larger, a NaN when either is one (NMax gives the
     /// number); of −0 and +0, which rank the same, the one NMax gives. An integer kind's max.</summary>
     internal static V First(Spv b, V a, V c)

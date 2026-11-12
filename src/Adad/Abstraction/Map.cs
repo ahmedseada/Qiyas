@@ -37,14 +37,16 @@ public static class Ops
     private static double Log1p(double u) { double w = 1 + u; return w == 1 ? u : Math.Log(w) * u / (w - 1); }
     private static double FocalCe(double x, double t) => Math.Max(x, 0) - x * t + Log1p(Math.Exp(-Math.Abs(x)));
     private static double FocalQ(double x, double t) => t * Sigmoid(-x) + (1 - t) * Sigmoid(x);
-    private static double FocalAlpha(double t, double a) => a < 0 ? 1 : a * t + (1 - a) * (1 - t);
+    private static double FocalAlpha(double t, double a) => a * t + (1 - a) * (1 - t);
     private static double Focal(double x, double t, double a, double g) => FocalAlpha(t, a) * Math.Pow(FocalQ(x, t), g) * FocalCe(x, t);
 
     private static double FocalGradTerms(double x, double t, double a, double g)
     {
         double q = FocalQ(x, t), qg = Math.Pow(q, g), s = Sigmoid(x), sn = Sigmoid(-x);
         double second = g == 0 || q == 0 ? 0 : g * FocalCe(x, t) * (qg / q) * Math.Abs(2 * t - 1) * s * sn;
-        return Math.Abs(FocalAlpha(t, a)) * (Math.Abs((1 - t) * s - t * sn) * qg + second);
+        // σ(x) − t as (1 − t)·σ(x) − t·σ(−x): its two terms' magnitudes, which its rounding follows (the difference itself
+        // cancels near a soft target's minimum, the second term's γ·BCE then the only other scale: none at γ = 0).
+        return Math.Abs(FocalAlpha(t, a)) * ((Math.Abs((1 - t) * s) + Math.Abs(t * sn)) * qg + second);
     }
 
     private static double FocalGrad(double x, double t, double a, double g)
@@ -65,7 +67,14 @@ public static class Ops
     private static double Silu(double x) => x * Sigmoid(x);
     private static double SiluGrad(double x) => Sigmoid(x) * (1 + x * Sigmoid(-x));
     private static double Sign(double x) => x > 0 ? 1 : x < 0 ? -1 : 0;
-    private static double Pow(double x, double a) => Math.Exp(a * Math.Log(Math.Abs(x))) * (x < 0 && Math.Abs(a % 2) == 1 ? -1 : 1);
+    // x^a as exp(a·log|x|); where x < 0, an integer a gives the sign (negative for an odd a) and any other a a NaN, −∞ among
+    // the x < 0 (Math.Pow's special values give +∞ there).
+    private static double Pow(double x, double a)
+    {
+        double m = Math.Exp(a * Math.Log(Math.Abs(x)));
+        if (!(x < 0)) return m;
+        return Math.Round(a) != a ? double.NaN : Math.Abs(a % 2) == 1 ? -m : m;
+    }
 
     private static readonly (double, double) Unit = (-1, 1), Positive = (0.5, 4), Any = (-4, 4), Wide = (-20, 20);
     private const string Cond = " (ill-conditioned past |x| ≈ 3: the result follows σ or sech² of a rounded argument that grows as |x|³, so its error in ulps grows with |x|)";
@@ -90,8 +99,8 @@ public static class Ops
         new("sub", 2, false, (x, y, z, a, b) => x - y, Any, Any, 0, 0),
         new("mul", 2, false, (x, y, z, a, b) => x * y, Any, Any, 0, 0),
         new("div", 2, false, (x, y, z, a, b) => x / y, Any, (1, 4), 0, 0, "integer lanes: truncating"),
-        new("max", 2, false, (x, y, z, a, b) => Math.Max(x, y), Any, Any, 0, 0),
-        new("min", 2, false, (x, y, z, a, b) => Math.Min(x, y), Any, Any, 0, 0),
+        new("max", 2, false, (x, y, z, a, b) => Routing.Order(x, y) >= 0 ? x : y, Any, Any, 0, 0, "the first-ranked of x and y in Adad's order (Routing.Order): a NaN where either is one; a reduction's max of the two"),
+        new("min", 2, false, (x, y, z, a, b) => Routing.Order(x, y) <= 0 ? x : y, Any, Any, 0, 0, "the last-ranked: the number where one is a NaN, a NaN where both are; a reduction's min of the two"),
         new("axpy", 2, false, (x, y, z, a, b) => a * x + y, Any, Any, 2, 0),
         new("muladd", 3, false, (x, y, z, a, b) => x * y + z, Any, Any, 0, 0),
         new("where", 3, false, (x, y, z, a, b) => x != 0 ? y : z, (0, 1), Any, 0, 0, "x is the mask: nonzero takes y"),
@@ -100,10 +109,10 @@ public static class Ops
         new("relu_bwd", 2, false, (x, y, z, a, b) => x > 0 ? y : 0, Any, Any, 0, 0),
         new("clamp_bwd", 2, false, (x, y, z, a, b) => x > a && x < b ? y : 0, Any, Any, -1, 2),
         new("where_bwd", 2, false, (x, y, z, a, b) => x != 0 ? y : 0, (0, 1), Any, 0, 0),
-        new("max_bwd_x", 3, false, (x, y, z, a, b) => x >= y ? z : 0, Any, Any, 0, 0, "max(x, y)'s gradient to x given dz: x takes it where x ≥ y"),
-        new("max_bwd_y", 3, false, (x, y, z, a, b) => x >= y ? 0 : z, Any, Any, 0, 0, "y takes it where x < y"),
-        new("min_bwd_x", 3, false, (x, y, z, a, b) => x <= y ? z : 0, Any, Any, 0, 0, "min(x, y)'s gradient to x given dz: x takes it where x ≤ y"),
-        new("min_bwd_y", 3, false, (x, y, z, a, b) => x <= y ? 0 : z, Any, Any, 0, 0, "y takes it where x > y"),
+        new("max_bwd_x", 3, false, (x, y, z, a, b) => Routing.Order(x, y) >= 0 ? z : 0, Any, Any, 0, 0, "max(x, y)'s gradient given dz goes to the operand max gives: to x unless y ranks above x (a tie to x, as a max pool's backward to the first)"),
+        new("max_bwd_y", 3, false, (x, y, z, a, b) => Routing.Order(x, y) >= 0 ? 0 : z, Any, Any, 0, 0, "to y where y ranks above x"),
+        new("min_bwd_x", 3, false, (x, y, z, a, b) => Routing.Order(x, y) <= 0 ? z : 0, Any, Any, 0, 0, "min(x, y)'s gradient given dz goes to the operand min gives: to x unless x ranks above y (a tie to x)"),
+        new("min_bwd_y", 3, false, (x, y, z, a, b) => Routing.Order(x, y) <= 0 ? 0 : z, Any, Any, 0, 0, "to y where x ranks above y"),
         new("gated_relu", 2, false, (x, y, z, a, b) => Math.Max(x, 0) * y, Any, Any, 0, 0),
         new("gated_relu_bwd_x", 3, false, (x, y, z, a, b) => x > 0 ? y * z : 0, Any, Any, 0, 0, "d/dx of relu(x)·y given dz"),
         new("gated_relu_bwd_y", 3, false, (x, y, z, a, b) => Math.Max(x, 0) * z, Any, Any, 0, 0),
@@ -124,11 +133,11 @@ public static class Ops
         new("silu", 1, true, (x, y, z, a, b) => Silu(x), Any, Any, 0, 0),
         new("leaky_relu", 1, true, (x, y, z, a, b) => x > 0 ? x : a * x, Any, Any, 0.1, 0),
         new("pow", 1, true, (x, y, z, a, b) => Pow(x, a), Positive, Any, 2.5, 0, "x^a for x > 0; x < 0 with an odd integer a keeps the sign (exp(a·log|x|): a·log|x| ulps)", Ulps: 16),
-        new("dropout", 2, true, (x, y, z, a, b) => y != 0 ? x * a : 0, Any, (0, 1), 1.25, 0, "y is the keep mask, a the scale"),
+        new("mask_scale", 2, true, (x, y, z, a, b) => y != 0 ? x * a : 0, Any, (0, 1), 1.25, 0, "x·a where the mask y is nonzero, 0 where it is 0: a mask kept from a draw (Dropout draws its own), applied forward or backward"),
         new("gated_silu", 2, true, (x, y, z, a, b) => Silu(x) * y, Any, Any, 0, 0),
         new("gated_gelu", 2, true, (x, y, z, a, b) => Gelu(x) * y, Any, Any, 0, 0, Cond, Ulps: 64),
         new("sqrt_bwd", 2, true, (x, y, z, a, b) => y / (2 * Math.Sqrt(x)), Positive, Any, 0, 0),
-        new("inv_sqrt_bwd", 2, true, (x, y, z, a, b) => -0.5 * y / Math.Pow(x + a, 1.5), Positive, Any, 1e-6, 0),
+        new("inv_sqrt_bwd", 2, true, (x, y, z, a, b) => -0.5 * y / ((x + a) * Math.Sqrt(x + a)), Positive, Any, 1e-6, 0, "d/dx of 1/√(x + a) given dy: −½·dy/((x + a)·√(x + a)), a NaN where x + a < 0 as the forward's"),
         new("exp_bwd", 2, true, (x, y, z, a, b) => Math.Exp(x) * y, Any, Any, 0, 0),
         new("log_bwd", 2, true, (x, y, z, a, b) => y / x, Positive, Any, 0, 0),
         new("sin_bwd", 2, true, (x, y, z, a, b) => Math.Cos(x) * y, Wide, Any, 0, 0),
@@ -149,7 +158,7 @@ public static class Ops
         new("gated_tanh_sigmoid_bwd_y", 3, true, (x, y, z, a, b) => Math.Tanh(x) * Sigmoid(y) * Sigmoid(-y) * z, Any, Any, 0, 0, "d/dy given dz"),
         new("add_gelu", 2, true, (x, y, z, a, b) => Gelu(x + y), Any, Any, 0, 0, "gelu(x + y): a bias and its gelu in one pass (a row of biases by MapRowFloat); the sum rounded in the lane first, then gelu's conditioning" + Cond, Ulps: 256),
         new("sigmoid_focal", 2, true, (x, y, z, a, b) => Focal(x, y, a, b), Any, (0, 1), 0.25, 2,
-            "torchvision's sigmoid focal loss: α_t·(1 − p_t)^γ·BCE(x, y), p = σ(x), y the target in [0, 1], a = α (no weighting where a < 0), b = γ ≥ 0" + FocalCond, Ulps: 256),
+            "the sigmoid focal loss: α_t·(1 − p_t)^γ·BCE(x, y), p = σ(x), y the target in [0, 1], α_t = α·y + (1 − α)·(1 − y) with a = α (½ weighs both classes alike, at half the unweighted loss), b = γ ((1 − p_t)^0 = 1, 0^0 among them)" + FocalCond, Ulps: 256),
         new("sigmoid_focal_bwd", 3, true, (x, y, z, a, b) => FocalGrad(x, y, a, b) * z, Any, (0, 1), 0.25, 2,
             "d/dx given dz (the target a constant): α_t·((σ(x) − t)·q^γ − γ·BCE·q^(γ−1)·(2t − 1)·σ(x)σ(−x)), q = 1 − p_t; the two terms share their sign for a target of 0 or 1 and cancel near a soft target's minimum (measured against their magnitude)" + FocalCond,
             Ulps: 256, Scale: (x, y, z, a, b) => FocalGradTerms(x, y, a, b) * Math.Abs(z)),

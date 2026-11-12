@@ -288,6 +288,9 @@ internal static partial class Ptx
             b.L($"neg.{op} {nx2b}, {x2};");
             b.L($"fma.rn.{op} {x2lo}, {ax}, {ax}, {nx2b};");
             b.L($"sub.rn.{op} {corr}, {L(lane, 1)}, {x2lo};");
+            string pcorr = b.P();                                              // x² infinite: its low part ∞ − ∞, e^(−x²) 0: no correction
+            b.L($"testp.notanumber.{op} {pcorr}, {corr};");
+            b.L($"selp.{op} {corr}, {L(lane, 1)}, {corr}, {pcorr};");
             b.L($"neg.{op} {nx2}, {x2};");
             string e = Codec.Exp(b, lane, nx2);
             b.L($"mul.rn.{op} {e}, {e}, {corr};");
@@ -333,6 +336,9 @@ internal static partial class Ptx
             b.L($"neg.{op} {nx2b}, {x2};");
             b.L($"fma.rn.{op} {x2lo}, {ax}, {ax}, {nx2b};");
             b.L($"sub.rn.{op} {corr}, {L(lane, 1)}, {x2lo};");
+            string pcorr = b.P();                                              // x² infinite: its low part ∞ − ∞, e^(−x²) 0: no correction
+            b.L($"testp.notanumber.{op} {pcorr}, {corr};");
+            b.L($"selp.{op} {corr}, {L(lane, 1)}, {corr}, {pcorr};");
             b.L($"neg.{op} {nx2}, {x2};");
             string e = Codec.Exp(b, lane, nx2);
             b.L($"mul.rn.{op} {e}, {e}, {corr};");
@@ -378,6 +384,16 @@ internal static partial class Ptx
         public string Max(string x, string y) => Bin($"max.{_op}", x, y);
         public string Min(string x, string y) => Bin($"min.{_op}", x, y);
 
+        // Adad's order (Routing.Order): the first-ranked of x and y (a NaN where either is one), and whether p ranks above q.
+        public string First(string x, string y)
+        {
+            string r = lane.NewReg(b);
+            Ptx.First(b, lane, r, x, y);
+            return r;
+        }
+
+        public string Above(string p, string q) => Ptx.RankAbove(b, lane, p, q);
+
         public string Fma(string x, string y, string z)
         {
             string r = lane.NewReg(b);
@@ -422,12 +438,23 @@ internal static partial class Ptx
             return p;
         }
 
+        // x ≠ 0, a NaN among them (unordered, as the reference's x != 0).
         public string NotZero(string x)
         {
             string p = b.P();
-            b.L($"setp.ne.{_op} {p}, {x}, {lane.Literal(0)};");
+            b.L($"setp.{(_f ? "neu" : "ne")}.{_op} {p}, {x}, {lane.Literal(0)};");
             return p;
         }
+
+        public string Nan(string x)
+        {
+            string p = b.P();
+            b.L($"testp.notanumber.{_op} {p}, {x};");
+            return p;
+        }
+
+        // x held to [lo, hi]; a NaN stays a NaN (it has no place to be held to).
+        public string Clamp(string x, string lo, string hi) => _f ? Select(Nan(x), x, Min(Max(x, lo), hi)) : Min(Max(x, lo), hi);
 
         public string Select(string p, string x, string y)
         {
@@ -470,6 +497,7 @@ internal static partial class Ptx
             double ch = (float)c;
             string p = Fma(Mul(C(c * 0.044715), x2), x, Mul(C(c - ch), x));
             string t = Fma(C(ch), x, p);
+            t = Select(Nan(t), x, t);                                          // x infinite: t is ±∞ with x (its parts ∞ − ∞)
             string lo = Add(Fma(C(ch), x, Neg(t)), p);
             return XSigmoid(x, t, lo);
         }
@@ -480,11 +508,11 @@ internal static partial class Ptx
         {
             if (lane.Wide) return Mul(x, Sigmoid(t));
             string e = Exp(Neg(t));
-            if (lo != null) e = Fma(e, Neg(lo), e);
+            if (lo != null) e = Fma(e, Neg(Select(Nan(lo), C(0), lo)), e);    // lo a NaN only where t is infinite (∞ − ∞): no low part
             string one = C(1), d = Add(e, one), bv = Sub(d, e);
             string dlo = Add(Sub(e, Sub(d, bv)), Sub(one, bv));
-            string q = Div(x, d);
-            return Fma(Neg(q), Bin($"div.approx.{_op}", dlo, d), q);
+            string q = Div(x, d), c = Bin($"div.approx.{_op}", dlo, d);
+            return Select(Equal(c, C(0)), q, Fma(Neg(q), c, q));             // no correction: q as it is (q infinite, c 0: not ∞·0)
         }
 
         public string GeluGrad(string x)
@@ -529,17 +557,17 @@ internal static partial class Ptx
             case "abs": return e.Abs(x);
             case "sign": return e.Sign(x);
             case "square": return e.Mul(x, x);
-            case "relu": return e.Max(x, e.C(0));
+            case "relu": return e.First(x, e.C(0));              // max(x, 0) by the order: a NaN stays a NaN
             case "add_scalar": return e.Add(x, a);
             case "scale": return e.Mul(x, a);
             case "affine": return e.Fma(a, x, pb);
-            case "clamp": return e.Min(e.Max(x, a), pb);
+            case "clamp": return e.Clamp(x, a, pb);
             case "add": return e.Add(x, y);
             case "sub": return e.Sub(x, y);
             case "mul": return e.Mul(x, y);
             case "div": return e.Div(x, y);
-            case "max": return e.Max(x, y);
-            case "min": return e.Min(x, y);
+            case "max": return e.First(x, y);                    // by the order: a NaN where either is one
+            case "min": return e.Min(x, y);                      // min.f32 / min.f64: the number where one is a NaN, as the order's last
             case "axpy": return e.Fma(a, x, y);
             case "muladd": return e.Fma(x, y, z);
             case "where": return e.Select(e.NotZero(x), y, z);
@@ -548,13 +576,13 @@ internal static partial class Ptx
             case "relu_bwd": return e.Select(e.Greater(x, e.C(0)), y, e.C(0));
             case "clamp_bwd": return e.Select(e.And(e.Greater(x, a), e.Less(x, pb)), y, e.C(0));
             case "where_bwd": return e.Select(e.NotZero(x), y, e.C(0));
-            case "max_bwd_x": return e.Select(e.Greater(y, x), e.C(0), z);
-            case "max_bwd_y": return e.Select(e.Greater(y, x), z, e.C(0));
-            case "min_bwd_x": return e.Select(e.Greater(x, y), e.C(0), z);
-            case "min_bwd_y": return e.Select(e.Greater(x, y), z, e.C(0));
-            case "gated_relu": return e.Mul(e.Max(x, e.C(0)), y);
+            case "max_bwd_x": return e.Select(e.Above(y, x), e.C(0), z);
+            case "max_bwd_y": return e.Select(e.Above(y, x), z, e.C(0));
+            case "min_bwd_x": return e.Select(e.Above(x, y), e.C(0), z);
+            case "min_bwd_y": return e.Select(e.Above(x, y), z, e.C(0));
+            case "gated_relu": return e.Mul(e.First(x, e.C(0)), y);
             case "gated_relu_bwd_x": return e.Select(e.Greater(x, e.C(0)), e.Mul(y, z), e.C(0));
-            case "gated_relu_bwd_y": return e.Mul(e.Max(x, e.C(0)), z);
+            case "gated_relu_bwd_y": return e.Mul(e.First(x, e.C(0)), z);
             case "sqrt": return e.Sqrt(x);
             case "inv_sqrt": return e.Div(e.C(1), e.Sqrt(e.Add(x, a)));
             case "exp": return e.Exp(x);
@@ -571,7 +599,7 @@ internal static partial class Ptx
             case "silu": return e.XSigmoid(x, x);
             case "leaky_relu": return e.Select(e.Greater(x, e.C(0)), x, e.Mul(a, x));
             case "pow": return e.Pow(x, a);
-            case "dropout": return e.Select(e.NotZero(y), e.Mul(x, a), e.C(0));
+            case "mask_scale": return e.Select(e.NotZero(y), e.Mul(x, a), e.C(0));
             case "gated_silu": return e.Mul(e.Mul(x, e.Sigmoid(x)), y);
             case "gated_gelu": return e.Mul(e.Gelu(x), y);
             case "sqrt_bwd": return e.Div(y, e.Mul(e.C(2), e.Sqrt(x)));
@@ -613,12 +641,12 @@ internal static partial class Ptx
                 string ce = e.Add(e.Fma(e.Neg(x), y, e.Max(x, nil)), lp);
                 string s = e.Sigmoid(x), sn = e.Sigmoid(e.Neg(x)), u = e.Sub(one, y);
                 string q = e.Add(e.Mul(y, sn), e.Mul(u, s));
-                string qg = e.Select(e.Greater(pb, nil), e.Pow(q, pb), one);
-                string at = e.Select(e.Greater(nil, a), one, e.Add(e.Mul(a, y), e.Mul(e.Sub(one, a), u)));
+                string qg = e.Select(e.Equal(pb, nil), one, e.Pow(q, pb));
+                string at = e.Add(e.Mul(a, y), e.Mul(e.Sub(one, a), u));
                 if (op == "sigmoid_focal") return e.Mul(e.Mul(at, qg), ce);
                 string d = e.Sub(e.Mul(u, s), e.Mul(y, sn));
                 string second = e.Mul(e.Mul(e.Mul(e.Mul(pb, ce), e.Div(qg, q)), e.Sub(e.Add(y, y), one)), e.Mul(s, sn));
-                second = e.Select(e.Greater(q, nil), e.Select(e.Greater(pb, nil), second, nil), nil);
+                second = e.Select(e.Equal(q, nil), nil, e.Select(e.Equal(pb, nil), nil, second));
                 return e.Mul(e.Mul(at, e.Sub(e.Mul(d, qg), second)), z);
             }
 

@@ -125,6 +125,7 @@ internal static partial class Checks
         ok &= Function32("erfc f32", Funcs.Erfc, Funcs.ErfcReference, -4, 9, 4, random);
         ok &= Function64("erfc f64", Funcs.Erfc, Funcs.ErfcReference, -4, 26, 4, random);
         ok &= Maps(null);
+        ok &= Maps(null, special: true);
         ok &= Elementwise(null);
         ok &= Group2(null);
         ok &= Rows(null);
@@ -2476,14 +2477,17 @@ internal static partial class Checks
 
     /// <summary>Each formula over 1001 values of each of its types, on the CPU (ops null) or the device, against the float64
     /// reference rounded as the type rounds: integer types exact; float types within one step of the type plus a few ulps of
-    /// the lane (the transcendental functions' own error).</summary>
-    public static bool Maps(IDevice<ulong, ulong>? ops, string device = "device")
+    /// the lane (the transcendental functions' own error). With <paramref name="special"/>, each float type over NaN, ±∞,
+    /// ±0, values of each input's range and a negative one, in every combination of the inputs (SpecialInputs): a NaN or an
+    /// infinity exactly where the reference has one. Each formula at its catalogue parameters and its Variants.</summary>
+    public static bool Maps(IDevice<ulong, ulong>? ops, string device = "device", bool special = false)
     {
-        const int N = 1001;
+        const int Count = 1001;
         bool ok = true;
         string where = ops is null ? "cpu" : device;
-        foreach (var op in Ops.All)
+        foreach (var op in Ops.All.SelectMany(Variants))
         {
+            string name = ReferenceEquals(op, Ops.Find(op.Name)) ? op.Name : $"{op.Name} a={op.A} b={op.B}";
             double worst = 0;
             string worstType = "";
             bool failed = false;
@@ -2492,9 +2496,17 @@ internal static partial class Checks
                 if (Bench.Registry.IsBlock(type)) continue;                    // measured by the block formats' gate (block steps)
                 if (type == "bool" && op.Name == "div") continue;              // bool: a divisor of 0 is half its values: no division (n/a)
                 if (op.FloatOnly && !Bench.Registry.IsFloat(type)) continue;
-                byte[]? x = op.Inputs >= 1 ? Bench.Registry.Make(type, N, 31, op.XRange.Low, op.XRange.High) : null;
-                byte[]? y = op.Inputs >= 2 ? Bench.Registry.Make(type, N, 32, op.YRange.Low, op.YRange.High) : null;
-                byte[]? z = op.Inputs >= 3 ? Bench.Registry.Make(type, N, 33, op.YRange.Low, op.YRange.High) : null;
+                if (special && !Bench.Registry.IsFloat(type)) continue;             // NaN, ±∞ and −0 are the float types'
+                int N = Count, shown = 0;
+                byte[]? x, y, z;
+                if (special) (x, y, z, N) = SpecialInputs(type, op);
+                else
+                {
+                    x = op.Inputs >= 1 ? Bench.Registry.Make(type, N, 31, op.XRange.Low, op.XRange.High) : null;
+                    y = op.Inputs >= 2 ? Bench.Registry.Make(type, N, 32, op.YRange.Low, op.YRange.High) : null;
+                    z = op.Inputs >= 3 ? Bench.Registry.Make(type, N, 33, op.YRange.Low, op.YRange.High) : null;
+                }
+
                 var output = new byte[Bench.Registry.Bytes(type, N)];
                 var reference = References.Map(type, op, x, y, z, N, wrap: false);
                 if (ops is null) Bench.Registry.With(type, new CpuMap(op, x, y, z, output, N));
@@ -2539,6 +2551,8 @@ internal static partial class Checks
                         e = Off(gap, tol) ? Steps(gap, stepType) : 0;
                     }
 
+                    if (e > 0 && shown++ < 3)
+                        Console.WriteLine($"  {name} {where} {type}: x {(x is null ? 0 : Bench.Registry.Values(type, x, N)[i]):R}, y {(y is null ? 0 : Bench.Registry.Values(type, y, N)[i]):R}, z {(z is null ? 0 : Bench.Registry.Values(type, z, N)[i]):R}: got {v:R}, want {want:R}");
                     if (e > worst)
                     {
                         worst = e; worstType = type;
@@ -2549,11 +2563,36 @@ internal static partial class Checks
                 if (worst > 0 && !failed) failed = true;
             }
 
-            Console.WriteLine($"check map {op.Name,-18} {where,-6} {(worst == 0 ? "every type exact to its step" : $"DIFFERS by {worst:0.##} steps in {worstType}")}");
+            Console.WriteLine($"check map {name,-18} {where + (special ? " (NaN, inf, 0)" : ""),-6} {(worst == 0 ? "every type exact to its step" : $"DIFFERS by {worst:0.##} steps in {worstType}")}");
             ok &= worst == 0;
         }
 
         return ok;
+    }
+
+    // NaN, +∞, −∞, +0, −0, the 0.2, 0.5 and 0.9 points of each input's range (x's XRange, y's and z's YRange) and the 0.9
+    // point negated (a negative value where the range has none), in every combination of the formula's inputs (9, 81 or 729
+    // values), stored as the type stores them.
+    private static (byte[]? X, byte[]? Y, byte[]? Z, int N) SpecialInputs(string type, MapOp op)
+    {
+        static double[] Values((double Low, double High) r) => [double.NaN, double.PositiveInfinity, double.NegativeInfinity, 0.0, -0.0,
+            r.Low + 0.2 * (r.High - r.Low), r.Low + 0.5 * (r.High - r.Low), r.Low + 0.9 * (r.High - r.Low), -(r.Low + 0.9 * (r.High - r.Low))];
+        double[] vx = Values(op.XRange), vy = Values(op.YRange);
+        int k = vx.Length, n = (int)Math.Pow(k, Math.Max(op.Inputs, 1));
+        double[] xs = new double[n], ys = new double[n], zs = new double[n];
+        for (int i = 0; i < n; i++) { xs[i] = vx[i % k]; ys[i] = vy[i / k % k]; zs[i] = vy[i / (k * k) % k]; }
+        return (op.Inputs >= 1 ? Bench.Registry.Encode(type, xs) : null, op.Inputs >= 2 ? Bench.Registry.Encode(type, ys) : null,
+                op.Inputs >= 3 ? Bench.Registry.Encode(type, zs) : null, n);
+    }
+
+    // Each formula at its catalogue parameters and, where its parameters choose among branches, at more: the focal loss at
+    // γ 0, a fraction, 1 and below 0, α 0, 1 and past [0, 1].
+    private static IEnumerable<MapOp> Variants(MapOp op)
+    {
+        yield return op;
+        if (op.Name.StartsWith("sigmoid_focal", StringComparison.Ordinal))
+            foreach (var (a, b) in new[] { (0.25, 0.0), (0.0, 0.5), (1.0, 1.0), (-0.5, 2.0), (0.6, -0.5) })
+                yield return op with { A = a, B = b };
     }
 
     private sealed class CpuMap(MapOp op, byte[]? x, byte[]? y, byte[]? z, byte[] output, int n) : Bench.ITypeVisitor<bool>
@@ -2630,6 +2669,7 @@ internal static partial class Checks
         ok &= Device<Int16, double>(ops, Lane.F64);
         ok &= Sliced(ops);
         ok &= Maps(ops);
+        ok &= Maps(ops, special: true);
         ok &= Elementwise(ops, "cuda");
         ok &= Group2(ops);
         ok &= Rows(ops);

@@ -184,6 +184,7 @@ internal static partial class VkKernels
             var f = ax;
             for (int d = w ? Funcs.ErfDepth64 : Funcs.ErfDepth32; d >= 1; d--) f = ax + b.C(x.Kind, d * 0.5) / f;
             var corr = b.C(x.Kind, 1) - b.Fma(ax, ax, -x2);
+            corr = b.Select(b.IsNan(corr), b.C(x.Kind, 1), corr);              // x² infinite: its low part ∞ − ∞, e^(−x²) 0: no correction
             var e = Exp(b, -x2) * corr;
             var tail = b.C(x.Kind, 1) - (e * Funcs.InvSqrtPi) / f;
             var y = b.Select(ax < (w ? Funcs.ErfBound64 : Funcs.ErfBound32), series, tail);
@@ -201,6 +202,7 @@ internal static partial class VkKernels
             var f = ax;
             for (int d = w ? Funcs.ErfcDepth64 : Funcs.ErfcDepth32; d >= 1; d--) f = ax + b.C(x.Kind, d * 0.5) / f;
             var corr = b.C(x.Kind, 1) - b.Fma(ax, ax, -x2);
+            corr = b.Select(b.IsNan(corr), b.C(x.Kind, 1), corr);              // x² infinite: its low part ∞ − ∞, e^(−x²) 0: no correction
             var e = Exp(b, -x2) * corr;
             var tail = (e * Funcs.InvSqrtPi) / f;
             var mid = b.C(x.Kind, 1) - series;
@@ -235,6 +237,7 @@ internal static partial class VkKernels
             double ch = (float)c;
             var p = b.Fma(x2 * (c * 0.044715), x, x * (c - ch));
             var t = b.Fma(C(ch), x, p);
+            t = b.Select(b.IsNan(t), x, t);                                     // x infinite: t is ±∞ with x (its parts ∞ − ∞)
             var lo = b.Fma(C(ch), x, -t) + p;
             return XSigmoid(x, t, lo);
         }
@@ -245,13 +248,14 @@ internal static partial class VkKernels
         {
             if (k == K.F64) return x * Sigmoid(t);
             var e = Exp(-t);
-            if (lo is { } l) e = b.Fma(e, -l, e);
+            if (lo is { } l) e = b.Fma(e, -b.Select(b.IsNan(l), C(0), l), e);  // lo a NaN only where t is infinite (∞ − ∞): no low part
             var one = C(1);
             var d = e + one;
             var bv = d - e;
             var dlo = (e - (d - bv)) + (one - bv);
             var q = x / d;
-            return b.Fma(-q, b.Op2(dlo, d, SpirvOp.FDiv), q);
+            var c = b.Op2(dlo, d, SpirvOp.FDiv);
+            return b.Select(c == 0, q, b.Fma(-q, c, q));                         // no correction: q as it is (q infinite, c 0: not ∞·0)
         }
 
         public V GeluGrad(V x)
@@ -288,17 +292,17 @@ internal static partial class VkKernels
             case "abs": return b.Abs(x);
             case "sign": return e.Sign(x);
             case "square": return x * x;
-            case "relu": return b.Max(x, e.C(0));
+            case "relu": return First(b, x, e.C(0));             // max(x, 0) by the order: a NaN stays a NaN
             case "add_scalar": return x + a;
             case "scale": return x * a;
             case "affine": return b.Fma(a, x, pb);
-            case "clamp": return b.Min(b.Max(x, a), pb);
+            case "clamp": return x.Kind.IsFloat() ? b.Select(b.IsNan(x), x, b.Min(b.Max(x, a), pb)) : b.Min(b.Max(x, a), pb);   // a NaN stays a NaN
             case "add": return x + y;
             case "sub": return x - y;
             case "mul": return x * y;
             case "div": return x / y;
-            case "max": return b.Max(x, y);
-            case "min": return b.Min(x, y);
+            case "max": return First(b, x, y);                   // by the order: a NaN where either is one
+            case "min": return b.Min(x, y);                      // NMin: the number where one is a NaN, as the order's last
             case "axpy": return b.Fma(a, x, y);
             case "muladd": return b.Fma(x, y, z);
             case "where": return b.Select(x != 0, y, z);
@@ -307,13 +311,13 @@ internal static partial class VkKernels
             case "relu_bwd": return b.Select(x > 0, y, e.C(0));
             case "clamp_bwd": return b.Select((x > a) & (x < pb), y, e.C(0));
             case "where_bwd": return b.Select(x != 0, y, e.C(0));
-            case "max_bwd_x": return b.Select(y > x, e.C(0), z);
-            case "max_bwd_y": return b.Select(y > x, z, e.C(0));
-            case "min_bwd_x": return b.Select(x > y, e.C(0), z);
-            case "min_bwd_y": return b.Select(x > y, z, e.C(0));
-            case "gated_relu": return b.Max(x, e.C(0)) * y;
+            case "max_bwd_x": return b.Select(Above(b, y, x), e.C(0), z);
+            case "max_bwd_y": return b.Select(Above(b, y, x), z, e.C(0));
+            case "min_bwd_x": return b.Select(Above(b, x, y), e.C(0), z);
+            case "min_bwd_y": return b.Select(Above(b, x, y), z, e.C(0));
+            case "gated_relu": return First(b, x, e.C(0)) * y;
             case "gated_relu_bwd_x": return b.Select(x > 0, y * z, e.C(0));
-            case "gated_relu_bwd_y": return b.Max(x, e.C(0)) * z;
+            case "gated_relu_bwd_y": return First(b, x, e.C(0)) * z;
             case "sqrt": return b.Sqrt(x);
             case "inv_sqrt": return e.C(1) / b.Sqrt(x + a);
             case "exp": return e.Exp(x);
@@ -330,7 +334,7 @@ internal static partial class VkKernels
             case "silu": return e.XSigmoid(x, x);
             case "leaky_relu": return b.Select(x > 0, x, a * x);
             case "pow": return e.Pow(x, a);
-            case "dropout": return b.Select(y != 0, x * a, e.C(0));
+            case "mask_scale": return b.Select(y != 0, x * a, e.C(0));
             case "gated_silu": return (x * e.Sigmoid(x)) * y;
             case "gated_gelu": return e.Gelu(x) * y;
             case "sqrt_bwd": return y / (e.C(2) * b.Sqrt(x));
@@ -374,12 +378,12 @@ internal static partial class VkKernels
                 var ce = b.Fma(-x, y, b.Max(x, zero)) + lp;
                 V s = e.Sigmoid(x), sn = e.Sigmoid(-x), u = one - y;
                 var q = y * sn + u * s;
-                var qg = b.Select(pb > 0, e.Pow(q, pb), one);
-                var at = b.Select(a < 0, one, a * y + (one - a) * u);
+                var qg = b.Select(pb == 0, one, e.Pow(q, pb));
+                var at = a * y + (one - a) * u;
                 if (op == "sigmoid_focal") return at * qg * ce;
                 var d = u * s - y * sn;
                 var second = pb * ce * (qg / q) * (y + y - one) * (s * sn);
-                second = b.Select(q > 0, b.Select(pb > 0, second, zero), zero);
+                second = b.Select(q == 0, zero, b.Select(pb == 0, zero, second));
                 return at * (d * qg - second) * z;
             }
 

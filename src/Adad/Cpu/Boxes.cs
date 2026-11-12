@@ -128,8 +128,10 @@ internal sealed partial class Kernels
     {
         private static Vector<T> C(double v) => new(TL.From(v));
 
-        // The share of max(a, b)'s gradient a takes (min's: Below).
-        private static Vector<T> Above(Vector<T> a, Vector<T> b) => Vector.ConditionalSelect(Vector.GreaterThan(a, b), C(1), Vector.ConditionalSelect(Vector.Equals(a, b), C(0.5), Vector<T>.Zero));
+        // The share of max(a, b)'s gradient a takes (min's: Below): all of it unless b ranks above a in Adad's order (larger,
+        // or a NaN against a number), none where it does.
+        private static Vector<T> Above(Vector<T> a, Vector<T> b) =>
+            Vector.ConditionalSelect(Vector.GreaterThan(b, a) | Vector.AndNot(Vector.Equals(a, a), Vector.Equals(b, b)), Vector<T>.Zero, C(1));
 
         private static Vector<T> Below(Vector<T> a, Vector<T> b) => Above(b, a);
 

@@ -3,7 +3,7 @@
 
 // The box overlap losses (Boxes.cs) on every device against their float64 reference: IoU, GIoU, DIoU and CIoU over every
 // float type (the block formats among them), pairs overlapping, apart, enclosing, equal and with tied corners (a tie's
-// gradient shared in halves), eps the type's precision (in the narrow types large enough that its place in each divisor
+// gradient all to the predicted corner, the side Adad's order gives), eps the type's precision (in the narrow types large enough that its place in each divisor
 // shows); the loss within the lane's rounding of its terms (Boxes.Reference's scale) plus the type's step, the backward's
 // components the same with their own scales; and first the reference's gradient against its own loss by central
 // differences at a wide and a narrow type's eps (CIoU's α moving with the pair; away from the ties).
@@ -88,7 +88,7 @@ internal static partial class Checks
     }
 
     // The reference's gradient against central differences of its loss, over the pairs whose corners and overlap edges are
-    // apart (a tie's gradient is the halves', not a derivative).
+    // apart (a tie's gradient is the side the order gives, not a derivative).
     private static bool BoxGradients(double[] pv, double[] tv, int count, double eps)
     {
         bool ok = true;

@@ -93,7 +93,7 @@ internal static partial class Ptx
         dW = e.Add(dW, e.Mul(dUnion, hp));
         dH = e.Add(dH, e.Mul(dUnion, wp));
         string ix = e.Select(overlaps, e.Mul(ih, dInter), zero), iy = e.Select(overlaps, e.Mul(iw, dInter), zero);
-        string Above(string p, string q) => e.Select(e.Greater(p, q), one, e.Select(e.Equal(p, q), half, zero));
+        string Above(string p, string q) => e.Select(e.Above(q, p), zero, one);              // all unless q ranks above p (Adad's order)
         string Below(string p, string q) => Above(q, p);
         string g0 = e.Sub(e.Sub(e.Add(e.Neg(dW), e.Mul(dPx, half)), e.Mul(ix, Above(x1, gx1))), e.Mul(dCw, Below(x1, gx1)));
         string g1 = e.Sub(e.Sub(e.Add(e.Neg(dH), e.Mul(dPy, half)), e.Mul(iy, Above(y1, gy1))), e.Mul(dCh, Below(y1, gy1)));

@@ -243,6 +243,7 @@ public static class Funcs
         var sp = new Vector<float>((float)ErfcTail32[^1]);
         for (int k = ErfcTail32.Length - 2; k >= 0; k--) sp = Vector.FusedMultiplyAdd(sp, u, new Vector<float>((float)ErfcTail32[k]));
         var x2lo = Vector.FusedMultiplyAdd(ax, ax, -x2);
+        x2lo = Vector.ConditionalSelect(Vector.Equals(x2lo, x2lo), x2lo, Vector<float>.Zero);   // x² infinite: ∞ − ∞, and e^(−x²) 0
         return Exps.Exp(-x2) * (Vector<float>.One - x2lo) * (t * sp);
     }
 
@@ -447,6 +448,7 @@ public static class Funcs
         series *= ax;
         var f = Fraction(ax, ErfDepth64);
         var x2lo = Vector.FusedMultiplyAdd(ax, ax, -x2);
+        x2lo = Vector.ConditionalSelect(Vector.Equals(x2lo, x2lo), x2lo, Vector<double>.Zero);  // x² infinite: ∞ − ∞, and e^(−x²) 0
         var tail = Vector<double>.One - Exps.Exp(-x2) * (Vector<double>.One - x2lo) * new Vector<double>(InvSqrtPi) / f;
         var y = Vector.ConditionalSelect(Vector.LessThan(ax, new Vector<double>(ErfBound64)), series, tail);
         y = Vector.Min(y, Vector<double>.One);
@@ -463,6 +465,7 @@ public static class Funcs
         series *= x;
         var f = Fraction(ax, ErfcDepth64);
         var x2lo = Vector.FusedMultiplyAdd(ax, ax, -x2);
+        x2lo = Vector.ConditionalSelect(Vector.Equals(x2lo, x2lo), x2lo, Vector<double>.Zero);  // x² infinite: ∞ − ∞, and e^(−x²) 0
         var tail = Exps.Exp(-x2) * (Vector<double>.One - x2lo) * new Vector<double>(InvSqrtPi) / f;
         var y = Vector.ConditionalSelect(Vector.LessThan(ax, new Vector<double>(ErfcBound64)), Vector<double>.One - series,
             Vector.ConditionalSelect(Vector.LessThan(x, Vector<double>.Zero), new Vector<double>(2.0) - tail, tail));
@@ -478,7 +481,7 @@ public static class Funcs
         double f = ax;
         for (int d = 1200; d >= 1; d--) f = ax + d * 0.5 / f;
         double hi = ax * ax, lo = Math.FusedMultiplyAdd(ax, ax, -hi);
-        double tail = Math.Exp(-hi) * (1 - lo) * InvSqrtPi / f;
+        double tail = double.IsPositiveInfinity(hi) ? 0 : Math.Exp(-hi) * (1 - lo) * InvSqrtPi / f;   // x² past the range: e^−x² is 0 (lo ∞ − ∞)
         return x < 0 ? 2 - tail : tail;
     }
 
@@ -510,7 +513,7 @@ public static class Funcs
             double f = ax;
             for (int d = 400; d >= 1; d--) f = ax + d * 0.5 / f;
             double hi = ax * ax, lo = Math.FusedMultiplyAdd(ax, ax, -hi);
-            y = 1 - Math.Exp(-hi) * (1 - lo) * InvSqrtPi / f;
+            y = double.IsPositiveInfinity(hi) ? 1 : 1 - Math.Exp(-hi) * (1 - lo) * InvSqrtPi / f;   // x² past the range: e^−x² is 0 (lo ∞ − ∞)
         }
 
         return x < 0 ? -y : y;
