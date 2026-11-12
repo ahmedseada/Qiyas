@@ -198,16 +198,49 @@ internal sealed partial class Kernels
         public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
         {
             Lane = TL.Name;
+            if (TN.Bits % 8 == 0 && TN.Granularity == 1)
+            {
+                // Values of whole bytes: the picked value is its stored bytes, copied as they are (a column outside the row
+                // reads nothing: the type's 0, stored).
+                int size = TN.Bits / 8;
+                var zero = new TLane[1];
+                zero[0] = TL.Zero;
+                for (int r = 0; r < rows; r++)
+                {
+                    if ((uint)index[r] >= (uint)cols) { TN.Store(zero, output, r); continue; }
+                    long from = ((long)r * cols + index[r]) * size;
+                    switch (size)
+                    {
+                        case 1: output[r] = x[from]; break;
+                        case 2: Unsafe.WriteUnaligned(ref output[r * 2], Unsafe.ReadUnaligned<ushort>(ref x[from])); break;
+                        case 4: Unsafe.WriteUnaligned(ref output[r * 4], Unsafe.ReadUnaligned<uint>(ref x[from])); break;
+                        case 8: Unsafe.WriteUnaligned(ref output[r * 8], Unsafe.ReadUnaligned<ulong>(ref x[from])); break;
+                        default: x.AsSpan((int)from, size).CopyTo(output.AsSpan(r * size, size)); break;
+                    }
+                }
+                return;
+            }
+
+            // Values that share a storage unit (packed bits, a block): each read through the type, its whole unit decoded, so
+            // the rows go to the team by the units' bytes (a byte of packed bits stays on the caller; blocks spread).
             var picked = new TLane[rows];
-            var one = new TLane[1];
-            for (int r = 0; r < rows; r++)
+            Team.For(rows, Math.Max(1, rows / (Threads * 4)), rows * TN.Bytes(TN.Granularity),
+                new PickBody<TN, TLane, TL>(x, cols, index, picked));
+            TN.Store(picked, output, 0);
+        }
+    }
+
+    private readonly struct PickBody<TN, TLane, TL>(byte[] x, int cols, int[] index, TLane[] picked) : Team.IBody
+        where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
+    {
+        public void Run(int first, int last)
+        {
+            for (int r = first; r < last; r++)
             {
                 // A column outside the row reads nothing: 0.
                 if ((uint)index[r] >= (uint)cols) { picked[r] = TL.Zero; continue; }
-                TN.Load(x, r * cols + index[r], one.AsSpan(0, 1));
-                picked[r] = one[0];
+                TN.Load(x, r * cols + index[r], picked.AsSpan(r, 1));
             }
-            TN.Store(picked, output, 0);
         }
     }
 
