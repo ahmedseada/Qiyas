@@ -41,6 +41,20 @@ internal sealed partial class Kernels
     public static string Layout<TN>(LayoutArgs k) where TN : struct, IAdad<TN>
     {
         k = k.ForKernels();
+        // A move of a float type stored a whole byte or two a value whose lane is wider (float16, bfloat16, the 8-bit floats):
+        // each value moves as stored, so its stored word moves as it is, by the unsigned type of its width (in place, the
+        // type's own lane being its storage), nothing decoded into a lane or encoded back. Zeros (a pad, an index that
+        // selects nothing) are the all-zero word, every such type's +0.
+        if (Moves(k.Name) && TN.IsFloat && TN.Granularity == 1 && TN.Bits is 8 or 16)
+            return TN.Bits == 8 ? LayoutOf<Adad.Abstraction.UInt8>(k) : LayoutOf<Adad.Abstraction.UInt16>(k);
+        return LayoutOf<TN>(k);
+    }
+
+    // The operations that only move values (or write zeros): each output value an input value as stored, or 0.
+    private static bool Moves(string name) => name is "strided" or "gather_rows" or "gather_cols" or "im2col" or "shift" or "pad2d" or "interpolate_nearest";
+
+    private static string LayoutOf<TN>(LayoutArgs k) where TN : struct, IAdad<TN>
+    {
         if (LayoutArgs.Sums(k.Name))
         {
             // The bounds choose an integer type's sum lane; a float type's lane is its float lane whatever the values, so its
