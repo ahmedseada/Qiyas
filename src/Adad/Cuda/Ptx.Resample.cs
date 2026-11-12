@@ -96,7 +96,6 @@ internal static partial class Ptx
             b.L($"@{pw2} bra DONE;");
             string code = f.WordBits == 64 ? b.RD() : b.R();
             if (f.WordBits == 32) b.L($"mov.b32 {code}, 0;");
-            var natural = f.Natural;
             b.L($"sub.u32 {last}, {count}, 1;");
             for (int i = 0; i < f.Per; i++)
             {
@@ -106,10 +105,9 @@ internal static partial class Ptx
                 b.L($"setp.lt.u32 {inside}, {at}, {count};");
                 b.L($"min.u32 {at}, {at}, {last};");
                 string value = Value(at);
-                string stored = lane == natural ? value : Codec.Convert(b, lane, value, natural, f);
-                string kept = natural.NewReg(b);
-                b.L($"selp.{natural.Reg} {kept}, {stored}, {natural.Zero}, {inside};");
-                Codec.Pack(b, f, kept, natural, i, code);
+                string kept = lane.NewReg(b);
+                b.L($"selp.{lane.Reg} {kept}, {value}, {lane.Zero}, {inside};");
+                Codec.Pack(b, f, kept, lane, i, code);                             // an integer's: rounded, held to its range
             }
 
             string addr = b.RD();

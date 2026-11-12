@@ -39,8 +39,6 @@ internal static partial class VkKernels
         V count = b.Arg(5, K.U32), oh = b.Arg(6, K.U32), ow = b.Arg(7, K.U32), h = b.Arg(8, K.U32), across = b.Arg(9, K.U32), taps = b.Arg(10, K.U32);
         V rb = b.Arg(11, K.U32), rw = b.Arg(12, K.U32), channels = b.Arg(13, K.U32);
         var gid = b.GlobalX;
-        var natural = f.Natural;
-        var nk = Kinds.Of(natural);
         b.If(gid < WordCount(b, f, count), () =>
         {
             var word = b.CBits(Codec.WordKind(f), 0);
@@ -50,8 +48,7 @@ internal static partial class VkKernels
                 // A word's values past the count take the last value's addresses (dropped).
                 var at = gid * (double)f.Per + i;
                 var value = ResampleValue(b, src, lane, k, vertical, norm, ps, pb, pw, pv, oh, ow, h, across, taps, rb, rw, channels, b.Min(at, last));
-                var stored = lane.Name == natural.Name ? value : Codec.Convert(b, lane, value, natural);
-                word = Codec.Pack(b, f, b.Select(at < count, stored, b.C(nk, 0)), natural, i, word);
+                word = Codec.Pack(b, f, b.Select(at < count, value, b.C(k, 0)), lane, i, word);   // an integer's: rounded, held to its range
             }
 
             b.Store(b.At(py, gid, f.WordBits / 8), word);

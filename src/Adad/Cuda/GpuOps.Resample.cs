@@ -10,11 +10,11 @@ namespace Adad.Cuda;
 
 public sealed partial class GpuOps
 {
-    public string Resample<TIn, TN>(ResampleArgs a, ulong x, ulong bounds, ulong weights, ulong values, ulong y) where TIn : struct, IAdad<TIn> where TN : struct, IFloatAdad<TN>
+    public string Resample<TIn, TN>(ResampleArgs a, ulong x, ulong bounds, ulong weights, ulong values, ulong y) where TIn : struct, IAdad<TIn> where TN : struct, IAdad<TN>
     {
         a.Validate();
         Fmt fi = Fmt.Of<TIn>(), f = Fmt.Of<TN>();
-        var lane = RowLane(f);
+        var lane = f.FloatLane;
         string name = lane.Name;
         if (a.Count == 0) return name;
         // The horizontal pass's values: the lane's.

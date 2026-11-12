@@ -7,9 +7,10 @@
 // shrinking pass averages over the input each output covers; its taps are the input positions whose centres lie within
 // the stretched support around c, each weighted k((i + ½ − c)/s), the weights normalized to sum 1. The horizontal pass
 // runs, then the vertical one, a pass skipped where its size is kept. The plan (bounds and weights) is made here once, on
-// the host, in float64 and rounded once to the output's float lane, so every device sums the same weights; each pass is
-// Σ x·w in the lane in order by fma, the input read where it is stored. Then y = v·scale[c] + shift[c] (one fma), and y
-// rounded to the output's type once.
+// the host, in float64 and rounded once to the output's float lane (Fmt.FloatLane), so every device sums the same
+// weights; each pass is Σ x·w in the lane in order by fma, the input read where it is stored. Then y = v·scale[c] +
+// shift[c] (one fma), and y rounded to the output's type once by its own conversion (every type: an integer's or bool's
+// to nearest, ties to even, held to its range).
 // The devices implement it in their folders: Cpu/Resample.cs; Cuda/GpuOps.Resample.cs (Cuda/Ptx.Resample.cs);
 // Vulkan/VulkanOps.Resample.cs (Vulkan/Kernels.Resample.cs).
 using System.Runtime.InteropServices;

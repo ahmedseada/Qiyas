@@ -3,8 +3,9 @@
 
 // Resampling with a per-channel scale and shift on the CPU (Abstraction/Resample.cs has the plan and the reference): a
 // task a run of planes (RowChunk: whole stored words and blocks of the output), each plane's input rows read where they
-// are stored into TN's float lane, the horizontal pass into a plane of lane values, then the vertical pass, the channel's
-// scale and shift, and the task's outputs stored once.
+// are stored into the output type's float lane (Fmt.FloatLane), the horizontal pass into a plane of lane values, then the
+// vertical pass, the channel's scale and shift, and the task's outputs stored once (an integer's or bool's by the type's
+// own conversion: rounded to nearest, ties to even, held to its range).
 using System.Buffers;
 using System.Runtime.InteropServices;
 using Adad.Abstraction;
@@ -13,43 +14,36 @@ namespace Adad.Cpu;
 
 internal sealed partial class Kernels
 {
-    public static string Resample<TIn, TN>(ResampleArgs a, byte[] x, int[] bounds, byte[] weights, byte[]? values, byte[] y) where TIn : struct, IAdad<TIn> where TN : struct, IFloatAdad<TN>
+    public static string Resample<TIn, TN>(ResampleArgs a, byte[] x, int[] bounds, byte[] weights, byte[]? values, byte[] y) where TIn : struct, IAdad<TIn> where TN : struct, IAdad<TN>
     {
         a.Validate();
-        var v = new ResampleIn<TN>(a, x, bounds, weights, values, y);
-        TIn.Elementwise(ref v);
-        return v.Lane;
+        return InFloatLane<TN, ResampleCall<TIn>>(new ResampleCall<TIn>(a, x, bounds, weights, values, y));
     }
 
-    private struct ResampleIn<TN>(ResampleArgs a, byte[] x, int[] bounds, byte[] weights, byte[]? values, byte[] y) : ILaneVisitor where TN : struct, IFloatAdad<TN>
+    private readonly struct ResampleCall<TIn>(ResampleArgs a, byte[] x, int[] bounds, byte[] weights, byte[]? values, byte[] y) : IFloatOf where TIn : struct, IAdad<TIn>
     {
-        public string Lane = "";
+        public string Run<TN, TE, TLane, TL>() where TN : struct, IAdad<TN, TE> where TE : unmanaged where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+        {
+            if (a.Count == 0) return TL.Name;
+            var v = new ResampleIn<TN, TE, TLane, TL>(a, x, bounds, weights, values, y);
+            TIn.Elementwise(ref v);
+            return TL.Name;
+        }
+    }
 
+    private readonly struct ResampleIn<TN, TE, TLane, TL>(ResampleArgs a, byte[] x, int[] bounds, byte[] weights, byte[]? values, byte[] y) : ILaneVisitor
+        where TN : struct, IAdad<TN, TE> where TE : unmanaged where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    {
         public void Run<TF, TLF, TLFL>() where TF : struct, IAdad<TF, TLF> where TLF : unmanaged where TLFL : struct, ILane<TLFL, TLF>
         {
-            var o = new ResampleOut<TF, TLF>(a, x, bounds, weights, values, y);
-            TN.Float(ref o);
-            Lane = o.Lane;
-        }
-    }
-
-    private struct ResampleOut<TF, TLF>(ResampleArgs a, byte[] x, int[] bounds, byte[] weights, byte[]? values, byte[] y) : IFloatLaneVisitor
-        where TF : struct, IAdad<TF, TLF> where TLF : unmanaged
-    {
-        public string Lane = "";
-
-        public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
-        {
-            Lane = TL.Name;
-            if (a.Count == 0) return;
             int plane = a.OutHeight * a.OutWidth;
             long work = (long)a.Count * Math.Max(1, a.XTaps + a.YTaps) + (long)a.InputCount;
-            Team.For(a.Planes, RowChunk<TN>(a.Planes, plane, a.Planes / (Threads * 4)), work, new ResampleBody<TF, TLF, TN, TLane, TL>(a, x, bounds, weights, values, y));
+            Team.For(a.Planes, RowChunk<TN>(a.Planes, plane, a.Planes / (Threads * 4)), work, new ResampleBody<TF, TLF, TN, TE, TLane, TL>(a, x, bounds, weights, values, y));
         }
     }
 
-    private readonly struct ResampleBody<TF, TLF, TN, TLane, TL>(ResampleArgs a, byte[] x, int[] bounds, byte[] weights, byte[]? values, byte[] y) : Team.IBody
-        where TF : struct, IAdad<TF, TLF> where TLF : unmanaged where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    private readonly struct ResampleBody<TF, TLF, TN, TE, TLane, TL>(ResampleArgs a, byte[] x, int[] bounds, byte[] weights, byte[]? values, byte[] y) : Team.IBody
+        where TF : struct, IAdad<TF, TLF> where TLF : unmanaged where TN : struct, IAdad<TN, TE> where TE : unmanaged where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         public void Run(int first, int last)
         {
@@ -108,7 +102,22 @@ internal sealed partial class Kernels
                     }
                 }
 
-                TN.Store(outs.AsSpan(0, (last - first) * plane), y, first * plane);
+                var done = outs.AsSpan(0, (last - first) * plane);
+                if (typeof(TE) == typeof(TLane)) TN.Store(MemoryMarshal.Cast<TLane, TE>(done), y, first * plane);
+                else
+                {
+                    // An integer's (or bool's) values: the lane's taken to the natural lane by the type's conversion, then stored.
+                    var natural = ArrayPool<TE>.Shared.Rent(done.Length);
+                    try
+                    {
+                        Widths.Store<TLane, TE>(done, natural.AsSpan(0, done.Length));
+                        TN.Store(natural.AsSpan(0, done.Length), y, first * plane);
+                    }
+                    finally
+                    {
+                        ArrayPool<TE>.Shared.Return(natural);
+                    }
+                }
             }
             finally
             {

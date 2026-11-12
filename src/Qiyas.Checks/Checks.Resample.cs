@@ -2,8 +2,11 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // The resampling with a scale and a shift a channel (Resampling), on every device against its float64 reference: every
-// float output type from uint8, int16, float16, float32, float64 and the output's own type (by a scale and a shift a
-// channel or none, within the lane's rounding), over each filter, shrinking, enlarging, one axis or neither.
+// output type (the integers and bool among them, computed in the output's float lane, Fmt.FloatLane) from uint8, int16,
+// float16, float32, float64 and the output's own type (a 64-bit integer's spread past 2^53), by a scale and a shift a
+// channel or none, over each filter, shrinking, enlarging, one axis or neither: a float type's within the lane's
+// rounding, an integer's (and bool's) the reference rounded and held to the type's range within half a step plus the
+// lane's rounding; the lane named.
 namespace Qiyas;
 
 internal static partial class Checks
@@ -26,8 +29,9 @@ internal static partial class Checks
         string[] inputs = ["uint8", "int16", "float16", "float32", "float64"];
         foreach (var type in Bench.Registry.Names)
         {
-            if (!Bench.Registry.IsFloat(type)) continue;
-            bool f64 = type == "float64";
+            bool isFloat = Bench.Registry.IsFloat(type);
+            int bits = Bench.Registry.Bits(type);
+            bool f64 = isFloat ? bits == 64 : bits > 16;                       // Fmt.FloatLane
             foreach (var k in ResampleCases)
                 foreach (string input in inputs.Append(type).Distinct())
                     foreach (bool norm in new[] { true, false })
@@ -35,7 +39,8 @@ internal static partial class Checks
                         var (a, bounds, raw) = Resampling.Plan(k.Planes, k.Channels, k.H, k.W, k.OH, k.OW, k.Filter);
                         var weights = Resampling.InLane(raw, f64);
                         var (low, high) = input switch { "uint8" => (0.0, 255.0), "int16" => (-300.0, 300.0), _ => (-4.0, 4.0) };
-                        var x = Bench.Registry.Make(input, a.InputCount, 91, low, high);
+                        bool wide = input == type && !isFloat && bits == 64;
+                        var x = wide ? Wide64(type, a.InputCount, 91) : Bench.Registry.Make(input, a.InputCount, 91, low, high);
                         var xv = Bench.Registry.Values(input, x, a.InputCount);
                         double[]? values = null;
                         if (norm)
@@ -49,25 +54,26 @@ internal static partial class Checks
                         var (ry, scale) = Resampling.Reference(a, xv, bounds, weights, values);
                         var y = new byte[Bench.Registry.Bytes(type, a.Count)];
                         var vb = values is null ? null : Resampling.LaneBytes(values, f64);
-                        Bench.Registry.With(input, new ResampleRun(ops, type, a, x, bounds, Resampling.LaneBytes(weights, f64), vb, y));
-                        string what = $"resample {k.Name} {input}{(norm ? " scaled" : "")}";
-                        double worst = Excess(type, what, y, ry, i => scale[i], 1);
+                        string lane = Bench.Registry.With(input, new ResampleRun(ops, type, a, x, bounds, Resampling.LaneBytes(weights, f64), vb, y));
+                        string what = $"resample {k.Name} {input}{(wide ? " past 2^53" : "")}{(norm ? " scaled" : "")}";
+                        if (lane != (f64 ? "f64" : "f32")) { Console.WriteLine($"check {what,-56} {where,-6} {type,-12} DIFFERS: the lane {lane}"); ok = false; continue; }
+                        double worst = isFloat ? Excess(type, what, y, ry, i => scale[i], 1) : IntegerExcess(type, y, ry, i => scale[i], 1);
                         if (worst > 0) { Console.WriteLine($"check {what,-56} {where,-6} {type,-12} DIFFERS by {worst:0.##}"); ok = false; }
                     }
         }
 
-        if (ok) Console.WriteLine($"check resamples              {where,-6} every float type: the box, triangle, Hamming, cubic and Lanczos filters shrinking, enlarging, one axis and neither, from 6 input types in the lane (by a scale and a shift a channel or none): as the references");
+        if (ok) Console.WriteLine($"check resamples              {where,-6} every type (the integers and bool by their own conversion, 64-bit integers past 2^53): the box, triangle, Hamming, cubic and Lanczos filters shrinking, enlarging, one axis and neither, from 6 input types in the output's float lane (by a scale and a shift a channel or none): as the references");
         return ok;
     }
 
     private sealed class ResampleRun(IDevice<ulong, ulong>? ops, string type, ResampleArgs a, byte[] x, int[] bounds, byte[] weights, byte[]? values, byte[] y) : Bench.ITypeVisitor<string>
     {
-        public string Visit<TI>() where TI : struct, IAdad<TI, float> => Bench.Registry.WithFloat(type, new Out<TI>(ops, a, x, bounds, weights, values, y));
+        public string Visit<TI>() where TI : struct, IAdad<TI, float> => Bench.Registry.With(type, new Out<TI>(ops, a, x, bounds, weights, values, y));
 
-        private sealed class Out<TI>(IDevice<ulong, ulong>? ops, ResampleArgs a, byte[] x, int[] bounds, byte[] weights, byte[]? values, byte[] y) : Bench.IFloatTypeVisitor<string>
+        private sealed class Out<TI>(IDevice<ulong, ulong>? ops, ResampleArgs a, byte[] x, int[] bounds, byte[] weights, byte[]? values, byte[] y) : Bench.ITypeVisitor<string>
             where TI : struct, IAdad<TI, float>
         {
-            public string Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+            public string Visit<TN>() where TN : struct, IAdad<TN, float>
             {
                 if (ops is null) return CpuDevice.Device.Resample<TI, TN>(a, x, bounds, weights, values, y);
                 using var st = new Staged(ops);

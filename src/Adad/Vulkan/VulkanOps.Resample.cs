@@ -10,11 +10,11 @@ namespace Adad.Vulkan;
 
 public sealed partial class VulkanOps
 {
-    public string Resample<TIn, TN>(ResampleArgs a, ulong x, ulong bounds, ulong weights, ulong values, ulong y) where TIn : struct, IAdad<TIn> where TN : struct, IFloatAdad<TN>
+    public string Resample<TIn, TN>(ResampleArgs a, ulong x, ulong bounds, ulong weights, ulong values, ulong y) where TIn : struct, IAdad<TIn> where TN : struct, IAdad<TN>
     {
         a.Validate();
         Fmt fi = Fmt.Of<TIn>(), f = Fmt.Of<TN>();
-        var lane = RowLane(f);
+        var lane = f.FloatLane;
         string name = lane.Name;
         if (a.Count == 0) return name;
         var midFmt = lane.Wide ? new Fmt("float64", 64, true, true) : new Fmt("float32", 32, true, true);
