@@ -4,8 +4,8 @@
 // Layout and indexing: data movement by index arithmetic, exact in every type (the value moves as stored; the lane is
 // the type's own; where values are summed — scatter-add, col2im — the sum lane by the bounds, stored as the type).
 //
-//   strided    a contiguous copy of a strided view of up to six dimensions: output[i0, …] = x[base + Σ i_d · stride_d]
-//              (permutes, transposed views, slices, broadcasts with a zero stride); canonical first (LayoutArgs.StridedKernel)
+//   strided    a contiguous copy of a strided view of any rank: output[i0, …] = x[base + Σ i_d · stride_d] (permutes,
+//              transposed views, slices, broadcasts with a zero stride); canonical first (LayoutArgs.StridedKernel)
 //   one_hot    output[i][c] = (c == index[i]) ? 1 : 0 over `classes` columns
 //   gather_rows   output[i] = x[index[i]] (a row each); gather_cols output[r][j] = x[r][index[j]]
 //   scatter_add_rows   output[index[i]] += x[i] (the embedding gradient): every output row sums its sources in source
@@ -205,7 +205,7 @@ internal sealed partial class Kernels
                 int tile = Math.Max(16, 64 / System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>());
                 if (!TN.Direct) tile = Math.Max(tile, TN.Granularity);
                 var p = k.P;
-                long groups = (long)p[0] * p[1] * p[2] / p[dim] * ((p[dim] + tile - 1) / tile);
+                long groups = (long)rows / p[dim] * ((p[dim] + tile - 1) / tile);
                 Team.For((int)groups, Math.Max(1, (int)(groups / (Threads * 4))), (long)k.Count, new StridedTileBody<TN, TLane>(k, cols, dim, tile));
             }
             else Move<TN, TLane, TL>(k, rows, cols, at);
@@ -280,22 +280,23 @@ internal sealed partial class Kernels
         return true;
     }
 
-    /// <summary>A strided copy whose output rows run across the input (the last dimension's stride not 1) while one of the
-    /// three outer dimensions has stride 1 (a transposition): taken by tiles of output rows along that dimension (see
+    /// <summary>A strided copy whose output rows run across the input (the last dimension's stride not 1) while an outer
+    /// dimension has stride 1 (a transposition): taken by tiles of output rows along the innermost such dimension (see
     /// StridedTileBody). Rows ending on whole bytes only (each row stored by one thread), values read in place or through
     /// the task's reader.</summary>
     private static bool StridedTiled<TN, TLane>(LayoutArgs k, int cols, out int dim) where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
     {
         dim = -1;
-        if (k.Name != "strided" || k.P.Length != 9 || k.P[7] == 1 || (long)cols * TN.Bits % 8 != 0) return false;   // the four-dimensional form
-        for (int j = 2; j >= 0; j--) if (k.P[4 + j] == 1 && k.P[j] > 1) { dim = j; return true; }
+        int rank = k.P.Length / 2;
+        if (k.Name != "strided" || rank < 2 || k.P[2 * rank - 1] == 1 || (long)cols * TN.Bits % 8 != 0) return false;
+        for (int j = rank - 2; j >= 0; j--) if (k.P[rank + j] == 1 && k.P[j] > 1) { dim = j; return true; }
         return false;
     }
 
     /// <summary>The tiled strided copy: a group is `tile` output rows that differ only in dimension `dim` (whose input
-    /// stride is 1) at one index of the other two; for each output column the group's values lie side by side in the input
-    /// (a cache line read once, not a line a value), gathered into the group's rows (a tile × cols block in lane storage),
-    /// each row then stored whole. Groups are disjoint sets of whole rows.</summary>
+    /// stride is 1) at one index of the other outer dimensions; for each output column the group's values lie side by side
+    /// in the input (a cache line read once, not a line a value), gathered into the group's rows (a tile × cols block in
+    /// lane storage), each row then stored whole. Groups are disjoint sets of whole rows.</summary>
     private struct StridedTileBody<TN, TLane>(LayoutArgs k, int cols, int dim, int tile) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
     {
@@ -303,8 +304,9 @@ internal sealed partial class Kernels
         public readonly void Run(int first, int last)
         {
             var p = k.P;
-            int d0 = p[0], d1 = p[1], d2 = p[2], dj = p[dim], blocks = (dj + tile - 1) / tile;
-            long s7 = p[7];
+            int rank = p.Length / 2, outer = rank - 1, dj = p[dim], blocks = (dj + tile - 1) / tile;
+            long sLast = p[2 * rank - 1], rowStep = 1;
+            for (int i = dim + 1; i < outer; i++) rowStep *= p[i];      // the output rows between two indices of dim
             ReadOnlySpan<TLane> src = TN.Direct ? MemoryMarshal.Cast<byte, TLane>(k.X.AsSpan()) : default;
             var input = TN.Direct ? null : new Reader<TN, TLane>(k.X, k.InputCount);
             var lineBuffer = TN.Direct ? null : ArrayPool<TLane>.Shared.Rent(tile);
@@ -313,27 +315,25 @@ internal sealed partial class Kernels
             {
                 for (int g = first; g < last; g++)
                 {
-                    // g = outer · blocks + block; outer enumerates the two other dimensions (in their order).
-                    int block = g % blocks, outer = g / blocks;
-                    int lo = block * tile, count = Math.Min(tile, dj - lo);
-                    int i0, i1, i2;
-                    if (dim == 0) { i2 = outer % d2; i1 = outer / d2; i0 = lo; }
-                    else if (dim == 1) { i2 = outer % d2; i0 = outer / d2; i1 = lo; }
-                    else { i1 = outer % d1; i0 = outer / d1; i2 = lo; }
-                    long b0 = p[8] + (long)i0 * p[4] + (long)i1 * p[5] + (long)i2 * p[6];  // value lo of the group (stride 1 in t)
+                    // g = rest · blocks + block; rest enumerates the other outer dimensions (in their order).
+                    int block = g % blocks, lo = block * tile, count = Math.Min(tile, dj - lo);
+                    long rest = g / blocks, b0 = p[2 * rank] + lo, r0 = 0, step = 1;     // value lo of the group (stride 1 in t)
+                    for (int i = outer - 1; i >= 0; i--)
+                    {
+                        long index = i == dim ? lo : rest % p[i];
+                        if (i != dim) { rest /= p[i]; b0 += index * p[rank + i]; }
+                        r0 += index * step;
+                        step *= p[i];
+                    }
+
                     var t2 = buffer.AsSpan(0, tile * cols);
                     for (int c = 0; c < cols; c++)
                     {
-                        var line = input is null ? src.Slice((int)(b0 + c * s7), count) : input.Span(b0 + c * s7, count, lineBuffer!);
+                        var line = input is null ? src.Slice((int)(b0 + c * sLast), count) : input.Span(b0 + c * sLast, count, lineBuffer!);
                         for (int t = 0; t < count; t++) t2[t * cols + c] = line[t];
                     }
 
-                    for (int t = 0; t < count; t++)
-                    {
-                        int r0 = dim == 0 ? i0 + t : i0, r1 = dim == 1 ? i1 + t : i1, r2 = dim == 2 ? i2 + t : i2;
-                        long r = ((long)r0 * d1 + r1) * d2 + r2;
-                        TN.Store(t2.Slice(t * cols, cols), k.Output, (int)(r * cols));
-                    }
+                    for (int t = 0; t < count; t++) TN.Store(t2.Slice(t * cols, cols), k.Output, (int)((r0 + t * rowStep) * cols));
                 }
             }
             finally
@@ -448,8 +448,8 @@ internal sealed partial class Kernels
                     {
                         case "strided":
                         {
-                            // Row r over the outer dimensions (three, or five of a six-dimensional view), the row along the last.
-                            int rank = (p.Length - 1) / 2;
+                            // Row r over the outer dimensions, the row along the last.
+                            int rank = p.Length / 2;
                             long b = p[2 * rank];
                             for (int d = rank - 2, t = r; d >= 0; d--) { b += (long)(t % p[d]) * p[rank + d]; t /= p[d]; }
                             long step = p[2 * rank - 1];

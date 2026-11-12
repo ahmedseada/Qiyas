@@ -31,8 +31,8 @@ internal static partial class VkKernels
         return args;
     }
 
-    /// <summary>The integer parameters a layout kernel takes (LayoutArgs.KernelP: a six-dimensional view's thirteen the most).</summary>
-    public const int LayoutParamCount = 16;
+    /// <summary>The integer parameters a layout kernel takes (LayoutArgs.KernelParams).</summary>
+    public const int LayoutParamCount = LayoutArgs.KernelParams;
 
     private readonly struct LayoutIn
     {
@@ -256,39 +256,26 @@ internal static partial class VkKernels
         V Load2(V index) => Codec.UnpackAt(b, f, a.X2, index, lane);
         V Index(V ptr, V i) => b.Bitcast(b.Load(K.S32, b.At(ptr, i, 4)), K.U32);
         V Zero() => b.C(k, 0);
+        if (name.StartsWith("strided", StringComparison.Ordinal))
+        {
+            // A canonical view of rank n (strided1 … strided7: LayoutArgs.StridedKernel): row r over the outer dimensions, column
+            // c along the last; source = base + Σ i_d · s_d (strides wrap as u32: the source itself is inside the input).
+            int n = int.Parse(name.AsSpan(7));
+            var src = c * p[2 * n - 1] + p[2 * n];
+            var t = r;
+            for (int d = n - 2; d >= 1; d--)
+            {
+                var i = t % p[d];
+                t = t / p[d];
+                src = i * p[n + d] + src;
+            }
+
+            if (n >= 2) src = t * p[n] + src;
+            return Load(src);
+        }
+
         switch (name)
         {
-            case "strided":
-            {
-                // v = ((i0·d1 + i1)·d2 + i2)·d3 + i3; source = base + Σ i_d · s_d.
-                var i3 = v % p[3];
-                var t = v / p[3];
-                var i2 = t % p[2];
-                t = t / p[2];
-                var i1 = t % p[1];
-                var i0 = t / p[1];
-                var src = i0 * p[4] + p[8];
-                src = i1 * p[5] + src;
-                src = i2 * p[6] + src;
-                src = i3 * p[7] + src;
-                return Load(src);
-            }
-
-            case "strided6":
-            {
-                // Six dimensions (LayoutArgs.StridedKernel): v = ((((i0·d1 + i1)·d2 + i2)·d3 + i3)·d4 + i4)·d5 + i5; source = base + Σ i_d · s_d.
-                var t = v;
-                var src = p[12];
-                for (int d = 5; d >= 1; d--)
-                {
-                    var i = t % p[d];
-                    t = t / p[d];
-                    src = i * p[6 + d] + src;
-                }
-
-                return Load(t * p[6] + src);
-            }
-
             case "one_hot":
                 return b.Select(Index(a.Idx, r) == c, b.C(k, 1), Zero());
 

@@ -22,8 +22,8 @@ public sealed partial class VulkanOps
         k = k.ForKernels();
         var f = Fmt.Of<TN>();
         var (_, cols) = LayoutArgs.OutputRows(k);
-        // A six-dimensional view takes its own kernel (the four-dimensional one keeps its three divisions a value).
-        string kn = k.Name == "strided" && k.P.Length == 13 ? "strided6" : k.Name;
+        // A strided view takes the kernel of its canonical rank (a division a dimension a value).
+        string kn = LayoutArgs.KernelName(k.Name, k.P);
         Lane lane;
         if (inFmt is not null) lane = inFmt.Natural;
         else if (LayoutArgs.Sums(k.Name))

@@ -1707,7 +1707,24 @@ internal static partial class Checks
         }
 
         if (cuda is not null) cuda.LayoutPerValue = null;
-        if (ok) Console.WriteLine($"check layouts                {where,-6} every type{(blocks ? "" : " but the block formats")}: moves exact, sums and resizes within the lane's rounding; max pooling in Adad's order (NaN, ±0, −inf, ties: exactly)");
+
+        // A view whose eight dimensions do not merge, past the device kernels' rank: the CPU copies it exactly; a device refuses
+        // it with NotSupportedException naming it.
+        foreach (var type in Bench.Registry.Names)
+        {
+            if (!blocks && Bench.Registry.IsBlock(type)) continue;
+            var k = Bench.LayoutCases.PastKernelRank(type);
+            var reference = LayoutArgs.Reference(k.Name, Bench.Registry.Values(type, k.X, k.InputCount), null, k.P, k.Count);
+            try
+            {
+                Bench.Registry.With(type, new LayoutRun(ops, k));
+                if (ops is null) ok &= Close(type, "layout strided of rank 8", where, k.Output, reference, k.Count, 0);
+                else { Console.WriteLine($"check layouts {where} {type}: a strided view of eight dimensions DIFFERS: not refused"); ok = false; }
+            }
+            catch (NotSupportedException e) when (ops is not null && e.Message.StartsWith("strided:", StringComparison.Ordinal)) { }
+        }
+
+        if (ok) Console.WriteLine($"check layouts                {where,-6} every type{(blocks ? "" : " but the block formats")}: moves exact, sums and resizes within the lane's rounding; max pooling in Adad's order (NaN, ±0, −inf, ties: exactly); views of any rank ({(ops is null ? "eight dimensions" : $"past {LayoutArgs.KernelRank} dimensions refused")})");
         return ok;
     }
 
@@ -1717,15 +1734,22 @@ internal static partial class Checks
         {
             if (ops is null) { Kernels.Layout<TN>(k); return true; }
             ulong dx = ops.Rent(k.X.Length + 16), dout = ops.Rent(k.Output.Length + 16), didx = k.Index is null ? 0 : ops.RentIndices(k.Index.Length), dx2 = k.X2 is null ? 0 : ops.Rent(k.X2.Length + 16);
-            ops.Upload(k.X, dx);
-            if (k.Index is not null) ops.UploadIndices(k.Index, didx);
-            if (k.X2 is not null) ops.Upload(k.X2, dx2);
-            ops.Layout<TN>(k, dx, didx, dout, dx2);
-            ops.Synchronize();
-            ops.Download(dout, k.Output);
-            ops.Return(dx); ops.Return(dout);
-            if (didx != 0) ops.ReturnIndices(didx);
-            if (dx2 != 0) ops.Return(dx2);
+            try
+            {
+                ops.Upload(k.X, dx);
+                if (k.Index is not null) ops.UploadIndices(k.Index, didx);
+                if (k.X2 is not null) ops.Upload(k.X2, dx2);
+                ops.Layout<TN>(k, dx, didx, dout, dx2);
+                ops.Synchronize();
+                ops.Download(dout, k.Output);
+            }
+            finally
+            {
+                ops.Return(dx); ops.Return(dout);
+                if (didx != 0) ops.ReturnIndices(didx);
+                if (dx2 != 0) ops.Return(dx2);
+            }
+
             return true;
         }
     }

@@ -22,9 +22,25 @@ public static class LayoutCases
 
     private static int PoolCount(int[] p) { var (oh, ow) = LayoutArgs.PoolOut(p); return p[0] * oh * ow; }
 
+    /// <summary>A contiguous array of the shape read with its dimensions in the given order (a strided view: the order's
+    /// sizes, each with its dimension's stride in the array).</summary>
+    private static LayoutArgs Permuted(string type, int[] shape, int[] order, int seed)
+    {
+        int rank = shape.Length, n = 1;
+        var stride = new int[rank];
+        for (int i = rank - 1; i >= 0; i--) { stride[i] = n; n *= shape[i]; }
+        var p = new int[2 * rank + 1];
+        for (int i = 0; i < rank; i++) { p[i] = shape[order[i]]; p[rank + i] = stride[order[i]]; }
+        return Make("strided", type, n, null, p, n, seed);
+    }
+
+    /// <summary>A view of eight dimensions that do not merge (a reversal of 2⁸ values): past the device kernels' rank
+    /// (LayoutArgs.KernelRank), taken by the CPU and refused by a device.</summary>
+    public static LayoutArgs PastKernelRank(string type) => Permuted(type, [2, 2, 2, 2, 2, 2, 2, 2], [7, 6, 5, 4, 3, 2, 1, 0], 58);
+
     public static string Shape(LayoutArgs k) => k.Name switch
     {
-        "strided" => string.Join("x", k.P.Take((k.P.Length - 1) / 2)),
+        "strided" => k.P.Length == 1 ? "one value" : string.Join("x", k.P.Take(k.P.Length / 2)),
         "one_hot" => $"{k.P[0]}x{k.P[1]}",
         "gather_rows" => $"{k.P[2]} of {k.P[0]}x{k.P[1]}",
         "gather_cols" => $"{k.P[2]} of {k.P[0]}x{k.P[1]}",
@@ -68,6 +84,16 @@ public static class LayoutCases
                 yield return Make(name, type, 480, null, [2, 3, 5, 2, 4, 2, 240, 80, 4, 40, 1, 20, 0], 480, 68);
                 yield return Make(name, type, 144, null, [2, 3, 3, 2, 2, 2, 1, 4, 24, 2, 12, 72, 0], 144, 69);
                 yield return Make(name, type, 130, null, [1, 2, 1, 3, 4, 5, 0, 60, 0, 20, 5, 1, 7], 120, 60);
+                // Other ranks: a single value (rank 0), a strided slice (1), a transposition (2), a broadcast over a third (3),
+                // a permutation of five, seven dimensions that do not merge (the device kernels' largest rank), and eight that
+                // merge to two.
+                yield return Make(name, type, 7, null, [5], 1, 51);
+                yield return Make(name, type, 30, null, [9, 3, 2], 9, 52);
+                yield return Make(name, type, 35, null, [5, 7, 1, 5, 0], 35, 53);
+                yield return Make(name, type, 20, null, [3, 4, 5, 0, 5, 1, 0], 60, 54);
+                yield return Permuted(type, [2, 3, 2, 3, 2], [3, 0, 4, 2, 1], 55);
+                yield return Permuted(type, [2, 2, 2, 2, 2, 2, 2], [6, 5, 4, 3, 2, 1, 0], 56);
+                yield return Permuted(type, [2, 3, 1, 4, 5, 1, 2, 3], [4, 5, 6, 7, 0, 1, 2, 3], 57);
                 break;
             case "one_hot":
                 yield return Make(name, type, 1, Indices(37, 17, 64), [37, 17], 37 * 17, 64);

@@ -12,8 +12,8 @@ namespace Adad.Cuda;
 
 internal static partial class Ptx
 {
-    /// <summary>The integer parameters a layout kernel takes (LayoutArgs.KernelP: a six-dimensional view's thirteen the most).</summary>
-    public const int LayoutParamCount = 16;
+    /// <summary>The integer parameters a layout kernel takes (LayoutArgs.KernelParams).</summary>
+    public const int LayoutParamCount = LayoutArgs.KernelParams;
 
     private static readonly string LayoutParams = ".param .u64 p_x, .param .u64 p_x2, .param .u64 p_idx, .param .u64 p_aux, .param .u64 p_out, .param .u32 p_count, .param .u32 p_rows, .param .u32 p_cols, "
         + string.Join(", ", Enumerable.Range(0, LayoutParamCount).Select(k => $".param .u32 p_p{k}"));
@@ -266,25 +266,28 @@ internal static partial class Ptx
         string Index(string ptr, string i) { string a = b.RD(), o = b.R(); b.L($"mul.wide.u32 {a}, {i}, 4;"); b.L($"add.u64 {a}, {ptr}, {a};"); b.L($"ld.global.s32 {o}, [{a}];"); return o; }
         string Zero() { string z = lane.NewReg(b); b.L($"mov.{lane.Reg} {z}, {lane.Zero};"); return z; }
         string Sel(string pred, string a, string z) { string d = lane.NewReg(b); b.L($"selp.{(lane.IsFloat ? lane.Op : lane.Reg)} {d}, {a}, {z}, {pred};"); return d; }
+        if (name.StartsWith("strided", StringComparison.Ordinal))
+        {
+            // A canonical view of rank n (strided1 … strided7: LayoutArgs.StridedKernel): row r over the outer dimensions, column
+            // c along the last; source = base + Σ i_d · s_d (strides wrap as u32: the source itself is inside the input).
+            int n = int.Parse(name.AsSpan(7));
+            string src = b.R(), t = b.R();
+            b.L($"mad.lo.u32 {src}, {c}, {p[2 * n - 1]}, {p[2 * n]};");
+            b.L($"mov.u32 {t}, {r};");
+            for (int d = n - 2; d >= 1; d--)
+            {
+                string i = b.R();
+                b.L($"rem.u32 {i}, {t}, {p[d]};");
+                b.L($"div.u32 {t}, {t}, {p[d]};");
+                b.L($"mad.lo.u32 {src}, {i}, {p[n + d]}, {src};");
+            }
+
+            if (n >= 2) b.L($"mad.lo.u32 {src}, {t}, {p[n]}, {src};");
+            return Load(src);
+        }
+
         switch (name)
         {
-            case "strided":
-            {
-                // v = ((i0·d1 + i1)·d2 + i2)·d3 + i3; source = base + Σ i_d · s_d.
-                string i3 = b.R(), t = b.R(), i2 = b.R(), i1 = b.R(), i0 = b.R(), src = b.R(), q = b.R();
-                b.L($"rem.u32 {i3}, {v}, {p[3]};");
-                b.L($"div.u32 {t}, {v}, {p[3]};");
-                b.L($"rem.u32 {i2}, {t}, {p[2]};");
-                b.L($"div.u32 {t}, {t}, {p[2]};");
-                b.L($"rem.u32 {i1}, {t}, {p[1]};");
-                b.L($"div.u32 {i0}, {t}, {p[1]};");
-                b.L($"mad.lo.u32 {src}, {i0}, {p[4]}, {p[8]};");
-                b.L($"mad.lo.u32 {src}, {i1}, {p[5]}, {src};");
-                b.L($"mad.lo.u32 {src}, {i2}, {p[6]}, {src};");
-                b.L($"mad.lo.u32 {src}, {i3}, {p[7]}, {src};");
-                _ = q;
-                return Load(src);
-            }
 
             case "one_hot":
             {
@@ -415,24 +418,6 @@ internal static partial class Ptx
                 b.L($"bra CA{tag};");
                 b.Label($"CA{tag}_END");
                 return acc;
-            }
-
-            case "strided6":
-            {
-                // Six dimensions (LayoutArgs.StridedKernel): v = ((((i0·d1 + i1)·d2 + i2)·d3 + i3)·d4 + i4)·d5 + i5; source = base + Σ i_d · s_d.
-                string t = b.R(), src = b.R();
-                b.L($"mov.u32 {t}, {v};");
-                b.L($"mov.u32 {src}, {p[12]};");
-                for (int d = 5; d >= 1; d--)
-                {
-                    string i = b.R();
-                    b.L($"rem.u32 {i}, {t}, {p[d]};");
-                    b.L($"div.u32 {t}, {t}, {p[d]};");
-                    b.L($"mad.lo.u32 {src}, {i}, {p[6 + d]}, {src};");
-                }
-
-                b.L($"mad.lo.u32 {src}, {t}, {p[6]}, {src};");
-                return Load(src);
             }
 
             case "interpolate_nearest":

@@ -27,8 +27,8 @@ public sealed partial class GpuOps
     {
         k = k.ForKernels();
         var f = Fmt.Of<TN>();
-        // A six-dimensional view takes its own kernel (the four-dimensional one keeps its three divisions a value).
-        string kn = k.Name == "strided" && k.P.Length == 13 ? "strided6" : k.Name;
+        // A strided view takes the kernel of its canonical rank (a division a dimension a value).
+        string kn = LayoutArgs.KernelName(k.Name, k.P);
         // A block format takes the same lanes (f32: a float type's) with its inputs decoded where they are stored, and its
         // output written by a warp or a CTA per block (Ptx.LayoutBlocks).
         var (rows, cols) = LayoutArgs.OutputRows(k);

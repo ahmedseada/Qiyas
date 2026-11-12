@@ -68,7 +68,7 @@ public sealed class LayoutArgs
     };
 
     // ---- the shapes behind P, in each operation's order
-    // strided: d0 d1 d2 d3 | s0 s1 s2 s3 | base            output d0·d1·d2·d3 (or six of each: d0..d5 | s0..s5 | base)
+    // strided: d0 … d(r−1) | s0 … s(r−1) | base             output d0·…·d(r−1), any rank r (P has 2r + 1 integers)
     // one_hot: n classes                                   output n·classes
     // gather_rows: rows cols n                             output n·cols
     // gather_cols: rows cols m                             output rows·m
@@ -90,7 +90,7 @@ public sealed class LayoutArgs
         var p = k.P;
         return k.Name switch
         {
-            "strided" => p.Length == 13 ? (p[0] * p[1] * p[2] * p[3] * p[4], p[5]) : (p[0] * p[1] * p[2], p[3]),
+            "strided" => StridedRows(p),
             "one_hot" => (p[0], p[1]),
             "gather_rows" => (p[2], p[1]),
             "gather_cols" => (p[0], p[2]),
@@ -139,8 +139,62 @@ public sealed class LayoutArgs
 
     // ---- the parameters as the kernels take them
 
-    /// <summary>A copy with the parameters the kernels read (KernelP).</summary>
-    public LayoutArgs ForKernels() => new() { Name = Name, X = X, X2 = X2, Index = Index, P = KernelP(Name, P), Output = Output, Count = Count, InputCount = InputCount };
+    /// <summary>A copy with the parameters the kernels read (KernelP), the shape validated first.</summary>
+    public LayoutArgs ForKernels()
+    {
+        Validate();
+        return new() { Name = Name, X = X, X2 = X2, Index = Index, P = KernelP(Name, P), Output = Output, Count = Count, InputCount = InputCount };
+    }
+
+    /// <summary>Throws ArgumentException on a shape the operation does not take.</summary>
+    public void Validate()
+    {
+        if (Name == "strided")
+        {
+            // 2r + 1 integers; every size ≥ 0, the output their product; a view with values reads inside the input.
+            if (P.Length % 2 == 0) throw new ArgumentException($"strided: {P.Length} parameters (a view of rank r takes 2r + 1)");
+            int rank = P.Length / 2;
+            long count = 1, low = P[2 * rank], high = P[2 * rank];
+            for (int i = 0; i < rank; i++)
+            {
+                if (P[i] < 0) throw new ArgumentException($"strided: dimension {i} of size {P[i]}");
+                count *= P[i];
+                long reach = (long)Math.Max(P[i] - 1, 0) * P[rank + i];
+                if (reach < 0) low += reach; else high += reach;
+            }
+
+            if (count != Count) throw new ArgumentException($"strided: a view of {count} values into an output of {Count}");
+            if (count > 0 && (low < 0 || high >= InputCount)) throw new ArgumentException($"strided: the view reads positions {low} to {high} of an input of {InputCount}");
+        }
+    }
+
+    /// <summary>The integers a device's layout kernel takes (its parameters past the buffers and counts).</summary>
+    public const int KernelParams = 16;
+
+    /// <summary>The largest rank of a canonical strided view (StridedKernel) the device kernels take: its 2r + 1 integers
+    /// within KernelParams.</summary>
+    public const int KernelRank = (KernelParams - 1) / 2;
+
+    /// <summary>The device kernel of the operation as the kernels take it (KernelP): a strided view's by its rank (strided1 …
+    /// strided7), the others their own; NotSupportedException where its integers pass the kernels' KernelParams.</summary>
+    public static string KernelName(string name, int[] kernelP)
+    {
+        if (kernelP.Length > KernelParams)
+            throw new NotSupportedException(name == "strided"
+                ? $"strided: a view of {kernelP.Length / 2} dimensions that do not merge (the device kernels take {KernelRank})"
+                : $"{name}: {kernelP.Length} parameters (the device kernels take {KernelParams})");
+        return name == "strided" ? $"strided{kernelP.Length / 2}" : name;
+    }
+
+    // A strided view's output rows: the outer dimensions' product by the last's size (one row of one value at rank 0).
+    private static (int Rows, int Cols) StridedRows(int[] p)
+    {
+        int rank = p.Length / 2;
+        if (rank == 0) return (1, 1);
+        long rows = 1;
+        for (int i = 0; i < rank - 1; i++) rows *= p[i];
+        return ((int)rows, p[rank - 1]);
+    }
 
     /// <summary>The parameters the device kernels read: a strided view canonical (StridedKernel), an interpolation's axes as
     /// C H W OH OW αh βh δh αw βw δw (InterpolateAxis); the others as given.</summary>
@@ -155,13 +209,13 @@ public sealed class LayoutArgs
         _ => p,
     };
 
-    /// <summary>A strided view (four or six dimensions) canonical: its dimensions of size 1 dropped and each that continues the
-    /// one inside it (stride = the inner's stride × its size) merged into it; four or fewer then as d0..d3 s0..s3 base, more
-    /// as d0..d5 s0..s5 base (leading dimensions of size 1). A view with no values is kept as given.</summary>
+    /// <summary>A strided view of any rank canonical: its dimensions of size 1 dropped and each that continues the one inside
+    /// it (stride = the inner's stride × its size) merged into it, the rest kept in order: rank 1 or more (a single value
+    /// is [1 | 0 | base]); a view with no values is [0, 1 | 0, 0 | base] (no rows).</summary>
     public static int[] StridedKernel(int[] p)
     {
-        int rank = (p.Length - 1) / 2;
-        for (int i = 0; i < rank; i++) if (p[i] == 0) return p;
+        int rank = p.Length / 2;
+        for (int i = 0; i < rank; i++) if (p[i] == 0) return [0, 1, 0, 0, p[2 * rank]];
         var d = new List<int>();
         var st = new List<int>();
         for (int i = 0; i < rank; i++)
@@ -172,14 +226,10 @@ public sealed class LayoutArgs
             st.Add(p[rank + i]);
         }
 
-        int r = d.Count <= 4 ? 4 : 6, lead = r - d.Count;
+        if (d.Count == 0) { d.Add(1); st.Add(0); }
+        int r = d.Count;
         var q = new int[2 * r + 1];
-        for (int i = 0; i < r; i++)
-        {
-            q[i] = i < lead ? 1 : d[i - lead];
-            q[r + i] = i < lead ? 0 : st[i - lead];
-        }
-
+        for (int i = 0; i < r; i++) { q[i] = d[i]; q[r + i] = st[i]; }
         q[2 * r] = p[2 * rank];
         return q;
     }
