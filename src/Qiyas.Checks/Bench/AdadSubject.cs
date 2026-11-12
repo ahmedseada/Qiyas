@@ -435,10 +435,10 @@ public sealed class AdadSubject : IBenchSubject
     public IBenchRun? AttentionStepsFirst(Device device, string type, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) =>
         Registry.IsFloat(type) ? Registry.WithFloat(type, new AttentionVisitor(device, a, q, k, v, o, false, null, null, null)) : null;
 
-    public IBenchRun? Rope(Device device, string type, RopeArgs a, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] y) =>
-        Registry.IsFloat(type) ? Registry.WithFloat(type, new RopeVisitor(device, a, x, gain, cos, sin, positions, y)) : null;
+    public IBenchRun? Rope(Device device, string type, RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new RopeVisitor(device, a, x, cos, sin, positions, y)) : null;
 
-    private sealed class RopeVisitor(Device device, RopeArgs a, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] y) : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+    private sealed class RopeVisitor(Device device, RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y) : IFloatTypeVisitor<IBenchRun?>, IFloatRun
     {
         public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, RopeVisitor>(device, this);
 
@@ -446,9 +446,8 @@ public sealed class AdadSubject : IBenchSubject
         {
             int pad = s.Slack;
             TB dx = s.In(x, pad), dc = s.In(cos, pad), ds = s.In(sin, pad), dy = s.Out(y, pad);
-            TB? dg = s.InOrNone(gain, pad);
             TI at = s.Index(positions);
-            return s.Run(() => s.D.Rope<TN>(a, dx, dg, dc, ds, at, dy));
+            return s.Run(() => s.D.Rope<TN>(a, dx, dc, ds, at, dy));
         }
     }
 

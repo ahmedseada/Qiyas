@@ -141,7 +141,7 @@ internal sealed class Options
     public static readonly string[] Group8 = ["lstm_step", "gru_step", "lstm_step_bwd", "gru_step_bwd", "lstm_seq", "lstm_seq_bwd", "gru_seq", "gru_seq_bwd"];
     public static readonly string[] Group9 = ["topk_rows", "log_softmax_topk", "pick_rows", "sample_rows", "route", "route_wide", "cross_entropy", "ctc", "ctc_bwd"];
     public static readonly string[] Group10 = ["cache_write", "quantize_rows", "attention_cached", "decoder_mask"];
-    public static readonly string[] Group11 = ["rope_table", "rope_heads", "attention_steps"];
+    public static readonly string[] Group11 = ["rope_table", "attention_steps"];
     public static readonly string[] Group12 = ["penalize", "sample_filtered", "sample_plain"];
     public static readonly string[] Group13 = ["memory:copy", "memory:clear", "memory:rent_zeroed"];
     public List<string>? Subjects;
@@ -893,9 +893,8 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         public double Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => CacheView.Excluded<TN>();
     }
 
-    // A layer's projections into the layouts attention reads (float types). The table rotary embedding after an RMS
-    // normalization over 16 heads of 512 steps of d = 128: rope_table (y's rows x's) and rope_heads (y's rows a head at a
-    // time). attention_steps: attention_causal's shape with Q, K, V and O a step at a time (the form's time and the strided
+    // A layer's projections into the layouts attention reads (float types). rope_table: the table rotary embedding over 16
+    // heads of 512 steps of d = 128. attention_steps: attention_causal's shape with Q, K, V and O a step at a time (the form's time and the strided
     // copies').
     private void HeadsRow(Device device, string type, string name)
     {
@@ -927,11 +926,10 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         byte[] cosBytes = Lanes(cos), sinBytes = Lanes(sin);
         int[] positions = [.. Enumerable.Range(0, steps)];
         var x = Registry.Make(type, n, 92, -1, 1);
-        var gain = Registry.Make(type, d, 93, 0.5, 2);
-        var a2 = new RopeArgs(rows, d, heads, steps, half, false) { HeadsFirst = name != "rope_table" };
+        var a2 = new RopeArgs(rows, d, heads, steps, half, false);
         var want = new double[n];
-        RowOps.RopeReference(Registry.Values(type, x, n), Registry.Values(type, gain, d), cos, sin, positions, a2, want);
-        Measure(device, name, type, $"{rows}x{d}", want, (s, y) => s.Rope(device, type, a2, x, gain, cosBytes, sinBytes, positions, y), x.Length);
+        RowOps.RopeReference(Registry.Values(type, x, n), cos, sin, positions, a2, want);
+        Measure(device, name, type, $"{rows}x{d}", want, (s, y) => s.Rope(device, type, a2, x, cosBytes, sinBytes, positions, y), x.Length);
     }
 
     // Products on views at the core product's size: transposed operands, 16 batches of a quarter size, the backward pair (dA and dB; dA scored).

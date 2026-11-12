@@ -102,9 +102,9 @@ public interface IBenchSubject
     /// <summary>O for the queries at the position against caches of cacheType (ICache.AttentionCached).</summary>
     IBenchRun? AttentionCached(Device device, string type, string cacheType, AttentionArgs a, int position, byte[] q, byte[] k, byte[] v, byte[] o) => null;
 
-    /// <summary>The rotary embedding by tables (IRows.Rope): x's rows normalized (a gain given) and rotated into y (the type),
-    /// y's rows a head at a time when a.HeadsFirst; cos and sin the float lane's storage.</summary>
-    IBenchRun? Rope(Device device, string type, RopeArgs a, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] y) => null;
+    /// <summary>The rotary embedding by tables (IRows.Rope): x's rows rotated into y (the type); cos and sin the float lane's
+    /// storage.</summary>
+    IBenchRun? Rope(Device device, string type, RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y) => null;
 
     /// <summary>O for Q, K, V and O a step at a time (AttentionArgs.StepsFirst).</summary>
     IBenchRun? AttentionStepsFirst(Device device, string type, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o) => null;

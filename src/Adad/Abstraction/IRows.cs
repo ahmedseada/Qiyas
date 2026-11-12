@@ -33,6 +33,6 @@ public interface IRows<TBuffer, TIndex>
         where TN : struct, IFloatAdad<TN>;
 
     /// <summary>The rotary embedding by tables (RopeArgs) of x into y (not x itself): positions per step, cos and sin in the float
-    /// lane's storage; with a gain, each row RMS-normalized first (the queries' and keys' norm and their rotation in one pass).</summary>
-    string Rope<TN>(RopeArgs a, TBuffer x, TBuffer? gain, TBuffer cos, TBuffer sin, TIndex positions, TBuffer y) where TN : struct, IFloatAdad<TN>;
+    /// lane's storage.</summary>
+    string Rope<TN>(RopeArgs a, TBuffer x, TBuffer cos, TBuffer sin, TIndex positions, TBuffer y) where TN : struct, IFloatAdad<TN>;
 }

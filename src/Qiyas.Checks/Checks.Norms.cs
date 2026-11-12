@@ -4,7 +4,7 @@
 // The normalizations past the rows, on every device against their float64 references (RowOps): group normalization over
 // batch, group, instance and a layer's layouts (GroupShape), with and without its gain and bias and by given statistics, and
 // its backward (dx, dgamma, dbeta); the rotary embedding by tables over half and interleaved pairs, a partial rotation and
-// the inverse, alone and after an RMS normalization by an offset gain. Every float type, the block formats among them.
+// the inverse. Every float type, the block formats among them.
 namespace Qiyas;
 
 internal static partial class Checks
@@ -245,20 +245,20 @@ internal static partial class Checks
 
     // ---------------------------------------------------------------- the rotary embedding by tables
 
-    /// <summary>Every float type over half and interleaved pairs, a partial rotation, an odd row, the inverse, and the RMS
-    /// normalization by an offset gain first: within the type's step plus 8 lane ulps of each row's error scale.</summary>
+    /// <summary>Every float type over half and interleaved pairs, a partial rotation, an odd row and the inverse: within the
+    /// type's step plus 8 lane ulps of each row's error scale.</summary>
     private static bool Ropes(IDevice<ulong, ulong>? ops, string device)
     {
         bool ok = true;
         string where = ops is null ? "cpu" : device;
         const int MaxPos = 64;
-        var cases = new (int Batch, int Steps, int Heads, int Cols, int Half, bool Interleaved, bool Inverse, bool Gain)[]
+        var cases = new (int Batch, int Steps, int Heads, int Cols, int Half, bool Interleaved, bool Inverse)[]
         {
-            (2, 5, 3, 64, 32, false, false, false),
-            (2, 5, 3, 64, 16, true, false, false),
-            (1, 7, 2, 17, 8, false, true, false),
-            (2, 3, 4, 128, 32, false, false, true),
-            (1, 4, 3, 40, 20, true, true, true),
+            (2, 5, 3, 64, 32, false, false),
+            (2, 5, 3, 64, 16, true, false),
+            (1, 7, 2, 17, 8, false, true),
+            (2, 3, 4, 128, 32, false, false),
+            (1, 4, 3, 40, 20, true, true),
         };
 
         foreach (var type in Bench.Registry.Names)
@@ -268,7 +268,7 @@ internal static partial class Checks
             foreach (var k in cases)
             {
                 int rows = k.Batch * k.Steps * k.Heads;
-                var a = new RopeArgs(rows, k.Cols, k.Heads, k.Steps, k.Half, k.Interleaved, k.Inverse, 1e-6, k.Gain ? 1 : 0);
+                var a = new RopeArgs(rows, k.Cols, k.Heads, k.Steps, k.Half, k.Interleaved, k.Inverse);
                 var cos = new double[MaxPos * k.Half];
                 var sin = new double[MaxPos * k.Half];
                 for (int p = 0; p < MaxPos; p++)
@@ -283,28 +283,27 @@ internal static partial class Checks
                 sin = LaneRound(lane, sin);
                 var positions = Enumerable.Range(0, k.Steps).Select(t => t * 7 % MaxPos).ToArray();
                 var x = Bench.Registry.Make(type, rows * k.Cols, 81, -4, 4);
-                var gain = k.Gain ? Bench.Registry.Make(type, k.Cols, 82, 0.5, 2) : null;
                 var ry = new double[rows * k.Cols];
-                var scale = RowOps.RopeReference(Bench.Registry.Values(type, x, rows * k.Cols), gain is null ? null : Bench.Registry.Values(type, gain, k.Cols), cos, sin, positions, a, ry);
+                var scale = RowOps.RopeReference(Bench.Registry.Values(type, x, rows * k.Cols), cos, sin, positions, a, ry);
                 var y = new byte[x.Length];
-                Bench.Registry.WithFloat(type, new RopeRun(ops, a, x, gain, LaneBytes(lane, cos), LaneBytes(lane, sin), positions, y));
-                string what = $"rope {rows}x{k.Cols} half {k.Half}{(k.Interleaved ? " interleaved" : "")}{(k.Inverse ? " inverse" : "")}{(k.Gain ? " rms" : "")}";
+                Bench.Registry.WithFloat(type, new RopeRun(ops, a, x, LaneBytes(lane, cos), LaneBytes(lane, sin), positions, y));
+                string what = $"rope {rows}x{k.Cols} half {k.Half}{(k.Interleaved ? " interleaved" : "")}{(k.Inverse ? " inverse" : "")}";
                 double worst = Excess(type, what, y, ry, i => scale[i / k.Cols], 8);
                 if (worst > 0) { Console.WriteLine($"check {what,-40} {where,-6} {type,-12} DIFFERS by {worst:0.##}"); ok = false; }
             }
         }
 
-        if (ok) Console.WriteLine($"check ropes                  {where,-6} every float type: half and interleaved pairs, partial, odd rows, inverse, and after an RMS normalization: within the lane's rounding of the references");
+        if (ok) Console.WriteLine($"check ropes                  {where,-6} every float type: half and interleaved pairs, partial, odd rows, inverse: within the lane's rounding of the references");
         return ok;
     }
 
-    private sealed class RopeRun(IDevice<ulong, ulong>? ops, RopeArgs a, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] y) : Bench.IFloatTypeVisitor<string>
+    private sealed class RopeRun(IDevice<ulong, ulong>? ops, RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y) : Bench.IFloatTypeVisitor<string>
     {
         public string Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
         {
-            if (ops is null) return CpuDevice.Device.Rope<TN>(a, x, gain, cos, sin, positions, y);
+            if (ops is null) return CpuDevice.Device.Rope<TN>(a, x, cos, sin, positions, y);
             using var st = new Staged(ops);
-            var lane = ops.Rope<TN>(a, st.In(x), st.In(gain), st.In(cos), st.In(sin), st.Indices(positions), st.Out(y));
+            var lane = ops.Rope<TN>(a, st.In(x), st.In(cos), st.In(sin), st.Indices(positions), st.Out(y));
             st.Collect();
             return lane;
         }

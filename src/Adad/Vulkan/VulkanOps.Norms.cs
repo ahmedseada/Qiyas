@@ -53,51 +53,20 @@ public sealed partial class VulkanOps
         return lane.Name;
     }
 
-    public string Rope<TN>(RopeArgs a, ulong x, ulong gain, ulong cos, ulong sin, ulong positions, ulong y) where TN : struct, IFloatAdad<TN> =>
-        RopeTo(a, Fmt.Of<TN>(), null, x, gain, cos, sin, positions, y);
-
-    /// <summary>IRows.Rope of x (f) into y stored as outFmt (null: f; the lane's own format for a composition's intermediate),
-    /// y's rows a head at a time when a.HeadsFirst.</summary>
-    internal string RopeTo(RopeArgs a, Fmt f, Fmt? outFmt, ulong x, ulong gain, ulong cos, ulong sin, ulong positions, ulong y)
+    public string Rope<TN>(RopeArgs a, ulong x, ulong cos, ulong sin, ulong positions, ulong y) where TN : struct, IFloatAdad<TN>
     {
+        var f = Fmt.Of<TN>();
         var lane = RowLane(f);
         long n = (long)a.Rows * a.Cols;
         if (n == 0) return lane.Name;
-        bool norm = gain != 0, rotate = a.Half > 0;
-        ulong st = norm ? vk.Rent((long)a.Rows * 2 * lane.Size) : 0;
-        try
+        bool rotate = a.Half > 0;
+        if (f.IsBlock)
+            Encode(f, n, vk.Cached($"block_rope_out:{f.Name}:{a.Interleaved}:{a.Inverse}:{rotate}", () => VkKernels.BlockRopeOut(vk, f, a.Interleaved, a.Inverse, rotate)), y,
+                x, cos, sin, positions, Vulkan.U(a.Cols), Vulkan.U(a.Heads), Vulkan.U(a.Steps), Vulkan.U(a.Half));
+        else
         {
-            if (norm)
-            {
-                var stats = vk.Cached($"norm_stats:False:{f.Name}", () => VkKernels.NormStats(vk, f, lane, false));
-                vk.Launch(stats, (uint)a.Rows, 1, x, 0, 0, 0, 0, 0, st, 0, Vulkan.U(a.Rows), Vulkan.U(a.Cols), Slot(lane, a.Eps), Slot(lane, 0), 0);
-            }
-
-            var fo = outFmt ?? f;
-            if (outFmt is not null || a.HeadsFirst)
-            {
-                if (fo.IsBlock)
-                    Encode(fo, n, vk.Cached($"block_rope_heads:{f.Name}:{norm}:{a.Interleaved}:{a.Inverse}:{rotate}", () => VkKernels.BlockRopeHeads(vk, f, norm, a.Interleaved, a.Inverse, rotate)), y,
-                        x, gain, cos, sin, positions, st, Vulkan.U(a.Cols), Vulkan.U(a.Heads), Vulkan.U(a.Steps), Vulkan.U(a.Half), Vulkan.F((float)a.Offset));
-                else
-                {
-                    var to = vk.Cached($"rope_to:{f.Name}:{fo.Name}:{lane.Name}:{norm}:{a.Interleaved}:{a.Inverse}:{rotate}:{a.HeadsFirst}",
-                        () => VkKernels.RopeTo(vk, f, fo, lane, norm, a.Interleaved, a.Inverse, rotate, a.HeadsFirst));
-                    vk.Launch(to, Groups(fo.Words(n), VkKernels.Threads), 1, x, gain, cos, sin, positions, st, y, Vulkan.U((int)n), Vulkan.U(a.Cols), Vulkan.U(a.Heads), Vulkan.U(a.Steps), Vulkan.U(a.Half), Slot(lane, a.Offset));
-                }
-            }
-            else if (f.IsBlock)
-                Encode(f, n, vk.Cached($"block_rope_out:{f.Name}:{norm}:{a.Interleaved}:{a.Inverse}:{rotate}", () => VkKernels.BlockRopeOut(vk, f, norm, a.Interleaved, a.Inverse, rotate)), y,
-                    x, gain, cos, sin, positions, st, Vulkan.U(a.Cols), Vulkan.U(a.Heads), Vulkan.U(a.Steps), Vulkan.U(a.Half), Vulkan.F((float)a.Offset));
-            else
-            {
-                var k = vk.Cached($"rope_out:{f.Name}:{lane.Name}:{norm}:{a.Interleaved}:{a.Inverse}:{rotate}", () => VkKernels.RopeOut(vk, f, lane, norm, a.Interleaved, a.Inverse, rotate));
-                vk.Launch(k, Groups(f.Words(n), VkKernels.Threads), 1, x, gain, cos, sin, positions, st, y, Vulkan.U((int)n), Vulkan.U(a.Cols), Vulkan.U(a.Heads), Vulkan.U(a.Steps), Vulkan.U(a.Half), Slot(lane, a.Offset));
-            }
-        }
-        finally
-        {
-            if (st != 0) vk.Return(st);
+            var k = vk.Cached($"rope_out:{f.Name}:{lane.Name}:{a.Interleaved}:{a.Inverse}:{rotate}", () => VkKernels.RopeOut(vk, f, lane, a.Interleaved, a.Inverse, rotate));
+            vk.Launch(k, Groups(f.Words(n), VkKernels.Threads), 1, x, cos, sin, positions, y, Vulkan.U((int)n), Vulkan.U(a.Cols), Vulkan.U(a.Heads), Vulkan.U(a.Steps), Vulkan.U(a.Half));
         }
 
         return lane.Name;

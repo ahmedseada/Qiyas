@@ -5,8 +5,8 @@
 // type's float lane (Rows.cs has their references). A group's statistics by a task a group, its Outer runs of Inner values
 // gathered; the outputs by aligned tiles of the index (a stored word or block written by one task), each run of values with
 // one group and one channel taken with that group's statistics and that channel's gain and bias; the parameters' gradients by
-// a task a channel. The rotary embedding by a task a run of rows (RowChunk: whole words and blocks), each row normalized in
-// the lane when a gain is given and rotated there.
+// a task a channel. The rotary embedding by a task a run of rows (RowChunk: whole words and blocks), each row rotated in the
+// lane.
 using System.Buffers;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -241,72 +241,32 @@ internal sealed partial class Kernels
 
     // ---------------------------------------------------------------- the rotary embedding by tables
 
-    public static string Rope<TN>(RopeArgs a, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] y) where TN : struct, IFloatAdad<TN>
+    public static string Rope<TN>(RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y) where TN : struct, IFloatAdad<TN>
     {
-        var v = new RopeVisitor(a, x, gain, cos, sin, positions, y);
+        var v = new RopeVisitor(a, x, cos, sin, positions, y);
         TN.Float(ref v);
         return v.Lane;
     }
 
-    private struct RopeVisitor(RopeArgs a, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] y) : IFloatLaneVisitor
+    private struct RopeVisitor(RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y) : IFloatLaneVisitor
     {
         public string Lane = "";
 
         public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
         {
             Lane = TL.Name;
-            RopeRows<TN, TLane, TL>(a, x, gain, cos, sin, positions, y, false);
+            if (a.Rows == 0 || a.Cols == 0) return;
+            Team.For(a.Rows, RowChunk<TN>(a.Rows, a.Cols, a.Rows / (Threads * 4)), (long)a.Rows * a.Cols * 3, new RopeBody<TN, TLane, TL>(a, x, cos, sin, positions, y));
         }
     }
 
-    /// <summary>The rows of IRows.Rope into y: as TN, or (lanes) the lane's values as they are, in the lane's own storage (a
-    /// composition's intermediate: no rounding). Rows a head at a time (a.HeadsFirst) land out of x's order, so a type whose
-    /// values share a storage unit takes them through the lane's storage and is stored once, whole.</summary>
-    internal static void RopeRows<TN, TLane, TL>(RopeArgs a, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] y, bool lanes)
-        where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
-    {
-        if (a.Rows == 0 || a.Cols == 0) return;
-        TLane[]? gl = null;
-        if (gain is not null)
-        {
-            gl = new TLane[a.Cols];
-            TN.Load(gain, 0, gl);
-            TLane off = TL.From(a.Offset);
-            for (int i = 0; i < a.Cols; i++) gl[i] = TL.Add(gl[i], off);                // the gain g + offset, as each value scales by it
-        }
-
-        long work = (long)a.Rows * a.Cols * 3;
-        if (lanes)
-        {
-            Team.For(a.Rows, Math.Max(1, a.Rows / (Threads * 4)), work, new RopeBody<TN, TLane, TL>(a, x, gl, cos, sin, positions, y, true));
-            return;
-        }
-
-        if (a.HeadsFirst && TN.Granularity > 1)
-        {
-            // Every value of the pooled buffer below the count is written before it is read.
-            var target = ArrayPool<byte>.Shared.Rent(a.Rows * a.Cols * System.Runtime.CompilerServices.Unsafe.SizeOf<TLane>());
-            try
-            {
-                Team.For(a.Rows, Math.Max(1, a.Rows / (Threads * 4)), work, new RopeBody<TN, TLane, TL>(a, x, gl, cos, sin, positions, target, true));
-                StoreLanes<TN, TLane>(target, y, 0, (long)a.Rows * a.Cols);
-            }
-            finally { ArrayPool<byte>.Shared.Return(target); }
-
-            return;
-        }
-
-        Team.For(a.Rows, RowChunk<TN>(a.Rows, a.Cols, a.Rows / (Threads * 4)), work, new RopeBody<TN, TLane, TL>(a, x, gl, cos, sin, positions, y, false));
-    }
-
-    // v = x, or x·rstd·(g + offset); y = v with pair (i, j) rotated: y_i = fma(−v_j, s, v_i·c), y_j = fma(v_i, s, v_j·c) (s = −sin inverse).
-    // Row r of x into row a.OutRow(r) of y: stored as TN, or (lanes) the lane's values as they are.
-    private readonly struct RopeBody<TN, TLane, TL>(RopeArgs a, byte[] x, TLane[]? gl, byte[] cos, byte[] sin, int[] positions, byte[] y, bool lanes) : Team.IBody
+    // y = x with pair (i, j) rotated: y_i = fma(−x_j, s, x_i·c), y_j = fma(x_i, s, x_j·c) (s = −sin inverse).
+    private readonly struct RopeBody<TN, TLane, TL>(RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         public void Run(int first, int last)
         {
-            int n = a.Cols, w = Vector<TLane>.Count;
+            int n = a.Cols;
             var pool = ArrayPool<TLane>.Shared;
             var xl = pool.Rent(n);
             var yl = pool.Rent(n);
@@ -319,15 +279,6 @@ internal sealed partial class Kernels
                     var xs = xl.AsSpan(0, n);
                     var ys = yl.AsSpan(0, n);
                     TN.Load(x, r * n, xs);
-                    if (gl is not null)
-                    {
-                        TLane rstd = TL.Div(TL.From(1), TL.Sqrt(TL.Add(TL.Div(RowMath<TLane, TL>.SumSq(xs, TL.Zero), TL.From(n)), TL.From(a.Eps))));
-                        Vector<TLane> rv = new(rstd);
-                        int i = 0;
-                        for (; i + w <= n; i += w) (new Vector<TLane>(xs[i..]) * rv * new Vector<TLane>(gl.AsSpan(i))).CopyTo(xs[i..]);
-                        for (; i < n; i++) xs[i] = TL.Mul(TL.Mul(xs[i], rstd), gl[i]);
-                    }
-
                     xs.CopyTo(ys);
                     int pos = a.Position(positions, r);
                     for (int p = 0; p < a.Half; p++)
@@ -339,9 +290,7 @@ internal sealed partial class Kernels
                         ys[j] = TL.Fma(xs[i], sn, TL.Mul(xs[j], c));
                     }
 
-                    int o = a.OutRow(r);
-                    if (lanes) ys.CopyTo(MemoryMarshal.Cast<byte, TLane>(y.AsSpan()).Slice(o * n, n));
-                    else TN.Store(ys, y, o * n);
+                    TN.Store(ys, y, r * n);
                 }
             }
             finally

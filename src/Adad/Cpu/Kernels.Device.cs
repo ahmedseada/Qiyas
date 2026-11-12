@@ -147,7 +147,7 @@ internal sealed partial class Kernels : IDevice<byte[], int[]>
     string IRows<byte[], int[]>.GroupNormBwd<TN>(byte[] x, byte[] dy, byte[]? gamma, byte[]? mean, byte[]? variance, byte[]? dx, byte[]? dgamma, byte[]? dbeta, GroupShape shape, double eps, bool given) =>
         GroupNormBwd<TN>(x, dy, gamma, mean, variance, dx, dgamma, dbeta, shape, eps, given);
 
-    string IRows<byte[], int[]>.Rope<TN>(RopeArgs a, byte[] x, byte[]? gain, byte[] cos, byte[] sin, int[] positions, byte[] y) => Rope<TN>(a, x, gain, cos, sin, positions, y);
+    string IRows<byte[], int[]>.Rope<TN>(RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y) => Rope<TN>(a, x, cos, sin, positions, y);
 
     // ---------------------------------------------------------------- layouts
 

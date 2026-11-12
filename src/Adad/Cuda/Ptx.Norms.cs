@@ -9,8 +9,7 @@
 //   GroupOut    a thread per stored word (a warp per block of a block format): each value with its group's coefficients
 //               and its channel's gain and bias, the word packed and stored once (a word's values may span two groups);
 //   GroupParams a block per channel: Σ dy·x̂ and Σ dy over the channel's values;
-//   RopeOut     a thread per stored word (a warp per block): each value and its pair's partner, normalized by the row's
-//               rstd (the rows' statistics by the row kernels' NormStats) when a gain is given, rotated by the tables.
+//   RopeOut     a thread per stored word (a warp per block): each value and its pair's partner, rotated by the tables.
 using Adad.Abstraction;
 
 namespace Adad.Cuda;
@@ -307,24 +306,17 @@ internal static partial class Ptx
             ReduceBytes);
     }
 
-    /// <summary>The rotary embedding by tables: each value v (normalized, with a gain: v·rstd·(g + offset), rstd = stats[2·row + 1])
-    /// and its pair's partner w: fma(∓w, s, v·c) (− for a pair's low value; s = −sin inverse) in a pair, v past 2·half.</summary>
-    /// With outFmt or headsFirst: y stored as outFmt (the type's when null; the lane's own format for a composition's
-    /// intermediate), its rows a head at a time (RopeArgs.HeadsFirst: value i of y from row (b·steps + s)·heads + h of x for
-    /// y's row (b·heads + h)·steps + s) — a StoreEach kernel, each value reading its source where it is.
-    public static string RopeOut(Gpu gpu, Fmt f, Lane lane, bool gain, bool interleaved, bool inverse, bool rotate, out string entry, Fmt? outFmt = null, bool headsFirst = false)
+    /// <summary>The rotary embedding by tables: each value v and its pair's partner w: fma(∓w, s, v·c) (− for a pair's low
+    /// value; s = −sin inverse) in a pair, v past 2·half.</summary>
+    public static string RopeOut(Gpu gpu, Fmt f, Lane lane, bool interleaved, bool inverse, bool rotate, out string entry)
     {
-        bool plain = outFmt is null && !headsFirst;
-        var fo = outFmt ?? f;
-        entry = $"rope_out_{f.Name}_{lane.Name}{(gain ? "_norm" : "")}{(interleaved ? "_il" : "")}{(inverse ? "_inv" : "")}{(rotate ? "" : "_norot")}{(plain ? "" : $"_to_{fo.Name}{(headsFirst ? "_heads" : "")}")}";
+        entry = $"rope_out_{f.Name}_{lane.Name}{(interleaved ? "_il" : "")}{(inverse ? "_inv" : "")}{(rotate ? "" : "_norot")}";
         var b = new PtxBuilder();
-        string px = Param64(b, "p_x"), pg = Param64(b, "p_g"), pcos = Param64(b, "p_cos"), psin = Param64(b, "p_sin"), ppos = Param64(b, "p_pos"), pst = Param64(b, "p_stats"), py = Param64(b, "p_y");
+        string px = Param64(b, "p_x"), pcos = Param64(b, "p_cos"), psin = Param64(b, "p_sin"), ppos = Param64(b, "p_pos"), py = Param64(b, "p_y");
         string n = Param32(b, "p_n"), cols = Param32(b, "p_cols"), heads = Param32(b, "p_heads"), steps = Param32(b, "p_steps"), half = Param32(b, "p_half");
-        string off = lane.NewReg(b);
-        b.L($"ld.param.{lane.Mem} {off}, [p_off];");
         string nm1 = b.R();
         b.L($"sub.u32 {nm1}, {n}, 1;");
-        string Value(string at, string x)
+        WordOut(b, f, lane, px, px, py, n, false, (at, x, _) =>
         {
             // A value past the last (in the last word) takes the last one's row and partner: no read past the arrays.
             string idx = b.R(), row = b.R(), col = b.R();
@@ -332,22 +324,7 @@ internal static partial class Ptx
             b.L($"div.u32 {row}, {idx}, {cols};");
             b.L($"mul.lo.u32 {col}, {row}, {cols};");
             b.L($"sub.u32 {col}, {idx}, {col};");
-            string? rstd = null;
-            string Norm(string v, string at)
-            {
-                if (rstd is null) return v;
-                string ge = LaneOp(b, lane, "add", Codec.UnpackAt(b, f, pg, at, lane), off);
-                return LaneOp(b, lane, "mul", LaneOp(b, lane, "mul", v, rstd), ge);
-            }
-
-            if (gain)
-            {
-                string si = b.R();
-                b.L($"mad.lo.u32 {si}, {row}, 2, 1;");
-                rstd = LoadLane(b, lane, pst, si);
-            }
-
-            string v = Norm(x, col);
+            string v = x;
             if (!rotate) return v;
             string st = Within(b, row, heads, steps), pa = b.RD(), pos = b.R();
             b.L($"mul.wide.u32 {pa}, {st}, 4;");
@@ -379,7 +356,7 @@ internal static partial class Ptx
             b.L($"sub.u32 {hm1}, {half}, 1;");
             b.L($"min.u32 {pr}, {pr}, {hm1};");
             b.L($"mad.lo.u32 {pIdx}, {row}, {cols}, {partner};");
-            string w = Norm(Codec.UnpackAt(b, f, px, pIdx, lane), partner);
+            string w = Codec.UnpackAt(b, f, px, pIdx, lane);
             b.L($"mad.lo.u32 {tIdx}, {pos}, {half}, {pr};");
             string cs = LoadLane(b, lane, pcos, tIdx), sn = LoadLane(b, lane, psin, tIdx);
             if (inverse) { string ns = lane.NewReg(b); b.L($"neg.{lane.Op} {ns}, {sn};"); sn = ns; }
@@ -389,40 +366,10 @@ internal static partial class Ptx
             b.L(lane.Fma(r, ws, sn, LaneOp(b, lane, "mul", v, cs)));
             b.L($"selp.{lane.Op} {o}, {r}, {v}, {inPair};");
             return o;
-        }
-
-        if (plain) WordOut(b, f, lane, px, px, py, n, false, (at, x, _) => Value(at, x));
-        else
-            StoreEach(b, fo, lane, py, n, at =>
-            {
-                string src = at;
-                if (headsFirst)
-                {
-                    // y's row (b·heads + h)·steps + s is x's row (b·steps + s)·heads + h.
-                    string ro = b.R(), co = b.R(), per = b.R(), bb = b.R(), rem = b.R(), hh = b.R(), ss = b.R(), rx = b.R();
-                    src = b.R();
-                    // Three divisions a value (each remainder from its quotient).
-                    b.L($"div.u32 {ro}, {at}, {cols};");
-                    b.L($"mul.lo.u32 {co}, {ro}, {cols};");
-                    b.L($"sub.u32 {co}, {at}, {co};");
-                    b.L($"mul.lo.u32 {per}, {heads}, {steps};");
-                    b.L($"div.u32 {bb}, {ro}, {per};");
-                    b.L($"mul.lo.u32 {rem}, {bb}, {per};");
-                    b.L($"sub.u32 {rem}, {ro}, {rem};");
-                    b.L($"div.u32 {hh}, {rem}, {steps};");
-                    b.L($"mul.lo.u32 {ss}, {hh}, {steps};");
-                    b.L($"sub.u32 {ss}, {rem}, {ss};");
-                    b.L($"mad.lo.u32 {rx}, {bb}, {steps}, {ss};");
-                    b.L($"mad.lo.u32 {rx}, {rx}, {heads}, {hh};");
-                    b.L($"mad.lo.u32 {src}, {rx}, {cols}, {co};");
-                }
-
-                return Value(src, Codec.UnpackAt(b, f, px, src, lane));
-            });
+        });
         b.Label("DONE");
         b.L("ret;");
         return b.Finish(Header(gpu), entry,
-            $".param .u64 p_x, .param .u64 p_g, .param .u64 p_cos, .param .u64 p_sin, .param .u64 p_pos, .param .u64 p_stats, .param .u64 p_y, .param .u32 p_n, .param .u32 p_cols, .param .u32 p_heads, .param .u32 p_steps, .param .u32 p_half, .param .{lane.Mem} p_off",
-            plain ? 0 : EachShared(fo));
+            ".param .u64 p_x, .param .u64 p_cos, .param .u64 p_sin, .param .u64 p_pos, .param .u64 p_y, .param .u32 p_n, .param .u32 p_cols, .param .u32 p_heads, .param .u32 p_steps, .param .u32 p_half");
     }
 }
