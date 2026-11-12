@@ -54,6 +54,12 @@ if (!proven)
     proof.Record(Device.Cpu, Checks.Stress);
 }
 
+// The sliced float64 product is taken only where this build's checks proved it on the device (Checks.Sliced sets it as
+// they pass); a run on a proof takes the proof for it, as for every other check (where the device has no such route,
+// MatMulSliced declines it at use). Without this a proven run never took it: matmul float64 22.6 ms in the plain f64
+// lane against 4.1 in the sliced one.
+if (proven && options.Devices.Contains(Device.Cuda) && Devices.HasCuda) Devices.Ops.SlicedProven = true;
+
 if (options.Report) Console.WriteLine(Adad.Cpu.Kernels.Report());
 
 if (options.Mode == "team")
