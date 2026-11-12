@@ -644,6 +644,13 @@ internal sealed partial class Kernels
         where TA : struct, IAdad<TA, TIn> where TC : struct, IAdad<TC, TAcc>
         where TIn : unmanaged where TAcc : unmanaged where TL : struct, ILane<TL, TAcc> where TP : struct, IPanelSource<TAcc>
     {
+        if (k == 0)
+        {
+            // A sum of no terms: C = 0, stored as the type (the tiles below would write nothing, leaving C as it was).
+            if ((long)m * n > 0) StoreLanes<TC, TAcc>(new byte[(long)m * n * Unsafe.SizeOf<TAcc>()], c, o.COff, (long)m * n);
+            return;
+        }
+
         int g = Unsafe.SizeOf<TAcc>() / Unsafe.SizeOf<TIn>(), kg = (k + g - 1) / g;
         int w = Vector<TAcc>.Count, strip = 2 * w, strips = (n + strip - 1) / strip;
         bool cDirect = Lanes.Direct<TC, TAcc>();
