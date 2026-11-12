@@ -197,12 +197,15 @@ public sealed partial class VulkanOps
         if (lane.Wide) Map<Float64>(m, x, y, 0, output, n, a, b); else Map<Float32>(m, x, y, 0, output, n, a, b);
     }
 
-    /// <summary>The additive mask excluding the keys below each query's start (span starts, a window; lane storage), 0 when none.</summary>
+    /// <summary>The additive mask excluding the keys below each query's start (span starts, a window; lane storage) by the
+    /// excluded score (CacheView.Excluded of the lane's own type: −∞, so such a key takes no weight and a query left with
+    /// none 0), 0 when none.</summary>
     private ulong SpanMask(AttentionArgs a, Lane lane, List<ulong> rented)
     {
         if (!a.HasStarts) return 0;
+        double excluded = lane.Wide ? CacheView.Excluded<Float64>() : CacheView.Excluded<Float32>();
         var m = new double[(long)a.Lq * a.Lk];
-        for (int i = 0; i < a.Lq; i++) for (int j = 0; j < a.Start(i); j++) m[(long)i * a.Lk + j] = -400;
+        for (int i = 0; i < a.Lq; i++) for (int j = 0; j < a.Start(i); j++) m[(long)i * a.Lk + j] = excluded;
         var bytes = lane.Wide ? Stored.StoreValues<Float64>(m) : Stored.StoreValues<Float32>(m);
         ulong d = vk.Rent(bytes.Length);
         rented.Add(d);

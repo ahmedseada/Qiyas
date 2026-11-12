@@ -395,6 +395,8 @@ internal static class RowKernels
             else for (; i < vec; i += w) TL.Fma(new Vector<TLane>(x[i..]), av, new Vector<TLane>(x2[i..])).CopyTo(y[i..]);
             for (; i < limit; i++) y[i] = x2.IsEmpty ? TL.Mul(x[i], a) : TL.Fma(x[i], a, x2[i]);
             TLane m = RowMath<TLane, TL>.Max(y[..limit]);
+            // Every kept column at −∞ (the mask's): no column kept.
+            if (EqualityComparer<TLane>.Default.Equals(m, TL.NegativeInfinity)) { y.Fill(TL.Zero); return TL.NegativeInfinity; }
             TLane sum = RowMath<TLane, TL>.ExpSum(y[..limit], m, y[..limit]);
             RowMath<TLane, TL>.Scale(y[..limit], TL.Zero, TL.Div(TL.From(1), sum), y[..limit]);
             if (limit < n) y[limit..].Fill(TL.Zero);

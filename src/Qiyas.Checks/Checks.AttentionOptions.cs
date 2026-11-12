@@ -4,8 +4,9 @@
 // Attention's options (Attention.cs) on every device against the float64 reference, every float type: grouped heads
 // (KvHeads: grouped and multi-query) by every form (the measured choice, the fused rows, the composition, decode, the
 // backward by each route), a sliding window (with the causal rule, with spans and starts, with grouped heads), a cap on the
-// scores (forward and backward: the composition), and each query's log-sum-exp (−∞ for a query that sees no key, on the
-// types with an infinity); within the lane's rounding over the keys, as the attention check's.
+// scores (forward and backward: the composition), each query's log-sum-exp, and queries that see no key (a span of none, a
+// start at or past the span's end) by every form and backward route: O and the gradients 0, the log-sum-exp −∞ (the types
+// that store −∞); within the lane's rounding over the keys, as the attention check's.
 namespace Qiyas;
 
 internal static partial class Checks
@@ -25,10 +26,13 @@ internal static partial class Checks
             ("grouped window spans starts", new AttentionArgs(4, 37, 53, 24, 0.2, false, Range(37, i => 20 + i % 30), Range(37, i => i % 25)) { KvHeads = 2, Window = 11 }),
             ("softcap causal", new AttentionArgs(2, 37, 53, 24, 0.6, true) { Softcap = 1 }),
             ("grouped softcap window", new AttentionArgs(4, 37, 53, 24, 0.6, false) { KvHeads = 2, Softcap = 1, Window = 20 }),
+            ("keyless spans", new AttentionArgs(2, 5, 9, 8, 0.3, false, [0, 3, 9, 1, 0]) { KvHeads = 1 }),
+            ("keyless starts", new AttentionArgs(2, 5, 9, 8, 0.3, false, [4, 3, 9, 6, 9], [4, 0, 9, 2, 3]) { KvHeads = 1 }),
         };
         foreach (var type in Bench.Registry.Names)
         {
             if (!Bench.Registry.IsFloat(type) || (!blocks && Bench.Registry.IsBlock(type))) continue;
+            bool infinite = Bench.Registry.WithFloat(type, new StoresInfinity());
             foreach (var (name, a) in cases)
             {
                 var q = Bench.Registry.Make(type, (int)a.QValues, 41, -1, 1);
@@ -44,11 +48,11 @@ internal static partial class Checks
                 {
                     var o = new byte[q.Length];
                     Bench.Registry.WithFloat(type, new AttentionRun(ops, a, q, k, v, o, form == "decode", null, null, null, fused: form == "fused", composed: form == "composed"));
-                    ok &= Close(type, $"attention {name} {form}", where, o, want, (int)a.QValues, terms);
+                    ok &= CloseNumbers(type, $"attention {name} {form}", where, o, want, (int)a.QValues, terms);
                 }
 
-                // O and each query's log-sum-exp.
-                ok &= LseCase(ops, where, type, $"attention_lse {name}", a, q, k, v, want, lseWant, terms);
+                // O and each query's log-sum-exp (a query that sees no key: −∞, on the types that store it).
+                if (infinite || !name.StartsWith("keyless")) ok &= LseCase(ops, where, type, $"attention_lse {name}", a, q, k, v, want, lseWant, terms);
 
                 // The backward by each route (a cap takes the composition by every one).
                 var dO = Bench.Registry.Make(type, (int)a.QValues, 44, -1, 1);
@@ -64,9 +68,9 @@ internal static partial class Checks
                     Bench.Registry.WithFloat(type, new AttentionRun(ops, a, q, k, v, dO, false, dq, dk, dv));
                     string tag = $" {name}{(mode == 1 ? " composed" : mode == 2 ? " fma" : "")}";
                     int rows = a.Group * a.Lq;
-                    ok &= Close(type, "attention_bwd dQ" + tag, where, dq, wq, (int)a.QValues, 2 * (a.Lk + a.D));
-                    ok &= Close(type, "attention_bwd dK" + tag, where, dk, wk, (int)a.KValues, 2 * (rows + a.D));
-                    ok &= Close(type, "attention_bwd dV" + tag, where, dv, wv, (int)a.KValues, rows + a.D);
+                    ok &= CloseNumbers(type, "attention_bwd dQ" + tag, where, dq, wq, (int)a.QValues, 2 * (a.Lk + a.D));
+                    ok &= CloseNumbers(type, "attention_bwd dK" + tag, where, dk, wk, (int)a.KValues, 2 * (rows + a.D));
+                    ok &= CloseNumbers(type, "attention_bwd dV" + tag, where, dv, wv, (int)a.KValues, rows + a.D);
                     string? route = cuda?.BackwardRoute ?? vulkan?.BackwardRoute;
                     if (a.Softcap > 0 && ops is not null && route != "composed")
                     {
@@ -79,21 +83,9 @@ internal static partial class Checks
                     else Kernels.FusedBackwardCpu = null;
                 }
             }
-
-            // A query that sees no key: its log-sum-exp −∞, its O 0 (the types with an infinity).
-            if (type is "float32" or "float64" or "float16" or "bfloat16")
-            {
-                var a = new AttentionArgs(2, 5, 9, 8, 0.3, false, [0, 3, 9, 1, 0]) { KvHeads = 1 };
-                var q = Bench.Registry.Make(type, (int)a.QValues, 45, -1, 1);
-                var k = Bench.Registry.Make(type, (int)a.KValues, 46, -1, 1);
-                var v = Bench.Registry.Make(type, (int)a.KValues, 47, -1, 1);
-                var lseWant = new double[(long)a.Heads * a.Lq];
-                var want = a.Reference(Bench.Registry.Values(type, q, (int)a.QValues), Bench.Registry.Values(type, k, (int)a.KValues), Bench.Registry.Values(type, v, (int)a.KValues), null, lseWant);
-                ok &= LseCase(ops, where, type, "attention_lse keyless rows", a, q, k, v, want, lseWant, a.Lk + a.D);
-            }
         }
 
-        if (ok) Console.WriteLine($"check attention options      {where,-6} every float type{(blocks ? "" : " but the block formats")}: grouped heads and multi-query by every form, a sliding window, a cap on the scores, and each query's log-sum-exp (-inf where it sees no key), forward and backward within the lane's rounding");
+        if (ok) Console.WriteLine($"check attention options      {where,-6} every float type{(blocks ? "" : " but the block formats")}: grouped heads and multi-query by every form, a sliding window, a cap on the scores, each query's log-sum-exp, and queries that see no key (by a span or a start: O and the gradients 0, the log-sum-exp -inf where the type stores it), forward and backward within the lane's rounding");
         return ok;
     }
 
@@ -105,7 +97,7 @@ internal static partial class Checks
         int n = a.Heads * a.Lq;
         var lse = new byte[Bench.Registry.Bytes(type, n)];
         Bench.Registry.WithFloat(type, new AttentionLseRun(ops, a, q, k, v, o, lse));
-        bool ok = Close(type, what + " O", where, o, want, (int)a.QValues, terms);
+        bool ok = CloseNumbers(type, what + " O", where, o, want, (int)a.QValues, terms);
         ok &= Close(type, what, where, lse, lseWant, n, terms);
         var got = Bench.Registry.Values(type, lse, n);
         for (int i = 0; i < n; i++)
@@ -116,6 +108,27 @@ internal static partial class Checks
         }
 
         return ok;
+    }
+
+    // Close, and a NaN only where the reference is NaN (Close's comparison lets a NaN pass).
+    private static bool CloseNumbers(string type, string what, string where, byte[] output, double[] reference, int n, int terms)
+    {
+        bool ok = Close(type, what, where, output, reference, n, terms);
+        var got = Bench.Registry.Values(type, output, n);
+        for (int i = 0; i < n; i++)
+        {
+            if (double.IsNaN(got[i]) == double.IsNaN(reference[i])) continue;
+            Console.WriteLine($"check {what} {where,-6} {type,-12} [{i}]: {got[i]:R}, not {reference[i]:R}");
+            return false;
+        }
+
+        return ok;
+    }
+
+    // Whether the type stores −∞ (CacheView.Excluded: −∞ where it does).
+    private readonly struct StoresInfinity : Bench.IFloatTypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => double.IsNegativeInfinity(CacheView.Excluded<TN>());
     }
 
     private sealed class AttentionLseRun(IDevice<ulong, ulong>? ops, AttentionArgs a, byte[] q, byte[] k, byte[] v, byte[] o, byte[] lse) : Bench.IFloatTypeVisitor<string>

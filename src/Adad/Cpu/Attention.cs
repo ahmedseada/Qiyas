@@ -186,12 +186,15 @@ internal sealed partial class Kernels
         return limits;
     }
 
-    /// <summary>The additive mask (Lq × Lk, lane storage) excluding the keys below each query's span start; null when no span starts.</summary>
+    /// <summary>The additive mask (Lq × Lk, lane storage) excluding the keys below each query's span start by the excluded
+    /// score (CacheView.Excluded of the lane's storage: −∞ where it stores −∞, so scale_mask_softmax gives such a key no weight
+    /// and a query left with no key 0); null when no span starts.</summary>
     private static byte[]? SpanMask<TS>(AttentionArgs a) where TS : struct, IFloatAdad<TS>
     {
         if (!a.HasStarts) return null;
+        double excluded = CacheView.Excluded<TS>();
         var m = new double[(long)a.Lq * a.Lk];
-        for (int i = 0; i < a.Lq; i++) for (int j = 0; j < a.Start(i); j++) m[(long)i * a.Lk + j] = -400;
+        for (int i = 0; i < a.Lq; i++) for (int j = 0; j < a.Start(i); j++) m[(long)i * a.Lk + j] = excluded;
         return Stored.StoreValues<TS>(m);
     }
 

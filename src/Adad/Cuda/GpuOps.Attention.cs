@@ -236,12 +236,15 @@ public sealed partial class GpuOps
         }
     }
 
-    /// <summary>The additive mask excluding the keys below each query's span start (lane storage on the device), 0 when no span starts.</summary>
+    /// <summary>The additive mask excluding the keys below each query's span start by the excluded score (CacheView.Excluded
+    /// of the lane's storage: −∞, so such a key takes no weight and a query left with none 0; lane storage on the device),
+    /// 0 when no span starts.</summary>
     private ulong SpanMask<TS>(AttentionArgs a, List<ulong> rented) where TS : struct, IFloatAdad<TS>
     {
         if (!a.HasStarts) return 0;
+        double excluded = CacheView.Excluded<TS>();
         var m = new double[(long)a.Lq * a.Lk];
-        for (int i = 0; i < a.Lq; i++) for (int j = 0; j < a.Start(i); j++) m[(long)i * a.Lk + j] = -400;
+        for (int i = 0; i < a.Lq; i++) for (int j = 0; j < a.Start(i); j++) m[(long)i * a.Lk + j] = excluded;
         var bytes = Stored.StoreValues<TS>(m);
         ulong d = gpu.Rent(bytes.Length);
         rented.Add(d);
