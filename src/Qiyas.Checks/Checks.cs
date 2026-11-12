@@ -1471,6 +1471,7 @@ internal static partial class Checks
         // k and n in fours, m and n past whole tiles: the batched launch of every batch at once (CUDA's staged product reads
         // each batch where it is stored at these, its edge tiles guarded).
         if (ops is not null) ok &= ProductsWith(ops, where, 37, 36, 52, " [k and n in fours]", blocks);
+        ok &= ProductsNoTerms(ops, where, blocks);
         if (cuda is not null)
         {
             // Split-k (item 6j): one tile of C (37 × 29 padded to 128 × 256) with k = 1100 (1152 padded): the rule's 4 slices,
@@ -1581,6 +1582,56 @@ internal static partial class Checks
         ops.ForcedShape = null; ops.FourBit = null; ops.K32 = null;
         if (ok) Console.WriteLine($"check tensor configurations  device {GpuOps.MmaConfigs.Length} configurations x 4 kind choices: {tried} products at k = 53 and 300 as the references");
         return ok;
+    }
+
+    /// <summary>Products of no terms (k = 0, which ProductView accepts): every orientation and batched views, C filled with
+    /// ones before (on the device too), all of C zeros after: the empty sum, not C as it was.</summary>
+    private static bool ProductsNoTerms(IDevice<ulong, ulong>? ops, string where, bool blocks)
+    {
+        bool ok = true;
+        const int M = 5, N = 7;
+        foreach (var type in Bench.Registry.Names)
+        {
+            if (!blocks && Bench.Registry.IsBlock(type)) continue;
+            var views = new List<ProductView>();
+            foreach (bool ta in new[] { false, true }) foreach (bool tb in new[] { false, true }) views.Add(new ProductView(M, N, 0, ta, tb));
+            views.Add(new ProductView(M, N, 0, false, false, 3, 0, 0, M * N));
+            foreach (var v in views)
+            {
+                var a = Bench.Registry.Make(type, (int)v.ValuesA, 34, -1, 1);
+                var b = Bench.Registry.Make(type, (int)v.ValuesB, 35, -1, 1);
+                var c = Bench.Registry.Encode(type, Enumerable.Repeat(1.0, (int)v.ValuesC).ToArray());
+                Bench.Registry.With(type, new ProductInto(ops, v, a, b, c));
+                var got = Bench.Registry.Values(type, c, (int)v.ValuesC);
+                int bad = got.Count(x => x != 0);
+                if (bad > 0)
+                {
+                    Console.WriteLine($"check product of no terms {M}x{N}x0{(v.TransA ? " Aᵀ" : "")}{(v.TransB ? " Bᵀ" : "")}{(v.Batch > 1 ? $" x{v.Batch}" : "")} {where,-6} {type,-12} DIFFERS: {bad} of {v.ValuesC} values of C not 0");
+                    ok = false;
+                }
+            }
+        }
+
+        if (ok) Console.WriteLine($"check products of no terms   {where,-6} every type{(blocks ? "" : " but the block formats")}: k = 0 in every orientation and batched, C (ones before) all zeros");
+        return ok;
+    }
+
+    // A product into C as given (uploaded to the device first): what the product leaves of C's old values shows.
+    private sealed class ProductInto(IDevice<ulong, ulong>? ops, ProductView v, byte[] a, byte[] b, byte[] c) : Bench.ITypeVisitor<bool>
+    {
+        public bool Visit<TN>() where TN : struct, IAdad<TN, float>
+        {
+            if (ops is null) { Kernels.MatMulView<TN>(v, a, b, c); return true; }
+            ulong dA = ops.Rent(a.Length + 16), dB = ops.Rent(b.Length + 16), dC = ops.Rent(c.Length + 16);
+            if (a.Length > 0) ops.Upload(a, dA);
+            if (b.Length > 0) ops.Upload(b, dB);
+            ops.Upload(c, dC);
+            ops.MatMulView<TN>(v, dA, dB, dC);
+            ops.Synchronize();
+            ops.Download(dC, c);
+            ops.Return(dA); ops.Return(dB); ops.Return(dC);
+            return true;
+        }
     }
 
     private static bool ProductsWith(IDevice<ulong, ulong>? ops, string where, int M, int N, int K, string kindName, bool blocks = true)
