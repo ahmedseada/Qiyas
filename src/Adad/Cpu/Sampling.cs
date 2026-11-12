@@ -54,6 +54,7 @@ internal sealed partial class Kernels
             bool ranked = a.HasTopK || a.HasTopP;
             var keys = ranked ? ArrayPool<ulong>.Shared.Rent(cols) : null;
             var top = ranked ? ArrayPool<(ulong, int)>.Shared.Rent(TopGathered) : null;
+            var candidates = ranked ? ArrayPool<int>.Shared.Rent(TopGathered) : null;
             var key = Draws.Key(a.Seed);
             TLane temperature = TL.From(a.Temperature), q = TL.From(a.MinP);
             try
@@ -78,16 +79,18 @@ internal sealed partial class Kernels
 
                     Weigh<TLane, TL>(w, m, temperature);
                     var b = new Boundary(false, 0, 0);
+                    int gathered = 0;
                     if (ranked)
                     {
                         var k = keys.AsSpan(0, cols);
-                        for (int c = 0; c < cols; c++) k[c] = Routing.OrderKey(v[c]);
-                        int gathered = 0;
+                        OrderKeys<TE>(v, k);
                         if (a.HasTopK) (b, gathered) = TopBoundary(k, a.TopK, top!);
                         if (a.HasTopP) b = gathered > 0 ? NucleusOfTop<TLane, TL>(top.AsSpan(0, gathered), w, a.TopK, TL.From(a.TopP)) : NucleusBoundary<TLane, TL>(k, w, b, TL.From(a.TopP));
                     }
 
-                    var (pick, p) = Draw<TLane, TL>(w[..cols], keys, b, a.HasMinP, q, TL.From(Draws.Uniform(key, (uint)step, (uint)r)));
+                    var u = TL.From(Draws.Uniform(key, (uint)step, (uint)r));
+                    var (pick, p) = gathered > 0 ? DrawOfTop<TLane, TL>(w[..cols], top.AsSpan(0, gathered), b, a.HasMinP, q, u, candidates!)
+                        : Draw<TLane, TL>(w[..cols], keys, b, a.HasMinP, q, u);
                     picks[r] = pick;
                     if (probability is not null) probability[r] = p;
                 }
@@ -98,6 +101,7 @@ internal sealed partial class Kernels
                 ArrayPool<TLane>.Shared.Return(row);
                 if (keys is not null) ArrayPool<ulong>.Shared.Return(keys);
                 if (top is not null) ArrayPool<(ulong, int)>.Shared.Return(top);
+                if (candidates is not null) ArrayPool<int>.Shared.Return(candidates);
             }
         }
     }
@@ -158,10 +162,10 @@ internal sealed partial class Kernels
     // halving runs to its end and the key's columns are cut by column order. Returns how many were gathered (0: none).
     private static (Boundary, int) TopBoundary(ReadOnlySpan<ulong> k, int topK, (ulong Key, int Col)[] top)
     {
-        ulong lo = ulong.MaxValue, hi = 0;
-        foreach (ulong v in k) { lo = Math.Min(lo, v); hi = Math.Max(hi, v); }
+        var (lo, hi) = KeyRange(k);
         int room = Math.Min(TopGathered, Math.Max(64, 4 * topK));
         long count = k.Length;
+        if (count > room && lo < hi) (lo, hi, count) = Narrowed(k, topK, lo, hi);
         while (count > room && lo < hi)
         {
             ulong mid = lo + (hi - lo) / 2 + 1;
@@ -184,6 +188,93 @@ internal sealed partial class Kernels
         for (int c = 0; c < k.Length; c++)
             if (k[c] == lo && --need == 0) return (new Boundary(true, lo, c), 0);
         return (new Boundary(true, lo, k.Length - 1), 0);
+    }
+
+    // The keys' least and largest (vectors of keys, then the tail).
+    private static (ulong Lo, ulong Hi) KeyRange(ReadOnlySpan<ulong> k)
+    {
+        int width = Vector<ulong>.Count, i = 0;
+        var vlo = new Vector<ulong>(ulong.MaxValue);
+        var vhi = Vector<ulong>.Zero;
+        for (; i + width <= k.Length; i += width)
+        {
+            var v = new Vector<ulong>(k[i..]);
+            vlo = Vector.Min(vlo, v);
+            vhi = Vector.Max(vhi, v);
+        }
+
+        ulong lo = ulong.MaxValue, hi = 0;
+        for (int l = 0; l < width; l++) { lo = Math.Min(lo, vlo[l]); hi = Math.Max(hi, vhi[l]); }
+        for (; i < k.Length; i++) { lo = Math.Min(lo, k[i]); hi = Math.Max(hi, k[i]); }
+        return (lo, hi);
+    }
+
+    // One pass over the keys narrows the halving's range: a histogram of [lo, hi] in Bins equal bins, walked from the top to
+    // the bin where the keys at least its lower edge first reach topK. That edge has at least topK keys at or above it and
+    // the bin's upper edge + 1 fewer: the halving's own invariants, so it ends where it would have, in fewer passes (none
+    // where that bin's columns fit the room). Returns the narrowed range and the count at its lower edge.
+    private const int Bins = 2048;
+
+    private static (ulong Lo, ulong Hi, long Count) Narrowed(ReadOnlySpan<ulong> k, int topK, ulong lo, ulong hi)
+    {
+        int shift = Math.Max(0, 64 - BitOperations.LeadingZeroCount(hi - lo) - 11);        // (hi − lo) >> shift < Bins
+        Span<int> bins = stackalloc int[Bins];
+        bins.Clear();
+        foreach (ulong v in k) bins[(int)((v - lo) >> shift)]++;
+        int last = (int)((hi - lo) >> shift);
+        long above = 0;
+        for (int b = last; b >= 0; b--)
+        {
+            long at = above + bins[b];
+            if (at >= topK)
+            {
+                ulong edge = lo + ((ulong)b << shift);
+                return (edge, b == last ? hi : edge + ((1UL << shift) - 1), at);
+            }
+
+            above = at;
+        }
+
+        return (lo, hi, k.Length);
+    }
+
+    // keys[c] = Routing.OrderKey(v[c]): a float lane's whole vectors by the same rule (±0 the key of 0, a NaN the largest
+    // key, a negative value its bits inverted, any other its sign bit set), widened to 64 bits; any other lane value by
+    // value.
+    private static void OrderKeys<TE>(ReadOnlySpan<TE> v, Span<ulong> keys) where TE : unmanaged
+    {
+        int c = 0;
+        if (typeof(TE) == typeof(float))
+        {
+            var f = MemoryMarshal.Cast<TE, float>(v);
+            int width = Vector<float>.Count, half = width / 2;
+            var sign = new Vector<uint>(0x80000000u);
+            for (; c + width <= f.Length; c += width)
+            {
+                var x = new Vector<float>(f[c..]);
+                var u = Vector.AndNot(Vector.AsVectorUInt32(x), Vector.AsVectorUInt32(Vector.Equals(x, Vector<float>.Zero)));
+                var key = Vector.ConditionalSelect(Vector.Equals(u & sign, sign), ~u, u | sign);
+                key = Vector.ConditionalSelect(Vector.AsVectorUInt32(Vector.Equals(x, x)), key, new Vector<uint>(uint.MaxValue));
+                Vector.Widen(key, out var k0, out var k1);
+                k0.CopyTo(keys[c..]);
+                k1.CopyTo(keys[(c + half)..]);
+            }
+        }
+        else if (typeof(TE) == typeof(double))
+        {
+            var d = MemoryMarshal.Cast<TE, double>(v);
+            int width = Vector<double>.Count;
+            var sign = new Vector<ulong>(0x8000000000000000ul);
+            for (; c + width <= d.Length; c += width)
+            {
+                var x = new Vector<double>(d[c..]);
+                var u = Vector.AndNot(Vector.AsVectorUInt64(x), Vector.AsVectorUInt64(Vector.Equals(x, Vector<double>.Zero)));
+                var key = Vector.ConditionalSelect(Vector.Equals(u & sign, sign), ~u, u | sign);
+                Vector.ConditionalSelect(Vector.AsVectorUInt64(Vector.Equals(x, x)), key, new Vector<ulong>(ulong.MaxValue)).CopyTo(keys[c..]);
+            }
+        }
+
+        for (; c < v.Length; c++) keys[c] = Routing.OrderKey(v[c]);
     }
 
     private sealed class ByOrder : IComparer<(ulong Key, int Col)>
@@ -281,6 +372,33 @@ internal sealed partial class Kernels
         for (int c = 0; c < cols; c++)
         {
             if (!Kept(w, keys, b, minP, q, c) || !(LaneValue(w[c]) > 0)) continue;
+            last = c;
+            run = TL.Add(run, w[c]);
+            if (Widths.Compare(run, target) > 0) { pick = c; break; }
+        }
+
+        if (pick < 0) pick = last;
+        return (pick, TL.Div(w[pick], total));
+    }
+
+    // Draw's rule where top-k gathered its columns (every column within the prefix is among them): the kept ones (within
+    // the prefix; with min-p, of weight at least q) put in column order, then Draw's sums in Draw's order over those
+    // columns alone.
+    private static (int Pick, TLane Probability) DrawOfTop<TLane, TL>(ReadOnlySpan<TLane> w, ReadOnlySpan<(ulong Key, int Col)> top, Boundary b, bool minP, TLane q, TLane u, int[] candidates)
+        where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
+    {
+        int n = 0;
+        foreach (var (k, c) in top) if (b.Holds(k, c) && (!minP || Widths.Compare(w[c], q) >= 0)) candidates[n++] = c;
+        var kept = candidates.AsSpan(0, n);
+        kept.Sort();
+        TLane total = TL.Zero;
+        foreach (int c in kept) total = TL.Add(total, w[c]);
+        if (!(LaneValue(total) > 0)) return (-1, TL.From(double.NaN));
+        TLane target = TL.Mul(u, total), run = TL.Zero;
+        int pick = -1, last = -1;
+        foreach (int c in kept)
+        {
+            if (!(LaneValue(w[c]) > 0)) continue;
             last = c;
             run = TL.Add(run, w[c]);
             if (Widths.Compare(run, target) > 0) { pick = c; break; }
