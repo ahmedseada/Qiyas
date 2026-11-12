@@ -1,24 +1,23 @@
 // Copyright (c) 2026 Ahmed Seada
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
-// The device-neutral part of the box overlap losses (torchvision's ops/giou_loss.py, diou_loss.py, ciou_loss.py) over pairs
-// of corner boxes (x1, y1, x2, y2): the kinds and the float64 reference with its gradient. The devices implement it in
-// their folders: Cpu/Boxes.cs; Cuda/Ptx.Boxes.cs with Cuda/GpuOps.Boxes.cs; Vulkan/Kernels.Boxes.cs with
-// Vulkan/VulkanOps.Boxes.cs. Each computes a pair in the float lane in the reference's order: every width, and the centres'
-// offset as (x1 − x1') + (x2 − x2'), a difference of two stored corners (within a rounding of its own value, not of the
-// corners'); the partials chained as here.
+// The device-neutral part of the box overlap losses over pairs of corner boxes (x1, y1, x2, y2): the kinds and the float64
+// reference with its gradient. The devices implement it in their folders: Cpu/Boxes.cs; Cuda/Ptx.Boxes.cs with
+// Cuda/GpuOps.Boxes.cs; Vulkan/Kernels.Boxes.cs with Vulkan/VulkanOps.Boxes.cs. Each computes a pair in the float lane in
+// the reference's order: every width, and the centres' offset as (x1 − x1') + (x2 − x2'), a difference of two stored
+// corners (within a rounding of its own value, not of the corners'); the partials chained as here.
 namespace Adad.Abstraction;
 
-/// <summary>How a pair's overlap becomes its loss (torchvision's): 1 − IoU; GIoU adds the enclosing box's empty share; DIoU
-/// the centres' squared distance over the enclosing box's squared diagonal; CIoU DIoU's and α·v, v = (4/π²)·(atan(w_t/h_t) −
-/// atan(w_p/h_p))², α = v / (1 − IoU + v + eps) a constant to the gradient.</summary>
+/// <summary>How a pair's overlap becomes its loss, IoU = |p ∩ t| / (|p ∪ t| + eps): IoU's is 1 − IoU; GIoU adds the share of
+/// the enclosing box C outside the union, (|C| − |p ∪ t|) / (|C| + eps); DIoU the centres' squared distance over C's squared
+/// diagonal + eps; CIoU DIoU's and α·v, v = (4/π²)·(atan(w_t/h_t) − atan(w_p/h_p))² the aspects' disagreement and
+/// α = v / (1 − IoU + v + eps). eps, added to each divisor that can be 0, is the stored type's precision (IFloatAdad.Epsilon:
+/// float32's 2^−23, float16's 2^−10, …), so it moves no quotient whose divisor is 1 or more by more than the type's step;
+/// the gradient is the loss's derivative, α's included.</summary>
 public enum BoxOverlap { IoU, GIoU, DIoU, CIoU }
 
 public static class Boxes
 {
-    /// <summary>torchvision's eps.</summary>
-    public const double Eps = 1e-7;
-
     /// <summary>4/π², CIoU's aspect-ratio factor.</summary>
     public const double AspectFactor = 0.40528473456935108578;
 
@@ -29,12 +28,10 @@ public static class Boxes
     };
 
     /// <summary>A pair's loss in float64 from its predicted corners p and target t; with grad (4 values) the loss's derivative
-    /// with respect to p there (a tie of a minimum or a maximum sharing its gradient in halves, as PyTorch's), with gradScale
-    /// the magnitude each component's terms add to (the scale the lane's rounding acts on). Returns the loss and its terms'
-    /// magnitude. fixedAlpha (CIoU): α taken as given rather than from the pair (the loss the gradient is the derivative of,
-    /// α held).</summary>
-    public static (double Loss, double Scale) Reference(BoxOverlap overlap, ReadOnlySpan<double> p, ReadOnlySpan<double> t, double eps, Span<double> grad = default, Span<double> gradScale = default,
-        double fixedAlpha = double.NaN)
+    /// with respect to p there (where the two sides of a minimum or a maximum tie, each takes half: of the derivatives the
+    /// sides and their mixtures give, the least), with gradScale the magnitude each component's terms add to (the scale the
+    /// lane's rounding acts on). Returns the loss and its terms' magnitude.</summary>
+    public static (double Loss, double Scale) Reference(BoxOverlap overlap, ReadOnlySpan<double> p, ReadOnlySpan<double> t, double eps, Span<double> grad = default, Span<double> gradScale = default)
     {
         _ = Name(overlap);
         double x1 = p[0], y1 = p[1], x2 = p[2], y2 = p[3], gx1 = t[0], gy1 = t[1], gx2 = t[2], gy2 = t[3];
@@ -48,7 +45,7 @@ public static class Boxes
 
         // ∂loss / ∂(each part), and their terms' magnitudes (…S).
         double dInter = -1 / ue, dUnion = iou / ue, dUnionS = Math.Abs(dUnion);
-        double dCw = 0, dCh = 0, dPx = 0, dPy = 0, dW = 0, dH = 0, dCwS = 0, dChS = 0, dPxS = 0, dPyS = 0, dWS = 0, dHS = 0;
+        double dCw = 0, dCh = 0, dPx = 0, dPy = 0, dW = 0, dH = 0, dCwS = 0, dChS = 0, dPxS = 0, dPyS = 0, dWS = 0, dHS = 0, heldS = 1;
         if (overlap == BoxOverlap.GIoU)
         {
             double area = cw * ch, ae = area + eps;
@@ -75,11 +72,16 @@ public static class Boxes
             (dCwS, dChS) = (2 * dDiagS * Math.Abs(cw), 2 * dDiagS * Math.Abs(ch));
             if (overlap == BoxOverlap.CIoU)
             {
+                // α·v = v² / D, D = 1 − IoU + v + eps: ∂(α·v)/∂IoU = v²/D² = α², ∂(α·v)/∂v = 2v/D − v²/D² = α·(2 − α).
                 double ag = Math.Atan(wg / hg), ap = Math.Atan(wp / hp), diff = ag - ap, spread = Math.Abs(ag) + Math.Abs(ap);
-                double v = AspectFactor * diff * diff, alpha = double.IsNaN(fixedAlpha) ? v / (1 - iou + v + eps) : fixedAlpha;
+                double v = AspectFactor * diff * diff, alpha = v / (1 - iou + v + eps);
                 loss += alpha * v;
                 scale += alpha * (v + 2 * AspectFactor * Math.Abs(diff) * spread + 1);
-                double r2 = wp * wp + hp * hp, k = 2 * AspectFactor * alpha * diff / r2, kS = 2 * AspectFactor * alpha * (Math.Abs(diff) + spread) / r2;
+                double held = 1 - alpha * alpha;
+                heldS = 1 + alpha * alpha;
+                (dInter, dUnion, dUnionS) = (dInter * held, dUnion * held, dUnionS * heldS);
+                double dv = alpha * (2 - alpha), dvS = alpha * (2 + alpha);
+                double r2 = wp * wp + hp * hp, k = 2 * AspectFactor * dv * diff / r2, kS = 2 * AspectFactor * dvS * (Math.Abs(diff) + spread) / r2;
                 (dW, dH) = (-(k * hp), k * wp);
                 (dWS, dHS) = (kS * Math.Abs(hp), kS * Math.Abs(wp));
             }
@@ -89,7 +91,7 @@ public static class Boxes
 
         // The union holds the predicted area and minus the intersection.
         dInter -= dUnion;
-        double dInterS = 1 / ue + dUnionS;
+        double dInterS = heldS / ue + dUnionS;
         dW += dUnion * hp;
         dH += dUnion * wp;
         dWS += dUnionS * Math.Abs(hp);
@@ -113,15 +115,7 @@ public static class Boxes
         return (loss, scale);
     }
 
-    /// <summary>CIoU's α of a pair: v / (1 − IoU + v + eps).</summary>
-    public static double CiouAlpha(ReadOnlySpan<double> p, ReadOnlySpan<double> t, double eps)
-    {
-        double iou = 1 - Reference(BoxOverlap.IoU, p, t, eps).Loss;
-        double diff = Math.Atan((t[2] - t[0]) / (t[3] - t[1])) - Math.Atan((p[2] - p[0]) / (p[3] - p[1])), v = AspectFactor * diff * diff;
-        return v / (1 - iou + v + eps);
-    }
-
-    /// <summary>The share of max(a, b)'s gradient a takes (min's: Below).</summary>
+    /// <summary>The share of max(a, b)'s gradient a takes (min's: Below): all of it, none, or at a tie half.</summary>
     public static double Above(double a, double b) => a > b ? 1 : a == b ? 0.5 : 0;
 
     public static double Below(double a, double b) => a < b ? 1 : a == b ? 0.5 : 0;

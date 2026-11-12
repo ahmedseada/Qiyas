@@ -266,6 +266,7 @@ public readonly struct Q8_0 : IFloatAdad<Q8_0>, IAdad<Q8_0, float>
     public static bool IsFloat => true;
     public static double Min => -65504;
     public static double Max => 65504;
+    public static double Epsilon => Math.Pow(2, -7);                 // codes −127 … 127
     public static long Bytes(long values) => (values + BlockValues - 1) / BlockValues * BlockBytes;
     public static int Granularity => BlockValues;
     public static (double Min, double Max) Range(ReadOnlySpan<byte> s, int count) => BlockRange.Of(s, count, BlockValues, BlockBytes, Blocks.DecodeQ8_0);
@@ -284,6 +285,7 @@ public readonly struct Q4_0 : IFloatAdad<Q4_0>, IAdad<Q4_0, float>
     public static bool IsFloat => true;
     public static double Min => -65504;
     public static double Max => 65504;
+    public static double Epsilon => Math.Pow(2, -3);                 // codes −8 … 7
     public static long Bytes(long values) => (values + BlockValues - 1) / BlockValues * BlockBytes;
     public static int Granularity => BlockValues;
     public static (double Min, double Max) Range(ReadOnlySpan<byte> s, int count) => BlockRange.Of(s, count, BlockValues, BlockBytes, Blocks.DecodeQ4_0);
@@ -302,6 +304,7 @@ public readonly struct Q4_K : IFloatAdad<Q4_K>, IAdad<Q4_K, float>
     public static bool IsFloat => true;
     public static double Min => -65504;
     public static double Max => 65504;
+    public static double Epsilon => Math.Pow(2, -4);                 // codes 0 … 15 above the sub-block's minimum
     public static long Bytes(long values) => (values + BlockValues - 1) / BlockValues * BlockBytes;
     public static int Granularity => BlockValues;
     public static (double Min, double Max) Range(ReadOnlySpan<byte> s, int count) => BlockRange.Of(s, count, BlockValues, BlockBytes, Blocks.DecodeQ4_K);
@@ -320,6 +323,7 @@ public readonly struct Q6_K : IFloatAdad<Q6_K>, IAdad<Q6_K, float>
     public static bool IsFloat => true;
     public static double Min => -65504;
     public static double Max => 65504;
+    public static double Epsilon => Math.Pow(2, -5);                 // codes −32 … 31
     public static long Bytes(long values) => (values + BlockValues - 1) / BlockValues * BlockBytes;
     public static int Granularity => BlockValues;
     public static (double Min, double Max) Range(ReadOnlySpan<byte> s, int count) => BlockRange.Of(s, count, BlockValues, BlockBytes, Blocks.DecodeQ6_K);

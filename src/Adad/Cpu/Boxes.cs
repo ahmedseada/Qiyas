@@ -15,18 +15,19 @@ namespace Adad.Cpu;
 
 internal sealed partial class Kernels
 {
-    /// <summary>loss[i] of count pairs of corner boxes (count × 4 as the type each) as the type; returns the lane's name.</summary>
-    public static string BoxLoss<TN>(BoxOverlap overlap, byte[] predicted, byte[] target, byte[] loss, int count, double eps) where TN : struct, IFloatAdad<TN>
+    /// <summary>loss[i] of count pairs of corner boxes (count × 4 as the type each) as the type, eps the type's; returns the
+    /// lane's name.</summary>
+    public static string BoxLoss<TN>(BoxOverlap overlap, byte[] predicted, byte[] target, byte[] loss, int count) where TN : struct, IFloatAdad<TN>
     {
-        var v = new BoxVisitor(overlap, predicted, target, null, loss, count, eps);
+        var v = new BoxVisitor(overlap, predicted, target, null, loss, count, TN.Epsilon);
         TN.Float(ref v);
         return v.Lane;
     }
 
     /// <summary>dpredicted = dloss[i] · ∂loss[i] / ∂predicted[i] (count × 4 as the type); returns the lane's name.</summary>
-    public static string BoxLossBackward<TN>(BoxOverlap overlap, byte[] predicted, byte[] target, byte[] dloss, byte[] dpredicted, int count, double eps) where TN : struct, IFloatAdad<TN>
+    public static string BoxLossBackward<TN>(BoxOverlap overlap, byte[] predicted, byte[] target, byte[] dloss, byte[] dpredicted, int count) where TN : struct, IFloatAdad<TN>
     {
-        var v = new BoxVisitor(overlap, predicted, target, dloss, dpredicted, count, eps);
+        var v = new BoxVisitor(overlap, predicted, target, dloss, dpredicted, count, TN.Epsilon);
         TN.Float(ref v);
         return v.Lane;
     }
@@ -176,7 +177,9 @@ internal sealed partial class Kernels
                     var v = C(Boxes.AspectFactor) * diff * diff;
                     var alpha = v / (one - iou + v + eps);
                     loss += alpha * v;
-                    var k = two * C(Boxes.AspectFactor) * alpha * diff / (wp * wp + hp * hp);
+                    var held = one - alpha * alpha;                         // ∂(α·v)/∂IoU = α², ∂(α·v)/∂v = α·(2 − α)
+                    (dInter, dUnion) = (dInter * held, dUnion * held);
+                    var k = two * C(Boxes.AspectFactor) * (alpha * (two - alpha)) * diff / (wp * wp + hp * hp);
                     (dW, dH) = (-(k * hp), k * wp);
                 }
             }

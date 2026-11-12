@@ -9,16 +9,18 @@ namespace Adad.Vulkan;
 
 public sealed partial class VulkanOps
 {
-    /// <summary>loss[i] of count pairs of corner boxes (count × 4 as the type each) as the type; returns the lane's name.</summary>
-    public string BoxLoss<TN>(BoxOverlap overlap, ulong predicted, ulong target, ulong loss, int count, double eps) where TN : struct, IFloatAdad<TN> =>
-        BoxRun<TN>(overlap, predicted, target, 0, loss, count, eps);
+    /// <summary>loss[i] of count pairs of corner boxes (count × 4 as the type each) as the type, eps the type's; returns the
+    /// lane's name.</summary>
+    public string BoxLoss<TN>(BoxOverlap overlap, ulong predicted, ulong target, ulong loss, int count) where TN : struct, IFloatAdad<TN> =>
+        BoxRun<TN>(overlap, predicted, target, 0, loss, count);
 
     /// <summary>dpredicted = dloss[i] · ∂loss[i] / ∂predicted[i] (count × 4 as the type); returns the lane's name.</summary>
-    public string BoxLossBackward<TN>(BoxOverlap overlap, ulong predicted, ulong target, ulong dloss, ulong dpredicted, int count, double eps) where TN : struct, IFloatAdad<TN> =>
-        BoxRun<TN>(overlap, predicted, target, dloss, dpredicted, count, eps);
+    public string BoxLossBackward<TN>(BoxOverlap overlap, ulong predicted, ulong target, ulong dloss, ulong dpredicted, int count) where TN : struct, IFloatAdad<TN> =>
+        BoxRun<TN>(overlap, predicted, target, dloss, dpredicted, count);
 
-    private string BoxRun<TN>(BoxOverlap overlap, ulong predicted, ulong target, ulong dloss, ulong output, int count, double eps) where TN : struct, IFloatAdad<TN>
+    private string BoxRun<TN>(BoxOverlap overlap, ulong predicted, ulong target, ulong dloss, ulong output, int count) where TN : struct, IFloatAdad<TN>
     {
+        double eps = TN.Epsilon;
         _ = Boxes.Name(overlap);
         var f = Fmt.Of<TN>();
         var lane = RowLane(f);

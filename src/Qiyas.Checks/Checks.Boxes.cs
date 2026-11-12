@@ -3,9 +3,10 @@
 
 // The box overlap losses (Boxes.cs) on every device against their float64 reference: IoU, GIoU, DIoU and CIoU over every
 // float type (the block formats among them), pairs overlapping, apart, enclosing, equal and with tied corners (a tie's
-// gradient shared in halves); the loss within the lane's rounding of its terms (Boxes.Reference's scale) plus the type's
-// step, the backward's components the same with their own scales; and first the reference's gradient against its own loss
-// by central differences (CIoU's α held at its value, as the gradient takes it; away from the ties).
+// gradient shared in halves), eps the type's precision (in the narrow types large enough that its place in each divisor
+// shows); the loss within the lane's rounding of its terms (Boxes.Reference's scale) plus the type's step, the backward's
+// components the same with their own scales; and first the reference's gradient against its own loss by central
+// differences at a wide and a narrow type's eps (CIoU's α moving with the pair; away from the ties).
 namespace Qiyas;
 
 internal static partial class Checks
@@ -18,7 +19,7 @@ internal static partial class Checks
         string where = ops is null ? "cpu" : device;
         const int count = 1001;
         var (pv, tv) = BoxPairs(count);
-        if (ops is null) ok &= BoxGradients(pv, tv, count);
+        if (ops is null) ok &= BoxGradients(pv, tv, count, Math.Pow(2, -23)) & BoxGradients(pv, tv, count, Math.Pow(2, -3));
         foreach (var type in Bench.Registry.Names)
         {
             if (!Bench.Registry.IsFloat(type) || (!blocks && Bench.Registry.IsBlock(type))) continue;
@@ -26,6 +27,7 @@ internal static partial class Checks
             var t = Bench.Registry.Encode(type, tv);
             var dl = Bench.Registry.Make(type, count, 75, -1, 1);
             double[] ps = Bench.Registry.Values(type, p, 4 * count), ts = Bench.Registry.Values(type, t, 4 * count), ds = Bench.Registry.Values(type, dl, count);
+            double eps = Bench.Registry.WithFloat(type, new EpsilonOf());
             foreach (var overlap in Overlaps)
             {
                 string name = Boxes.Name(overlap);
@@ -36,7 +38,7 @@ internal static partial class Checks
                 for (int i = 0; i < count; i++)
                 {
                     var g = wantGrad.AsSpan(4 * i, 4);
-                    (want[i], scale[i]) = Boxes.Reference(overlap, ps.AsSpan(4 * i, 4), ts.AsSpan(4 * i, 4), Boxes.Eps, g, gradScale.AsSpan(4 * i, 4));
+                    (want[i], scale[i]) = Boxes.Reference(overlap, ps.AsSpan(4 * i, 4), ts.AsSpan(4 * i, 4), eps, g, gradScale.AsSpan(4 * i, 4));
                     for (int k = 0; k < 4; k++) { g[k] *= ds[i]; gradScale[4 * i + k] *= Math.Abs(ds[i]); }
                 }
 
@@ -85,9 +87,9 @@ internal static partial class Checks
         return (p, t);
     }
 
-    // The reference's gradient against central differences of its loss (CIoU's α held at the pair's value), over the pairs
-    // whose corners and overlap edges are apart (a tie's gradient is the halves', not a derivative).
-    private static bool BoxGradients(double[] pv, double[] tv, int count)
+    // The reference's gradient against central differences of its loss, over the pairs whose corners and overlap edges are
+    // apart (a tie's gradient is the halves', not a derivative).
+    private static bool BoxGradients(double[] pv, double[] tv, int count, double eps)
     {
         bool ok = true;
         const double h = 1e-6;
@@ -103,15 +105,14 @@ internal static partial class Checks
                 for (int k = 0; k < 4; k++) near |= Math.Abs(p[k] - t[k]) < 1e-3;
                 near |= Math.Abs(Math.Min(p[2], t[2]) - Math.Max(p[0], t[0])) < 1e-3 || Math.Abs(Math.Min(p[3], t[3]) - Math.Max(p[1], t[1])) < 1e-3;
                 if (near) continue;
-                Boxes.Reference(overlap, p, t, Boxes.Eps, g, gs);
-                double alpha = Boxes.CiouAlpha(p, t, Boxes.Eps);
+                Boxes.Reference(overlap, p, t, eps, g, gs);
                 for (int k = 0; k < 4; k++)
                 {
                     p.CopyTo(q);
                     q[k] = p[k] + h;
-                    double up = Boxes.Reference(overlap, q, t, Boxes.Eps, fixedAlpha: alpha).Loss;
+                    double up = Boxes.Reference(overlap, q, t, eps).Loss;
                     q[k] = p[k] - h;
-                    double down = Boxes.Reference(overlap, q, t, Boxes.Eps, fixedAlpha: alpha).Loss;
+                    double down = Boxes.Reference(overlap, q, t, eps).Loss;
                     worst = Math.Max(worst, Math.Abs((up - down) / (2 * h) - g[k]) / (1 + gs[k]));
                 }
             }
@@ -122,16 +123,21 @@ internal static partial class Checks
         return ok;
     }
 
+    private sealed class EpsilonOf : Bench.IFloatTypeVisitor<double>
+    {
+        public double Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => TN.Epsilon;
+    }
+
     private sealed class BoxRun(IDevice<ulong, ulong>? ops, BoxOverlap overlap, byte[] p, byte[] t, byte[]? dl, byte[] y, int count) : Bench.IFloatTypeVisitor<string>
     {
         public string Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
         {
             if (ops is null)
-                return dl is null ? CpuDevice.Device.BoxLoss<TN>(overlap, p, t, y, count, Boxes.Eps) : CpuDevice.Device.BoxLossBackward<TN>(overlap, p, t, dl, y, count, Boxes.Eps);
+                return dl is null ? CpuDevice.Device.BoxLoss<TN>(overlap, p, t, y, count) : CpuDevice.Device.BoxLossBackward<TN>(overlap, p, t, dl, y, count);
             using var st = new Staged(ops);
             var lane = dl is null
-                ? ops.BoxLoss<TN>(overlap, st.In(p), st.In(t), st.Out(y), count, Boxes.Eps)
-                : ops.BoxLossBackward<TN>(overlap, st.In(p), st.In(t), st.In(dl), st.Out(y), count, Boxes.Eps);
+                ? ops.BoxLoss<TN>(overlap, st.In(p), st.In(t), st.Out(y), count)
+                : ops.BoxLossBackward<TN>(overlap, st.In(p), st.In(t), st.In(dl), st.Out(y), count);
             st.Collect();
             return lane;
         }

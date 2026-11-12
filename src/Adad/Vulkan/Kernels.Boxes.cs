@@ -77,7 +77,9 @@ internal static partial class VkKernels
                 var v = af * diff * diff;
                 var alpha = v / (one - iou + v + eps);
                 loss = loss + alpha * v;
-                var kk = two * af * alpha * diff / (wp * wp + hp * hp);
+                var held = one - alpha * alpha;                             // ∂(α·v)/∂IoU = α², ∂(α·v)/∂v = α·(2 − α)
+                (dInter, dUnion) = (dInter * held, dUnion * held);
+                var kk = two * af * (alpha * (two - alpha)) * diff / (wp * wp + hp * hp);
                 (dW, dH) = (-(kk * hp), kk * wp);
             }
         }

@@ -81,7 +81,9 @@ internal static partial class Ptx
                 string v = e.Mul(e.Mul(af, diff), diff);
                 string alpha = e.Div(v, e.Add(e.Add(e.Sub(one, iou), v), eps));
                 loss = e.Add(loss, e.Mul(alpha, v));
-                string k = e.Div(e.Mul(e.Mul(e.Mul(two, af), alpha), diff), e.Add(e.Mul(wp, wp), e.Mul(hp, hp)));
+                string held = e.Sub(one, e.Mul(alpha, alpha));             // ∂(α·v)/∂IoU = α², ∂(α·v)/∂v = α·(2 − α)
+                (dInter, dUnion) = (e.Mul(dInter, held), e.Mul(dUnion, held));
+                string k = e.Div(e.Mul(e.Mul(e.Mul(two, af), e.Mul(alpha, e.Sub(two, alpha))), diff), e.Add(e.Mul(wp, wp), e.Mul(hp, hp)));
                 (dW, dH) = (e.Neg(e.Mul(k, hp)), e.Mul(k, wp));
             }
         }

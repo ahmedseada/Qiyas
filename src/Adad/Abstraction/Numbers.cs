@@ -65,6 +65,12 @@ public interface IFloatAdad<TSelf> : IAdad<TSelf> where TSelf : struct, IFloatAd
 {
     static abstract void Float<TV>(ref TV visitor) where TV : struct, IFloatLaneVisitor;
 
+    /// <summary>The type's precision as a value: the step from 1 to the next value the type holds, 2^−(fraction bits); a block
+    /// format's, its codes' step against the largest magnitude a block's scale gives them, 2^−(code bits less the sign's).
+    /// What keeps a division finite takes it (the box losses' eps): added to a divisor of 1 or more, it moves the quotient by
+    /// no more than the type's own step.</summary>
+    static abstract double Epsilon { get; }
+
     static bool IAdad<TSelf>.TryFloat<TV>(ref TV visitor)
     {
         TSelf.Float(ref visitor);

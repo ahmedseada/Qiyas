@@ -70,6 +70,7 @@ public readonly struct Float64 : IFloatAdad<Float64>, IAdad<Float64, double>, IA
     public static bool IsFloat => true;
     public static double Min => double.MinValue;
     public static double Max => double.MaxValue;
+    public static double Epsilon => Math.Pow(2, -52);
     static bool IAdad<Float64, double>.Direct => true;
     public static void Load(ReadOnlySpan<byte> s, int first, Span<double> l) => Stored.Load<double, double>(s, first, l);
     public static void Store(ReadOnlySpan<double> l, Span<byte> s, int first) => Stored.Store<double, double>(l, s, first);
@@ -87,6 +88,7 @@ public readonly struct Float32 : IFloatAdad<Float32>, IAdad<Float32, float>, IAd
     public static bool IsFloat => true;
     public static double Min => float.MinValue;
     public static double Max => float.MaxValue;
+    public static double Epsilon => Math.Pow(2, -23);
     static bool IAdad<Float32, float>.Direct => true;
     public static void Load(ReadOnlySpan<byte> s, int first, Span<float> l) => Stored.Load<float, float>(s, first, l);
     public static void Store(ReadOnlySpan<float> l, Span<byte> s, int first) => Stored.Store<float, float>(l, s, first);
@@ -104,6 +106,7 @@ public readonly struct Float16 : IFloatAdad<Float16>, IAdad<Float16, float>
     public static bool IsFloat => true;
     public static double Min => -65504;
     public static double Max => 65504;
+    public static double Epsilon => Math.Pow(2, -10);
     public static void Load(ReadOnlySpan<byte> s, int first, Span<float> l) => Cvt.FromHalf(Cvt.As<ushort>(s).Slice(first, l.Length), l);
     public static void Store(ReadOnlySpan<float> l, Span<byte> s, int first) => Cvt.ToHalf(l, Cvt.As<ushort>(s).Slice(first, l.Length));
     public static void Elementwise<TV>(ref TV v) where TV : struct, ILaneVisitor => v.Run<Float16, float, F32>();
@@ -118,6 +121,7 @@ public readonly struct BFloat16 : IFloatAdad<BFloat16>, IAdad<BFloat16, float>
     public static bool IsFloat => true;
     public static double Min => -3.3895313892515355e38;
     public static double Max => 3.3895313892515355e38;
+    public static double Epsilon => Math.Pow(2, -7);
     public static void Load(ReadOnlySpan<byte> s, int first, Span<float> l) => Cvt.FromBFloat16(Cvt.As<ushort>(s).Slice(first, l.Length), l);
     public static void Store(ReadOnlySpan<float> l, Span<byte> s, int first) => Cvt.ToBFloat16(l, Cvt.As<ushort>(s).Slice(first, l.Length));
     public static void Elementwise<TV>(ref TV v) where TV : struct, ILaneVisitor => v.Run<BFloat16, float, F32>();
@@ -132,6 +136,7 @@ public readonly struct Float8E4M3 : IFloatAdad<Float8E4M3>, IAdad<Float8E4M3, fl
     public static bool IsFloat => true;
     public static double Min => -448;
     public static double Max => 448;
+    public static double Epsilon => Math.Pow(2, -3);
     public static void Load(ReadOnlySpan<byte> s, int first, Span<float> l) => Cvt.E4M3ToFloat(s.Slice(first, l.Length), l);
     public static void Store(ReadOnlySpan<float> l, Span<byte> s, int first) => Cvt.E4M3FromFloat(l, s.Slice(first, l.Length));
     public static void Elementwise<TV>(ref TV v) where TV : struct, ILaneVisitor => v.Run<Float8E4M3, float, F32>();
@@ -146,6 +151,7 @@ public readonly struct Float8E5M2 : IFloatAdad<Float8E5M2>, IAdad<Float8E5M2, fl
     public static bool IsFloat => true;
     public static double Min => -57344;
     public static double Max => 57344;
+    public static double Epsilon => Math.Pow(2, -2);
     public static void Load(ReadOnlySpan<byte> s, int first, Span<float> l) => Cvt.E5M2ToFloat(s.Slice(first, l.Length), l);
     public static void Store(ReadOnlySpan<float> l, Span<byte> s, int first) => Cvt.E5M2FromFloat(l, s.Slice(first, l.Length));
     public static void Elementwise<TV>(ref TV v) where TV : struct, ILaneVisitor => v.Run<Float8E5M2, float, F32>();
