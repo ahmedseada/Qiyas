@@ -15,6 +15,7 @@
 //                   cross_entropy_bwd (softmax(x) − one_hot(target)) in Rows.cs
 
 using System.Buffers;
+using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using Adad.Abstraction;
@@ -62,19 +63,7 @@ internal sealed partial class Kernels
                 for (int r = first; r < last; r++)
                 {
                     TN.Load(x, r * cols, row.AsSpan(0, cols));
-                    // One pass keeping the k first in Adad's order (Widths.Compare: larger first, a NaN above every number;
-                    // an equal value after the earlier ones): a value enters only when it ranks strictly above the k-th, then
-                    // moves past every kept value it ranks strictly above. The order is total, so this is the k passes of
-                    // first-ranked exactly.
-                    int taken = 0;
-                    for (int c = 0; c < cols; c++)
-                    {
-                        TLane v = row[c];
-                        if (taken == k && Widths.Compare(v, best[k - 1]) <= 0) continue;
-                        int j = taken < k ? taken++ : k - 1;
-                        while (j > 0 && Widths.Compare(v, best[j - 1]) > 0) { best[j] = best[j - 1]; bestAt[j] = bestAt[j - 1]; j--; }
-                        best[j] = v; bestAt[j] = c;
-                    }
+                    TopKRow<TLane, TL>(row.AsSpan(0, cols), k, best, bestAt);
 
                     if (lanes) best.AsSpan(0, k).CopyTo(MemoryMarshal.Cast<byte, TLane>(values.AsSpan()).Slice(r * k, k));
                     else TN.Store(best.AsSpan(0, k), values, r * k);
@@ -86,6 +75,42 @@ internal sealed partial class Kernels
                 pool.Return(row); pool.Return(best); ArrayPool<int>.Shared.Return(bestAt);
             }
         }
+    }
+
+    // One pass keeping a row's k first in Adad's order (Widths.Compare: larger first, a NaN above every number; an equal
+    // value after the earlier ones): a value enters only when it ranks strictly above the k-th, then moves past every kept
+    // value it ranks strictly above. The order is total, so this is the k passes of first-ranked exactly. Once k are kept,
+    // a vector of the row none of whose values ranks strictly above the k-th is passed over whole (its values would each
+    // have been passed over), so the values that enter, and the order they enter in, are the same.
+    private static void TopKRow<TLane, TL>(ReadOnlySpan<TLane> xs, int k, TLane[] best, int[] bestAt) where TLane : unmanaged where TL : struct, ILane<TL, TLane>
+    {
+        if (k == 0) return;                                                   // nothing kept (the k-th would be best[−1])
+        int cols = xs.Length, w = Vector<TLane>.Count, taken = 0, c = 0;
+        for (; c < cols && taken < k; c++) Enter(xs[c], c);
+        for (; c + w <= cols; c += w)
+        {
+            if (!AnyAbove(new Vector<TLane>(xs.Slice(c, w)), best[k - 1])) continue;
+            for (int l = 0; l < w; l++) Enter(xs[c + l], c + l);
+        }
+
+        for (; c < cols; c++) Enter(xs[c], c);
+
+        void Enter(TLane v, int at)
+        {
+            if (taken == k && Widths.Compare(v, best[k - 1]) <= 0) return;
+            int j = taken < k ? taken++ : k - 1;
+            while (j > 0 && Widths.Compare(v, best[j - 1]) > 0) { best[j] = best[j - 1]; bestAt[j] = bestAt[j - 1]; j--; }
+            best[j] = v;
+            bestAt[j] = at;
+        }
+    }
+
+    // Whether a value of v ranks strictly above t in Adad's order: larger, or a NaN where t is a number (−0 and +0 equal).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool AnyAbove<TLane>(Vector<TLane> v, TLane t) where TLane : unmanaged
+    {
+        var tv = new Vector<TLane>(t);
+        return Vector.GreaterThanAny(v, tv) || (Vector.EqualsAll(tv, tv) && !Vector.EqualsAll(v, v));
     }
 
     /// <summary>The top-k of each row as log-probabilities (IRouting.LogSoftmaxTopK): the row in the float lane, TopK's
@@ -138,15 +163,7 @@ internal sealed partial class Kernels
                     var xs = row.AsSpan(0, cols);
                     TN.Load(x, r * cols, xs);
                     // TopK's pass: the k first in Adad's order, an equal value after the earlier ones.
-                    int taken = 0;
-                    for (int c = 0; c < cols; c++)
-                    {
-                        TLane v = xs[c];
-                        if (taken == k && Widths.Compare(v, best[k - 1]) <= 0) continue;
-                        int j = taken < k ? taken++ : k - 1;
-                        while (j > 0 && Widths.Compare(v, best[j - 1]) > 0) { best[j] = best[j - 1]; bestAt[j] = bestAt[j - 1]; j--; }
-                        best[j] = v; bestAt[j] = c;
-                    }
+                    TopKRow<TLane, TL>(xs, k, best, bestAt);
 
                     // The row's first-ranked value (the first chosen) and the log of Σ exp(x − it) (the row is the sum's
                     // scratch after the selection); k is at least 1 here and at most the row's columns.
