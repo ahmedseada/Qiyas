@@ -1150,7 +1150,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
     {
         var outputs = new Dictionary<IBenchSubject, byte[]>();
         double[]? defined = null;
-        Record(device, op, type, shape, work, s => prepare(s, outputs[s] = new byte[outputBytes]), (subject, _) => Err(scored ?? type, outputs[subject], defined ??= Defined(scored ?? type, reference)));
+        Record(device, op, type, shape, work with { Written = Math.Min(outputBytes, work.Bytes) }, s => prepare(s, outputs[s] = new byte[outputBytes]), (subject, _) => Err(scored ?? type, outputs[subject], defined ??= Defined(scored ?? type, reference)));
     }
 
     /// <summary>The float64 reference as the type defines its result, as the checks hold it: a type that is not float stores
@@ -1239,7 +1239,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
     private static (string Rate, string Of) Reached(Row r, Cell c, (double Ms, string By) bound)
     {
         double seconds = c.Ms / 1e3;
-        string rate = bound.By == "copy" ? Work.Size(r.Work.Bytes / seconds, "B/s") : Work.Size(r.Work.Ops / seconds, "op/s");
+        string rate = bound.By is "copy" or "memory" ? Work.Size(r.Work.Bytes / seconds, "B/s") : Work.Size(r.Work.Ops / seconds, "op/s");
         return (rate, string.Create(CultureInfo.InvariantCulture, $"{100 * bound.Ms / c.Ms:0.#} %"));
     }
 
@@ -1362,7 +1362,7 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         sb.AppendLine(string.Create(CultureInfo.InvariantCulture,
             $"{DateTime.Now:yyyy-MM-dd HH:mm}. Median wall time (ms){(options.Repeat > 1 ? $" of {options.Repeat} readings, the subjects in turn" : "")}; `×` = {_baseline} ÷ subject (above 1: faster than {_baseline}). `err` = largest |result − float64 math on the same stored inputs| as the type defines the result (a type that is not float: rounded as it rounds and held to its range; a float type: held where it saturates). `lane` = what the subject computed in.{(CoolDownSeconds > 0 ? $" Timed after {CoolDownSeconds} s idle following the gates (the processor's boost budget recovered)." : "")}"));
         sb.AppendLine();
-        sb.AppendLine("The readout: `bytes` and `ops` are what the row's operation moves and computes by its own definition (every operand read once and every result written once at its stored width; each arithmetic operation or elementary function one, a multiply-add two); `bound` is the time those take at this device's limits, measured at the start of this run (the larger of the bytes at the copy bandwidth and the operations at the lane's peak; `by` names which); each subject's `rate` is what it reached in the bound's unit and `of bound` the bound ÷ its time; `held` a bound on the working memory its run held beyond its operands (host: the pooled buffers out at once at their peak, every other allocation as if all were live together, and the subject's kept buffers, each thread's peak summed; + device on a GPU, the subject's buffers at their peak; ? where the subject cannot tell).");
+        sb.AppendLine("The readout: `bytes` and `ops` are what the row's operation moves and computes by its own definition (every operand read once and every result written once at its stored width; each arithmetic operation or elementary function one, a multiply-add two); `bound` is the time those take at this device's limits, measured at the start of this run (the larger of the bytes at the memory's measured rates, reads at the read rate and writes at the write rate or a copy's mix at the copy rate, whichever model is fastest, and the operations at the lane's peak; `by` names which: memory, copy where the row does not say which bytes it writes, or the lane); each subject's `rate` is what it reached in the bound's unit and `of bound` the bound ÷ its time; `held` a bound on the working memory its run held beyond its operands (host: the pooled buffers out at once at their peak, every other allocation as if all were live together, and the subject's kept buffers, each thread's peak summed; + device on a GPU, the subject's buffers at their peak; ? where the subject cannot tell).");
         sb.AppendLine();
         sb.AppendLine($"Proof: {Proof}.");
         sb.AppendLine();

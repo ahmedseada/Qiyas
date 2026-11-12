@@ -19,9 +19,13 @@ namespace Qiyas.Bench;
 /// elementary function one; a multiply-add two).</summary>
 internal readonly record struct Work(double Bytes, double Ops)
 {
-    public static Work operator +(Work a, Work b) => new(a.Bytes + b.Bytes, a.Ops + b.Ops);
+    /// <summary>Of the bytes, those written (the rest read); null where the row does not say (its bytes then held to the copy's
+    /// mix). Measure sets it to the row's output.</summary>
+    public double? Written { get; init; }
 
-    public static Work operator *(double k, Work a) => new(k * a.Bytes, k * a.Ops);
+    public static Work operator +(Work a, Work b) => new(a.Bytes + b.Bytes, a.Ops + b.Ops) { Written = a.Written + b.Written };
+
+    public static Work operator *(double k, Work a) => new(k * a.Bytes, k * a.Ops) { Written = k * a.Written };
 
     /// <summary>The stored bytes of values of the type.</summary>
     public static double B(string type, long values) => Registry.Bytes(type, values);
@@ -29,13 +33,14 @@ internal readonly record struct Work(double Bytes, double Ops)
     /// <summary>Values of the type read (or written) and nothing computed.</summary>
     public static Work Of(string type, long values) => new(B(type, values), 0);
 
-    /// <summary>The time the row takes at the device's limits: its bytes at the copy bandwidth of their size, or its operations at the lane's
-    /// peak, the larger, and which one binds.</summary>
+    /// <summary>The time the row takes at the device's limits: its bytes at the memory's rates for their size (Limits.MoveSeconds:
+    /// reads, writes and copies as measured; "copy" where the row does not say which bytes it writes, "memory" where it
+    /// does), or its operations at the lane's peak, the larger, and which one binds.</summary>
     public (double Ms, string By) Bound(Limits limits, string lane)
     {
-        double copy = limits.CopySeconds(Bytes) * 1e3;
+        double move = limits.MoveSeconds(Bytes, Written) * 1e3;
         double ops = limits.Ops(lane) is { } peak && Ops > 0 ? Ops / peak * 1e3 : 0;
-        return ops > copy ? (ops, lane) : (copy, "copy");
+        return ops > move ? (ops, lane) : (move, Written is null ? "copy" : "memory");
     }
 
     public static string Size(double v, string unit)
