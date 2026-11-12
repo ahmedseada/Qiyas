@@ -69,7 +69,7 @@ internal static partial class Checks
                     }
                 }
 
-                if (wrong is not null) { Console.WriteLine($"check {what,-50} {where,-6} {type,-12} {wrong}"); ok = false; }
+                if (wrong is not null) { Console.WriteLine($"check {what,-50} {where,-6} {type,-12} DIFFERS: {wrong}"); ok = false; }
             }
         }
 

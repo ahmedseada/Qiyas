@@ -174,7 +174,7 @@ internal static partial class Checks
             for (int i = 0; i < count; i++) { if (hits[i] == 0) missed++; else if (hits[i] > 1) twice++; }
             if (bad[0] != 0 || missed != 0 || twice != 0)
             {
-                Console.WriteLine($"check team                   cpu    job {j} of {count} in chunks of {size}: {bad[0]} chunks outside the job, {missed} indices missed, {twice} run twice");
+                Console.WriteLine($"check team                   cpu    FAILS: job {j} of {count} in chunks of {size}: {bad[0]} chunks outside the job, {missed} indices missed, {twice} run twice");
                 ok = false;
             }
         }
