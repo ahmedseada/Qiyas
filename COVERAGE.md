@@ -70,7 +70,7 @@ regression comparer and the baseline run.
 
 1. The todo rows below (item 4, in this order: fused attention rows — done, ctc — done, the GRU sequence bench row — done, the block-scaled
    tiled product — done, the transposition fused into the product's packing — done, the radix step of scatter-add — done, the fused direct
-   convolution — done); the designs and the progress are in `docs/wip/HANDOFF.md`.
+   convolution — done).
 2. A bump-allocated scope past the pool (buffers reserved once from the shapes; zero rents on the hot path) — done
    (item 5: the device arena and the CPU product workspace, above).
 3. The known-slow list — done (item 6, closed with the assembled bench below).
@@ -98,7 +98,7 @@ machine's state since 00:51, not the code. The CUDA float64 product took the sli
 exact under the double-double reference).
 
 **Settled — item 6's bench (the end of item 6).** Item 6's capped full run was stopped at the owner's request at 03:09
-on 2026-11-07 (invocation 1, the core and products at every type, and invocation 2, the core with lib and number,
+on 2026-11-07 (invocation 1, the core and products at every type, and invocation 2, the core with number,
 complete; invocation 3 partial: CUDA float32, float16 and part of float64; invocation 4 not run), and no further runs
 were made. `docs/wip/baseline.md` is assembled from this session's runs: each subject's newest reading of each cell
 from that run and from the single-family runs of items 5 and 6, using only readings of code that is in main and
@@ -107,7 +107,7 @@ source column. Qiyas cells by source: 3512 from the item 4 run, 352 invocation 1
 CPU layout run, 39 6j's CPU reductions, 30 the small cells' CUDA layout run, 15 6k's CUDA rows, 12 + 4 6k's CPU
 recurrent runs, 11 + 10 + 6 + 4 + 2 the small cells' CPU pools / rows / map / ctc runs, 8 6k's float64 attention and
 conv, 6 + 4 6k's CPU sums, 3 6j's CPU attention backward, 2 + 2 the small cells' CUDA float16 / bfloat16 formulas, and
-one row with no Qiyas reading (4234 rows). The lib and number columns are invocation 2's at the core rows it ran and
+one row with no Qiyas reading (4234 rows). The number columns are invocation 2's at the core rows it ran and
 item 4's elsewhere. `docs/wip/compare.py` against item 4's baseline: 93 cells slower by more than 5 % (single readings;
 most are CUDA bandwidth rows near 1.9× — the memory P-state, the three-stream row below — or CPU sub-2 ms cells; the ones
 in code items 5 and 6 changed are a Known slow row below), 6 errors grown, each a recorded lane change (CUDA attention
@@ -115,8 +115,7 @@ float64 3.82e-16 → 4.58e-16, the fused rows' measured choice; attention_bwd fl
 backward; CPU gemv_t float64 0 → 5.97e-13, 6h's column tiles; CPU attention_bwd float32 1.47e-7 → 1.72e-7, 6j's
 attention backward; CPU lstm_seq and lstm_seq_bwd float32 2.76e-7 → 2.85e-7 and 9.1e-7 → 9.4e-7, 6f's one product over
 all steps), 18 new
-rows (the CPU's q6_k and bool, q4_k's softmax and rms_norm). The README Results are generated from this file. No Idrak
-operation-name check was made: the owner ended item 6 with the assembled bench.
+rows (the CPU's q6_k and bool, q4_k's softmax and rms_norm). The README Results are generated from this file.
 
 **Settled — the float64 product reference.** `References.MatMul` (the bench's and the gates' float64 reference for every
 product, view and backward) accumulates in double-double: each product exact by a fused multiply-add, each sum with its

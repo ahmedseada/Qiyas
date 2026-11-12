@@ -1,9 +1,9 @@
-"""The README's Results tables from a full `cuda,cpu` results file: one table per device, a row per type, the four core
-operations as lib / number / adad / x (x = lib / adad). Run from the repository root:
+"""The README's Results tables from a full `cuda,cpu` results file of the subjects adad and number: one table per device,
+a row per type, the four core operations as number / adad / x (x = number / adad); then the rows measured per family.
+Run from the repository root:
     python docs/wip/readme_results.py results-qiyas-cuda-cpu.md
-and paste the output over the two tables in README.md; the per-family summary table follows them (every row of an
---ops all run)."""
-import sys, collections
+and paste the output over the README's Results tables."""
+import sys, collections, math
 sys.stdout.reconfigure(encoding='utf-8')
 path = sys.argv[1]
 rows = collections.OrderedDict()
@@ -19,13 +19,13 @@ for line in open(path, encoding='utf-8'):
     device, op, typ, shape = cells[:4]
     subj = {name: cells[i] for name, i in at.items()}
     if 'adad' not in subj and 'qiyas' in subj: subj['adad'] = subj['qiyas']
-    for name in ('lib', 'number'): subj.setdefault(name, '—')
+    subj.setdefault('number', '—')
     rows[(device, typ, op)] = subj
     if typ not in types: types.append(typ)
 ops = ['add', 'matmul', 'softmax', 'rms_norm']
 titles = {'cuda': 'CUDA (2048³ product, 16M-value add, 4096×4096 rows)', 'cpu': 'CPU (1024³ product, 16M-value add, 4096×4096 rows)'}
 for device in ('cuda', 'cpu'):
-    print(f"**{titles[device]}** — lib / number / **adad** / × (× = lib ÷ adad)\n")
+    print(f"**{titles[device]}** — number / **adad** / × (× = number ÷ adad)\n")
     print("| type | add | matmul | softmax | rms_norm |")
     print("|---|---|---|---|---|")
     for typ in types:
@@ -33,27 +33,31 @@ for device in ('cuda', 'cpu'):
         for op in ops:
             r = rows.get((device, typ, op))
             if r is None: cells.append(''); continue
-            lib, num, q = r['lib'], r['number'], r['adad']
-            try: x = f"{float(lib) / float(q):.2f}×"
+            num, q = r['number'], r['adad']
+            try: x = f"{float(num) / float(q):.2f}×"
             except ValueError: x = '—'
-            cells.append(f"{lib} / {num} / **{q}** / {x}")
+            cells.append(f"{num} / **{q}** / {x}")
         print(f"| {typ} | " + " | ".join(cells) + " |")
     print()
 
-# The per-family summary of every row of the run (--ops all): rows measured per device, and against the lib where it has
-# the row: the geometric mean of lib ÷ adad and on how many rows adad is ahead.
-import math
+# The per-family summary of every row of the run (--ops all): rows measured per device, and against number where it has
+# the row: the geometric mean of number ÷ adad and on how many rows adad is ahead.
 def family(op):
     if op in ('add', 'matmul', 'softmax', 'rms_norm'): return 'core'
     if op.startswith('map:'): return 'map (element-wise formulas)'
     if op.startswith(('sum:', 'sumsq:', 'max:', 'min:', 'argmax:', 'maprow:')) or op in ('transpose', 'gemv', 'gemv_t'): return 'reductions, broadcasts, transpose, gemv'
     if op.startswith(('row:', 'norm_params_bwd:')): return 'rows'
-    if op.startswith('layout:'): return 'layout and indexing'
+    if op.startswith('layout:') or op == 'resample': return 'layout and indexing'
     if op.startswith('matmul_'): return 'products on views'
-    if op.startswith('attention'): return 'attention'
+    if op in ('attention_cached', 'cache_write', 'quantize_rows', 'decoder_mask'): return 'caches'
+    if op.startswith('attention') or op == 'rope_table': return 'attention'
     if op in ('conv', 'conv_bwd'): return 'convolution'
-    if op.startswith('optimizer:'): return 'optimizers'
+    if op.startswith('optimizer'): return 'optimizers'
     if op.startswith(('lstm_', 'gru_')): return 'recurrent'
+    if op in ('penalize', 'sample_filtered', 'sample_plain', 'sample_rows', 'dropout', 'dropout_residual'): return 'draws and decoding'
+    if op.startswith('memory:'): return 'memory'
+    if op in ('route_topk', 'expert_matmul', 'expert_gated'): return 'experts'
+    if op.startswith('box_loss'): return 'box losses'
     return 'routing, losses'
 order = []
 stats = collections.defaultdict(lambda: {'rows': 0, 'ops': set(), 'logs': [], 'ahead': 0})
@@ -64,17 +68,17 @@ for (device, typ, op), r in rows.items():
     try: q = float(r['adad'])
     except ValueError: continue
     s['rows'] += 1; s['ops'].add(op)
-    try: lib = float(r['lib'])
+    try: num = float(r['number'])
     except ValueError: continue
-    if lib > 0 and q > 0:
-        s['logs'].append(math.log(lib / q))
-        if lib > q: s['ahead'] += 1
+    if num > 0 and q > 0:
+        s['logs'].append(math.log(num / q))
+        if num > q: s['ahead'] += 1
 def vs(s):
     n = len(s['logs'])
     if n == 0: return '—'
     return f"{math.exp(sum(s['logs']) / n):.2f}× (ahead on {s['ahead']} of {n})"
-print("**Every family** — rows measured (operation × type) and, where the lib has the row, the geometric mean of lib ÷ adad\n")
-print("| family | operations | CUDA rows | CUDA vs lib | CPU rows | CPU vs lib |")
+print("**Every family** — rows measured (operation × type) and, where number has the row, the geometric mean of number ÷ adad\n")
+print("| family | operations | CUDA rows | CUDA vs number | CPU rows | CPU vs number |")
 print("|---|---:|---:|---|---:|---|")
 for f in order:
     c, p = stats[(f, 'cuda')], stats[(f, 'cpu')]

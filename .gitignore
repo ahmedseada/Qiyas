@@ -1,4 +1,4 @@
-# Idrak's code and the bench's lib column: not part of this repo.
+# The bench's local opponent (the lib column) and its host: not part of this repo.
 Lib/
 bench/Qiyas.Bench/CpuCurrent.cs
 bench/Qiyas.Bench/CudaHost.cs
@@ -13,6 +13,4 @@ obj/
 results-cuda-cpu.md
 results3-cuda-cpu.md
 results4-cpu.md
-results-qiyas-cpu.md
-results-qiyas-cuda.md
-results-qiyas-vulkan.md
+results-qiyas-*.md
