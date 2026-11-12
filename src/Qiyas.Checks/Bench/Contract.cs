@@ -156,6 +156,14 @@ public interface IBenchSubject
     /// pick's probability (rows of the type's float lane, as stored).</summary>
     IBenchRun? SampleFiltered(Device device, string type, SamplingArgs a, byte[] x, int step, int[] picks, byte[] probability) => null;
 
+    /// <summary>Dropout (IElementwise.Dropout) of n values of the type by the seed's draws at p, a residual added where one is
+    /// given: output n values as the type.</summary>
+    IBenchRun? Dropout(Device device, string type, byte[] x, byte[]? residual, int n, double p, ulong seed, byte[] output) => null;
+
+    /// <summary>Resampling (ILayouts.Resample) of a.InputCount values of inType through the plan (bounds; weights and the
+    /// channels' scale and shift, or none, in the output's float lane) into a.Count values of the type.</summary>
+    IBenchRun? Resample(Device device, string inType, string type, ResampleArgs a, byte[] x, int[] bounds, byte[] weights, byte[]? values, byte[] output) => null;
+
     /// <summary>A memory operation by a range (IMemory) over the bytes from <paramref name="offset"/> to as many before the
     /// end: "copy" (the source's range into the output's), "clear" (the output's range zeroed), "rent_zeroed" (a zeroed
     /// buffer of the source's length rented and returned; the output is not written).</summary>

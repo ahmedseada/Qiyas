@@ -197,6 +197,24 @@ internal static class Works
         long n = (long)a.Rows * a.Cols;
         return new(2 * B(type, n) + 2.0 * a.Steps * a.Half * laneBytes + 4.0 * a.Steps, 6.0 * a.Rows * a.Half);
     }
+
+    /// <summary>Dropout of n values: x (and the residual) read, y written; a value's draw by its definition (Draws.Bits: the
+    /// counter's xor, two mixes of eight, the add: eighteen), the threshold's comparison and the scale (and the residual's
+    /// add).</summary>
+    public static Work Dropout(string type, long n, bool residual) => new((residual ? 3 : 2) * B(type, n), (residual ? 21.0 : 20.0) * n);
+
+    /// <summary>Resampling: the input read as inType, the output written as the type, the plan (bounds, weights and the
+    /// channels' scale and shift in the lane) read; a multiply-add a tap of each pass (the horizontal over every input row,
+    /// the vertical over every output column, the taps each output position's bounds count) and the scale and shift's.</summary>
+    public static Work Resample(ResampleArgs a, int[] bounds, string inType, string type, int laneBytes)
+    {
+        double cols = 0, rows = 0;
+        for (int o = 0; a.XTaps > 0 && o < a.OutWidth; o++) cols += bounds[2 * o + 1];
+        for (int o = 0; a.YTaps > 0 && o < a.OutHeight; o++) rows += bounds[a.RowBounds + 2 * o + 1];
+        double plan = 4.0 * bounds.Length + (double)laneBytes * (a.WeightCount + a.ValueCount);
+        double ops = 2 * cols * a.Planes * a.Height + 2 * rows * a.Planes * a.Across + 2.0 * a.Count;
+        return new(B(inType, a.InputCount) + B(type, a.Count) + plan, ops);
+    }
 }
 
 /// <summary>The host bytes a run takes from the runtime: the most of the shared array pools' buffers out at once (their rents

@@ -187,6 +187,7 @@ internal sealed class Options
     public static readonly string[] Group13 = ["memory:copy", "memory:clear", "memory:rent_zeroed"];
     public static readonly string[] Group14 = ["route_topk", "expert_matmul", "expert_gated"];
     public static readonly string[] Group15 = [.. Enum.GetValues<BoxOverlap>().SelectMany(o => new[] { "box_loss:" + Boxes.Name(o), "box_loss_bwd:" + Boxes.Name(o) })];
+    public static readonly string[] Group16 = ["dropout", "dropout_residual", "resample"];
     public List<string>? Subjects;
     public string? Baseline;
 
@@ -217,7 +218,7 @@ internal sealed class Options
                 case "--types": o.Types = Next(); break;
                 case "--ops":
                     o.Ops = Next();
-                    if (o.Ops.Contains("all")) o.Ops = [.. Core, .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name), .. Group2, .. Group3, .. Group4, .. Group4b, .. Group5, .. Group6, .. Group7, .. Group7b, .. Group8, .. Group9, .. Group10, .. Group11, .. Group12, .. Group13, .. Group14, .. Group15];
+                    if (o.Ops.Contains("all")) o.Ops = [.. Core, .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name), .. Group2, .. Group3, .. Group4, .. Group4b, .. Group5, .. Group6, .. Group7, .. Group7b, .. Group8, .. Group9, .. Group10, .. Group11, .. Group12, .. Group13, .. Group14, .. Group15, .. Group16];
                     if (o.Ops.Contains("map")) o.Ops = [.. o.Ops.Where(n => n != "map"), .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name)];
                     if (o.Ops.Contains("reduce")) o.Ops = [.. o.Ops.Where(n => n != "reduce"), .. Group2];
                     if (o.Ops.Contains("rows")) o.Ops = [.. o.Ops.Where(n => n != "rows"), .. Group3];
@@ -234,6 +235,7 @@ internal sealed class Options
                     if (o.Ops.Contains("memory")) o.Ops = [.. o.Ops.Where(n => n != "memory"), .. Group13];
                     if (o.Ops.Contains("experts")) o.Ops = [.. o.Ops.Where(n => n != "experts"), .. Group14];
                     if (o.Ops.Contains("boxes")) o.Ops = [.. o.Ops.Where(n => n != "boxes"), .. Group15];
+                    if (o.Ops.Contains("draws")) o.Ops = [.. o.Ops.Where(n => n != "draws"), .. Group16];
                     break;
                 case "--baseline": o.Baseline = args[++i]; break;
                 case "--shapes": o.Shapes = args[++i]; if (o.Shapes is not ("regular" or "odd")) throw new ArgumentException($"--shapes takes regular or odd, not {o.Shapes}"); break;
@@ -424,6 +426,11 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         foreach (var name in Options.Group15)
         {
             if (options.Ops.Contains(name)) BoxRow(device, type, name);
+        }
+
+        foreach (var name in Options.Group16)
+        {
+            if (options.Ops.Contains(name)) DrawsRow(device, type, name);
         }
 
         if (!Registry.IsFloat(type)) return;
@@ -819,6 +826,44 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             if (op == "clear") source.CopyTo(o, 0); else Array.Clear(o);
             return s.Memory(device, op, source, o, offset);
         }, n);
+    }
+
+    // Dropout (every type but bool: bool is refused) and resampling (every output type). Dropout: as many values as a map
+    // row (16M), p = 0.1 by the seed's draws, a residual added in the same pass (dropout_residual); the reference keep(i) ?
+    // x/(1 − p) + r : r in float64. Resample: eight images of three channels, 1080 × 1920 bytes (uint8), to 540 × 960 by the
+    // cubic filter with a scale and a shift a channel (an image's preprocessing), into the type; the float64 reference on the
+    // plan's weights as the output's float lane holds them.
+    private void DrawsRow(Device device, string type, string name)
+    {
+        if (name is "dropout" or "dropout_residual")
+        {
+            if (Registry.Bits(type) == 1) return;
+            int n = Prime(1 << 24);
+            const double p = 0.1;
+            const ulong seed = 41;
+            var x = Registry.Make(type, n, 97, -4, 4);
+            var r = name == "dropout_residual" ? Registry.Make(type, n, 98, -2, 2) : null;
+            var xv = Registry.Values(type, x, n);
+            var rv = r is null ? null : Registry.Values(type, r, n);
+            var key = Draws.Key(seed);
+            uint thr = Draws.Threshold(p);
+            var want = new double[n];
+            Parallel.For(0, n, i => want[i] = (Draws.Keep(key, (uint)i, thr) ? xv[i] / (1 - p) : 0) + (rv?[i] ?? 0));
+            Measure(device, name, type, $"{n}", Works.Dropout(type, n, r is not null), want, (s, y) => s.Dropout(device, type, x, r, n, p, seed, y), (int)Registry.Bytes(type, n));
+            return;
+        }
+
+        {
+            int bits = Registry.Bits(type);
+            bool wide = Registry.IsFloat(type) ? bits == 64 : bits > 16;           // the output's float lane (Fmt.FloatLane)
+            var (a, bounds, raw) = Resampling.Plan(24, 3, Prime(1080), Prime(1920), Prime(540), Prime(960), ResampleFilter.Cubic);
+            var weights = Resampling.InLane(raw, wide);
+            var values = Resampling.InLane([1 / 58.4, -2.12, 1 / 57.1, -2.04, 1 / 57.4, -1.80], wide);
+            var x = Registry.Make("uint8", a.InputCount, 99, 0, 255);
+            var (want, _) = Resampling.Reference(a, Registry.Values("uint8", x, a.InputCount), bounds, weights, values);
+            Measure(device, name, type, $"24x{a.Height}x{a.Width} to {a.OutHeight}x{a.OutWidth} cubic from uint8", Works.Resample(a, bounds, "uint8", type, wide ? 8 : 4), want,
+                (s, y) => s.Resample(device, "uint8", type, a, x, bounds, Resampling.LaneBytes(weights, wide), Resampling.LaneBytes(values, wide), y), (int)Registry.Bytes(type, a.Count));
+        }
     }
 
     // A decoder's steps, every type but bool (bool holds truth values, not scores).

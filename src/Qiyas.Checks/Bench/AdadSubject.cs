@@ -717,6 +717,43 @@ public sealed class AdadSubject : IBenchSubject
         }
     }
 
+    public IBenchRun? Dropout(Device device, string type, byte[] x, byte[]? residual, int n, double p, ulong seed, byte[] output) =>
+        Registry.Bits(type) == 1 ? null : Registry.With(type, new DropoutVisitor(device, x, residual, n, p, seed, output));
+
+    private sealed class DropoutVisitor(Device device, byte[] x, byte[]? residual, int n, double p, ulong seed, byte[] output) : ITypeVisitor<IBenchRun?>, INumberRun
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IAdad<TN, float> => On<TN, DropoutVisitor>(device, this);
+
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IAdad<TN, float>
+        {
+            TB dx = s.In(x, s.Slack), dy = s.Out(output, s.Slack);
+            TB? dr = residual is null ? default : s.In(residual, s.Slack);
+            return s.Run(() => s.D.Dropout<TN>(dx, dr, dy, n, p, seed));
+        }
+    }
+
+    public IBenchRun? Resample(Device device, string inType, string type, ResampleArgs a, byte[] x, int[] bounds, byte[] weights, byte[]? values, byte[] output) =>
+        Registry.With(inType, new ResampleInput(device, type, a, x, bounds, weights, values, output));
+
+    private sealed class ResampleInput(Device device, string type, ResampleArgs a, byte[] x, int[] bounds, byte[] weights, byte[]? values, byte[] output) : ITypeVisitor<IBenchRun?>
+    {
+        public IBenchRun? Visit<TIn>() where TIn : struct, IAdad<TIn, float> => Registry.With(type, new ResampleVisitor<TIn>(device, a, x, bounds, weights, values, output));
+    }
+
+    private sealed class ResampleVisitor<TIn>(Device device, ResampleArgs a, byte[] x, int[] bounds, byte[] weights, byte[]? values, byte[] output) : ITypeVisitor<IBenchRun?>, INumberRun
+        where TIn : struct, IAdad<TIn, float>
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IAdad<TN, float> => On<TN, ResampleVisitor<TIn>>(device, this);
+
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IAdad<TN, float>
+        {
+            TB dx = s.In(x, s.Slack), dw = s.In(weights), dy = s.Out(output, s.Slack);
+            TB? dv = values is null ? default : s.In(values);
+            TI db = s.Index(bounds);
+            return s.Run(() => s.D.Resample<TIn, TN>(a, dx, db, dw, dv, dy));
+        }
+    }
+
     public IBenchRun? Memory(Device device, string op, byte[] source, byte[] output, int offset) =>
         device == Device.Cpu ? MemoryRun(new Staged<byte[], int[]>(CpuDevice.Device, 0), op, source, output, offset)
             : MemoryRun(new Staged<ulong, ulong>(Devices.Of(device), 4), op, source, output, offset);
