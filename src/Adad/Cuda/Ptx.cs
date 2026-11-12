@@ -3113,9 +3113,8 @@ internal static partial class Ptx
             string e = Codec.Exp(b, lane, d);
             b.L(lane.Add(sum, sum, e));
         }, threads);
-        sum = BlockReduce(b, lane, tid, sum, "add", threads);
-        string scale = lane.NewReg(b);
-        b.L($"div.rn.{lane.Op} {scale}, {lane.Literal(1)}, {sum};");
+        var (total, scale) = SumAndReciprocal(b, lane, tid, sum, threads);
+        sum = total;
         RowPass(b, f, lane, tid, wordsPerRow, rowSrc, rowDst, "OUT", (v, outReg) =>
         {
             string d = lane.NewReg(b);
@@ -3139,13 +3138,7 @@ internal static partial class Ptx
         string sum = lane.NewReg(b);
         b.L($"mov.{lane.Reg} {sum}, {lane.Zero};");
         RowPass(b, f, lane, tid, wordsPerRow, rowSrc, null, "SQ", (v, _) => b.L(lane.Fma(sum, v, v, sum)), threads);
-        sum = BlockReduce(b, lane, tid, sum, "add", threads);
-        string count = lane.NewReg(b), mean = lane.NewReg(b), root = lane.NewReg(b), scale = lane.NewReg(b);
-        b.L($"cvt.rn.{lane.Op}.u32 {count}, {cols};");
-        b.L($"div.rn.{lane.Op} {mean}, {sum}, {count};");
-        b.L(lane.Add(mean, mean, eps));
-        b.L($"sqrt.rn.{lane.Op} {root}, {mean};");
-        b.L($"div.rn.{lane.Op} {scale}, {lane.Literal(1)}, {root};");
+        string scale = BlockReduce(b, lane, tid, sum, "add", threads, s => [RmsScale(b, lane, s, cols, eps)])[0];
         RowPass(b, f, lane, tid, wordsPerRow, rowSrc, rowDst, "OUT", (v, outReg) => b.L(lane.Mul(outReg, v, scale)), threads);
         b.L("ret;");
         return b.Finish(Header(gpu), entry, $".param .u64 p_x, .param .u64 p_y, .param .u32 p_cols, .param .{(lane.Wide ? "f64" : "f32")} p_eps", ReduceBytes);
@@ -3188,9 +3181,8 @@ internal static partial class Ptx
             }
         }
 
-        sum = BlockReduce(b, lane, tid, sum, "add", threads);
-        string scale = lane.NewReg(b);
-        b.L($"div.rn.{lane.Op} {scale}, {lane.Literal(1)}, {sum};");
+        var (total, scale) = SumAndReciprocal(b, lane, tid, sum, threads);
+        sum = total;
         RowStore(b, f, lane, present, inWords, rowDst, wordsPerThread, (q, i) =>
         {
             string o = lane.NewReg(b);
@@ -3213,13 +3205,7 @@ internal static partial class Ptx
         string sum = lane.NewReg(b);
         b.L($"mov.{lane.Reg} {sum}, {lane.Zero};");
         foreach (var row in values) foreach (var v in row) b.L(lane.Fma(sum, v, v, sum));
-        sum = BlockReduce(b, lane, tid, sum, "add", threads);
-        string count = lane.NewReg(b), mean = lane.NewReg(b), root = lane.NewReg(b), scale = lane.NewReg(b);
-        b.L($"cvt.rn.{lane.Op}.u32 {count}, {cols};");
-        b.L($"div.rn.{lane.Op} {mean}, {sum}, {count};");
-        b.L(lane.Add(mean, mean, eps));
-        b.L($"sqrt.rn.{lane.Op} {root}, {mean};");
-        b.L($"div.rn.{lane.Op} {scale}, {lane.Literal(1)}, {root};");
+        string scale = BlockReduce(b, lane, tid, sum, "add", threads, s => [RmsScale(b, lane, s, cols, eps)])[0];
         RowStore(b, f, lane, present, inWords, rowDst, wordsPerThread, (q, i) =>
         {
             string o = lane.NewReg(b);
@@ -3391,13 +3377,46 @@ internal static partial class Ptx
         b.Label($"{label}_END");
     }
 
-    /// <summary>Shared bytes a reduction uses: a slot per warp and one for the result.</summary>
-    private const int ReduceBytes = 33 * 8;
+    /// <summary>Shared bytes a reduction uses: a slot per warp and up to FinishedSlots for the results.</summary>
+    private const int ReduceBytes = (32 + FinishedSlots) * 8;
+
+    private const int FinishedSlots = 4;
 
     // The block's reduction of a lane value (op: "add", "max", "min", or "first": the first-ranked in Adad's order, a NaN
     // when there is one): butterflies within each warp, the warps' results through shared memory, the first warp's
     // butterfly over those, the result read by all. Two barriers.
-    private static string BlockReduce(PtxBuilder b, Lane lane, string tid, string v, string op, int threads)
+    private static string BlockReduce(PtxBuilder b, Lane lane, string tid, string v, string op, int threads) => BlockReduce(b, lane, tid, v, op, threads, null)[0];
+
+    // The block's sum of v and its reciprocal 1/sum, the reciprocal by the first warp alone.
+    private static (string Sum, string Reciprocal) SumAndReciprocal(PtxBuilder b, Lane lane, string tid, string v, int threads)
+    {
+        var r = BlockReduce(b, lane, tid, v, "add", threads, s =>
+        {
+            string scale = lane.NewReg(b);
+            b.L($"div.rn.{lane.Op} {scale}, {lane.Literal(1)}, {s};");
+            return [s, scale];
+        });
+        return (r[0], r[1]);
+    }
+
+    // rms_norm's scale from the row's Σ x²: 1/√(Σ/cols + eps).
+    private static string RmsScale(PtxBuilder b, Lane lane, string sum, string cols, string eps)
+    {
+        string count = lane.NewReg(b), mean = lane.NewReg(b), root = lane.NewReg(b), scale = lane.NewReg(b);
+        b.L($"cvt.rn.{lane.Op}.u32 {count}, {cols};");
+        b.L($"div.rn.{lane.Op} {mean}, {sum}, {count};");
+        b.L(lane.Add(mean, mean, eps));
+        b.L($"sqrt.rn.{lane.Op} {root}, {mean};");
+        b.L($"div.rn.{lane.Op} {scale}, {lane.Literal(1)}, {root};");
+        return scale;
+    }
+
+    // The same reduction with the row's scalar arithmetic on its result (`finish`: a division, a root, a log) done by the
+    // first warp alone, before the results go to shared memory: once a block where every warp of the block repeated it
+    // (32 warps of a 1024-thread block; in a float64 lane a division and a root are some 30 instructions at the device's
+    // f64 rate). The same instructions on the same values, so the same bits. Every thread reads back the lane registers
+    // `finish` gives (up to FinishedSlots).
+    private static string[] BlockReduce(PtxBuilder b, Lane lane, string tid, string v, string op, int threads, Func<string, string[]>? finish)
     {
         int warps = threads / 32;
         string tag = $"RED{b.P().TrimStart('%')}";
@@ -3420,12 +3439,19 @@ internal static partial class Ptx
         b.L($"mov.{lane.Reg} {acc}, {identity};");
         b.L($"@{pl} ld.shared.{lane.Mem} {acc}, [{mine}];");
         WarpReduce(b, lane, acc, op);
-        b.L($"@!{p0} st.shared.{lane.Mem} [{smem}+256], {acc};");
+        string[] finished = finish is null ? [acc] : finish(acc);
+        if (finished.Length is 0 or > FinishedSlots) throw new ArgumentException($"a block reduction gives 1 to {FinishedSlots} values, not {finished.Length}");
+        for (int i = 0; i < finished.Length; i++) b.L($"@!{p0} st.shared.{lane.Mem} [{smem}+{256 + 8 * i}], {finished[i]};");
         b.Label($"{tag}_SKIP");
         b.L("bar.sync 0;");
-        string result = lane.NewReg(b);
-        b.L($"ld.shared.{lane.Mem} {result}, [{smem}+256];");
-        return result;
+        var results = new string[finished.Length];
+        for (int i = 0; i < finished.Length; i++)
+        {
+            results[i] = lane.NewReg(b);
+            b.L($"ld.shared.{lane.Mem} {results[i]}, [{smem}+{256 + 8 * i}];");
+        }
+
+        return results;
     }
 
     // A block's sum of f32 pairs hi + lo (the same butterflies and shared slots as BlockReduce): each step's hi sum split

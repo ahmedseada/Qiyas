@@ -81,9 +81,8 @@ internal static partial class Ptx
         c.Prologue(false);
         var b = c.B;
         string n = c.Count();
-        string mean = centered ? c.Div(c.Reduce("add", (q, i) => c.X(q, i)), n) : c.Lit(0);
-        string ss = c.Reduce("add", (q, i) => { string d = c.Sub(c.X(q, i), mean); return c.Mul(d, d); });
-        string rstd = c.Rcp(c.Sqrt(c.Add(c.Div(ss, n), c.A)));
+        string mean = centered ? c.Reduce("add", (q, i) => c.X(q, i), s => [c.Div(s, n)])[0] : c.Lit(0);
+        string rstd = c.Reduce("add", (q, i) => { string d = c.Sub(c.X(q, i), mean); return c.Mul(d, d); }, ss => [c.Rcp(c.Sqrt(c.Add(c.Div(ss, n), c.A)))])[0];
         string p0 = b.P(), addr = b.RD();
         b.L($"setp.ne.u32 {p0}, {c.Tid}, 0;");
         b.L($"@{p0} bra OUT;");
@@ -348,6 +347,7 @@ internal static partial class Ptx
         {
             if (cache.Length == 0) { cache = new string[perThread][]; for (int k = 0; k < perThread; k++) cache[k] = new string[Per]; }
             if (cache[q][i] is not null) return cache[q][i];
+            NotFinishing("a per-column value");
             string cs = b.R();
             b.L($"min.u32 {cs}, {Col(q, i)}, {ColsM1};");   // the padding lanes read the last value (dropped on the store)
             return cache[q][i] = Codec.UnpackAt(b, f, ptr, cs, lane);
@@ -357,6 +357,7 @@ internal static partial class Ptx
         public string S()
         {
             if (_s is not null) return _s;
+            NotFinishing("the row's scalar");
             if (Mode == RowMode.Replay)
             {
                 string pn = b.P(), ptr = b.RD(), at = b.R(), r = lane.NewReg(b);
@@ -384,6 +385,7 @@ internal static partial class Ptx
         public string PosInt()
         {
             if (_posInt is not null) return _posInt;
+            NotFinishing("the row's position");
             string pz = b.P(), pi = b.R(), addr = b.RD();
             b.L($"setp.eq.u64 {pz}, {_ppos}, 0;");
             b.L($"mov.u32 {pi}, {Row};");
@@ -397,6 +399,7 @@ internal static partial class Ptx
         public string Pos()
         {
             if (_pos is not null) return _pos;
+            NotFinishing("the row's position");
             string v = lane.NewReg(b);
             b.L($"cvt.rn.{lane.Op}.s32 {v}, {PosInt()};");
             return _pos = v;
@@ -408,6 +411,7 @@ internal static partial class Ptx
         public string Count()
         {
             if (_n is not null) return _n;
+            NotFinishing("the column count");
             string v = lane.NewReg(b);
             b.L($"cvt.rn.{lane.Op}.u32 {v}, {Cols};");
             return _n = v;
@@ -511,7 +515,13 @@ internal static partial class Ptx
         public string ColF(int q, int i) { string v = lane.NewReg(b); b.L($"cvt.rn.{lane.Op}.u32 {v}, {Col(q, i)};"); return v; }
 
         /// <summary>The block's reduction ("add" or "max") of term(q, i) over this thread's present values.</summary>
-        public string Reduce(string kind, Func<int, int, string> term)
+        public string Reduce(string kind, Func<int, int, string> term) => Reduce(kind, term, s => [s])[0];
+
+        /// <summary>The block's reduction of term(q, i) and the row's scalar arithmetic on it (`finish`: a division, a root, a
+        /// log), done by the first warp alone (BlockReduce), its registers read back by every thread. finish may use only
+        /// registers every thread already holds (the lazy row values S, Pos, Count, G and Bt made before the call). A replay
+        /// applies finish to its loaded statistic; the statistics kernel stores the reduction itself, as before.</summary>
+        public string[] Reduce(string kind, Func<int, int, string> term, Func<string, string[]> finish)
         {
             if (Mode == RowMode.Replay)
             {
@@ -520,23 +530,40 @@ internal static partial class Ptx
                 b.L($"mul.wide.u32 {addr}, {slot}, {lane.Size};");
                 b.L($"add.u64 {addr}, {_stats}, {addr};");
                 b.L($"ld.global.{lane.Mem} {v}, [{addr}];");
-                return v;
+                return finish(v);
             }
 
-            string result = ReduceRow(kind, term);
-            if (Mode == RowMode.Stats)
+            string[] Once(string s)
             {
-                string addr = b.RD(), slot = b.R();
-                b.L($"mad.lo.u32 {slot}, {Row}, 4, {_k++};");
-                b.L($"mul.wide.u32 {addr}, {slot}, {lane.Size};");
-                b.L($"add.u64 {addr}, {_stats}, {addr};");
-                b.L($"@{_tid0} st.global.{lane.Mem} [{addr}], {result};");
+                _finishing = true;
+                try
+                {
+                    var r = finish(s);
+                    return Mode == RowMode.Stats ? [s, .. r] : r;
+                }
+                finally { _finishing = false; }
             }
 
-            return result;
+            var results = ReduceRow(kind, term, Once);
+            if (Mode != RowMode.Stats) return results;
+            string at = b.RD(), sl = b.R();
+            b.L($"mad.lo.u32 {sl}, {Row}, 4, {_k++};");
+            b.L($"mul.wide.u32 {at}, {sl}, {lane.Size};");
+            b.L($"add.u64 {at}, {_stats}, {at};");
+            b.L($"@{_tid0} st.global.{lane.Mem} [{at}], {results[0]};");
+            return results[1..];
         }
 
-        private string ReduceRow(string kind, Func<int, int, string> term)
+        // Set while a reduction's finish is emitted (the first warp's code alone): a lazy row value made there would be
+        // held by that warp only.
+        private bool _finishing;
+
+        private void NotFinishing(string what)
+        {
+            if (_finishing) throw new InvalidOperationException($"{what} first made inside a reduction's finish (the first warp's code): make it before the reduction");
+        }
+
+        private string[] ReduceRow(string kind, Func<int, int, string> term, Func<string, string[]> finish)
         {
             string acc = lane.NewReg(b);
             b.L($"mov.{lane.Reg} {acc}, {(kind == "max" ? lane.Literal(double.NegativeInfinity) : lane.Zero)};");
@@ -553,7 +580,7 @@ internal static partial class Ptx
             }
 
             EndSegments();
-            return BlockReduce(b, lane, Tid, acc, kind == "max" ? "max" : "add", threads);
+            return BlockReduce(b, lane, Tid, acc, kind == "max" ? "max" : "add", threads, finish);
         }
 
         /// <summary>The row's one value (RowOut: a lane value at y2[row], when y2 is given) by thread 0; a replay makes none (its
@@ -620,15 +647,15 @@ internal static partial class Ptx
             case "softmax":
             {
                 string m = c.Reduce("max", c.X);
-                string sum = c.Reduce("add", (q, i) => c.Exp(c.Sub(c.X(q, i), m)));
-                string scale = c.Rcp(sum);
+                var r = c.Reduce("add", (q, i) => c.Exp(c.Sub(c.X(q, i), m)), s => [s, c.Rcp(s)]);
+                string sum = r[0], scale = r[1];
                 c.Store((q, i) => c.Quotient(c.Exp(c.Sub(c.X(q, i), m)), sum, scale));
                 return;
             }
 
             case "rms_norm":
             {
-                string scale = c.Rcp(c.Sqrt(c.Add(c.Div(c.Reduce("sumsq", c.X), n), c.A)));
+                string scale = c.Reduce("sumsq", c.X, s => [c.Rcp(c.Sqrt(c.Add(c.Div(s, n), c.A)))])[0];
                 c.Store((q, i) => c.Mul(c.X(q, i), scale));
                 return;
             }
@@ -636,8 +663,7 @@ internal static partial class Ptx
             case "log_softmax":
             {
                 string m = c.Reduce("max", c.X);
-                string sum = c.Reduce("add", (q, i) => c.Exp(c.Sub(c.X(q, i), m)));
-                string ls = c.Add(m, c.Log(sum));
+                string ls = c.Reduce("add", (q, i) => c.Exp(c.Sub(c.X(q, i), m)), s => [c.Add(m, c.Log(s))])[0];
                 c.Store((q, i) => c.Sub(c.X(q, i), ls));
                 return;
             }
@@ -658,38 +684,35 @@ internal static partial class Ptx
 
             case "rms_norm_affine":
             {
-                string rstd = Rstd(c, c.Reduce("add", (q, i) => c.Mul(c.X(q, i), c.X(q, i))), n, c.A);
+                string rstd = c.Reduce("add", (q, i) => c.Mul(c.X(q, i), c.X(q, i)), s => [Rstd(c, s, n, c.A)])[0];
                 c.Store((q, i) => c.Mul(c.Mul(c.X(q, i), rstd), c.G(q, i)));
                 return;
             }
 
             case "rms_norm_bwd":
             {
-                string ss = c.Reduce("add", (q, i) => c.Mul(c.X(q, i), c.X(q, i)));
-                string t = c.Reduce("add", (q, i) => c.Mul(c.Mul(c.G(q, i), c.X2(q, i)), c.X(q, i)));
-                string rstd = Rstd(c, ss, n, c.A);
-                string k2 = c.Mul(rstd, c.Div(c.Mul(rstd, t), n));                      // rstd · mean(γ·dy·x̂)
+                string rstd = c.Reduce("add", (q, i) => c.Mul(c.X(q, i), c.X(q, i)), ss => [Rstd(c, ss, n, c.A)])[0];
+                string k2 = c.Reduce("add", (q, i) => c.Mul(c.Mul(c.G(q, i), c.X2(q, i)), c.X(q, i)),
+                    t => [c.Mul(rstd, c.Div(c.Mul(rstd, t), n))])[0];                      // rstd · mean(γ·dy·x̂)
                 c.Store((q, i) => c.Mul(c.Sub(c.Mul(c.G(q, i), c.X2(q, i)), c.Mul(c.X(q, i), k2)), rstd));
                 return;
             }
 
             case "layer_norm":
             {
-                string mu = c.Div(c.Reduce("add", c.X), n);
-                string v = c.Reduce("add", (q, i) => { string d = c.Sub(c.X(q, i), mu); return c.Mul(d, d); });
-                string rstd = Rstd(c, v, n, c.A);
+                string mu = c.Reduce("add", c.X, s => [c.Div(s, n)])[0];
+                string rstd = c.Reduce("add", (q, i) => { string d = c.Sub(c.X(q, i), mu); return c.Mul(d, d); }, v => [Rstd(c, v, n, c.A)])[0];
                 c.Store((q, i) => c.Fma(c.Mul(c.Sub(c.X(q, i), mu), rstd), c.G(q, i), c.Bt(q, i)));
                 return;
             }
 
             case "layer_norm_bwd":
             {
-                string mu = c.Div(c.Reduce("add", c.X), n);
-                string v = c.Reduce("add", (q, i) => { string d = c.Sub(c.X(q, i), mu); return c.Mul(d, d); });
-                string sgd = c.Reduce("add", (q, i) => c.Mul(c.G(q, i), c.X2(q, i)));
-                string sgdx = c.Reduce("add", (q, i) => c.Mul(c.Mul(c.G(q, i), c.X2(q, i)), c.Sub(c.X(q, i), mu)));
-                string rstd = Rstd(c, v, n, c.A);
-                string m1 = c.Div(sgd, n), k2 = c.Mul(rstd, c.Div(c.Mul(rstd, sgdx), n));
+                string mu = c.Reduce("add", c.X, s => [c.Div(s, n)])[0];
+                string rstd = c.Reduce("add", (q, i) => { string d = c.Sub(c.X(q, i), mu); return c.Mul(d, d); }, v => [Rstd(c, v, n, c.A)])[0];
+                string m1 = c.Reduce("add", (q, i) => c.Mul(c.G(q, i), c.X2(q, i)), sgd => [c.Div(sgd, n)])[0];
+                string k2 = c.Reduce("add", (q, i) => c.Mul(c.Mul(c.G(q, i), c.X2(q, i)), c.Sub(c.X(q, i), mu)),
+                    sgdx => [c.Mul(rstd, c.Div(c.Mul(rstd, sgdx), n))])[0];
                 c.Store((q, i) => c.Mul(c.Sub(c.Sub(c.Mul(c.G(q, i), c.X2(q, i)), m1), c.Mul(c.Sub(c.X(q, i), mu), k2)), rstd));
                 return;
             }
@@ -697,18 +720,20 @@ internal static partial class Ptx
             case "weight_norm_bwd":
             {
                 // dx = (s/n)·(dy − x·k), k = Σ dy·x / (Σ x² + a), n = √(Σ x² + a); the row's value (Σ dy·x)/n.
-                string ss = c.Reduce("add", (q, i) => c.Mul(c.X(q, i), c.X(q, i)));
-                string dot = c.Reduce("add", (q, i) => c.Mul(c.X2(q, i), c.X(q, i)));
-                string nn = c.Add(ss, c.A), nrm = c.Sqrt(nn), k = c.Div(dot, nn), fct = c.Div(c.S(), nrm);
+                string sv = c.S();
+                var r1 = c.Reduce("add", (q, i) => c.Mul(c.X(q, i), c.X(q, i)), ss => { string sum = c.Add(ss, c.A); return [sum, c.Sqrt(sum)]; });
+                string nn = r1[0], nrm = r1[1];
+                var r2 = c.Reduce("add", (q, i) => c.Mul(c.X2(q, i), c.X(q, i)), dot => [c.Div(dot, nn), c.Div(sv, nrm), c.Div(dot, nrm)]);
+                string k = r2[0], fct = r2[1];
                 c.Store((q, i) => c.Mul(c.Sub(c.X2(q, i), c.Mul(c.X(q, i), k)), fct));
-                c.StoreRow(c.Div(dot, nrm));
+                c.StoreRow(r2[2]);
                 return;
             }
 
             case "weight_norm":
             {
-                string ss = c.Reduce("add", (q, i) => c.Mul(c.X(q, i), c.X(q, i)));
-                string k = c.Div(c.S(), c.Sqrt(c.Add(ss, c.A)));
+                string sv = c.S();
+                string k = c.Reduce("add", (q, i) => c.Mul(c.X(q, i), c.X(q, i)), ss => [c.Div(sv, c.Sqrt(c.Add(ss, c.A)))])[0];
                 c.Store((q, i) => c.Mul(c.X(q, i), k));
                 return;
             }
@@ -754,10 +779,11 @@ internal static partial class Ptx
                 string Z(int q, int i) => c.Sel(Keep(q, i), c.Fma(c.X(q, i), c.A, c.X2(q, i)), negInf);
                 string m = c.Reduce("max", Z);
                 string pAny = c.Gt(m, negInf);
-                string sum = c.Reduce("add", (q, i) => c.Sel(Keep(q, i), c.Exp(c.Sub(Z(q, i), m)), c.Lit(0)));
-                string scale = c.Sel(pAny, c.Rcp(sum), c.Lit(0));
+                var r = c.Reduce("add", (q, i) => c.Sel(Keep(q, i), c.Exp(c.Sub(Z(q, i), m)), c.Lit(0)),
+                    sum => op.RowOut ? [c.Sel(pAny, c.Rcp(sum), c.Lit(0)), c.Sel(pAny, c.Add(m, c.Log(sum)), negInf)] : [c.Sel(pAny, c.Rcp(sum), c.Lit(0))]);
+                string scale = r[0];
                 c.Store((q, i) => c.Sel(c.And(Keep(q, i), pAny), c.Mul(c.Exp(c.Sub(Z(q, i), m)), scale), c.Lit(0)));
-                if (op.RowOut) c.StoreRow(c.Sel(pAny, c.Add(m, c.Log(sum)), negInf));
+                if (op.RowOut) c.StoreRow(r[1]);
                 return;
             }
 
@@ -766,8 +792,8 @@ internal static partial class Ptx
             {
                 // Weighted: (softmax − one_hot)·(a·s), the target's p − 1 before the scaling.
                 string m = c.Reduce("max", c.X);
-                string sum = c.Reduce("add", (q, i) => c.Exp(c.Sub(c.X(q, i), m)));
-                string inv = c.Rcp(sum), posInt = c.PosInt();
+                string posInt = c.PosInt();
+                string inv = c.Reduce("add", (q, i) => c.Exp(c.Sub(c.X(q, i), m)), s => [c.Rcp(s)])[0];
                 string? factor = op.Name == "weighted_cross_entropy_bwd" ? c.Mul(c.A, c.S()) : null;
                 c.Store((q, i) =>
                 {
@@ -785,7 +811,8 @@ internal static partial class Ptx
                 c.Store(H, second: true);
                 // y = h·g / s, s = √(mean h² + eps): the quotient by its reciprocal and one residual step (h·g − y·s, exact
                 // by fma) — near-correctly rounded, two roundings fewer than h · (1/s) · g.
-                string s = c.Sqrt(c.Add(c.Div(c.Reduce("add", (q, i) => { string h = H(q, i); return c.Mul(h, h); }), n), c.A)), rstd = c.Rcp(s);
+                var r = c.Reduce("add", (q, i) => { string h = H(q, i); return c.Mul(h, h); }, ss => { string root = c.Sqrt(c.Add(c.Div(ss, n), c.A)); return [root, c.Rcp(root)]; });
+                string s = r[0], rstd = r[1];
                 c.Store((q, i) => c.Quotient(c.Mul(H(q, i), c.G(q, i)), s, rstd));
                 return;
             }
@@ -794,9 +821,8 @@ internal static partial class Ptx
             {
                 string H(int q, int i) => c.Add(c.X(q, i), c.X2(q, i));
                 c.Store(H, second: true);
-                string mu = c.Div(c.Reduce("add", H), n);
-                string v = c.Reduce("add", (q, i) => { string d = c.Sub(H(q, i), mu); return c.Mul(d, d); });
-                string rstd = Rstd(c, v, n, c.A);
+                string mu = c.Reduce("add", H, s => [c.Div(s, n)])[0];
+                string rstd = c.Reduce("add", (q, i) => { string d = c.Sub(H(q, i), mu); return c.Mul(d, d); }, v => [Rstd(c, v, n, c.A)])[0];
                 c.Store((q, i) => c.Fma(c.Mul(c.Sub(H(q, i), mu), rstd), c.G(q, i), c.Bt(q, i)));
                 return;
             }
