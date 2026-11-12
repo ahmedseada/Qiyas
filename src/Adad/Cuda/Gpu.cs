@@ -289,7 +289,11 @@ public sealed unsafe partial class Gpu : IDisposable
 
     private static readonly Dictionary<IntPtr, int> s_maxThreads = [];
 
-    public static void Launch(IntPtr function, uint gridX, uint gridY, uint blockX, uint blockY, uint sharedBytes, params ReadOnlySpan<ulong> args)
+    public static void Launch(IntPtr function, uint gridX, uint gridY, uint blockX, uint blockY, uint sharedBytes, params ReadOnlySpan<ulong> args) =>
+        LaunchZ(function, gridX, gridY, 1, blockX, blockY, sharedBytes, args);
+
+    /// <summary>A launch over a grid of gridZ layers (a kernel's batches, %ctaid.z).</summary>
+    public static void LaunchZ(IntPtr function, uint gridX, uint gridY, uint gridZ, uint blockX, uint blockY, uint sharedBytes, params ReadOnlySpan<ulong> args)
     {
         var slots = stackalloc ulong[args.Length];
         var pointers = stackalloc void*[args.Length];
@@ -299,7 +303,7 @@ public sealed unsafe partial class Gpu : IDisposable
             pointers[i] = &slots[i];
         }
 
-        Driver.Check(Driver.cuLaunchKernel(function, gridX, gridY, 1, blockX, blockY, 1, sharedBytes, IntPtr.Zero, pointers, null), "cuLaunchKernel");
+        Driver.Check(Driver.cuLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY, 1, sharedBytes, IntPtr.Zero, pointers, null), "cuLaunchKernel");
     }
 
     public static ulong U(int value) => (uint)value;

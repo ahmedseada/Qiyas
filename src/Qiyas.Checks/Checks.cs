@@ -1468,6 +1468,9 @@ internal static partial class Checks
             ok &= ProductsWith(null, where, 64, 48, 320, " [in place]");
         }
         else ok &= ProductsWith(ops, where, 128, 256, 128, " [in place]", blocks);
+        // k and n in fours, m and n past whole tiles: the batched launch of every batch at once (CUDA's staged product reads
+        // each batch where it is stored at these, its edge tiles guarded).
+        if (ops is not null) ok &= ProductsWith(ops, where, 37, 36, 52, " [k and n in fours]", blocks);
         if (cuda is not null)
         {
             // Split-k (item 6j): one tile of C (37 × 29 padded to 128 × 256) with k = 1100 (1152 padded): the rule's 4 slices,

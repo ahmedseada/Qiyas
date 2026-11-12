@@ -962,10 +962,11 @@ internal static partial class Ptx
     /// k × n (B as a product's B is stored), read as they are: each k-block's tile copied as its k-rows, every row's
     /// 16-byte chunks XOR-swizzled by the row mod 8 (the same shared bytes as a packed tile), and the fragments taken by
     /// ldmatrix.trans. Whole tiles only (m a multiple of 128, n of BN, k of the block).</summary>
-    public static string GemmMma(Gpu gpu, Kind kind, int rowBytes, int stages, int bn, bool swizzle, out string entry, Fmt? store = null, bool kMajorA = false, bool kMajorB = false)
+    /// <summary>batched: grid z = the batches, batch z's A, B and C at z times the byte strides p_sa, p_sb, p_sc (as Gemm2's).</summary>
+    public static string GemmMma(Gpu gpu, Kind kind, int rowBytes, int stages, int bn, bool swizzle, out string entry, Fmt? store = null, bool kMajorA = false, bool kMajorB = false, bool batched = false)
     {
         if ((kMajorA || kMajorB) && kind.Bits != 16) throw new NotSupportedException("operands read k-major by 16-bit kinds only");
-        entry = $"gemm_mma_{kind.Tag}_r{rowBytes}_s{stages}_n{bn}{(swizzle ? "_x" : "")}{(store is null ? "" : "_e" + store.Name)}{(kMajorA ? "_ta" : "")}{(kMajorB ? "_tb" : "")}";
+        entry = $"gemm_mma_{kind.Tag}_r{rowBytes}_s{stages}_n{bn}{(swizzle ? "_x" : "")}{(store is null ? "" : "_e" + store.Name)}{(kMajorA ? "_ta" : "")}{(kMajorB ? "_tb" : "")}{(batched ? "_b" : "")}";
         const int BM = 128;
         int wn = bn / 4, nt = wn / 8;                                        // a warp's columns and its n-tiles
         // Rows padded by 16 bytes, or unpadded with each row's 16-byte chunks XOR-swizzled by the row (64-byte rows: by
@@ -986,6 +987,7 @@ internal static partial class Ptx
         b.L($"shr.u32 {wmR}, {warp}, 2;");
         b.L($"and.b32 {wnR}, {warp}, 3;");
         string pa = Param64(b, "p_a"), pb = Param64(b, "p_b"), pc = Param64(b, "p_c"), m = Param32(b, "p_m"), n = Param32(b, "p_n"), kp = Param32(b, "p_kp"), ld = Param32(b, "p_ld");
+        if (batched) BatchOffsets(b, pa, pb, pc);
         string row0 = b.R(), col0 = b.R(), smem = b.R();
         b.L($"mul.lo.u32 {row0}, {by}, {BM};");
         b.L($"mul.lo.u32 {col0}, {bx}, {bn};");
@@ -1326,7 +1328,8 @@ internal static partial class Ptx
         }
 
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_a, .param .u64 p_b, .param .u64 p_c, .param .u32 p_m, .param .u32 p_n, .param .u32 p_kp, .param .u32 p_ld", totalShared);
+        return b.Finish(Header(gpu), entry, ".param .u64 p_a, .param .u64 p_b, .param .u64 p_c, .param .u32 p_m, .param .u32 p_n, .param .u32 p_kp, .param .u32 p_ld"
+            + (batched ? BatchParams : ""), totalShared);
     }
 
     // ---------------------------------------------------------------- C stored as its type (the products' epilogue)
@@ -2368,6 +2371,23 @@ internal static partial class Ptx
         return b.Finish(Header(gpu), entry, ".param .u64 p_a, .param .u64 p_b, .param .u64 p_c, .param .u32 p_m, .param .u32 p_n, .param .u32 p_k" + convParams + storedParams, asBytes + bsBytes);
     }
 
+    // A batched product's parameters: the byte strides of A, B and C from one batch to the next.
+    private const string BatchParams = ", .param .u64 p_sa, .param .u64 p_sb, .param .u64 p_sc";
+
+    // Batch %ctaid.z's operands and C: each pointer moved by z times its stride (BatchParams).
+    private static void BatchOffsets(PtxBuilder b, string pa, string pb, string pc)
+    {
+        string z = b.R(), z64 = b.RD();
+        b.L($"mov.u32 {z}, %ctaid.z;");
+        b.L($"cvt.u64.u32 {z64}, {z};");
+        foreach (var (ptr, stride) in new[] { (pa, "p_sa"), (pb, "p_sb"), (pc, "p_sc") })
+        {
+            string st = b.RD();
+            b.L($"ld.param.u64 {st}, [{stride}];");
+            b.L($"mad.lo.u64 {ptr}, {z64}, {st}, {ptr};");
+        }
+    }
+
     /// <summary>Shared bytes the 32-bit-lane product takes: A 128 rows × 80 B and B 16 rows × 512 B per stage.</summary>
     public static int Gemm2Shared(int stages) => stages * (128 * 80 + 16 * 512);
 
@@ -2376,9 +2396,12 @@ internal static partial class Ptx
     /// (scalar broadcast reads), B rows 512 bytes (vector reads); the thread's 8 consecutive columns stored as two vectors.</summary>
     /// <summary>split (item 6j, split-k): grid y = the m tiles × the slices; slice z = ctaid.y / p_mb takes the k-blocks
     /// [z·p_kb, (z + 1)·p_kb) and stores its partial C at p_c + z·m·n lanes (SumSlices joins them in order).</summary>
-    public static string Gemm2(Gpu gpu, Lane lane, int stages, out string entry, bool split = false)
+    /// <summary>batched: grid z = the batches; batch z's A, B and C at z times the byte strides p_sa, p_sb, p_sc (one launch
+    /// for every batch of a view whose batches are each contiguous: a batch's tiles fill the device with the others').</summary>
+    public static string Gemm2(Gpu gpu, Lane lane, int stages, out string entry, bool split = false, bool batched = false)
     {
-        entry = $"gemm2_{lane.Name}_s{stages}{(split ? "_k" : "")}";
+        if (split && batched) throw new NotSupportedException("gemm2: split-k of a batched launch");
+        entry = $"gemm2_{lane.Name}_s{stages}{(split ? "_k" : "")}{(batched ? "_b" : "")}";
         const int Tile = 128, Bk = 16, AStride = 80, BStride = 512, ABytes = Tile * AStride, BBytes = Bk * BStride;
         int stageBytes = ABytes + BBytes, totalShared = stages * stageBytes;
         var b = new PtxBuilder(gpu);
@@ -2390,6 +2413,8 @@ internal static partial class Ptx
         b.L($"shr.u32 {ty}, {tid}, 4;");
         string pa = Param64(b, "p_a"), pb = Param64(b, "p_b"), pc = Param64(b, "p_c"), m = Param32(b, "p_m"), n = Param32(b, "p_n"), k = Param32(b, "p_k");
         string slice = "", sliceKb = "";
+        if (batched) BatchOffsets(b, pa, pb, pc);
+
         if (split)
         {
             // The slice: by = ctaid.y mod the m tiles; C's slice z at z·m·n lanes.
@@ -2603,7 +2628,8 @@ internal static partial class Ptx
         }
 
         b.L("ret;");
-        return b.Finish(Header(gpu), entry, ".param .u64 p_a, .param .u64 p_b, .param .u64 p_c, .param .u32 p_m, .param .u32 p_n, .param .u32 p_k" + (split ? ", .param .u32 p_mb, .param .u32 p_kb" : ""), totalShared);
+        return b.Finish(Header(gpu), entry, ".param .u64 p_a, .param .u64 p_b, .param .u64 p_c, .param .u32 p_m, .param .u32 p_n, .param .u32 p_k"
+            + (split ? ", .param .u32 p_mb, .param .u32 p_kb" : "") + (batched ? BatchParams : ""), totalShared);
     }
 
     /// <summary>y[i] = Σ_{z < p_s} w[z·p_count + i] in order of z (split-k's slices joined: the same sum every run), four

@@ -30,6 +30,7 @@ public sealed partial class GpuOps
         // A block format's values are addressed by blocks (a copy of a view's operand would re-encode them): every batch's
         // operands read where they are stored, transposed or at their offsets, by the product kernel itself.
         if (f.IsBlock) return MatMulStored<TN>(v, a, b, c, Lane.F32);
+        if (MatMulBatched<TN>(v, a, b, c, out string batched)) return batched;
 
         long bytesA = f.Words((long)v.M * v.K) * (f.WordBits / 8), bytesB = f.Words((long)v.K * v.N) * (f.WordBits / 8), bytesC = f.Words((long)v.M * v.N) * (f.WordBits / 8);
         // A batch's operands read where they are stored (Aᵀ, Bᵀ, a batch's offset on the pointer) where the product's packing
@@ -85,6 +86,51 @@ public sealed partial class GpuOps
         }
 
         return lane;
+    }
+
+    /// <summary>Every batch of the view in one launch (grid z the batches), each batch's A, B and C read and written where
+    /// they are stored, as the per-batch launches read them: the staged kernel (Ptx.Gemm2) for a float type whose product
+    /// lane is its own storage (the view not transposed: a batch's operands contiguous at its offsets), or the tensor
+    /// kernel (Ptx.GemmMma) for a 16-bit float in its own kind at whole tiles (operands as stored, Aᵀ and B k-major by its
+    /// in-place reads, C by its epilogue). The batches' C apart (no batch overwrites another's: an order one launch would
+    /// not keep) and every batch's operands on 16 bytes (the kernels' copies). One launch at a time, a small product's tiles
+    /// leave most of the device idle (16 batches of a 512² C: 16 tiles a launch on 70 multiprocessors); together they fill
+    /// it. The same kernel on the same tiles, so the same bits. False where the view is not such a one.</summary>
+    private bool MatMulBatched<TN>(ProductView v, ulong a, ulong b, ulong c, out string laneName) where TN : struct, IAdad<TN>
+    {
+        laneName = "";
+        var f = Fmt.Of<TN>();
+        if (v.Batch < 2 || v.Batch > 65535 || !f.IsFloat || f.IsBlock || v.M == 0 || v.N == 0 || v.K == 0 || v.StrideCOrDefault < (long)v.M * v.N) return false;
+        long bytesA = v.StrideAOrDefault * f.Bits / 8, bytesB = v.StrideBOrDefault * f.Bits / 8, bytesC = v.StrideCOrDefault * f.Bits / 8;
+        if ((a | b | c) % 16 != 0 || bytesA % 16 != 0 || bytesB % 16 != 0 || bytesC % 16 != 0) return false;
+        var ((aLo, aHi), (bLo, bHi)) = RangePair<TN>(a, v.M * v.K, b, v.K * v.N);
+        string name = ProductLane<TN>(new Bounds(aLo, aHi, bLo, bHi, v.K));
+        if (name.EndsWith("mma", StringComparison.Ordinal))
+        {
+            // As MatMul's in-place 16-bit route: whole tiles, the type the kind's own, no padding of k.
+            if (v.M % 128 != 0 || v.N % 256 != 0 || v.K % 128 != 0 || InPlace16 == false || Epilogue == false) return false;
+            var kind = KindOf(name, v.K);
+            if (kind.Bits != 16 || KPadded(kind, v.K) != v.K || !f.Is(kind == Ptx.Kind.F16 ? "float16" : "bfloat16")) return false;
+            var mfn = MmaFunction(kind, out uint shared, out int bn, f, v.TransA, !v.TransB, batched: true);
+            Gpu.LaunchZ(mfn, Grid(v.N, bn), Grid(v.M, 128), (uint)v.Batch, Ptx.GemmThreads, 1, shared, a, b, c, Gpu.U(v.M), Gpu.U(v.N), Gpu.U(v.K), Gpu.U(v.K),
+                (ulong)bytesA, (ulong)bytesB, (ulong)bytesC);
+            Gpu.Flush();
+            laneName = name;
+            return true;
+        }
+
+        var lane = LaneOf(name);
+        if (v.TransA || v.TransB || Staged == false || v.K % 4 != 0 || v.N % 4 != 0) return false;
+        if (lane.Wide || f.Natural != lane || f.Bits != lane.Size * 8 || f.IsFloat != lane.IsFloat) return false;
+        int stages = Gemm2Stages(lane, a, b, c, v.M, v.N, v.K);
+        if (stages == 0) return false;
+        var fn = gpu.Cached($"gemm2:{lane.Name}:{stages}:b", (out string e) => Ptx.Gemm2(gpu, lane, stages, out e, batched: true));
+        gpu.AllowShared(fn, Ptx.Gemm2Shared(stages));
+        Gpu.LaunchZ(fn, Grid(v.N, 128), Grid(v.M, 128), (uint)v.Batch, Ptx.GemmThreads, 1, Dynamic(Ptx.Gemm2Shared(stages)), a, b, c, Gpu.U(v.M), Gpu.U(v.N), Gpu.U(v.K),
+            (ulong)bytesA, (ulong)bytesB, (ulong)bytesC);
+        Gpu.Flush();
+        laneName = name;
+        return true;
     }
 
     /// <summary>C = the epilogue's y of op(A)·op(B) (ProductEpilogue): every batch's product into the lane's sums (the

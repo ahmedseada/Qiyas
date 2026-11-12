@@ -515,12 +515,13 @@ public sealed partial class GpuOps(Gpu gpu)
         return (k + chunk - 1) / chunk * chunk;
     }
 
-    private IntPtr MmaFunction(Ptx.Kind kind, out uint shared, out int bn, Fmt? store = null, bool kMajorA = false, bool kMajorB = false)
+    private IntPtr MmaFunction(Ptx.Kind kind, out uint shared, out int bn, Fmt? store = null, bool kMajorA = false, bool kMajorB = false, bool batched = false)
     {
         var cfg = MmaShape(kind) ?? throw new InvalidOperationException($"{kind.Name}: no tensor kernel on this device");
         shared = Dynamic(Ptx.MmaShared(cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle));
         bn = cfg.Bn;
-        var fn = gpu.Cached($"mma:{kind.Tag}:{cfg}:{store?.Name}:{kMajorA}:{kMajorB}", (out string e) => Ptx.GemmMma(gpu, kind, cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle, out e, store, kMajorA, kMajorB));
+        var fn = gpu.Cached($"mma:{kind.Tag}:{cfg}:{store?.Name}:{kMajorA}:{kMajorB}{(batched ? ":b" : "")}",
+            (out string e) => Ptx.GemmMma(gpu, kind, cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle, out e, store, kMajorA, kMajorB, batched));
         gpu.AllowShared(fn, Ptx.MmaShared(cfg.RowBytes, cfg.Stages, cfg.Bn, cfg.Swizzle));
         return fn;
     }
