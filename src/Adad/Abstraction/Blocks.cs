@@ -18,6 +18,7 @@
 //   bool   1 bit a value (8 a byte, the first value in the low bit): 0 or 1; and / or / not are the formulas mul / max /
 //          (1 − x) in its integer lane (u8 lanes, u32 sums).
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 
 namespace Adad.Abstraction;
 
@@ -27,10 +28,60 @@ internal static class Blocks
     private static float Half(ReadOnlySpan<byte> s, int at) => (float)BitConverter.ToHalf(s.Slice(at, 2));
     private static void Half(float v, Span<byte> s, int at) => BitConverter.TryWriteBytes(s.Slice(at, 2), (Half)v);
 
+    // The codecs on 128-bit vectors where the processor has them: the same operations on each value in the same order as
+    // the scalar lines they stand for (a code widened to an integer, less its bias, converted, times the scale, less the
+    // offset; a value times the inverse scale, rounded or offset and cut, held to the codes' range), so the same floats
+    // and the same codes. A block with a value that is not finite keeps the scalar lines (their conversions of NaN and
+    // the infinities are theirs).
+    private static readonly bool s_vectors = Vector128.IsHardwareAccelerated;
+
+    // Sixteen codes (bytes below 128) as values: (code − bias) · scale − offset into v[at .. at + 16).
+    private static void Values16(Vector128<byte> q, int bias, float scale, float offset, Span<float> v, int at)
+    {
+        var (lo, hi) = Vector128.Widen(q);
+        var (a0, a1) = Vector128.Widen(lo);
+        var (a2, a3) = Vector128.Widen(hi);
+        Vector128<int> b = Vector128.Create(bias);
+        Vector128<float> k = Vector128.Create(scale), m = Vector128.Create(offset);
+        (Vector128.ConvertToSingle(a0.AsInt32() - b) * k - m).CopyTo(v.Slice(at));
+        (Vector128.ConvertToSingle(a1.AsInt32() - b) * k - m).CopyTo(v.Slice(at + 4));
+        (Vector128.ConvertToSingle(a2.AsInt32() - b) * k - m).CopyTo(v.Slice(at + 8));
+        (Vector128.ConvertToSingle(a3.AsInt32() - b) * k - m).CopyTo(v.Slice(at + 12));
+    }
+
+    // Four values' codes: round((x + add) / div) to even, held to [lo, hi] (as floats, then converted: the same integers
+    // as converting first and holding after, the values finite).
+    private static Vector128<int> Codes4(ReadOnlySpan<float> x, int at, float add, float div, float lo, float hi) =>
+        Vector128.ConvertToInt32(Vector128.Min(Vector128.Max(Vector128.Round((Vector128.Create(x.Slice(at, 4)) + Vector128.Create(add)) / Vector128.Create(div)),
+            Vector128.Create(lo)), Vector128.Create(hi)));
+
+    private static bool Finite(ReadOnlySpan<float> v)
+    {
+        foreach (float x in v) if (!float.IsFinite(x)) return false;
+        return true;
+    }
+
     // ---- Q8_0
     public static void DecodeQ8_0(ReadOnlySpan<byte> block, Span<float> v)
     {
         float d = Half(block, 0);
+        if (s_vectors)
+        {
+            var dv = Vector128.Create(d);
+            for (int i = 0; i < 32; i += 16)
+            {
+                var (lo, hi) = Vector128.Widen(Vector128.Create(block.Slice(2 + i, 16)).AsSByte());
+                var (a0, a1) = Vector128.Widen(lo);
+                var (a2, a3) = Vector128.Widen(hi);
+                (dv * Vector128.ConvertToSingle(a0)).CopyTo(v.Slice(i));
+                (dv * Vector128.ConvertToSingle(a1)).CopyTo(v.Slice(i + 4));
+                (dv * Vector128.ConvertToSingle(a2)).CopyTo(v.Slice(i + 8));
+                (dv * Vector128.ConvertToSingle(a3)).CopyTo(v.Slice(i + 12));
+            }
+
+            return;
+        }
+
         for (int i = 0; i < 32; i++) v[i] = d * (sbyte)block[2 + i];
     }
 
@@ -41,6 +92,21 @@ internal static class Blocks
         float d = amax / 127, id = d == 0 ? 0 : 1 / d;
         Half(d, block, 0);
         d = Half(block, 0); id = d == 0 ? 0 : 1 / d;
+        if (s_vectors && float.IsFinite(amax))
+        {
+            Vector128<float> idv = Vector128.Create(id), lo = Vector128.Create(-127f), hi = Vector128.Create(127f);
+            for (int i = 0; i < 32; i += 16)
+            {
+                var q0 = Vector128.ConvertToInt32(Vector128.Min(Vector128.Max(Vector128.Round(Vector128.Create(v.Slice(i, 4)) * idv), lo), hi));
+                var q1 = Vector128.ConvertToInt32(Vector128.Min(Vector128.Max(Vector128.Round(Vector128.Create(v.Slice(i + 4, 4)) * idv), lo), hi));
+                var q2 = Vector128.ConvertToInt32(Vector128.Min(Vector128.Max(Vector128.Round(Vector128.Create(v.Slice(i + 8, 4)) * idv), lo), hi));
+                var q3 = Vector128.ConvertToInt32(Vector128.Min(Vector128.Max(Vector128.Round(Vector128.Create(v.Slice(i + 12, 4)) * idv), lo), hi));
+                Vector128.Narrow(Vector128.Narrow(q0, q1), Vector128.Narrow(q2, q3)).AsByte().CopyTo(block.Slice(2 + i));
+            }
+
+            return;
+        }
+
         for (int i = 0; i < 32; i++) block[2 + i] = (byte)(sbyte)Math.Clamp(MathF.Round(v[i] * id), -127, 127);
     }
 
@@ -48,6 +114,14 @@ internal static class Blocks
     public static void DecodeQ4_0(ReadOnlySpan<byte> block, Span<float> v)
     {
         float d = Half(block, 0);
+        if (s_vectors)
+        {
+            var b = Vector128.Create(block.Slice(2, 16));
+            Values16(b & Vector128.Create((byte)0xF), 8, d, 0, v, 0);
+            Values16(b >> 4, 8, d, 0, v, 16);
+            return;
+        }
+
         for (int i = 0; i < 16; i++)
         {
             v[i] = d * ((block[2 + i] & 0xF) - 8);
@@ -62,6 +136,20 @@ internal static class Blocks
         float d = max / -8, id = d == 0 ? 0 : 1 / d;
         Half(d, block, 0);
         d = Half(block, 0); id = d == 0 ? 0 : 1 / d;
+        if (s_vectors && Finite(v[..32]) && float.IsFinite(id))
+        {
+            // Each value times id plus 8.5, cut toward zero, held to [0, 15]: the low nibbles from the first 16, the high
+            // from the last.
+            Vector128<float> idv = Vector128.Create(id), half = Vector128.Create(8.5f);
+            Vector128<int> zero = Vector128<int>.Zero, top = Vector128.Create(15);
+            Vector128<int> Code(ReadOnlySpan<float> x, int at) =>
+                Vector128.Min(Vector128.Max(Vector128.ConvertToInt32(Vector128.Create(x.Slice(at, 4)) * idv + half), zero), top);
+            var low = Vector128.Narrow(Vector128.Narrow(Code(v, 0), Code(v, 4)), Vector128.Narrow(Code(v, 8), Code(v, 12))).AsByte();
+            var high = Vector128.Narrow(Vector128.Narrow(Code(v, 16), Code(v, 20)), Vector128.Narrow(Code(v, 24), Code(v, 28))).AsByte();
+            (low | (high << 4)).CopyTo(block.Slice(2));
+            return;
+        }
+
         for (int i = 0; i < 16; i++)
         {
             int lo = Math.Clamp((int)(v[i] * id + 8.5f), 0, 15), hi = Math.Clamp((int)(v[i + 16] * id + 8.5f), 0, 15);
@@ -86,6 +174,18 @@ internal static class Blocks
             ScaleMin(sc, 2 * pair, out int s0, out int m0);
             ScaleMin(sc, 2 * pair + 1, out int s1, out int m1);
             float d0 = d * s0, dm0 = dmin * m0, d1 = d * s1, dm1 = dmin * m1;
+            if (s_vectors)
+            {
+                for (int i = 0; i < 32; i += 16)
+                {
+                    var q = Vector128.Create(qs.Slice(pair * 32 + i, 16));
+                    Values16(q & Vector128.Create((byte)0xF), 0, d0, dm0, v, pair * 64 + i);
+                    Values16(q >> 4, 0, d1, dm1, v, pair * 64 + 32 + i);
+                }
+
+                continue;
+            }
+
             for (int i = 0; i < 32; i++)
             {
                 byte q = qs[pair * 32 + i];
@@ -98,8 +198,8 @@ internal static class Blocks
     public static void EncodeQ4_K(ReadOnlySpan<float> v, Span<byte> block)
     {
         // Each sub-block of 32: its min and the scale (max − min)/15; the 8 scales and mins quantized to 6 bits against the block's largest.
-        var scales = new float[8];
-        var mins = new float[8];
+        Span<float> scales = stackalloc float[8];                         // on the stack: an encode a block, no allocation
+        Span<float> mins = stackalloc float[8];
         float maxScale = 0, maxMin = 0;
         for (int j = 0; j < 8; j++)
         {
@@ -115,8 +215,8 @@ internal static class Blocks
         d = Half(block, 0); dmin = Half(block, 2);
         var sc = block.Slice(4, 12);
         sc.Clear();
-        var ls = new int[8];
-        var lm = new int[8];
+        Span<int> ls = stackalloc int[8];
+        Span<int> lm = stackalloc int[8];
         for (int j = 0; j < 8; j++)
         {
             ls[j] = d == 0 ? 0 : Math.Clamp((int)MathF.Round(scales[j] / d), 0, 63);
@@ -135,6 +235,26 @@ internal static class Blocks
         }
 
         var qs = block.Slice(16, 128);
+        if (s_vectors && Finite(v[..256]) && float.IsFinite(d) && float.IsFinite(dmin))
+        {
+            // A pair of sub-blocks a byte range: sub-block 2·pair's codes the low nibbles, 2·pair + 1's the high.
+            for (int pair = 0; pair < 4; pair++)
+            {
+                float d0 = d * ls[2 * pair], m0 = dmin * lm[2 * pair], d1 = d * ls[2 * pair + 1], m1 = dmin * lm[2 * pair + 1];
+                for (int i = 0; i < 32; i += 16)
+                {
+                    int a = 2 * pair * 32 + i, b = a + 32;
+                    var low = d0 == 0 ? Vector128<byte>.Zero : Vector128.Narrow(Vector128.Narrow(Codes4(v, a, m0, d0, 0, 15), Codes4(v, a + 4, m0, d0, 0, 15)),
+                        Vector128.Narrow(Codes4(v, a + 8, m0, d0, 0, 15), Codes4(v, a + 12, m0, d0, 0, 15))).AsByte();
+                    var high = d1 == 0 ? Vector128<byte>.Zero : Vector128.Narrow(Vector128.Narrow(Codes4(v, b, m1, d1, 0, 15), Codes4(v, b + 4, m1, d1, 0, 15)),
+                        Vector128.Narrow(Codes4(v, b + 8, m1, d1, 0, 15), Codes4(v, b + 12, m1, d1, 0, 15))).AsByte();
+                    (low | (high << 4)).CopyTo(qs.Slice(pair * 32 + i));
+                }
+            }
+
+            return;
+        }
+
         for (int j = 0; j < 8; j++)
         {
             float dj = d * ls[j], mj = dmin * lm[j];
@@ -157,6 +277,25 @@ internal static class Blocks
         for (int half = 0; half < 2; half++)
         {
             int lBase = half * 64, hBase = half * 32, sBase = half * 8, vBase = half * 128;
+            if (s_vectors)
+            {
+                var three = Vector128.Create((byte)3);
+                var low = Vector128.Create((byte)0xF);
+                for (int l = 0; l < 32; l += 16)
+                {
+                    int is0 = l / 16;
+                    var a = Vector128.Create(ql.Slice(lBase + l, 16));
+                    var b = Vector128.Create(ql.Slice(lBase + l + 32, 16));
+                    var h = Vector128.Create(qh.Slice(hBase + l, 16));
+                    Values16((a & low) | ((h & three) << 4), 32, d * (sbyte)sc[sBase + is0], 0, v, vBase + l);
+                    Values16((b & low) | (((h >> 2) & three) << 4), 32, d * (sbyte)sc[sBase + is0 + 2], 0, v, vBase + l + 32);
+                    Values16((a >> 4) | (((h >> 4) & three) << 4), 32, d * (sbyte)sc[sBase + is0 + 4], 0, v, vBase + l + 64);
+                    Values16((b >> 4) | (((h >> 6) & three) << 4), 32, d * (sbyte)sc[sBase + is0 + 6], 0, v, vBase + l + 96);
+                }
+
+                continue;
+            }
+
             for (int l = 0; l < 32; l++)
             {
                 int is0 = l / 16;
@@ -175,7 +314,7 @@ internal static class Blocks
     public static void EncodeQ6_K(ReadOnlySpan<float> v, Span<byte> block)
     {
         // 16 sub-blocks of 16: each scale = max|x| / 31 (6-bit values −32..31), the scales as int8 against the block's largest.
-        var scales = new float[16];
+        Span<float> scales = stackalloc float[16];                        // on the stack: an encode a block, no allocation
         float maxScale = 0;
         for (int j = 0; j < 16; j++)
         {
@@ -189,12 +328,21 @@ internal static class Blocks
         Half(d, block, 208);
         d = Half(block, 208);
         var sc = block.Slice(192, 16);
-        var ls = new int[16];
+        Span<int> ls = stackalloc int[16];
         for (int j = 0; j < 16; j++) { ls[j] = d == 0 ? 0 : Math.Clamp((int)MathF.Round(scales[j] / d), -127, 127); sc[j] = (byte)(sbyte)ls[j]; }
-        var q = new int[256];
+        Span<int> q = stackalloc int[256];
+        bool vectors = s_vectors && Finite(v[..256]) && float.IsFinite(d);
         for (int j = 0; j < 16; j++)
         {
             float dj = d * ls[j];
+            if (vectors)
+            {
+                var bias = Vector128.Create(32);
+                for (int i = 0; i < 16; i += 4)
+                    (dj == 0 ? bias : Codes4(v, j * 16 + i, 0, dj, -32, 31) + bias).CopyTo(q.Slice(j * 16 + i));
+                continue;
+            }
+
             for (int i = 0; i < 16; i++) q[j * 16 + i] = (dj == 0 ? 0 : Math.Clamp((int)MathF.Round(v[j * 16 + i] / dj), -32, 31)) + 32;
         }
 
