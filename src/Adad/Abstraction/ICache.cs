@@ -6,7 +6,8 @@ namespace Adad.Abstraction;
 /// <summary>Key and value caches (Cache.cs) at a position the device holds (position[0], an index buffer read where it is: no
 /// value crosses to the host between steps): the rows written there, attention over the rows filled, the mask of a
 /// decoder's steps, the position advanced. A cache's values are stored as its type TC, as every tensor's are: a compact
-/// cache is a cache of a compact type (a block format's values scaled by their blocks).</summary>
+/// cache is a cache of a compact type (a block format's values scaled by their blocks), TC any type. TN, the rows' and
+/// the scores' type, is attention's: a float type (softmax a float formula).</summary>
 public interface ICache<TBuffer, TIndex>
 {
     /// <summary>Rows [p, p + steps) of each head (p = position[0]; rows past Capacity or before row 0 not written) = the

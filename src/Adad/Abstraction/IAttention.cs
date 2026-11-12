@@ -3,8 +3,9 @@
 
 namespace Adad.Abstraction;
 
-/// <summary>Attention (Attention.cs): O = softmax(scale · Q·Kᵀ + mask) · V per head, in the type's float lane. Every form
-/// takes the grouped heads (KvHeads) and the window; a cap on the scores (Softcap) takes the composition in every form.</summary>
+/// <summary>Attention (Attention.cs): O = softmax(scale · Q·Kᵀ + mask) · V per head, in the type's float lane: the float
+/// types, softmax being a float formula (exp: Map's FloatOnly, which Map refuses on the other types). Every form takes the
+/// grouped heads (KvHeads) and the window; a cap on the scores (Softcap) takes the composition in every form.</summary>
 public interface IAttention<TBuffer>
 {
     /// <summary>O for rows of queries: the fused rows or the composition, whichever the device measures faster.</summary>

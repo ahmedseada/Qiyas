@@ -17,8 +17,9 @@ public interface IProducts<TBuffer>
     string MatMulEpilogue<TN>(ProductView v, ProductEpilogue e, TBuffer a, TBuffer b, TBuffer c, ProductTerms<TBuffer> t) where TN : struct, IAdad<TN>;
 
     /// <summary>y (m × N) = the epilogue's y of x (m × K) · Wᵀ (over ScaledWeight.View(m)), W the scaled weight's values made
-    /// in the float lane as the product reads each code (codes TW, any type; scales and zeros stored as TN): no W in memory
-    /// but its codes; y rounded to TN once.</summary>
+    /// in the float lane as the product reads each code (codes TW, any type; scales and zeros stored as TN, a float type, as
+    /// in ExpandScaled and Quantize: a scale is a fraction no integer type holds): no W in memory but its codes; y rounded to
+    /// TN once.</summary>
     string MatMulScaled<TN, TW>(ScaledWeight w, int m, ProductEpilogue e, TBuffer x, TBuffer codes, TBuffer scales, TBuffer? zeros, TBuffer y, ProductTerms<TBuffer> t)
         where TN : struct, IFloatAdad<TN> where TW : struct, IAdad<TW>;
 

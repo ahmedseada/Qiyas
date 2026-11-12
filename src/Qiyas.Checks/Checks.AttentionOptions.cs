@@ -74,7 +74,7 @@ internal static partial class Checks
                     string? route = cuda?.BackwardRoute ?? vulkan?.BackwardRoute;
                     if (a.Softcap > 0 && ops is not null && route != "composed")
                     {
-                        Console.WriteLine($"check attention_bwd{tag} {where} {type,-12} took the {route} route, not the composition");
+                        Console.WriteLine($"check attention_bwd{tag} {where} {type,-12} FAILS: took the {route} route, not the composition");
                         ok = false;
                     }
 
@@ -103,7 +103,7 @@ internal static partial class Checks
         for (int i = 0; i < n; i++)
         {
             if (double.IsNegativeInfinity(lseWant[i]) == double.IsNegativeInfinity(got[i]) && !double.IsNaN(got[i])) continue;
-            Console.WriteLine($"check {what} {where,-6} {type,-12} row {i}: {got[i]:R}, not {lseWant[i]:R}");
+            Console.WriteLine($"check {what} {where,-6} {type,-12} DIFFERS: row {i} {got[i]:R}, not {lseWant[i]:R}");
             return false;
         }
 
@@ -118,7 +118,7 @@ internal static partial class Checks
         for (int i = 0; i < n; i++)
         {
             if (double.IsNaN(got[i]) == double.IsNaN(reference[i])) continue;
-            Console.WriteLine($"check {what} {where,-6} {type,-12} [{i}]: {got[i]:R}, not {reference[i]:R}");
+            Console.WriteLine($"check {what} {where,-6} {type,-12} DIFFERS: [{i}] {got[i]:R}, not {reference[i]:R}");
             return false;
         }
 

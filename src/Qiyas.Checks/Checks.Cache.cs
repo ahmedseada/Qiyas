@@ -90,7 +90,7 @@ internal static partial class Checks
                     for (int i = u * cacheBlock; i < Math.Min(all, (u + 1) * cacheBlock); i += 1) touched |= Written(i / d % cap);
                     int bytes = Math.Min(blockBytes, cache.Length - u * blockBytes);
                     if (touched || cache.AsSpan(u * blockBytes, bytes).SequenceEqual(cacheBefore.AsSpan(u * blockBytes, bytes))) continue;
-                    Console.WriteLine($"check {at,-40} {where,-6} {type,-12} block {u}, outside the write, changed");
+                    Console.WriteLine($"check {at,-40} {where,-6} {type,-12} DIFFERS: block {u}, outside the write, changed");
                     return false;
                 }
 
@@ -114,7 +114,7 @@ internal static partial class Checks
                 for (int c = 0; c < d && wrong is null; c++) if (!got[c].Equals(want[c])) wrong = $"row {row} of head {h} [{c}]: {got[c]:R}, not {want[c]:R} (the source's {xs[c]:R})";
             }
 
-            if (wrong is not null) { Console.WriteLine($"check {at,-40} {where,-6} {type,-12} {wrong}"); return false; }
+            if (wrong is not null) { Console.WriteLine($"check {at,-40} {where,-6} {type,-12} DIFFERS: {wrong}"); return false; }
         }
 
         return true;
@@ -181,7 +181,7 @@ internal static partial class Checks
             for (int i = 0; i < n; i++)
             {
                 if (got[i] == want[i]) continue;
-                Console.WriteLine($"check {what,-40} {where,-6} {type,-12} [{i}]: {got[i]:R}, not {want[i]:R}");
+                Console.WriteLine($"check {what,-40} {where,-6} {type,-12} DIFFERS: [{i}] {got[i]:R}, not {want[i]:R}");
                 ok = false;
                 break;
             }
@@ -208,7 +208,7 @@ internal static partial class Checks
         }
 
         if (position[0] == 6 && position[1] == 1234) return true;
-        Console.WriteLine($"check position_advance       {where,-6} the position {position[0]} (its neighbour {position[1]}) after +3 and -4 from 7, not 6 (1234)");
+        Console.WriteLine($"check position_advance       {where,-6} DIFFERS: the position {position[0]} (its neighbour {position[1]}) after +3 and -4 from 7, not 6 (1234)");
         return false;
     }
 

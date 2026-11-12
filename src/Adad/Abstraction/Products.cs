@@ -104,25 +104,25 @@ public sealed record ProductEpilogue
 
     public void Validate(ProductView v, bool bias, bool residual, bool sums, bool actInputs, bool secondA, bool secondB)
     {
-        if (v.Batch > 1 && v.StrideCOrDefault != (long)v.M * v.N) throw new ArgumentException("matmul epilogue: the batches' C must be contiguous (StrideC m·n)");
-        if (v.ValuesC > int.MaxValue) throw new ArgumentException("matmul epilogue: C past 2^31 values");
-        if (Act is not null && Grad is not null) throw new ArgumentException("matmul epilogue: an activation or a gradient, not both");
-        if (Act is not null && Ops.Find(Act).Inputs != 1) throw new ArgumentException($"matmul epilogue: the activation {Act} is not a one-input formula");
-        if (Grad is not null && Ops.Find(Grad).Inputs != 2) throw new ArgumentException($"matmul epilogue: the gradient {Grad} is not a two-input formula");
-        if (Grad is not null && !actInputs) throw new ArgumentException("matmul epilogue: a gradient reads the activation's inputs (ActInputs)");
-        if (Grad is null && actInputs) throw new ArgumentException("matmul epilogue: the activation's inputs given without a gradient to read them");
+        if (v.Batch > 1 && v.StrideCOrDefault != (long)v.M * v.N) throw new ArgumentException("epilogue: the batches' C must be contiguous (StrideC m·n)");
+        if (v.ValuesC > int.MaxValue) throw new ArgumentException("epilogue: C past 2^31 values");
+        if (Act is not null && Grad is not null) throw new ArgumentException("epilogue: an activation or a gradient, not both");
+        if (Act is not null && Ops.Find(Act).Inputs != 1) throw new ArgumentException($"epilogue: the activation {Act} is not a one-input formula");
+        if (Grad is not null && Ops.Find(Grad).Inputs != 2) throw new ArgumentException($"epilogue: the gradient {Grad} is not a two-input formula");
+        if (Grad is not null && !actInputs) throw new ArgumentException("epilogue: a gradient reads the activation's inputs (ActInputs)");
+        if (Grad is null && actInputs) throw new ArgumentException("epilogue: the activation's inputs given without a gradient to read them");
         if (Second is null)
         {
-            if (secondA || secondB) throw new ArgumentException("matmul epilogue: a second product's operands given without its view");
+            if (secondA || secondB) throw new ArgumentException("epilogue: a second product's operands given without its view");
             return;
         }
 
         var w = Second;
-        if (!secondA || !secondB) throw new ArgumentException("matmul epilogue: the second product takes its A and B");
-        if (w.M != v.M || w.N != v.N || w.Batch != v.Batch) throw new ArgumentException($"matmul epilogue: a second product of {w.Batch} × {w.M} × {w.N} for a product of {v.Batch} × {v.M} × {v.N}");
-        if (w.K < 0) throw new ArgumentException("matmul epilogue: a second product of negative depth");
-        if (w.Batch > 1 && w.StrideCOrDefault != (long)w.M * w.N) throw new ArgumentException("matmul epilogue: the second product's C must be contiguous (StrideC m·n)");
-        if (w.ValuesA > int.MaxValue || w.ValuesB > int.MaxValue) throw new ArgumentException("matmul epilogue: a second product's operand past 2^31 values");
+        if (!secondA || !secondB) throw new ArgumentException("epilogue: the second product takes its A and B");
+        if (w.M != v.M || w.N != v.N || w.Batch != v.Batch) throw new ArgumentException($"epilogue: a second product of {w.Batch} × {w.M} × {w.N} for a product of {v.Batch} × {v.M} × {v.N}");
+        if (w.K < 0) throw new ArgumentException("epilogue: a second product of negative depth");
+        if (w.Batch > 1 && w.StrideCOrDefault != (long)w.M * w.N) throw new ArgumentException("epilogue: the second product's C must be contiguous (StrideC m·n)");
+        if (w.ValuesA > int.MaxValue || w.ValuesB > int.MaxValue) throw new ArgumentException("epilogue: a second product's operand past 2^31 values");
     }
 
     /// <summary>Refuses what a type that is not float does not take: a formula only the float types run (MapOp.FloatOnly,
@@ -132,12 +132,12 @@ public sealed record ProductEpilogue
     {
         if (isFloat) return;
         foreach (var name in new[] { Act, Grad })
-            if (name is not null && Ops.Find(name).FloatOnly) throw new NotSupportedException($"matmul epilogue: {name} is a float formula, and {type} is not a float type");
+            if (name is not null && Ops.Find(name).FloatOnly) throw new NotSupportedException($"epilogue: {name} is a float formula, and {type} is not a float type");
         if (Beta != Math.Floor(Beta) || ActA != Math.Floor(ActA) || ActB != Math.Floor(ActB))
-            throw new ArgumentException($"matmul epilogue: {type} takes an integer β and parameters, not {Beta}, {ActA} and {ActB}");
+            throw new ArgumentException($"epilogue: {type} takes an integer β and parameters, not {Beta}, {ActA} and {ActB}");
         foreach (var name in new[] { Act, Grad })
             if (name is not null && !Integral(Ops.Find(name), ActA, ActB))
-                throw new NotSupportedException($"matmul epilogue: {name}'s value at integers is not always an integer, and {type} is not a float type");
+                throw new NotSupportedException($"epilogue: {name}'s value at integers is not always an integer, and {type} is not a float type");
     }
 
     /// <summary>Whether a formula's value at integers is a finite integer at every point of a grid (each input -3 to 3; a
@@ -203,7 +203,7 @@ public sealed record ProductEpilogue
         hi = Math.Max(hi, Math.Max(o.Hi, y.Hi));
         // An unsigned lane holds a negative β or parameter only by wrapping: a float lane takes them.
         if (!signed && (Beta < 0 || ActA < 0 || ActB < 0)) lo = Math.Min(lo, -1);
-        return ExactSums("matmul epilogue", type, signed, lo, hi, (Math.Min(a.Lo, a2?.Lo ?? a.Lo), Math.Max(a.Hi, a2?.Hi ?? a.Hi)),
+        return ExactSums("epilogue", type, signed, lo, hi, (Math.Min(a.Lo, a2?.Lo ?? a.Lo), Math.Max(a.Hi, a2?.Hi ?? a.Hi)),
             (Math.Min(b.Lo, b2?.Lo ?? b.Lo), Math.Max(b.Hi, b2?.Hi ?? b.Hi)));
     }
 

@@ -4,7 +4,8 @@
 namespace Adad.Abstraction;
 
 /// <summary>Recurrent cells, steps and sequences (Recurrent.cs): LSTM and GRU over a batch of B rows, hidden size H, input
-/// size D, in the type's float lane.</summary>
+/// size D, in the type's float lane: the float types, the cells' gates being sigmoid and tanh (float formulas, which Map
+/// refuses on the other types); the gates' products (CellGates) take every type.</summary>
 public interface IRecurrent<TBuffer>
 {
     /// <summary>g = x·Wᵀ (+ h·Uᵀ) + bias: a cell's gate pre-activations.</summary>

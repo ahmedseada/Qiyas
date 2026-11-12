@@ -666,14 +666,14 @@ internal static partial class Checks
                         if (!backward)
                         {
                             var hOut = new byte[k.H.Length];
-                            Bench.Registry.WithFloat(type, new RecurrentRun(ops, a, k, hOut, null));
+                            Bench.Registry.WithFloat(type, new RecurrentRun(ops, a, k, hOut));
                             ok &= Close(type, $"{kind}_step h", where, hOut, k.WantH, B * H, D + H);
                             if (k.COut is not null) ok &= Close(type, $"{kind}_step c", where, k.COut, k.WantC!, B * H, D + H);
                             continue;
                         }
 
                         var dx = new byte[k.X.Length];
-                        Bench.Registry.WithFloat(type, new RecurrentRun(ops, a, k, dx, null));
+                        Bench.Registry.WithFloat(type, new RecurrentRun(ops, a, k, dx));
                         ok &= Close(type, $"{kind}_step_bwd dx", where, dx, k.WantDx!, B * D, 4 * (D + H + GH));
                         ok &= Close(type, $"{kind}_step_bwd dh", where, k.Dh!, k.WantDh!, B * H, 4 * (D + H + GH));
                         if (k.Dc is not null) ok &= Close(type, $"{kind}_step_bwd dc", where, k.Dc, k.WantDc!, B * H, 4 * (D + H));
@@ -771,7 +771,7 @@ internal static partial class Checks
                 worst = Math.Max(worst, Math.Abs((up - down) / (2 * step) - grads[v][i]));
             }
 
-            if (worst > 1e-7) { Console.WriteLine($"check gru_seq_bwd reference: the gradient differs from the loss's differences by {worst:R}"); ok = false; }
+            if (worst > 1e-7) { Console.WriteLine($"check gru_seq_bwd reference: the gradient DIFFERS from the loss's differences by {worst:R}"); ok = false; }
         }
 
         // GRU sequence backward: 3 steps of 5 × 7 → 11 (dx, dh0, dW, dU, db, dbh), every float type, the block formats through lane
@@ -808,7 +808,7 @@ internal static partial class Checks
         return ok;
     }
 
-    private sealed class RecurrentRun(IDevice<ulong, ulong>? ops, CellArgs a, Bench.RecurrentCase k, byte[] output, byte[]? unused) : Bench.IFloatTypeVisitor<bool>
+    private sealed class RecurrentRun(IDevice<ulong, ulong>? ops, CellArgs a, Bench.RecurrentCase k, byte[] output) : Bench.IFloatTypeVisitor<bool>
     {
         public bool Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
         {
@@ -1210,7 +1210,7 @@ internal static partial class Checks
                     string want = mode == 1 || !fits ? "composed" : "fused";
                     if (vulkan.BackwardRoute != want)
                     {
-                        Console.WriteLine($"check attention_bwd{tag} {where} {type,-12} took the {vulkan.BackwardRoute} route, not {want}");
+                        Console.WriteLine($"check attention_bwd{tag} {where} {type,-12} FAILS: took the {vulkan.BackwardRoute} route, not {want}");
                         ok = false;
                     }
                 }
@@ -1226,7 +1226,7 @@ internal static partial class Checks
                     string want = tensor ? "mma" : fma ? "fused" : "composed";
                     if (cuda.BackwardRoute != want)
                     {
-                        Console.WriteLine($"check attention_bwd{tag} {where} {type,-12} took the {cuda.BackwardRoute} route, not {want}");
+                        Console.WriteLine($"check attention_bwd{tag} {where} {type,-12} FAILS: took the {cuda.BackwardRoute} route, not {want}");
                         ok = false;
                     }
                 }
