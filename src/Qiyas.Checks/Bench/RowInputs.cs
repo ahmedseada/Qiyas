@@ -15,12 +15,10 @@ public sealed class RowCase
     public required double[] Y;              // the float64 reference (rows × cols)
     public double[]? Y2;
     public required double[] Scale;          // the error scale per row
-    public double B;                         // the operation's b (an offset of the gain: also 1)
 
     /// <summary>The operation's inputs for a shape (seeds fixed by the operation), with positions given when asked.</summary>
-    public static RowCase Make(RowOp op, string type, int rows, int cols, bool positions, double? b = null)
+    public static RowCase Make(RowOp op, string type, int rows, int cols, bool positions)
     {
-        double bv = b ?? op.B;
         int n = rows * cols;
         var x = Registry.Make(type, n, 51, op.XRange.Low, op.XRange.High);
         byte[]? x2 = null;
@@ -52,9 +50,9 @@ public sealed class RowCase
             ReadOnlySpan<double> gs = gv is null ? default : gv.AsSpan();
             ReadOnlySpan<double> bts = btv is null ? default : btv.AsSpan();
             scale[r] = op.Reference(xv.AsSpan(r * cols, cols), x2v is null ? default : x2v.AsSpan(r * cols, cols), gs, bts,
-                sv is null ? 1 : sv[r], pos is null ? r : pos[r], r, op.A, bv, y.AsSpan(r * cols, cols), y2 is null ? default : op.RowOut ? y2.AsSpan(r, 1) : y2.AsSpan(r * cols, cols));
+                sv is null ? 1 : sv[r], pos is null ? r : pos[r], r, op.A, op.B, y.AsSpan(r * cols, cols), y2 is null ? default : op.RowOut ? y2.AsSpan(r, 1) : y2.AsSpan(r * cols, cols));
         });
-        return new RowCase { Op = op, Type = type, Rows = rows, Cols = cols, X = x, X2 = x2, G = g, Bt = bt, S = s, Pos = pos, Y = y, Y2 = y2, Scale = scale, B = bv };
+        return new RowCase { Op = op, Type = type, Rows = rows, Cols = cols, X = x, X2 = x2, G = g, Bt = bt, S = s, Pos = pos, Y = y, Y2 = y2, Scale = scale };
     }
 
     /// <summary>The worst distance of an output from its reference, in steps of the type past the tolerance (0 when all within):

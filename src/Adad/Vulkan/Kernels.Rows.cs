@@ -332,9 +332,6 @@ internal static partial class VkKernels
 
     private static V Rstd(RowCtx c, V sumSq, V n, V eps) => c.Rcp(c.Sqrt(sumSq / n + eps));
 
-    // The gain of an operation that scales by g + b (RowOp.Offset).
-    private static V Gain(RowCtx c) => c.G() + c.Bs;
-
     private static void EmitRowOp(RowCtx c, RowOp op)
     {
         var n = c.N;
@@ -382,17 +379,17 @@ internal static partial class VkKernels
             case "rms_norm_affine":
             {
                 var rstd = Rstd(c, c.Reduce("add", () => c.X() * c.X()), n, c.A);
-                c.Store(() => c.X() * rstd * Gain(c));
+                c.Store(() => c.X() * rstd * c.G());
                 return;
             }
 
             case "rms_norm_bwd":
             {
                 var ss = c.Reduce("add", () => c.X() * c.X());
-                var t = c.Reduce("add", () => Gain(c) * c.X2() * c.X());
+                var t = c.Reduce("add", () => c.G() * c.X2() * c.X());
                 var rstd = Rstd(c, ss, n, c.A);
                 var k2 = rstd * (rstd * t / n);                                          // rstd · mean(γ·dy·x̂)
-                c.Store(() => (Gain(c) * c.X2() - c.X() * k2) * rstd);
+                c.Store(() => (c.G() * c.X2() - c.X() * k2) * rstd);
                 return;
             }
 
@@ -514,7 +511,7 @@ internal static partial class VkKernels
                 // by fma) — near-correctly rounded, two roundings fewer than h · (1/s) · g.
                 var s = c.Sqrt(c.Reduce("add", () => { var h = H(); return h * h; }) / n + c.A);
                 var rstd = c.Rcp(s);
-                c.Store(() => c.Quotient(H() * Gain(c), s, rstd));
+                c.Store(() => c.Quotient(H() * c.G(), s, rstd));
                 return;
             }
 

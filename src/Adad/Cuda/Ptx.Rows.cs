@@ -607,9 +607,6 @@ internal static partial class Ptx
 
     // ---------------------------------------------------------------- the operations
 
-    // The gain of an operation that scales by g + b (RowOp.Offset).
-    private static string Gain(RowCtx c, int q, int i) => c.Add(c.G(q, i), c.Bs);
-
     /// <summary>Softmax and rms_norm as row operations (their own kernels otherwise, Ptx.SoftmaxRegs and Ptx.RmsNormRegs, whose
     /// arithmetic these repeat): a block format's rows take them through RowStats and RowOpBlocks. rms_norm's eps is `a`.</summary>
     internal static readonly RowOp SoftmaxRow = new("softmax", false, false, false, false, false, false, 0, 0, static (_, _, _, _, _, _, _, _, _, _, _) => 0);
@@ -662,17 +659,17 @@ internal static partial class Ptx
             case "rms_norm_affine":
             {
                 string rstd = Rstd(c, c.Reduce("add", (q, i) => c.Mul(c.X(q, i), c.X(q, i))), n, c.A);
-                c.Store((q, i) => c.Mul(c.Mul(c.X(q, i), rstd), Gain(c, q, i)));
+                c.Store((q, i) => c.Mul(c.Mul(c.X(q, i), rstd), c.G(q, i)));
                 return;
             }
 
             case "rms_norm_bwd":
             {
                 string ss = c.Reduce("add", (q, i) => c.Mul(c.X(q, i), c.X(q, i)));
-                string t = c.Reduce("add", (q, i) => c.Mul(c.Mul(Gain(c, q, i), c.X2(q, i)), c.X(q, i)));
+                string t = c.Reduce("add", (q, i) => c.Mul(c.Mul(c.G(q, i), c.X2(q, i)), c.X(q, i)));
                 string rstd = Rstd(c, ss, n, c.A);
                 string k2 = c.Mul(rstd, c.Div(c.Mul(rstd, t), n));                      // rstd · mean(γ·dy·x̂)
-                c.Store((q, i) => c.Mul(c.Sub(c.Mul(Gain(c, q, i), c.X2(q, i)), c.Mul(c.X(q, i), k2)), rstd));
+                c.Store((q, i) => c.Mul(c.Sub(c.Mul(c.G(q, i), c.X2(q, i)), c.Mul(c.X(q, i), k2)), rstd));
                 return;
             }
 
@@ -788,7 +785,7 @@ internal static partial class Ptx
                 // y = h·g / s, s = √(mean h² + eps): the quotient by its reciprocal and one residual step (h·g − y·s, exact
                 // by fma) — near-correctly rounded, two roundings fewer than h · (1/s) · g.
                 string s = c.Sqrt(c.Add(c.Div(c.Reduce("add", (q, i) => { string h = H(q, i); return c.Mul(h, h); }), n), c.A)), rstd = c.Rcp(s);
-                c.Store((q, i) => c.Quotient(c.Mul(H(q, i), Gain(c, q, i)), s, rstd));
+                c.Store((q, i) => c.Quotient(c.Mul(H(q, i), c.G(q, i)), s, rstd));
                 return;
             }
 

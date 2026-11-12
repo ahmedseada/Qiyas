@@ -31,9 +31,6 @@ public sealed record RowOp(string Name, bool Second, bool Gamma, bool Beta, bool
 
     /// <summary>y2 holds one value a row, in the float lane's storage (a per-row parameter's gradient), not a second row.</summary>
     public bool RowOut { get; init; }
-
-    /// <summary>b is an offset of the gain: the operation scales by g + b (0: by g).</summary>
-    public bool Offset { get; init; }
 }
 
 /// <summary>The layout a group normalization reads (IRows.GroupNorm): x as [Outer, Groups, Inner], each group's statistics over
@@ -94,8 +91,8 @@ public static class RowOps
         new("log_softmax", false, false, false, false, false, false, 0, 0, LogSoftmax),
         new("softmax_bwd", true, false, false, false, false, false, 0, 0, SoftmaxBwd, "(y, dy) → dx = y·(dy − Σ y·dy)") { XRange = (0, 1) },
         new("log_softmax_bwd", true, false, false, false, false, false, 0, 0, LogSoftmaxBwd, "(log y, dy) → dx = dy − exp(log y)·Σ dy") { XRange = (-8, 0) },
-        new("rms_norm_affine", false, true, false, false, false, false, Eps, 0, RmsNormAffine, "y = x·(g + b) / √(mean x² + a)") { Offset = true },
-        new("rms_norm_bwd", true, true, false, false, false, false, Eps, 0, RmsNormBwd, "(x, dy, g) → dx; x̂ = x·rstd, γ = g + b: dx = rstd·(γ·dy − x̂·mean(γ·dy·x̂))") { Offset = true },
+        new("rms_norm_affine", false, true, false, false, false, false, Eps, 0, RmsNormAffine, "y = x·g / √(mean x² + a)"),
+        new("rms_norm_bwd", true, true, false, false, false, false, Eps, 0, RmsNormBwd, "(x, dy, g) → dx; x̂ = x·rstd: dx = rstd·(g·dy − x̂·mean(g·dy·x̂))"),
         new("layer_norm", false, true, true, false, false, false, Eps, 0, LayerNorm, "y = (x − μ)·g / √(var + a) + bt"),
         new("layer_norm_bwd", true, true, false, false, false, false, Eps, 0, LayerNormBwd, "(x, dy, g) → dx = rstd·(g·dy − mean(g·dy) − x̂·mean(g·dy·x̂))"),
         new("weight_norm", false, false, false, true, false, false, 1e-12, 0, WeightNorm, "y = x·s / √(Σ x² + a), s the row's scalar"),
@@ -103,7 +100,7 @@ public static class RowOps
         new("rope", false, false, false, false, true, false, 10000, 0, Rope, "pairs (i, i + cols/2) rotated by pos·a^(−2i/cols); an odd row's last value kept", Ulps: 64),
         new("scale_mask_softmax", true, false, false, false, false, false, 0.125, 1, ScaleMaskSoftmax, "softmax(a·x + mask); b ≠ 0: columns past the row's position excluded (causal; the position is the row's index, or the one given: a key span)"),
         new("scale_mask_softmax_lse", true, false, false, false, false, false, 0.125, 1, ScaleMaskSoftmaxLse, "scale_mask_softmax; y2[row] = the row's log-sum-exp m + log Σ e^(z − m) of its kept values (−∞ when none)") { RowOut = true },
-        new("add_rms_norm", true, true, false, false, false, true, Eps, 0, AddRmsNorm, "h = x + x2 (written to y2); y = rms_norm_affine(h)") { SecondRange = (-4, 4), Offset = true },
+        new("add_rms_norm", true, true, false, false, false, true, Eps, 0, AddRmsNorm, "h = x + x2 (written to y2); y = rms_norm_affine(h)") { SecondRange = (-4, 4) },
         new("add_layer_norm", true, true, true, false, false, true, Eps, 0, AddLayerNorm, "h = x + x2 (written to y2); y = layer_norm(h)") { SecondRange = (-4, 4) },
         new("cross_entropy_bwd", false, false, false, false, true, false, 0, 0, CrossEntropyBwd, "softmax(x) − one_hot(the row's position: the target class); the loss is −log_softmax(x) picked at the target (pick_rows)"),
         new("weighted_cross_entropy_bwd", false, false, false, true, true, false, 0.25, 0, WeightedCrossEntropyBwd, "a·s·(softmax(x) − one_hot(the row's position)): s the row's weight, a the loss's scale (1 / the normalizer); the loss is cross_entropy with the weights"),
@@ -149,16 +146,16 @@ public static class RowOps
     private static double RmsNormAffine(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)
     {
         double rstd = Rstd(x, 0, a);
-        for (int i = 0; i < x.Length; i++) y[i] = x[i] * rstd * (g[i] + b);
+        for (int i = 0; i < x.Length; i++) y[i] = x[i] * rstd * g[i];
         return MaxAbs(y) * Math.Sqrt(x.Length);
     }
 
     private static double RmsNormBwd(ReadOnlySpan<double> x, ReadOnlySpan<double> x2, ReadOnlySpan<double> g, ReadOnlySpan<double> bt, double s, int pos, int row, double a, double b, Span<double> y, Span<double> y2)
     {
         double rstd = Rstd(x, 0, a), t = 0, gm = 0;
-        for (int i = 0; i < x.Length; i++) { t += (g[i] + b) * x2[i] * x[i] * rstd; gm = Math.Max(gm, Math.Abs(g[i] + b)); }
+        for (int i = 0; i < x.Length; i++) { t += g[i] * x2[i] * x[i] * rstd; gm = Math.Max(gm, Math.Abs(g[i])); }
         double m = t / x.Length;
-        for (int i = 0; i < x.Length; i++) y[i] = rstd * ((g[i] + b) * x2[i] - x[i] * rstd * m);
+        for (int i = 0; i < x.Length; i++) y[i] = rstd * (g[i] * x2[i] - x[i] * rstd * m);
         return rstd * gm * MaxAbs(x2) * (1 + MaxAbs(x) * rstd * MaxAbs(x) * rstd) * Math.Sqrt(x.Length);
     }
 

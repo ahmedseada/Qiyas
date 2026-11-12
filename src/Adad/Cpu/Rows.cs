@@ -516,11 +516,7 @@ internal sealed partial class Kernels
             var sl = s is null ? null : pool.Rent(1);
             try
             {
-                if (g is not null)
-                {
-                    TN.Load(g, 0, gl.AsSpan(0, cols));
-                    if (op.Offset) for (int c = 0; c < cols; c++) gl![c] = TL.Add(gl[c], b);     // the gain g + b, as the operation scales by it
-                }
+                if (g is not null) TN.Load(g, 0, gl.AsSpan(0, cols));
                 if (bt is not null) TN.Load(bt, 0, btl.AsSpan(0, cols));
                 for (int r = first; r < last; r++)
                 {
