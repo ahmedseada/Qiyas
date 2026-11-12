@@ -174,7 +174,7 @@ internal sealed class Options
     ];
     public static readonly string[] Group3 = [.. RowOps.All.Select(o => "row:" + o.Name), "norm_params_bwd:rms", "norm_params_bwd:layer"];
     public static readonly string[] Group4 = [.. LayoutArgs.Names.Select(n => "layout:" + n)];
-    public static readonly string[] Group4b = ["matmul_nt", "matmul_tn", "matmul_tt", "matmul_batched", "matmul_bwd", "matmul_blocks"];
+    public static readonly string[] Group4b = ["matmul_nt", "matmul_tn", "matmul_tt", "matmul_batched", "matmul_bwd", "matmul_blocks", "matmul_epilogue", "matmul_epilogue2"];
     public static readonly string[] Group5 = ["attention", "attention_causal", "attention_fused", "attention_fused_causal", "attention_decode", "attention_bwd"];
     public static readonly string[] Group7 = [.. OptimizerArgs.Names.Select(n => "optimizer:" + n)];
     public static readonly string[] Group7b = ["optimizer_many"];
@@ -1167,6 +1167,32 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
             var bb = Registry.Make(type, s * s, 32, -1, 1);
             var bwant = blockView.Reference(Registry.Values(type, ba, s * s), Registry.Values(type, bb, s * s));
             Measure(device, name, type, $"{s}x{s}x{s} Bᵀ", Works.Product(type, (long)s * s, (long)s * s, (long)s * s, (double)s * s * s), bwant, (subject, c) => subject.MatMulBlocks(device, type, s, s, s, ba, bb, c), (int)Registry.Bytes(type, s * s));
+            return;
+        }
+
+        if (name is "matmul_epilogue" or "matmul_epilogue2")
+        {
+            // The core product's epilogue: a bias a column, an activation (gelu for a float type, relu for any other: the
+            // formulas every lane has) and a residual; matmul_epilogue2 also adds a second product of k = s/16 to the sums
+            // first (a low-rank update's shape). y is scored against the float64 reference (ProductEpilogue.Reference).
+            bool isFloat = Registry.IsFloat(type);
+            int k2 = s / 16;
+            var ev = new ProductView(s, s, s, false, false);
+            var second = name == "matmul_epilogue2" ? new ProductView(s, s, k2, false, false) : null;
+            var e = new ProductEpilogue { Act = isFloat ? "gelu" : "relu", Second = second };
+            var ea = Registry.Make(type, s * s, 31, -1, 1);
+            var eb = Registry.Make(type, s * s, 32, -1, 1);
+            var bias = Registry.Make(type, s, 36, -1, 1);
+            var residual = Registry.Make(type, s * s, 37, -1, 1);
+            var a2 = second is null ? null : Registry.Make(type, s * k2, 38, -1, 1);
+            var b2 = second is null ? null : Registry.Make(type, k2 * s, 39, -1, 1);
+            double[]? V(byte[]? x, int n) => x is null ? null : Registry.Values(type, x, n);
+            var (ewant, _) = e.Reference(ev, V(ea, s * s)!, V(eb, s * s)!, new double[s * s], V(bias, s), V(residual, s * s), null, V(a2, s * k2), V(b2, k2 * s));
+            double terms = (double)s * s * s + (second is null ? 0 : (double)s * s * k2);
+            var work = Works.Product(type, (long)s * s, (long)s * s, (long)s * s, terms)
+                + new Work(Work.B(type, s) + Work.B(type, (long)s * s) + (second is null ? 0 : 2 * Work.B(type, (long)s * k2)), (isFloat ? 11.0 : 3.0) * s * s);
+            Measure(device, name, type, $"{s}x{s}x{s} bias {e.Act} residual{(second is null ? "" : $", a second of k {k2}")}", work, ewant,
+                (subject, c) => subject.MatMulEpilogue(device, type, ev, e, ea, eb, c, bias, residual, a2, b2), (int)Registry.Bytes(type, s * s));
             return;
         }
 

@@ -314,6 +314,22 @@ public sealed class AdadSubject : IBenchSubject
     public IBenchRun? MatMulView(Device device, string type, ProductView v, byte[] a, byte[] b, byte[] c) =>
         Registry.With(type, new ProductVisitor(device, v, a, b, c, null, null));
 
+    public IBenchRun? MatMulEpilogue(Device device, string type, ProductView v, ProductEpilogue e, byte[] a, byte[] b, byte[] c, byte[]? bias, byte[]? residual, byte[]? a2, byte[]? b2) =>
+        Registry.With(type, new EpilogueVisitor(device, v, e, a, b, c, bias, residual, a2, b2));
+
+    private sealed class EpilogueVisitor(Device device, ProductView v, ProductEpilogue e, byte[] a, byte[] b, byte[] c, byte[]? bias, byte[]? residual, byte[]? a2, byte[]? b2)
+        : ITypeVisitor<IBenchRun?>, INumberRun
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IAdad<TN, float> => On<TN, EpilogueVisitor>(device, this);
+
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IAdad<TN, float>
+        {
+            TB dA = s.In(a), dB = s.In(b), dOut = s.Out(c);
+            var t = new ProductTerms<TB>(Bias: s.InOrNone(bias), Residual: s.InOrNone(residual), SecondA: s.InOrNone(a2), SecondB: s.InOrNone(b2));
+            return s.Run(() => s.D.MatMulEpilogue<TN>(v, e, dA, dB, dOut, t));
+        }
+    }
+
     public IBenchRun? MatMulBackward(Device device, string type, byte[] a, byte[] b, byte[] dc, byte[] da, byte[] db, int m, int n, int k) =>
         Registry.With(type, new ProductVisitor(device, new ProductView(m, n, k, false, false), a, b, dc, da, db));
 

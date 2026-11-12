@@ -93,6 +93,10 @@ public interface IBenchSubject
     /// <summary>C = op(A)·op(B) over a view's batches (ProductView: transposed operands, batch strides); c stored as the type.</summary>
     IBenchRun? MatMulView(Device device, string type, ProductView v, byte[] a, byte[] b, byte[] c) => null;
 
+    /// <summary>A product with its epilogue (IProducts.MatMulEpilogue): the view's C = the epilogue's y of A·B, its terms each
+    /// given or null (the bias, n values; the residual, y's layout; the second product's A2 and B2 as e.Second stores them).</summary>
+    IBenchRun? MatMulEpilogue(Device device, string type, ProductView v, ProductEpilogue e, byte[] a, byte[] b, byte[] c, byte[]? bias, byte[]? residual, byte[]? a2, byte[]? b2) => null;
+
     /// <summary>dA = dC·Bᵀ and dB = Aᵀ·dC for C = A·B (A m × k, B k × n, dC m × n), both stored as the type.</summary>
     IBenchRun? MatMulBackward(Device device, string type, byte[] a, byte[] b, byte[] dc, byte[] da, byte[] db, int m, int n, int k) => null;
 
