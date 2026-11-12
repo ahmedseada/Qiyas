@@ -463,6 +463,8 @@ internal sealed partial class Kernels
             var row = pool.Rent(cols);
             var tile = v0 >= 0 ? pool.Rent((int)(v1 - v0)) : null;
             TLane[]? source = null, source2 = null;
+            TLane[]? weights = null;                                                    // an interpolation backward's weights and their places
+            int[]? places = null;
             var input = new Reader<TN, TLane>(k.X, k.InputCount, inLanes);
             var second = k.X2 is null ? null : new Reader<TN, TLane>(k.X2, SecondCount(k));
             try
@@ -495,10 +497,8 @@ internal sealed partial class Kernels
                             break;
                         case "gather_cols":
                         {
-                            // The input row read in place or loaded once, then gathered.
                             source ??= pool.Rent(p[1]);
-                            var line = input.Span((long)r * p[1], p[1], source);
-                            for (int c = 0; c < cols; c++) o[c] = (uint)idx![c] < (uint)p[1] ? line[idx[c]] : default;
+                            GatherColsRow(input, idx!, p[1], r, o, source);
                             break;
                         }
                         case "scatter_add_rows":
@@ -536,31 +536,8 @@ internal sealed partial class Kernels
                         }
 
                         case "col2im":
-                        {
-                            // Input pixel (c, ih, iw = col): every (a, b, oh, ow) that maps onto it, in kernel order.
-                            var (OH, OW) = LayoutArgs.ConvOut(p);
-                            int H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], top = p[7], left = p[8], dh = p[11], dw = p[12];
-                            int ih = r % H, c = r / H;
-                            for (int iw = 0; iw < W; iw++)
-                            {
-                                TLane acc = TL.Zero;
-                                for (int a = 0; a < kh; a++)
-                                {
-                                    int th = ih + top - a * dh;
-                                    if (th < 0 || th % sh != 0 || th / sh >= OH) continue;
-                                    for (int b = 0; b < kw; b++)
-                                    {
-                                        int tw = iw + left - b * dw;
-                                        if (tw < 0 || tw % sw != 0 || tw / sw >= OW) continue;
-                                        acc = TL.Add(acc, input[((long)((c * kh + a) * kw + b) * (OH * OW)) + (th / sh) * OW + tw / sw]);
-                                    }
-                                }
-
-                                o[iw] = acc;
-                            }
-
+                            Col2ImRow(input, p, r, o);
                             break;
-                        }
 
                         case "interpolate_nearest":
                         {
@@ -600,29 +577,9 @@ internal sealed partial class Kernels
                         case "interpolate_nearest_bwd":
                         case "interpolate_bilinear_bwd":
                         {
-                            // Input position (c, ih, iw = col): the outputs whose source rows and columns include it (oh, then ow
-                            // ascending), each dy by its weight there: acc = fma(dy, wy·wx, acc).
-                            int H = p[1], W = p[2], OH = p[3], OW = p[4];
-                            int ih = r % H, c = r / H;
-                            bool bilinear = k.Name == "interpolate_bilinear_bwd";
-                            var (h0, h1) = LayoutArgs.InterpolateSources(bilinear, ih, H, OH, p[5], p[6], p[7]);
-                            for (int iw = 0; iw < W; iw++)
-                            {
-                                var (w0, w1) = LayoutArgs.InterpolateSources(bilinear, iw, W, OW, p[8], p[9], p[10]);
-                                TLane acc = TL.Zero;
-                                for (int oh = h0; oh <= h1; oh++)
-                                {
-                                    if (!InterpolateWeight<TLane, TL>(bilinear, oh, ih, H, p[5], p[6], p[7], out TLane wy)) continue;
-                                    for (int ow = w0; ow <= w1; ow++)
-                                    {
-                                        if (!InterpolateWeight<TLane, TL>(bilinear, ow, iw, W, p[8], p[9], p[10], out TLane wx)) continue;
-                                        acc = TL.Fma(input[((long)c * OH + oh) * OW + ow], TL.Mul(wy, wx), acc);
-                                    }
-                                }
-
-                                o[iw] = acc;
-                            }
-
+                            weights ??= pool.Rent(p[3] + p[4]);
+                            places ??= ArrayPool<int>.Shared.Rent(p[3] + p[4]);
+                            InterpolateBackRow(k.Name == "interpolate_bilinear_bwd", input, p, r, o, weights, places);
                             break;
                         }
 
@@ -922,8 +879,83 @@ internal sealed partial class Kernels
                 if (tile is not null) pool.Return(tile);
                 if (source is not null) pool.Return(source);
                 if (source2 is not null) pool.Return(source2);
+                if (weights is not null) pool.Return(weights);
+                if (places is not null) ArrayPool<int>.Shared.Return(places);
                 input.Return();
                 second?.Return();
+            }
+        }
+
+        // The row methods below are methods of their own. Within the row method, as it grew, the same code ran slower:
+        // col2im's loops 1.1 to 1.5 times its time before, even with the runtime's tiers off (everything compiled at the
+        // final tier from the start), so the row method's size, not its tier. gather_cols, the first operation of a run, was
+        // timed in its own method's first tier (two to three times slower): compiled at the final tier from the first call,
+        // as the hot kernels are. The others stay in the runtime's tiers, whose last (with the profile) ran the
+        // interpolation's backward 1.2 to 1.5 times faster than the final tier from the first call.
+
+        // gather_cols, output row r: input row r (of size values) read in place or loaded once, then gathered; an index
+        // outside the row selects nothing (the test against the row's own length: the read needs no bounds check of its own).
+        [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
+        private static void GatherColsRow(Reader<TN, TLane> input, int[] idx, int size, int r, Span<TLane> o, TLane[] source)
+        {
+            var line = input.Span((long)r * size, size, source);
+            for (int c = 0; c < o.Length; c++) { int j = idx[c]; o[c] = (uint)j < (uint)line.Length ? line[j] : default; }
+        }
+
+        // col2im, input row r (c, ih): each pixel iw the sum of every (a, b, oh, ow) that maps onto it, in kernel order.
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void Col2ImRow(Reader<TN, TLane> input, int[] p, int r, Span<TLane> o)
+        {
+            var (OH, OW) = LayoutArgs.ConvOut(p);
+            int H = p[1], W = p[2], kh = p[3], kw = p[4], sh = p[5], sw = p[6], top = p[7], left = p[8], dh = p[11], dw = p[12];
+            int ih = r % H, c = r / H;
+            for (int iw = 0; iw < W; iw++)
+            {
+                TLane acc = TL.Zero;
+                for (int a = 0; a < kh; a++)
+                {
+                    int th = ih + top - a * dh;
+                    if (th < 0 || th % sh != 0 || th / sh >= OH) continue;
+                    for (int b = 0; b < kw; b++)
+                    {
+                        int tw = iw + left - b * dw;
+                        if (tw < 0 || tw % sw != 0 || tw / sw >= OW) continue;
+                        acc = TL.Add(acc, input[((long)((c * kh + a) * kw + b) * (OH * OW)) + (th / sh) * OW + tw / sw]);
+                    }
+                }
+
+                o[iw] = acc;
+            }
+        }
+
+        // An interpolation's backward, input row r (c, ih): each position iw sums the outputs whose source rows and columns
+        // include it (oh, then ow ascending), each dy by its weight there: acc = fma(dy, wy·wx, acc). The row's weights wy
+        // are found once a row and a position's wx once a position, not again for every term (weights and places: OH + OW
+        // each, the row's first, then the position's): the same terms in the same order.
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void InterpolateBackRow(bool bilinear, Reader<TN, TLane> input, int[] p, int r, Span<TLane> o, TLane[] weights, int[] places)
+        {
+            int H = p[1], W = p[2], OH = p[3], OW = p[4];
+            int ih = r % H, c = r / H;
+            var (h0, h1) = LayoutArgs.InterpolateSources(bilinear, ih, H, OH, p[5], p[6], p[7]);
+            int rows = 0;
+            for (int oh = h0; oh <= h1; oh++)
+                if (InterpolateWeight<TLane, TL>(bilinear, oh, ih, H, p[5], p[6], p[7], out TLane wy)) { places[rows] = oh; weights[rows++] = wy; }
+            for (int iw = 0; iw < W; iw++)
+            {
+                var (w0, w1) = LayoutArgs.InterpolateSources(bilinear, iw, W, OW, p[8], p[9], p[10]);
+                int columns = 0;
+                for (int ow = w0; ow <= w1; ow++)
+                    if (InterpolateWeight<TLane, TL>(bilinear, ow, iw, W, p[8], p[9], p[10], out TLane wx)) { places[OH + columns] = ow; weights[OH + columns++] = wx; }
+                TLane acc = TL.Zero;
+                for (int j = 0; j < rows; j++)
+                {
+                    long dyRow = ((long)c * OH + places[j]) * OW;
+                    TLane wy = weights[j];
+                    for (int e = 0; e < columns; e++) acc = TL.Fma(input[dyRow + places[OH + e]], TL.Mul(wy, weights[OH + e]), acc);
+                }
+
+                o[iw] = acc;
             }
         }
     }
