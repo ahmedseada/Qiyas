@@ -491,6 +491,40 @@ public sealed class AdadSubject : IBenchSubject
         public byte[] Scales => scales;
     }
 
+    public IBenchRun? RouteTopK(Device device, string type, byte[] p, int tokens, int experts, int k, bool normalize, byte[] weights, int[] offsets, int[] tokenOfRow, int[] slotRow) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new RouteTopKVisitor(device, p, tokens, experts, k, normalize, weights, offsets, tokenOfRow, slotRow)) : null;
+
+    private sealed class RouteTopKVisitor(Device device, byte[] p, int tokens, int experts, int k, bool normalize, byte[] weights, int[] offsets, int[] tokenOfRow, int[] slotRow)
+        : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, RouteTopKVisitor>(device, this);
+
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        {
+            TB dp = s.In(p, s.Slack), dw = s.Out(weights, s.Slack);
+            TI doff = s.IndexOut(offsets), dt = s.IndexOut(tokenOfRow), ds = s.IndexOut(slotRow);
+            return s.Run(() => s.D.RouteTopK<TN>(dp, tokens, experts, k, normalize, dw, doff, dt, ds));
+        }
+    }
+
+    public IBenchRun? ExpertProducts(Device device, string type, ExpertView v, string? gate, byte[] x, int[] offsets, byte[] gw, byte[]? gb, byte[]? uw, byte[]? ub, byte[] y) =>
+        Registry.IsFloat(type) ? Registry.WithFloat(type, new ExpertsVisitor(device, v, gate, x, offsets, gw, gb, uw, ub, y)) : null;
+
+    private sealed class ExpertsVisitor(Device device, ExpertView v, string? gate, byte[] x, int[] offsets, byte[] gw, byte[]? gb, byte[]? uw, byte[]? ub, byte[] y)
+        : IFloatTypeVisitor<IBenchRun?>, IFloatRun
+    {
+        public IBenchRun? Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float> => OnFloat<TN, ExpertsVisitor>(device, this);
+
+        public IBenchRun Make<TN, TB, TI>(Staged<TB, TI> s) where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
+        {
+            int pad = s.Slack;
+            TB dx = s.In(x, pad), dg = s.In(gw, pad), dy = s.Out(y, pad);
+            TB? dgb = s.InOrNone(gb, pad), du = s.InOrNone(uw, pad), dub = s.InOrNone(ub, pad);
+            TI doff = s.Index(offsets);
+            return s.Run(() => gate is null ? s.D.ExpertMatMul<TN>(v, dx, doff, dg, dgb, dy) : s.D.ExpertGatedPair<TN>(v, gate, dx, doff, dg, dgb, du!, dub, dy));
+        }
+    }
+
     public IBenchRun? Optimizer(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) =>
         Registry.IsFloat(type) ? Registry.WithFloat(type, new OptimizerVisitor(device, a, p, g, m, v, n)) : null;
 

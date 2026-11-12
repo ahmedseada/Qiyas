@@ -115,6 +115,14 @@ public interface IBenchSubject
     /// <summary>The codes (of codesType) and scales (of the type) of a scaled weight's values (IProducts.Quantize, no zero points).</summary>
     IBenchRun? Quantize(Device device, string type, string codesType, ScaledWeight w, byte[] values, byte[] codes, byte[] scales) => null;
 
+    /// <summary>The routing of tokens rows of probabilities (the type) to their k first experts in TopK's order (IExperts.RouteTopK):
+    /// the weights (the type), offsets, tokenOfRow and slotRow.</summary>
+    IBenchRun? RouteTopK(Device device, string type, byte[] p, int tokens, int experts, int k, bool normalize, byte[] weights, int[] offsets, int[] tokenOfRow, int[] slotRow) => null;
+
+    /// <summary>The experts' products over x's rows grouped by expert (ExpertView; the offsets of the groups): y = x·W_e + b_e
+    /// (IExperts.ExpertMatMul), or with a gate, gate(x·G_e + gb_e, x·U_e + ub_e) (IExperts.ExpertGatedPair).</summary>
+    IBenchRun? ExpertProducts(Device device, string type, ExpertView v, string? gate, byte[] x, int[] offsets, byte[] gw, byte[]? gb, byte[]? uw, byte[]? ub, byte[] y) => null;
+
     /// <summary>An optimizer step (OptimizerArgs.Names) over n values: p (updated in place) and g as the type, the moments m, v as
     /// the subject's lane storage (float32 or float64 bytes; v null for one moment), updated in place.</summary>
     IBenchRun? Optimizer(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) => null;

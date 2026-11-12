@@ -144,6 +144,7 @@ internal sealed class Options
     public static readonly string[] Group11 = ["rope_table", "attention_steps"];
     public static readonly string[] Group12 = ["penalize", "sample_filtered", "sample_plain"];
     public static readonly string[] Group13 = ["memory:copy", "memory:clear", "memory:rent_zeroed"];
+    public static readonly string[] Group14 = ["route_topk", "expert_matmul", "expert_gated"];
     public List<string>? Subjects;
     public string? Baseline;
 
@@ -169,7 +170,7 @@ internal sealed class Options
                 case "--types": o.Types = Next(); break;
                 case "--ops":
                     o.Ops = Next();
-                    if (o.Ops.Contains("all")) o.Ops = [.. Core, .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name), .. Group2, .. Group3, .. Group4, .. Group4b, .. Group5, .. Group6, .. Group7, .. Group7b, .. Group8, .. Group9, .. Group10, .. Group11, .. Group12, .. Group13];
+                    if (o.Ops.Contains("all")) o.Ops = [.. Core, .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name), .. Group2, .. Group3, .. Group4, .. Group4b, .. Group5, .. Group6, .. Group7, .. Group7b, .. Group8, .. Group9, .. Group10, .. Group11, .. Group12, .. Group13, .. Group14];
                     if (o.Ops.Contains("map")) o.Ops = [.. o.Ops.Where(n => n != "map"), .. Adad.Abstraction.Ops.All.Select(m => "map:" + m.Name)];
                     if (o.Ops.Contains("reduce")) o.Ops = [.. o.Ops.Where(n => n != "reduce"), .. Group2];
                     if (o.Ops.Contains("rows")) o.Ops = [.. o.Ops.Where(n => n != "rows"), .. Group3];
@@ -184,6 +185,7 @@ internal sealed class Options
                     if (o.Ops.Contains("heads")) o.Ops = [.. o.Ops.Where(n => n != "heads"), .. Group11];
                     if (o.Ops.Contains("decoding")) o.Ops = [.. o.Ops.Where(n => n != "decoding"), .. Group12];
                     if (o.Ops.Contains("memory")) o.Ops = [.. o.Ops.Where(n => n != "memory"), .. Group13];
+                    if (o.Ops.Contains("experts")) o.Ops = [.. o.Ops.Where(n => n != "experts"), .. Group14];
                     break;
                 case "--baseline": o.Baseline = args[++i]; break;
                 case "--shapes": o.Shapes = args[++i]; if (o.Shapes is not ("regular" or "odd")) throw new ArgumentException($"--shapes takes regular or odd, not {o.Shapes}"); break;
@@ -350,6 +352,11 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         foreach (var name in Options.Group13)
         {
             if (options.Ops.Contains(name)) MemoryRow(device, type, name);
+        }
+
+        foreach (var name in Options.Group14)
+        {
+            if (options.Ops.Contains(name)) ExpertsRow(device, type, name);
         }
 
         if (!Registry.IsFloat(type)) return;
@@ -885,6 +892,48 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
         var v = Registry.Make(own, keys, 43, -1, 1);
         var wantO = CacheRule.AtPosition(a, position).Reference(Registry.Values(type, q, (int)a.QValues), Registry.Values(own, k, keys), Registry.Values(own, v, keys));
         Measure(device, name, type, $"{a.Heads}h {a.Lq}x{a.Lk} d{a.D}", wantO, (s, o) => s.AttentionCached(device, type, own, a, position, q, k, v, o), q.Length);
+    }
+
+    // A mixture of experts (float types). route_topk: 4096 tokens' 8 first of 64 experts, normalized (the weights scored).
+    // expert_matmul and expert_gated (gated_silu): the core product's size as 8 experts' products, the rows grouped as
+    // routing half as many tokens to 2 experts each groups them, the weights stored (K × N an expert) and drawn within
+    // ±√(3 / K) (the sums of order one, inside every type's range), with biases.
+    private void ExpertsRow(Device device, string type, string name)
+    {
+        if (!Registry.IsFloat(type)) return;
+        if (name == "route_topk")
+        {
+            int tokens = Prime(4096), experts = Prime(64), k = 8;
+            var p = Registry.Make(type, tokens * experts, 111, 0, 1);
+            var want = Experts.RouteTopKReference(Registry.Values(type, p, tokens * experts), tokens, experts, k, true).Weights;
+            int[] offsets = new int[experts + 1], tokenOfRow = new int[tokens * k], slotRow = new int[tokens * k];
+            Measure(device, name, type, $"{tokens}x{experts} k{k}", want, (s, w) => s.RouteTopK(device, type, p, tokens, experts, k, true, w, offsets, tokenOfRow, slotRow), (int)Registry.Bytes(type, tokens * k));
+            return;
+        }
+
+        int size = MatSize(device), groups = 8, routed = size / 2;
+        var random = new Random(112);
+        var probabilities = Enumerable.Range(0, routed * groups).Select(_ => random.NextDouble()).ToArray();
+        var offsets2 = Experts.RouteTopKReference(probabilities, routed, groups, 2, false).Offsets;
+        var v = new ExpertView(groups, routed * 2, size, size);
+        double r = Math.Sqrt(3.0 / size);
+        byte[] Draw(long n, int seed, double bound = 1) => Registry.Make(type, (int)n, seed, -bound, bound);
+        byte[] x = Draw(v.XValues, 113), gw = Draw(v.WeightValues, 114, r), gb = Draw(v.BiasValues, 115);
+        double[] xv = Registry.Values(type, x, (int)v.XValues);
+        var g = v.Reference(xv, offsets2, Registry.Values(type, gw, (int)v.WeightValues), Registry.Values(type, gb, (int)v.BiasValues));
+        string shape = $"{groups}x {v.Rows}x{v.N}x{v.K}";
+        if (name == "expert_matmul")
+        {
+            Measure(device, name, type, shape, g, (s, y) => s.ExpertProducts(device, type, v, null, x, offsets2, gw, gb, null, null, y), (int)Registry.Bytes(type, v.YValues));
+            return;
+        }
+
+        byte[] uw = Draw(v.WeightValues, 116, r), ub = Draw(v.BiasValues, 117);
+        var u = v.Reference(xv, offsets2, Registry.Values(type, uw, (int)v.WeightValues), Registry.Values(type, ub, (int)v.BiasValues));
+        var gate = Adad.Abstraction.Ops.Find("gated_silu");
+        var want2 = new double[g.Length];
+        for (int i = 0; i < g.Length; i++) want2[i] = gate.Reference(g[i], u[i], 0, 0, 0);
+        Measure(device, name, type, shape + " gated_silu", want2, (s, y) => s.ExpertProducts(device, type, v, gate.Name, x, offsets2, gw, gb, uw, ub, y), (int)Registry.Bytes(type, v.YValues));
     }
 
     // The score a decoder's mask excludes by, as the type stores it (CacheView.Excluded).

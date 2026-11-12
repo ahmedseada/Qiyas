@@ -52,7 +52,7 @@ does best for it, chosen per operation from the data itself. No type is fixed an
 
 ## The bench
 
-`Qiyas.Bench.dll [cpu|cuda|cuda,cpu] [--subjects a,b] [--types ...] [--ops add,matmul,softmax,rms_norm,map|reduce|rows|layout|products|attention|optimizers|conv|recurrent|routing|cache|heads|decoding|memory|all] [--baseline name] [--shapes regular|odd] [--report] [--repeat N]`
+`Qiyas.Bench.dll [cpu|cuda|cuda,cpu] [--subjects a,b] [--types ...] [--ops add,matmul,softmax,rms_norm,map|reduce|rows|layout|products|attention|optimizers|conv|recurrent|routing|cache|heads|decoding|memory|experts|all] [--baseline name] [--shapes regular|odd] [--report] [--repeat N]`
 
 `--subjects` picks the columns (`adad`, `number`, and what you add), `--types` the stored types (the seventeen plain
 ones, `bool`, `q8_0`, `q4_0`, `q4_k`, `q6_k`), `--ops` the rows, `--baseline` a named earlier results file to
@@ -104,7 +104,10 @@ window the last 64 tokens of a ring of 256 that has wrapped), `sample_plain` and
 min-p 0.02 at a temperature of 0.8). `memory` adds a device's memory by a range (the `uint8` row; 16M bytes but the
 first and last three, a range off a word at both ends): `memory:copy` (into another buffer), `memory:clear` and
 `memory:rent_zeroed` (a zeroed buffer of the 16M bytes rented and returned); `map:copy` over uint8 is the copy's
-nearest equivalent. The sampling rows' error is not a distance between columns: it is the probability the worst
+nearest equivalent. `experts` adds a mixture of experts (float types): `route_topk` (4096 tokens' 8 first of 64
+experts in TopK's order, normalized; the weights scored), `expert_matmul` and `expert_gated` (gated_silu: two products
+a row) over 8 experts with biases, the core product's size grouped as routing half as many tokens to 2 experts each
+groups them, the weights within ±√(3 / K) (the sums of order one, inside every type's range). The sampling rows' error is not a distance between columns: it is the probability the worst
 row's pick is off the float64 rule by (`SamplingArgs.PickErrors`): 0 where the seed's draw lies in the pick's interval of
 the kept weights' running sum, the lane's rounding where a sum's rounding moved the pick to the next kept column, and up
 to a column's probability where the lane holds two weights at a threshold as one and keeps them together; with
