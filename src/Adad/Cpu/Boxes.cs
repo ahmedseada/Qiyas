@@ -3,8 +3,9 @@
 
 // The box overlap losses on the CPU (Abstraction/Boxes.cs): a vector of pairs at a time in the type's float lane, each
 // component of the pairs gathered into a lane vector from the stored corners (read where they are stored: in place for
-// float32 and float64), the reference's formulas in its order; the losses (or the gradients, four a pair) stored as the
-// type once.
+// float32 and float64; a narrower type's tile of pairs converted into lanes at once), the reference's formulas in its
+// order; the losses (or the gradients, four a pair) rounded to the type once, each tile of pairs storing its own outputs
+// (in place for float32 and float64; a tile whole storage units of the type, so no two tiles write one block).
 
 using System.Buffers;
 using System.Numerics;
@@ -41,76 +42,91 @@ internal sealed partial class Kernels
             Lane = TL.Name;
             _ = Boxes.Name(overlap);
             if (count == 0) return;
-            int per = dloss is null ? 1 : 4, w = Vector<TLane>.Count, chunks = (count + w - 1) / w;
-            var lanes = new TLane[(long)count * per];
-            Team.For(chunks, Math.Max(1, chunks / (Threads * 4)), (long)count * per * 64, new BoxBody<TN, TLane, TL>(overlap, predicted, target, dloss, lanes, count, TL.From(eps)));
-            TN.Store(lanes, output, 0);
+            // A tile: some 512 pairs, whole vectors of them, whose outputs are whole storage units of the type.
+            int per = dloss is null ? 1 : 4, w = Vector<TLane>.Count, g = TN.Granularity;
+            int tile = Math.Max(1, 512 / w) * w;
+            while (tile * per % g != 0) tile += w;
+            int tiles = (count + tile - 1) / tile;
+            Team.For(tiles, Math.Max(1, tiles / (Threads * 4)), (long)count * per * 64, new BoxBody<TN, TLane, TL>(overlap, predicted, target, dloss, output, count, tile, TL.From(eps)));
         }
     }
 
-    private readonly struct BoxBody<TN, TLane, TL>(BoxOverlap overlap, byte[] predicted, byte[] target, byte[]? dloss, TLane[] lanes, int count, TLane eps) : Team.IBody
+    private readonly struct BoxBody<TN, TLane, TL>(BoxOverlap overlap, byte[] predicted, byte[] target, byte[]? dloss, byte[] output, int count, int tile, TLane eps) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         public void Run(int first, int last)
         {
-            int w = Vector<TLane>.Count;
+            int w = Vector<TLane>.Count, per = dloss is null ? 1 : 4;
             var pool = ArrayPool<TLane>.Shared;
-            var pr = TN.Direct ? null : pool.Rent(4 * w);
-            var tr = TN.Direct ? null : pool.Rent(4 * w);
-            var dr = dloss is null || TN.Direct ? null : pool.Rent(w);
+            var pr = TN.Direct ? null : pool.Rent(4 * tile);                // a narrower type's tile in lanes
+            var tr = TN.Direct ? null : pool.Rent(4 * tile);
+            var dr = dloss is null || TN.Direct ? null : pool.Rent(tile);
             var parts = pool.Rent(9 * w);                                   // the pairs' corners by component, and dloss
+            var outs = TN.Direct ? null : pool.Rent(tile * per);            // a tile's outputs in lanes, stored as the type once
             try
             {
-                for (int c = first; c < last; c++)
+                for (int k0 = first; k0 < last; k0++)
                 {
-                    int i0 = c * w, n = Math.Min(w, count - i0);
-                    ReadOnlySpan<TLane> ps, ts, ds = default;
+                    int p0 = k0 * tile, pairs = Math.Min(tile, count - p0);
+                    var lanes = TN.Direct ? MemoryMarshal.Cast<byte, TLane>(output.AsSpan()).Slice(p0 * per, pairs * per) : outs.AsSpan(0, pairs * per);
+                    ReadOnlySpan<TLane> pt, tt, dt = default;                // the tile's corners and dloss in lanes
                     if (TN.Direct)
                     {
-                        ps = MemoryMarshal.Cast<byte, TLane>(predicted.AsSpan()).Slice(4 * i0, 4 * n);
-                        ts = MemoryMarshal.Cast<byte, TLane>(target.AsSpan()).Slice(4 * i0, 4 * n);
-                        if (dloss is not null) ds = MemoryMarshal.Cast<byte, TLane>(dloss.AsSpan()).Slice(i0, n);
+                        pt = MemoryMarshal.Cast<byte, TLane>(predicted.AsSpan()).Slice(4 * p0, 4 * pairs);
+                        tt = MemoryMarshal.Cast<byte, TLane>(target.AsSpan()).Slice(4 * p0, 4 * pairs);
+                        if (dloss is not null) dt = MemoryMarshal.Cast<byte, TLane>(dloss.AsSpan()).Slice(p0, pairs);
                     }
                     else
                     {
-                        TN.Load(predicted, 4 * i0, pr.AsSpan(0, 4 * n));
-                        TN.Load(target, 4 * i0, tr.AsSpan(0, 4 * n));
-                        ps = pr.AsSpan(0, 4 * n);
-                        ts = tr.AsSpan(0, 4 * n);
-                        if (dloss is not null) { TN.Load(dloss, i0, dr.AsSpan(0, n)); ds = dr.AsSpan(0, n); }
+                        TN.Load(predicted, 4 * p0, pr.AsSpan(0, 4 * pairs));
+                        TN.Load(target, 4 * p0, tr.AsSpan(0, 4 * pairs));
+                        pt = pr.AsSpan(0, 4 * pairs);
+                        tt = tr.AsSpan(0, 4 * pairs);
+                        if (dloss is not null) { TN.Load(dloss, p0, dr.AsSpan(0, pairs)); dt = dr.AsSpan(0, pairs); }
                     }
 
-                    // Components by lane; the lanes past the count repeat the last pair (their results dropped).
-                    for (int j = 0; j < w; j++)
+                    for (int i0 = p0; i0 < p0 + pairs; i0 += w)
                     {
-                        int s = Math.Min(j, n - 1);
-                        for (int k = 0; k < 4; k++)
+                        int n = Math.Min(w, p0 + pairs - i0), o = (i0 - p0) * per;
+                        var ps = pt.Slice(4 * (i0 - p0), 4 * n);
+                        var ts = tt.Slice(4 * (i0 - p0), 4 * n);
+                        var ds = dloss is null ? default : dt.Slice(i0 - p0, n);
+
+                        // Components by lane; the lanes past the count repeat the last pair (their results dropped).
+                        for (int j = 0; j < w; j++)
                         {
-                            parts[k * w + j] = ps[4 * s + k];
-                            parts[(4 + k) * w + j] = ts[4 * s + k];
+                            int s = Math.Min(j, n - 1);
+                            for (int k = 0; k < 4; k++)
+                            {
+                                parts[k * w + j] = ps[4 * s + k];
+                                parts[(4 + k) * w + j] = ts[4 * s + k];
+                            }
+
+                            parts[8 * w + j] = dloss is null ? TL.From(1) : ds[s];
                         }
 
-                        parts[8 * w + j] = dloss is null ? TL.From(1) : ds[s];
+                        Vector<TLane> V(int k) => new(parts.AsSpan(k * w, w));
+                        var r = BoxMath<TLane, TL>.Pair(overlap, dloss is not null, V(0), V(1), V(2), V(3), V(4), V(5), V(6), V(7), new Vector<TLane>(eps));
+                        if (dloss is null)
+                        {
+                            if (n == w) r.Loss.CopyTo(lanes.Slice(o, w));
+                            else for (int j = 0; j < n; j++) lanes[o + j] = r.Loss[j];
+                            continue;
+                        }
+
+                        var dl = V(8);
+                        Vector<TLane> g0 = r.G0 * dl, g1 = r.G1 * dl, g2 = r.G2 * dl, g3 = r.G3 * dl;
+                        for (int j = 0; j < n; j++)
+                        {
+                            int at = o + 4 * j;
+                            lanes[at] = g0[j];
+                            lanes[at + 1] = g1[j];
+                            lanes[at + 2] = g2[j];
+                            lanes[at + 3] = g3[j];
+                        }
                     }
 
-                    Vector<TLane> V(int k) => new(parts.AsSpan(k * w, w));
-                    var r = BoxMath<TLane, TL>.Pair(overlap, dloss is not null, V(0), V(1), V(2), V(3), V(4), V(5), V(6), V(7), new Vector<TLane>(eps));
-                    if (dloss is null)
-                    {
-                        for (int j = 0; j < n; j++) lanes[i0 + j] = r.Loss[j];
-                        continue;
-                    }
-
-                    var dl = V(8);
-                    Vector<TLane> g0 = r.G0 * dl, g1 = r.G1 * dl, g2 = r.G2 * dl, g3 = r.G3 * dl;
-                    for (int j = 0; j < n; j++)
-                    {
-                        long at = 4L * (i0 + j);
-                        lanes[at] = g0[j];
-                        lanes[at + 1] = g1[j];
-                        lanes[at + 2] = g2[j];
-                        lanes[at + 3] = g3[j];
-                    }
+                    if (!TN.Direct) TN.Store(lanes, output, p0 * per);
                 }
             }
             finally
@@ -118,6 +134,7 @@ internal sealed partial class Kernels
                 if (pr is not null) pool.Return(pr);
                 if (tr is not null) pool.Return(tr);
                 if (dr is not null) pool.Return(dr);
+                if (outs is not null) pool.Return(outs);
                 pool.Return(parts);
             }
         }
