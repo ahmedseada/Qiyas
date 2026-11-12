@@ -379,10 +379,19 @@ public sealed partial class GpuOps
         ulong cols = gpu.Rent(colBytes), dcols = gpu.Rent(colBytes);
         try
         {
-            Layout<TS>(new LayoutArgs { Name = "im2col", X = [], P = a.P, Output = [], Count = a.Rows * a.Cols, InputCount = (int)a.XValues }, x, 0, cols);
+            // The columns made transposed (a row a position): dw = dy · colsᵀ then reads them as its B as stored, where the
+            // columns as rows took a strided copy into Bᵀ first (the same values: the same product, the same bits).
+            var k = new LayoutArgs { Name = "im2col", X = [], P = a.P, Output = [], Count = a.Rows * a.Cols, InputCount = (int)a.XValues }.ForKernels();
+            var lane = f.Natural;
+            var fn = gpu.Cached($"layout:im2col_t:{f.Name}:{lane.Name}", (out string e) => Ptx.Layout(gpu, f, lane, "im2col_t", out e));
+            var args = new ulong[8 + Ptx.LayoutParamCount + Ptx.LayoutDivisorArgs];
+            for (int i = 0; i < Ptx.LayoutParamCount; i++) args[8 + i] = Gpu.U(i < k.P.Length ? k.P[i] : 0);
+            args[0] = x; args[4] = cols; args[5] = Gpu.U(a.Rows * a.Cols); args[6] = Gpu.U(a.Cols); args[7] = Gpu.U(a.Rows);
+            Ptx.LayoutDivisors(args);
+            if (a.Rows * a.Cols > 0) Gpu.Launch(fn, Grid(f.Words(a.Rows * a.Cols), 256), 1, 256, 1, 0, args);
             MatMulView<TS>(new ProductView(a.Rows, a.Cols, a.OC, true, false), w, dy, dcols);
             Layout<TS>(new LayoutArgs { Name = "col2im", X = [], P = a.P, Output = [], Count = (int)a.XValues, InputCount = a.Rows * a.Cols }, dcols, 0, dx);
-            MatMulView<TS>(new ProductView(a.OC, a.Rows, a.Cols, false, true), dy, cols, dw);
+            MatMulView<TS>(new ProductView(a.OC, a.Rows, a.Cols, false, false), dy, cols, dw);
         }
         finally
         {

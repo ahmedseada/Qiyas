@@ -570,9 +570,12 @@ internal static partial class Ptx
             }
 
             case "im2col":
+            case "im2col_t":
             {
                 // r = (ch·kh + a)·kw + bb; c = oh·OW + ow; source (ch, oh·sh − top + a·dh, ow·sw − left + bb·dw) or 0 (p: C H W kh kw
-                // sh sw top left bottom right dh dw OH OW, LayoutArgs.KernelP).
+                // sh sw top left bottom right dh dw OH OW, LayoutArgs.KernelP). im2col_t (the device's own, for the backward's
+                // dw): the columns transposed, a row a position and a column a (ch, a, bb).
+                if (name == "im2col_t") (r, c) = (c, r);
                 string kw = p[4], kh = p[3], H = p[1], W = p[2], ow = b.R(), oh = b.R(), bb = b.R(), a = b.R(), ch = b.R(), t = b.R(), ih = b.R(), iw = b.R(), pin = b.P(), p2 = b.P(), src = b.R(), ow2 = b.R();
                 string OW = p[14];
                 RemU(b, ow, c, OW);
