@@ -103,7 +103,7 @@ internal sealed partial class Kernels
             Product(x, false, w, true, g, rows, GH, a.D);                                       // x · Wᵀ (W is GH × D)
             if (h.X is not null)
             {
-                var gh = Lanes((long)rows * GH);
+                var gh = ScratchLanes(Scratch.CellGh, (long)rows * GH);
                 Product(h, false, u, true, gh, rows, GH, a.H);                                  // h · Uᵀ (U is GH × H)
                 Add(g, gh, g, rows * GH);
             }
@@ -137,8 +137,8 @@ internal sealed partial class Kernels
             long values = (long)GH * a.H;
             if (T == 1) { Product(dgAll, true, new Arg(h0), false, new Arg(du), GH, a.H, a.B); return; }
             var (first, others, input) = a.Shift(T);
-            var d0 = Lanes(values);
-            var d1 = Lanes(values);
+            var d0 = ScratchLanes(Scratch.ShiftD0, values);
+            var d1 = ScratchLanes(Scratch.ShiftD1, values);
             Product(dgAll.Plus(first * bg), true, new Arg(h0), false, d0, GH, a.H, a.B);
             Product(dgAll.Plus(others * bg), true, hs.Plus(input * bh), false, d1, GH, a.H, (T - 1) * a.B);
             Add(d0, d1, new Arg(du), (int)values);
@@ -149,7 +149,7 @@ internal sealed partial class Kernels
         public static string LstmStep(CellArgs a, byte[] x, byte[] h, byte[] c, byte[] w, byte[] u, byte[] bias, byte[] hOut, byte[] cOut)
         {
             long bh = (long)a.B * a.H;
-            var g = Lanes(a.GateValues);
+            var g = ScratchLanes(Scratch.StepG, a.GateValues);
             Gates(a, new(x), new(w), new(h), new(u), new(bias), g, a.B);
             Arg ho = Out(hOut, bh), co = Out(cOut, bh);
             Cell(a, g, default, new(c), ho, co);
@@ -161,9 +161,9 @@ internal sealed partial class Kernels
             byte[] dx, byte[] dh, byte[] dc, byte[] dw, byte[] du, byte[] db)
         {
             long bh = (long)a.B * a.H;
-            var g = Lanes(a.GateValues);
+            var g = ScratchLanes(Scratch.BackG, a.GateValues);
             Gates(a, new(x), new(w), new(h), new(u), new(bias), g, a.B);
-            var dg = Lanes(a.GateValues);
+            var dg = ScratchLanes(Scratch.BackDg, a.GateValues);
             var dco = Out(dc, bh);
             CellBack(a, g, default, new(c), new(dhOut), new(dcOut), dg, dco, default);
             Done(dco, dc, bh);
@@ -175,8 +175,8 @@ internal sealed partial class Kernels
         {
             long bh = (long)a.B * a.H;
             var hArgs = a with { D = a.H };
-            var gx = Lanes(a.GateValues);
-            var gh = Lanes(a.GateValues);
+            var gx = ScratchLanes(Scratch.StepG, a.GateValues);
+            var gh = ScratchLanes(Scratch.StepG2, a.GateValues);
             Gates(a, new(x), new(w), default, default, new(bias), gx, a.B);
             Gates(hArgs, new(h), new(u), default, default, new(biasH), gh, a.B);
             var ho = Out(hOut, bh);
@@ -191,16 +191,16 @@ internal sealed partial class Kernels
             int GH = a.Gates * a.H;
             long bh = (long)a.B * a.H;
             var hArgs = a with { D = a.H };
-            var gx = Lanes(a.GateValues);
-            var gh = Lanes(a.GateValues);
+            var gx = ScratchLanes(Scratch.BackG, a.GateValues);
+            var gh = ScratchLanes(Scratch.BackG2, a.GateValues);
             Gates(a, new(x), new(w), default, default, new(bias), gx, a.B);
             Gates(hArgs, new(h), new(u), default, default, new(biasH), gh, a.B);
-            var dgx = Lanes(a.GateValues);
-            var dgh = Lanes(a.GateValues);
-            var dhCell = Lanes(bh);
+            var dgx = ScratchLanes(Scratch.BackDg, a.GateValues);
+            var dgh = ScratchLanes(Scratch.BackDg2, a.GateValues);
+            var dhCell = ScratchLanes(Scratch.DhCell, bh);
             CellBack(a, gx, gh, new(h), new(dhOut), default, dgx, dgh, dhCell);
             GatesBackward(a, a.B, dgx, new(x), default, new(w), default, dx, null, dw, null, db);
-            var dhGates = Lanes(bh);
+            var dhGates = ScratchLanes(Scratch.Dh, bh);
             Product(dgh, false, new(u), false, dhGates, a.B, a.H, GH);                          // dgh · U
             Add(dhGates, dhCell, new Arg(dh), (int)bh);
             Product(dgh, true, new(h), false, new Arg(du), GH, a.H, a.B);                       // dghᵀ · h

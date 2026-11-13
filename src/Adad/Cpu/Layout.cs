@@ -242,6 +242,7 @@ internal sealed partial class Kernels
                 Team.For((int)groups, Math.Max(1, (int)(groups / (Threads * 4))), (long)k.Count, new StridedTileBody<TN, TLane>(k, cols, dim, tile, span, TN.Direct && Streams.Past(TN.Bytes(k.InputCount) + TN.Bytes(k.Count))));
             }
             else Move<TN, TLane, TL>(k, rows, cols, at);
+            ReturnAux(at);
         }
     }
 
@@ -255,6 +256,7 @@ internal sealed partial class Kernels
             var (rows, cols) = OutputRows(k);
             var at = Aux<TN, TLane>(k);
             Move<TN, TLane, TL>(k, rows, cols, at);
+            ReturnAux(at);
         }
     }
 
@@ -268,6 +270,7 @@ internal sealed partial class Kernels
             var (rows, cols) = OutputRows(k);
             var at = Aux<TN, TLane>(k);
             Move<TN, TLane, TL>(k, rows, cols, at);
+            ReturnAux(at);
         }
 
         public void RunDot<TN, TIn, TAcc, TD>()
@@ -287,6 +290,7 @@ internal sealed partial class Kernels
             var (rows, cols) = OutputRows(k);
             var at = Aux<TN, TLane>(k);
             Move<TN, TLane, TL>(k, rows, cols, at);
+            ReturnAux(at);
         }
     }
 
@@ -459,7 +463,8 @@ internal sealed partial class Kernels
     /// window of the forward input (x2), found by the team (index into the input; every window holds a value), so each
     /// input row reads its windows' choice instead of scanning every window it lies in. scatter_add_rows: its offsets
     /// (rows + 1), then its sources in order of their row (Route: source order within a row, an index outside the rows in
-    /// none), as the devices' aux. Null for the other operations.</summary>
+    /// none), as the devices' aux. Null for the other operations. Rented from the shared pool (a window's choice for
+    /// every window of a large image is megabytes a call): given back by ReturnAux once the rows are moved.</summary>
     private static long[]? Aux<TN, TLane>(LayoutArgs k) where TN : struct, IAdad<TN, TLane> where TLane : unmanaged
     {
         if (k.Name == "scatter_add_rows")
@@ -469,7 +474,7 @@ internal sealed partial class Kernels
             var offsets = new int[targets + 1];
             var order = new int[sources];
             Route(index, targets, new int[targets], offsets, order);
-            var aux = new long[targets + 1 + sources];
+            var aux = ArrayPool<long>.Shared.Rent(targets + 1 + sources);
             for (int t = 0; t <= targets; t++) aux[t] = offsets[t];
             for (int q = 0; q < sources; q++) aux[targets + 1 + q] = order[q];
             return aux;
@@ -480,9 +485,14 @@ internal sealed partial class Kernels
         int C = p[0], H = p[1], W = p[2];
         var (OH, OW) = k.Name == "maxpool_bwd" ? LayoutArgs.PoolOut(p) : (p[3], p[4]);
         int windows = C * OH * OW, n = C * H * W;
-        var at = new long[windows];
+        var at = ArrayPool<long>.Shared.Rent(Math.Max(1, windows));
         Team.For(windows, Math.Max(1, windows / (Threads * 4)), (long)n, new ArgmaxBody<TN, TLane>(k, at, OH, OW));
         return at;
+    }
+
+    private static void ReturnAux(long[]? at)
+    {
+        if (at is not null) ArrayPool<long>.Shared.Return(at);
     }
 
     private readonly struct ArgmaxBody<TN, TLane>(LayoutArgs k, long[] at, int OH, int OW) : Team.IBody

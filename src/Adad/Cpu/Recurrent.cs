@@ -138,7 +138,7 @@ internal sealed partial class Kernels
         MatMulView<TN>(new ProductView(a.B, GH, a.D, false, true), x, w, g);                       // x · Wᵀ (W is GH × D)
         if (h is not null && u is not null)
         {
-            var gh = new byte[g.Length];
+            var gh = Scratch.Get(Scratch.CellGh, g.Length);
             MatMulView<TN>(new ProductView(a.B, GH, a.H, false, true), h, u, gh);                  // h · Uᵀ (U is GH × H)
             Map<TN>("add", g, gh, null, g, (int)a.GateValues, 0, 0);
         }
@@ -153,7 +153,7 @@ internal sealed partial class Kernels
     {
         if (!OwnLane<TN>()) return Mixed<TN, LstmStepCall>(new(a, x, h, c, w, u, bias, hOut, cOut));
 
-        var g = new byte[BytesOf<TN>(a.GateValues)];
+        var g = Scratch.Get(Scratch.StepG, BytesOf<TN>(a.GateValues));
         CellGates<TN>(a, x, w, h, u, bias, g);
         return LstmCell<TN>(a, g, c, hOut, cOut);
     }
@@ -335,9 +335,9 @@ internal sealed partial class Kernels
     {
         if (!OwnLane<TN>()) return Mixed<TN, LstmStepBackwardCall>(new(a, x, h, c, w, u, bias, dhOut, dcOut, dx, dh, dc, dw, du, db));
 
-        var g = new byte[BytesOf<TN>(a.GateValues)];
+        var g = Scratch.Get(Scratch.BackG, BytesOf<TN>(a.GateValues));
         CellGates<TN>(a, x, w, h, u, bias, g);
-        var dg = new byte[g.Length];
+        var dg = Scratch.Get(Scratch.BackDg, g.Length);
         string lane = LstmCellBackward<TN>(a, g, c, dhOut, dcOut, dg, dc);
         GatesBackward<TN>(a, dg, x, h, w, u, dx, dh, dw, du, db);
         return lane;
@@ -348,18 +348,17 @@ internal sealed partial class Kernels
     {
         if (!OwnLane<TN>()) return Mixed<TN, GruStepBackwardCall>(new(a, x, h, w, u, bias, biasH, dhOut, dx, dh, dw, du, db, dbh));
 
-        var gx = new byte[BytesOf<TN>(a.GateValues)];
-        var gh = new byte[gx.Length];
+        var gx = Scratch.Get(Scratch.BackG, BytesOf<TN>(a.GateValues));
+        var gh = Scratch.Get(Scratch.BackG2, gx.Length);
         CellGates<TN>(a, x, w, null, null, bias, gx);
         var hArgs = a with { D = a.H };
         CellGates<TN>(hArgs, h, u, null, null, biasH, gh);
-        var dgx = new byte[gx.Length];
-        var dgh = new byte[gx.Length];
-        var dhCell = new byte[dh.Length];
+        var dgx = Scratch.Get(Scratch.BackDg, gx.Length);
+        var dgh = Scratch.Get(Scratch.BackDg2, gx.Length);
+        var dhCell = Scratch.Get(Scratch.DhCell, dh.Length);
         string lane = GruCellBackward<TN>(a, gx, gh, h, dhOut, dgx, dgh, dhCell);
-        var dxOnly = new byte[dx.Length];
         GatesBackward<TN>(a, dgx, x, null, w, null, dx, null, dw, null, db);
-        var dhFromGates = new byte[dh.Length];
+        var dhFromGates = Scratch.Get(Scratch.Dh, dh.Length);
         GatesBackward<TN>(hArgs, dgh, h, null, u, null, dhFromGates, null, du, null, dbh);
         Map<TN>("add", dhFromGates, dhCell, null, dh, (int)((long)a.B * a.H), 0, 0);
         return lane;
@@ -457,9 +456,12 @@ internal sealed partial class Kernels
     {
         public const int Gx = 0, StepG = 1, StepG2 = 2, H0 = 3, H1 = 4, C0 = 5, C1 = 6, Prev = 7, Hs = 8, Cs = 9, Gates = 10, Dg = 11, Dg2 = 12,
             Dh = 13, BackG = 14, BackG2 = 15, BackDg = 16, BackDg2 = 17, PrevState = 18, Dh0 = 19, Dh1 = 20, Dc0 = 21, Dc1 = 22, DhCell = 23,
-            ConvDcols = 24, ConvCols = 25, AttnKt = 26, Count = 34;         // the convolution's backward (Conv.cs), the fused rows' Kᵀ (AttentionRows.cs) too
+            ConvDcols = 24, ConvCols = 25, AttnKt = 26, Count = 38;         // the convolution's backward (Conv.cs), the fused rows' Kᵀ (AttentionRows.cs) too
         public const int AttnVt = 27, AttnPt = 28, AttnDst = 29;           // the fused attention backward's Vᵀ, Pᵀ, dSᵀ (AttentionBackRows.cs)
         public const int Sums = 30, SecondSums = 31;                       // a product's sums before its store (Epilogue.cs, Experts.cs)
+        public const int CellGh = 32;                                      // CellGates' h · Uᵀ (a step's gates: StepG / BackG)
+        public const int ShiftD0 = 33, ShiftD1 = 34;                       // the sequences' backward dU in two parts (RecurrentMixed.cs)
+        public const int AttnS = 35, AttnDp = 36, AttnRaw = 37;            // the composed attention's scores, their gradient, the uncapped scores (Attention.cs)
 
         [ThreadStatic] private static byte[]?[]? s_slots;
         [ThreadStatic] private static long[]? s_counted, s_countedBytes;
@@ -595,8 +597,8 @@ internal sealed partial class Kernels
     {
         if (!OwnLane<TN>()) return Mixed<TN, GruStepCall>(new(a, x, h, w, u, bias, biasH, hOut));
 
-        var gx = new byte[BytesOf<TN>(a.GateValues)];
-        var gh = new byte[gx.Length];
+        var gx = Scratch.Get(Scratch.StepG, BytesOf<TN>(a.GateValues));
+        var gh = Scratch.Get(Scratch.StepG2, gx.Length);
         CellGates<TN>(a, x, w, null, null, bias, gx);
         CellGates<TN>(a with { D = a.H }, h, u, null, null, biasH, gh);
         return GruCell<TN>(a, gx, gh, h, hOut);

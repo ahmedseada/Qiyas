@@ -132,7 +132,7 @@ internal sealed partial class Kernels
         private void Forward<TS, TO>(byte[] lo, byte[]? ll) where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TO : struct, IAdad<TO, TLane>
         {
             int size = Unsafe.SizeOf<TLane>(), pairs = (int)((long)a.Lq * a.Lk);
-            var s = new byte[(long)pairs * size];
+            var s = Scratch.Get(Scratch.AttnS, (long)pairs * size);
             var row = ll is null ? null : new byte[(long)a.Lq * size];
             var limits = Limits(a);
             var softmax = RowOps.Find(ll is null ? "scale_mask_softmax" : "scale_mask_softmax_lse");
@@ -154,10 +154,10 @@ internal sealed partial class Kernels
         private void Backward<TS, TO>(byte[] gq, byte[] gk, byte[] gv) where TS : struct, IFloatAdad<TS>, IAdad<TS, TLane> where TO : struct, IAdad<TO, TLane>
         {
             int size = Unsafe.SizeOf<TLane>(), pairs = (int)((long)a.Lq * a.Lk);
-            var p = new byte[(long)pairs * size];
-            var dp = new byte[p.Length];
+            var p = Scratch.Get(Scratch.AttnS, (long)pairs * size);
+            var dp = Scratch.Get(Scratch.AttnDp, p.Length);
             bool capped = a.Softcap > 0;
-            var raw = capped ? new byte[p.Length] : null;
+            var raw = capped ? Scratch.Get(Scratch.AttnRaw, p.Length) : null;
             var limits = Limits(a);
             var softmax = RowOps.Find("scale_mask_softmax");
             var softmaxBwd = RowOps.Find("softmax_bwd");
