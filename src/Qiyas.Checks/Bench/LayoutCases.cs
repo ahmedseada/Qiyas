@@ -192,6 +192,11 @@ public static class LayoutCases
             case "shift":
                 yield return Make(name, type, 37 * 1001, null, [37, 1001, 5], 37 * 1001, 75);
                 yield return Make(name, type, 37 * 1001, null, [37, 1001, -3], 37 * 1001, 76);
+                // Moved by a whole row or more: every value zero.
+                yield return Make(name, type, 29 * 7, null, [29, 7, 9], 29 * 7, 97);
+                yield return Make(name, type, 29 * 7, null, [29, 7, 7], 29 * 7, 98);
+                yield return Make(name, type, 29 * 7, null, [29, 7, -7], 29 * 7, 100);
+                yield return Make(name, type, 29 * 7, null, [29, 7, -9], 29 * 7, 99);
                 break;
             case "pad2d":
                 yield return Make(name, type, 37 * 53, null, [37, 53, 56], 37 * 56, 77);

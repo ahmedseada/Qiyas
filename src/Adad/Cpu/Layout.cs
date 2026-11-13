@@ -136,6 +136,13 @@ internal sealed partial class Kernels
             return buffer.AsSpan(0, length);
         }
 
+        /// <summary>into.Length values from `at` into `into`: copied from the lanes in place, or decoded.</summary>
+        public void Load(long at, Span<TLane> into)
+        {
+            if (lanes is not null) lanes.AsSpan((int)at, into.Length).CopyTo(into);
+            else TN.Load(x, (int)at, into);
+        }
+
         private void Find(long c)
         {
             int set = (int)(((ulong)c * 0x9E3779B97F4A7C15UL) >> 58) * Ways;
@@ -681,8 +688,16 @@ internal sealed partial class Kernels
                         }
 
                         case "shift":
-                            for (int c = 0; c < cols; c++) { int s = c - p[2]; o[c] = (uint)s < (uint)cols ? input[(long)r * cols + s] : TL.Zero; }
+                        {
+                            // Row r moved p[2] columns along, zeros where it moves in from outside: the values it keeps,
+                            // columns lo .. hi, read as one span (in place, or decoded at once), not one at a time.
+                            long by = p[2];
+                            int lo = (int)Math.Clamp(by, 0, cols), hi = (int)Math.Clamp(cols + by, 0, cols);
+                            o[..lo].Clear();
+                            if (hi > lo) input.Load((long)r * cols + lo - by, o[lo..hi]);
+                            o[Math.Max(lo, hi)..].Clear();
                             break;
+                        }
                         case "pad2d":
                             o.Clear();
                             TN.Load(k.X, r * p[1], o[..p[1]]);
