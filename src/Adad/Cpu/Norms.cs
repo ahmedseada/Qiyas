@@ -260,43 +260,77 @@ internal sealed partial class Kernels
         }
     }
 
-    // y = x with pair (i, j) rotated: y_i = fma(−x_j, s, x_i·c), y_j = fma(x_i, s, x_j·c) (s = −sin inverse).
+    // y = x with pair (i, j) rotated: y_i = fma(−x_j, s, x_i·c), y_j = fma(x_i, s, x_j·c) (s = −sin inverse), each as
+    // fma(x_j, −s, x_i·c) (the same product, its sign on s). A direct type is read and written in place (x may be y: each pair
+    // read before it is written); another type through lane rows. The split pairs (p, p + Half) a vector of p at a time.
     private readonly struct RopeBody<TN, TLane, TL>(RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         public void Run(int first, int last)
         {
             int n = a.Cols;
+            bool direct = TN.Direct;
             var pool = ArrayPool<TLane>.Shared;
-            var xl = pool.Rent(n);
-            var yl = pool.Rent(n);
+            var xl = direct ? null : pool.Rent(n);
+            var yl = direct ? null : pool.Rent(n);
             var ct = MemoryMarshal.Cast<byte, TLane>(cos.AsSpan());
             var st = MemoryMarshal.Cast<byte, TLane>(sin.AsSpan());
             try
             {
                 for (int r = first; r < last; r++)
                 {
-                    var xs = xl.AsSpan(0, n);
-                    var ys = yl.AsSpan(0, n);
-                    TN.Load(x, r * n, xs);
-                    xs.CopyTo(ys);
-                    int pos = a.Position(positions, r);
-                    for (int p = 0; p < a.Half; p++)
+                    Span<TLane> xs, ys;
+                    if (direct)
                     {
-                        var (i, j) = a.Pair(p);
-                        TLane c = ct[pos * a.Half + p], sn = st[pos * a.Half + p];
-                        if (a.Inverse) sn = Negate(sn);
-                        ys[i] = TL.Fma(Negate(xs[j]), sn, TL.Mul(xs[i], c));
-                        ys[j] = TL.Fma(xs[i], sn, TL.Mul(xs[j], c));
+                        xs = MemoryMarshal.Cast<byte, TLane>(x.AsSpan()).Slice(r * n, n);
+                        ys = MemoryMarshal.Cast<byte, TLane>(y.AsSpan()).Slice(r * n, n);
+                    }
+                    else
+                    {
+                        xs = xl.AsSpan(0, n);
+                        ys = yl.AsSpan(0, n);
+                        TN.Load(x, r * n, xs);
                     }
 
-                    TN.Store(ys, y, r * n);
+                    int pos = a.Position(positions, r);
+                    Row(xs, ys, ct.Slice(pos * a.Half, a.Half), st.Slice(pos * a.Half, a.Half));
+                    if (!direct) TN.Store(ys, y, r * n);
                 }
             }
             finally
             {
-                pool.Return(xl);
-                pool.Return(yl);
+                if (!direct)
+                {
+                    pool.Return(xl!);
+                    pool.Return(yl!);
+                }
+            }
+        }
+
+        private void Row(ReadOnlySpan<TLane> xs, Span<TLane> ys, ReadOnlySpan<TLane> c, ReadOnlySpan<TLane> s)
+        {
+            int half = a.Half, p = 0;
+            xs[(2 * half)..].CopyTo(ys[(2 * half)..]);
+            if (!a.Interleaved && Vector.IsHardwareAccelerated && Vector<TLane>.Count > 1)
+            {
+                var sign = new Vector<TLane>(Negate(default(TLane)));
+                for (int w = Vector<TLane>.Count; p + w <= half; p += w)
+                {
+                    Vector<TLane> xi = new(xs[p..]), xj = new(xs[(half + p)..]), cv = new(c[p..]), sv = new(s[p..]);
+                    var nv = Vector.Xor(sv, sign);
+                    if (a.Inverse) (sv, nv) = (nv, sv);
+                    TL.Fma(xj, nv, TL.Mul(xi, cv)).CopyTo(ys[p..]);
+                    TL.Fma(xi, sv, TL.Mul(xj, cv)).CopyTo(ys[(half + p)..]);
+                }
+            }
+
+            for (; p < half; p++)
+            {
+                var (i, j) = a.Pair(p);
+                TLane xi = xs[i], xj = xs[j], cp = c[p], sn = s[p];
+                if (a.Inverse) sn = Negate(sn);
+                ys[i] = TL.Fma(xj, Negate(sn), TL.Mul(xi, cp));
+                ys[j] = TL.Fma(xi, sn, TL.Mul(xj, cp));
             }
         }
     }
