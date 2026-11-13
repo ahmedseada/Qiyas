@@ -250,6 +250,32 @@ internal sealed partial class Spv
 
     public void PutWord(V address, V index, V word) => Store(At(address, index, 4), word);
 
+    /// <summary><paramref name="count"/> values of <paramref name="kind"/> at <paramref name="address"/> in one access (a vector
+    /// of them, the address aligned to their whole size: 8 or 16 bytes), each as a value.</summary>
+    public V[] LoadN(K kind, int count, V address)
+    {
+        uint vector = _m.TypeVector(Type(kind), (uint)count);
+        uint loaded = _m.Value(SpirvOp.Load, vector, VectorPointer(vector, address), 0x2, (uint)(count * kind.Bytes()));
+        var values = new V[count];
+        for (int i = 0; i < count; i++) values[i] = new V(this, _m.Value(SpirvOp.CompositeExtract, Type(kind), loaded, (uint)i), kind);
+        return values;
+    }
+
+    /// <summary>The values (of one kind) at <paramref name="address"/> in one access, as LoadN reads them.</summary>
+    public void StoreN(V address, params V[] values)
+    {
+        foreach (var v in values) Check(values[0], v);
+        uint vector = _m.TypeVector(Type(values[0].Kind), (uint)values.Length);
+        uint built = _m.Value(SpirvOp.CompositeConstruct, vector, [.. values.Select(v => v.Id)]);
+        _m.Code(SpirvOp.Store, VectorPointer(vector, address), built, 0x2, (uint)(values.Length * values[0].Kind.Bytes()));
+    }
+
+    private uint VectorPointer(uint vector, V address)
+    {
+        if (address.Kind != K.U64) throw new InvalidOperationException($"{_name}: an address is a u64, not {address.Kind}");
+        return _m.Value(SpirvOp.ConvertUToPtr, _m.TypePointer(StorageClass.PhysicalStorageBuffer, vector), address.Id);
+    }
+
     private uint Pointer(K kind, V address)
     {
         if (address.Kind != K.U64) throw new InvalidOperationException($"{_name}: an address is a u64, not {address.Kind}");

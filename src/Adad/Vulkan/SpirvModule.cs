@@ -278,6 +278,7 @@ internal enum SpirvOp : ushort
     AccessChain = 65,
     Decorate = 71,
     MemberDecorate = 72,
+    CompositeConstruct = 80,
     CompositeExtract = 81,
     ConvertFToU = 109,
     ConvertFToS = 110,

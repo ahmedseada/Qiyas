@@ -6,19 +6,24 @@
 //
 //   - the copy bandwidth: bytes read plus bytes written a second by the fastest copy tried (on the CPU the runtime's
 //     memmove on one processor and on every processor, each a contiguous part, and a copy by non-temporal vector stores;
-//     on CUDA the driver's copy and a copy kernel of 16-byte words), at sizes from 64 KB up by fours to 64 MB, then
+//     on CUDA the driver's copy and a copy kernel of 16-byte words; on Vulkan the device's copy command and a copy kernel
+//     of 16-byte words), at sizes from 64 KB up by fours to 64 MB, then
 //     doubled until the rate settles within 3 % (past the caches, whatever their size) or the device has no more memory
 //     to give: a curve, so a row is held to the copy of its own size (a working set the caches hold runs at their rate).
-//     On CUDA each copy is a launch and a wait, as every row's run is (a launch is the least a GPU row costs); on the CPU
+//     On CUDA and Vulkan each copy is a launch and a wait, as every row's run is (a launch is the least a GPU row costs;
+//     on Vulkan a submission and a fence's wait); on the CPU
 //     a pass copies its buffers over and over, some 64 MB in all, so no dispatch is in the rate (a CPU row may run on the
 //     caller with none: a small row's dispatch shows as its gap to the bound);
 //   - the read bandwidth and the write bandwidth, curves by size in the same way (a buffer read: one thread's and every
-//     processor's loads on the CPU, a kernel of 16-byte loads on CUDA; written: memset, non-temporal stores, the driver's
-//     memset, a kernel of 16-byte stores): a row that says which of its bytes it writes is held to the fastest of the
+//     processor's loads on the CPU, a kernel of 16-byte loads on CUDA and Vulkan; written: memset,
+//     non-temporal stores, the driver's memset or the device's fill command, a kernel of 16-byte stores on CUDA
+//     and Vulkan): a row that says which of its bytes it writes is held to the fastest of the
 //     copy's, the reads' and the writes' models (Limits.MoveSeconds), so a row that mostly reads is held to reading;
 //   - each lane's peak multiply-add rate: independent chains of the lane's own multiply-add (Adad's lanes on the CPU,
 //     ILane.Fma at the vector width the runtime uses, on every processor at once; on CUDA the lane's instruction — fma,
-//     mad, dp4a, or the tensor instruction of each kind the JIT accepts — on every multiprocessor's resident warps). An
+//     mad, dp4a, or the tensor instruction of each kind the JIT accepts — on every multiprocessor's resident warps; on
+//     Vulkan each of the device's lanes' multiply-add over enough workgroups that a partly filled last wave costs little,
+//     the device reporting no count of its processors). An
 //     integer chain multiplies its own value, c = c·c + b: with both factors fixed (c = a·b + c) a compiler folds a·b
 //     into a constant and the chain into adds, exact for integers (one such run read 72 T multiply-adds a second for
 //     s32 on a GPU whose f32 fma ran at 22 T).
@@ -35,6 +40,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Text;
+using Adad.Vulkan;
 
 namespace Qiyas.Bench;
 
@@ -141,6 +147,7 @@ internal sealed class Limits(Device device, IReadOnlyList<(long Size, double Rat
         {
             Device.Cpu => CpuLimits.Measure(),
             Device.Cuda => CudaLimits.Measure(),
+            Device.Vulkan => VulkanLimits.Measure(),
             _ => new Limits(device, [], "not measured on this device", []),
         };
         limits.Seconds = Stopwatch.GetElapsedTime(start).TotalSeconds;
@@ -1060,6 +1067,342 @@ internal static unsafe class CudaLimits
         finally
         {
             Driver.cuMemFree(output);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------- Vulkan
+
+internal static class VulkanLimits
+{
+    private const int Threads = 256;
+
+    // Workgroups of the peak kernels: the device reports no count of its processors, so enough that a partly filled last
+    // wave costs little on any of them (16384 of 256 invocations: some 40 waves where 400 workgroups are resident at once).
+    private const int PeakGroups = 1 << 14;
+
+    public static Limits Measure()
+    {
+        var vk = Devices.Vk.Vk;
+        WarmUp(vk);
+        string how = "";
+        var copies = Refined(Limits.Curve(Copy, 4L << 30, []), Copy);
+        var lanes = new List<(string, double, string)>();
+        string across = $"{PeakGroups} workgroups × {Threads} invocations";
+        foreach (var (lane, k) in Scalar)
+        {
+            if (k == K.F64 && !vk.Float64) continue;
+            if (Peak(vk, k) is { } p) lanes.Add((lane, p.Rate, $"{p.Form}, {across}"));
+        }
+
+        var reads = Refined(Limits.Curve(Read, 4L << 30, [], 1), Read);
+        var writes = Refined(Limits.Curve(Write, 4L << 30, [], 1), Write);
+        return new Limits(Device.Vulkan, copies, $"{how} past the caches (the device reports no cache sizes: a point every half doubling)",
+            lanes, reads, writes);
+
+        double? Copy(long size)
+        {
+            if (Rates(vk, size) is not var (command, kernel)) return null;
+            how = command >= kernel ? "the device's copy command" : "a copy kernel of 16-byte words";
+            return Math.Max(command, kernel);
+        }
+
+        double? Read(long size) => MoveRate(vk, size, reading: true) is var r && r > 0 ? r : null;
+
+        double? Write(long size) => MoveRate(vk, size, reading: false) is var r && r > 0 ? r : null;
+    }
+
+    // The device reports no cache sizes, so no points are placed around them: the curve is measured at every half doubling
+    // instead (a size each √2 between those Limits.Curve measured, each measured twice and the faster kept), so a row is
+    // held to a rate measured within √2 of its own size wherever a cache's edge lies. A row's run and the passes alike
+    // pay a submission and a fence's wait, which hides a cache's rate up to tens of megabytes: a cache's edge shows as a
+    // rise slower than the sizes', not as a fall, so no rule on the rates finds it.
+    private static List<(long Size, double Rate)> Refined(List<(long Size, double Rate)> curve, Func<long, double?> rateAt)
+    {
+        var added = new List<(long Size, double Rate)>();
+        for (int i = 0; i + 1 < curve.Count; i++)
+        {
+            var (s0, _) = curve[i];
+            var (s1, _) = curve[i + 1];
+            for (double s = s0 * Math.Sqrt(2); s < s1 * 0.97; s *= Math.Sqrt(2))
+            {
+                long size = (long)s & ~4095L;
+                double best = 0;
+                for (int k = 0; k < 2; k++) if (rateAt(size) is { } r) best = Math.Max(best, r);
+                if (best > 0) added.Add((size, best));
+            }
+        }
+
+        curve.AddRange(added);
+        curve.Sort((x, y) => x.Size.CompareTo(y.Size));
+        return curve;
+    }
+
+    // A buffer of the device's, or 0 where it cannot give one; given back to the driver (Release), never kept in its pool.
+    private static ulong Rent(Vulkan vk, long size)
+    {
+        try { return vk.Rent(size); }
+        catch (InvalidOperationException) { return 0; }
+    }
+
+    // The device's copy between the largest two buffers it gives (256 MB down to 16 MB), batches of some 100 ms, until the
+    // rate holds.
+    private static void WarmUp(Vulkan vk)
+    {
+        for (long size = 256L << 20; size >= 16L << 20; size /= 2)
+        {
+            ulong a = Rent(vk, size);
+            if (a == 0) continue;
+            ulong b = Rent(vk, size);
+            if (b == 0) { vk.Release(a); continue; }
+            try
+            {
+                vk.Clear(a, size);
+                vk.Clear(b, size);
+                vk.Synchronize();
+                Limits.Warm(() =>
+                {
+                    long start = Stopwatch.GetTimestamp(), copies = 0;
+                    do
+                    {
+                        vk.Copy(a, b, size);
+                        vk.Synchronize();
+                        copies++;
+                    }
+                    while (Stopwatch.GetElapsedTime(start).TotalSeconds < 0.1);
+                    return 2.0 * size * copies / Stopwatch.GetElapsedTime(start).TotalSeconds;
+                });
+                return;
+            }
+            finally
+            {
+                vk.Release(a);
+                vk.Release(b);
+            }
+        }
+    }
+
+    // A grid of a 16-byte word an invocation up to the device's most workgroups (then each invocation strides).
+    private static uint Groups(Vulkan vk, long words) => (uint)Math.Clamp((words + Threads - 1) / Threads, 1, Math.Min(vk.MaxGroupsX, 65535u));
+
+    // The copy command's and the copy kernel's rates over two buffers of size bytes; null when the device cannot give them.
+    private static (double Command, double Kernel)? Rates(Vulkan vk, long size)
+    {
+        ulong a = Rent(vk, size);
+        if (a == 0) return null;
+        ulong b = Rent(vk, size);
+        if (b == 0) { vk.Release(a); return null; }
+        try
+        {
+            vk.Clear(a, size);
+            vk.Clear(b, size);
+            vk.Synchronize();
+            double command = Limits.Best(() =>
+            {
+                long start = Stopwatch.GetTimestamp();
+                vk.Copy(a, b, size);
+                vk.Synchronize();
+                return 2.0 * size / Stopwatch.GetElapsedTime(start).TotalSeconds;
+            });
+            var f = vk.Cached("limits_copy", () => CopyKernel(vk));
+            long words = size / 16;
+            uint groups = Groups(vk, words);
+            double kernel = Limits.Best(() =>
+            {
+                long start = Stopwatch.GetTimestamp();
+                vk.Launch(f, groups, 1, a, b, Vulkan.U(words));
+                vk.Synchronize();
+                return 2.0 * size / Stopwatch.GetElapsedTime(start).TotalSeconds;
+            });
+            return (command, kernel);
+        }
+        finally
+        {
+            vk.Release(a);
+            vk.Release(b);
+        }
+    }
+
+    // A buffer of size bytes read by a kernel of 16-byte loads (bytes read a second), or written by the device's fill command
+    // or a kernel of 16-byte stores, the faster (bytes written a second); 0 when the device cannot give the buffer.
+    private static double MoveRate(Vulkan vk, long size, bool reading)
+    {
+        ulong a = Rent(vk, size);
+        if (a == 0) return 0;
+        ulong b = Rent(vk, 256);
+        if (b == 0) { vk.Release(a); return 0; }
+        try
+        {
+            vk.Clear(a, size);
+            vk.Synchronize();
+            long words = size / 16;
+            uint groups = Groups(vk, words);
+            var read = vk.Cached("limits_read", () => ReadKernel(vk));
+            var write = vk.Cached("limits_write", () => WriteKernel(vk));
+            double Time(Action run)
+            {
+                long start = Stopwatch.GetTimestamp();
+                run();
+                vk.Synchronize();
+                return size / Stopwatch.GetElapsedTime(start).TotalSeconds;
+            }
+
+            if (reading) return Limits.Best(() => Time(() => vk.Launch(read, groups, 1, a, b, Vulkan.U(words))));
+            double fill = Limits.Best(() => Time(() => vk.Clear(a, size)));
+            return Math.Max(fill, Limits.Best(() => Time(() => vk.Launch(write, groups, 1, a, Vulkan.U(words)))));
+        }
+        finally
+        {
+            vk.Release(a);
+            vk.Release(b);
+        }
+    }
+
+    // A grid-stride walk over n 16-byte words: four words a step (one a stride apart) while four strides remain, more loads
+    // in flight an invocation; then a word a step.
+    private static void Walk(Spv b, V n, Action<V[]> four, Action<V> one)
+    {
+        var stride = b.StrideX.To(K.U64);
+        var i = b.Local(b.GlobalX.To(K.U64));
+        b.While(() => i.V + stride * 3.0 < n, () =>
+        {
+            var at = i.V;
+            four([at, at + stride, at + stride * 2.0, at + stride * 3.0]);
+            i.V = at + stride * 4.0;
+        });
+        b.While(() => i.V < n, () =>
+        {
+            one(i.V);
+            i.V = i.V + stride;
+        });
+    }
+
+    private static V[] Word(Spv b, V address, V index) => b.LoadN(K.U32, 4, b.At(address, index, 16));
+
+    // A grid-stride copy of 16-byte words. Slots: source, destination, words.
+    private static SpvKernel CopyKernel(Vulkan vk)
+    {
+        var b = new Spv("limits_copy", Threads, vk.Controls);
+        V src = b.Arg(0), dst = b.Arg(1), n = b.Arg(2);
+        Walk(b, n, at =>
+        {
+            var w = new V[4][];
+            for (int j = 0; j < 4; j++) w[j] = Word(b, src, at[j]);
+            for (int j = 0; j < 4; j++) b.StoreN(b.At(dst, at[j], 16), w[j]);
+        }, at => b.StoreN(b.At(dst, at, 16), Word(b, src, at)));
+        return b.Build();
+    }
+
+    // A grid-stride read of 16-byte words, each invocation's xor of them kept and stored only if it is a value no run makes
+    // (the loads cannot be dropped, and nothing is written). Slots: buffer, the word stored, words.
+    private static SpvKernel ReadKernel(Vulkan vk)
+    {
+        var b = new Spv("limits_read", Threads, vk.Controls);
+        V src = b.Arg(0), o = b.Arg(1), n = b.Arg(2);
+        var x = b.Local(b.U(0));
+        V Xor(V[] w) => (w[0] ^ w[1]) ^ (w[2] ^ w[3]);
+        Walk(b, n, at =>
+        {
+            var w = new V[4];
+            for (int j = 0; j < 4; j++) w[j] = Xor(Word(b, src, at[j]));
+            x.V = x.V ^ Xor(w);
+        }, at => x.V = x.V ^ Xor(Word(b, src, at)));
+        b.If(x.V == b.U(0x9E3779B9), () => b.Store(o, x.V));
+        return b.Build();
+    }
+
+    // A grid-stride write of 16-byte words of zeros. Slots: buffer, words.
+    private static SpvKernel WriteKernel(Vulkan vk)
+    {
+        var b = new Spv("limits_write", Threads, vk.Controls);
+        V dst = b.Arg(0), n = b.Arg(1);
+        var zero = b.U(0);
+        Walk(b, n, at =>
+        {
+            for (int j = 0; j < 4; j++) b.StoreN(b.At(dst, at[j], 16), zero, zero, zero, zero);
+        }, at => b.StoreN(b.At(dst, at, 16), zero, zero, zero, zero));
+        return b.Build();
+    }
+
+    // Adad's lanes on the device (Kinds: the lanes its kernels compute in) by the names the rows report them.
+    private static readonly (string Lane, K Kind)[] Scalar =
+    [
+        ("f64", K.F64), ("f32", K.F32), ("s64", K.S64), ("u64", K.U64), ("s32", K.S32), ("u32", K.U32),
+    ];
+
+    // Thirty-two multiply-adds an invocation a trip, in one of two forms. Chains: eight independent chains unrolled four
+    // times, c = fma(c, a, b) for a float lane (a and b from the arguments, c times a: nothing to hoist, the values held
+    // near 1), c = c·c + b for an integer one (no product the compiler can fold into a constant). A tile (float lanes): a
+    // 4 × 2 tile of sums, c = fma(x_i, y_j, c), x and y the invocation's own registers, as a product's inner loop has
+    // them. The forms differ by device and lane (one GPU's f64 lane ran the chains at 84 % of the tile's rate, its f32 lane
+    // the tile at 98 % of the chains'), so a float lane's peak is the faster. Slots: output, trips, a, b.
+    private static SpvKernel PeakKernel(Vulkan vk, K k, bool tile)
+    {
+        var b = new Spv($"limits_{k}{(tile ? "_tile" : "")}", Threads, vk.Controls);
+        V o = b.Arg(0), trips = b.Arg(1, K.U32), fa = b.Arg(2, k), fb = b.Arg(3, k);
+        bool f = Kinds.IsFloat(k);
+        var id = b.GlobalX;
+        var c = new Var[8];
+        for (int j = 0; j < 8; j++) c[j] = b.Local(f ? id.To(k) * 1e-9 + 0.1 * (j + 1) : id.To(k) + (double)(2 * j + 1));
+        var x = new V[4];
+        var y = new V[2];
+        for (int i = 0; tile && i < 4; i++) x[i] = id.To(k) * 1e-12 + (0.5 + 0.01 * i);
+        for (int j = 0; tile && j < 2; j++) y[j] = id.To(k) * 1e-12 + (0.25 + 0.01 * j);
+        b.For(b.U(0), trips, _ =>
+        {
+            for (int u = 0; u < 4; u++)
+                for (int j = 0; j < 8; j++)
+                    c[j].V = tile ? b.Fma(x[j / 2], y[j % 2], c[j].V) : f ? b.Fma(c[j].V, fa, fb) : c[j].V * c[j].V + fb;
+        });
+        var sum = c[0].V;
+        for (int j = 1; j < 8; j++) sum += c[j].V;
+        b.Store(b.At(o, id, 8), sum.Kind.Wide() ? sum : b.Convert(b.Bits(sum), K.U64));
+        return b.Build();
+    }
+
+    // The lane's multiply-adds a second over PeakGroups workgroups, the faster form's (a float lane's two), and which;
+    // null where the device refuses the kernel.
+    private static (double Rate, string Form)? Peak(Vulkan vk, K k)
+    {
+        (double, string)? best = null;
+        foreach (bool tile in Kinds.IsFloat(k) ? new[] { false, true } : [false])
+        {
+            if (Peak(vk, k, tile) is { } r && (best is null || r > best.Value.Item1)) best = (r, tile ? "fma, a 4 × 2 tile" : Kinds.IsFloat(k) ? "fma, 8 chains" : "c*c + b, 8 chains");
+        }
+
+        return best;
+    }
+
+    private static double? Peak(Vulkan vk, K k, bool tile)
+    {
+        (ulong, SpvKernel) f;
+        try { f = vk.Cached($"limits_{k}{(tile ? "_tile" : "")}", () => PeakKernel(vk, k, tile)); }
+        catch (Exception e) when (e is NotSupportedException or InvalidOperationException) { return null; }
+        ulong output = Rent(vk, (long)PeakGroups * Threads * 8);
+        if (output == 0) return null;
+        bool fl = Kinds.IsFloat(k);
+        ulong a = fl ? (k == K.F64 ? Vulkan.D(0.999) : Vulkan.F(0.999f)) : 3, c = fl ? (k == K.F64 ? Vulkan.D(1e-3) : Vulkan.F(1e-3f)) : 7;
+        try
+        {
+            double Pass(uint trips)
+            {
+                long start = Stopwatch.GetTimestamp();
+                vk.Launch(f, PeakGroups, 1, output, trips, a, c);
+                vk.Synchronize();
+                return Stopwatch.GetElapsedTime(start).TotalSeconds;
+            }
+
+            // Trips for a launch of about 20 ms, from a short one's time.
+            uint probe = 16;
+            Pass(probe);
+            double secs = Math.Max(Pass(probe), 1e-6);
+            uint trips = (uint)Math.Clamp(probe * 0.02 / secs, probe, 1 << 24);
+            double work = (double)PeakGroups * Threads * trips * 32;
+            return Limits.Median(() => work / Pass(trips));
+        }
+        finally
+        {
+            vk.Release(output);
         }
     }
 }

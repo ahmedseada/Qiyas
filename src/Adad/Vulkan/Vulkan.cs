@@ -366,6 +366,16 @@ public sealed unsafe class Vulkan : IDisposable
         stack.Push(address);
     }
 
+    /// <summary>A rented buffer given back to the driver instead of kept for a later rent of its size (a buffer only a passing
+    /// measurement wants, as the bench's limits: copies of up to gigabytes). Waits for the work recorded so far.</summary>
+    public void Release(ulong address)
+    {
+        Synchronize();
+        var a = _allocations[address];
+        _allocations.Remove(address);
+        Free(a);
+    }
+
     private Allocation Allocate(long size, bool host)
     {
         uint usage = VkApi.BufferStorageBuffer | VkApi.BufferTransferSource | VkApi.BufferTransferDestination | (host ? 0 : VkApi.BufferDeviceAddress);
