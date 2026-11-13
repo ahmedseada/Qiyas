@@ -2,7 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // The INumberBase<T> version as a bench subject: one implementation over T : INumberBase<T> (CpuGeneric.cs on the
-// CPU, GenericPtx.cs on CUDA; there is no Vulkan version, so a Vulkan row has no number cell), for the types .NET has
+// CPU, GenericPtx.cs on CUDA, GenericSpv.cs on Vulkan: NumberVulkan.cs, the cells CUDA has), for the types .NET has
 // such a T for. Stored bytes of those types are the .NET layout, so they are used in place. Its runs hold nothing
 // beyond their operands but rms_norm's row of inverse norms (a value a row on the CPU, 8 bytes a row on CUDA), ctc's
 // α, β and frames' log-sum-exp (per sequence), the convolution's columns and its backward's transposes,
@@ -21,10 +21,11 @@ public sealed class NumberSubject : IBenchSubject
 
     public string? Describe(Device device) => device == Device.Cpu ? $"number: INumberBase<T>, Vector<T> where .NET has it, {Environment.ProcessorCount} threads" : null;
 
-    // The devices it has a version for: the CPU and CUDA (any other device would time CUDA's kernels under its name).
-    private static bool Runs(Device device) => device is Device.Cpu or Device.Cuda;
+    // The devices it has a version for: the CPU and CUDA, and Vulkan where the cell has its Vulkan version (any other
+    // device would time CUDA's kernels under its name).
+    private static bool Runs(Device device, bool vulkan = false) => device is Device.Cpu or Device.Cuda || (vulkan && device == Device.Vulkan);
 
-    public IBenchRun? Add(Device device, string type, byte[] a, byte[] b, byte[] c, int n) => !Runs(device) ? null : type switch
+    public IBenchRun? Add(Device device, string type, byte[] a, byte[] b, byte[] c, int n) => !Runs(device, vulkan: true) ? null : type switch
     {
         "float64" => Add<double>(device, a, b, c, n),
         "float32" => Add<float>(device, a, b, c, n),
@@ -40,7 +41,7 @@ public sealed class NumberSubject : IBenchSubject
         _ => null,
     };
 
-    public IBenchRun? MatMul(Device device, string type, byte[] a, byte[] b, byte[] c, int m, int n, int k) => !Runs(device) ? null : type switch
+    public IBenchRun? MatMul(Device device, string type, byte[] a, byte[] b, byte[] c, int m, int n, int k) => !Runs(device, vulkan: true) ? null : type switch
     {
         "float64" => MatMul<double>(device, a, b, c, m, n, k),
         "float32" => MatMul<float>(device, a, b, c, m, n, k),
@@ -56,7 +57,7 @@ public sealed class NumberSubject : IBenchSubject
         _ => null,
     };
 
-    public IBenchRun? Softmax(Device device, string type, byte[] x, byte[] y, int rows, int cols) => !Runs(device) ? null : type switch
+    public IBenchRun? Softmax(Device device, string type, byte[] x, byte[] y, int rows, int cols) => !Runs(device, vulkan: true) ? null : type switch
     {
         "float64" => Rows<double>(device, x, y, rows, cols, null),
         "float32" => Rows<float>(device, x, y, rows, cols, null),
@@ -64,7 +65,7 @@ public sealed class NumberSubject : IBenchSubject
         _ => null,
     };
 
-    public IBenchRun? RmsNorm(Device device, string type, byte[] x, byte[] y, int rows, int cols, double eps) => !Runs(device) ? null : type switch
+    public IBenchRun? RmsNorm(Device device, string type, byte[] x, byte[] y, int rows, int cols, double eps) => !Runs(device, vulkan: true) ? null : type switch
     {
         "float64" => Rows<double>(device, x, y, rows, cols, (float)eps),
         "float32" => Rows<float>(device, x, y, rows, cols, (float)eps),
@@ -73,7 +74,7 @@ public sealed class NumberSubject : IBenchSubject
     };
 
     // One image of one group (the bench's row); images and groups are not this version's.
-    public IBenchRun? Conv(Device device, string type, ConvArgs a, byte[] x, byte[] w, byte[] y, byte[]? dx, byte[]? dw) => !Runs(device) || a.N != 1 || a.Groups != 1 ? null : type switch
+    public IBenchRun? Conv(Device device, string type, ConvArgs a, byte[] x, byte[] w, byte[] y, byte[]? dx, byte[]? dw) => !Runs(device, vulkan: true) || a.N != 1 || a.Groups != 1 ? null : type switch
     {
         "float64" => Conv<double>(device, a, x, w, y, dx, dw),
         "float32" => Conv<float>(device, a, x, w, y, dx, dw),
@@ -92,9 +93,10 @@ public sealed class NumberSubject : IBenchSubject
     // The convolution as the generic code writes it: im2col, then the product (the backward: wᵀ·dy then col2im for dx;
     // im2col, its transpose, then dy·colsᵀ for dw), every step in T. y is dy for the backward. The columns and the
     // backward's transposes are kept with the run (Held).
-    private static IBenchRun Conv<T>(Device device, ConvArgs a, byte[] x, byte[] w, byte[] y, byte[]? dx, byte[]? dw) where T : unmanaged, INumberBase<T>
+    private static IBenchRun? Conv<T>(Device device, ConvArgs a, byte[] x, byte[] w, byte[] y, byte[]? dx, byte[]? dw) where T : unmanaged, INumberBase<T>
     {
         if (device == Device.Cuda) return ConvCuda<T>(a, x, w, y, dx, dw);
+        if (device == Device.Vulkan) return NumberVulkan.Conv<T>(a, x, w, y, dx, dw);
         int rows = a.Rows, cols = a.Cols, oc = a.OC, size = Marshal.SizeOf<T>();
         T[] xs = Of<T>(x), ws = Of<T>(w), c = new T[rows * cols];
         string Lane() => CpuGeneric.Vectorized<T>() ? $"Vector<{typeof(T).Name}>" : "scalar";
@@ -118,7 +120,7 @@ public sealed class NumberSubject : IBenchSubject
     }
 
     // The moments come as float64 for float64, float32 otherwise: the step is in that type (TM).
-    public IBenchRun? Optimizer(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) => !Runs(device) ? null : type switch
+    public IBenchRun? Optimizer(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[] m, byte[]? v, int n) => !Runs(device, vulkan: true) ? null : type switch
     {
         "float64" => Optimizer<double, double>(device, a, p, g, m, v, [n], false),
         "float32" => Optimizer<float, float>(device, a, p, g, m, v, [n], false),
@@ -126,7 +128,7 @@ public sealed class NumberSubject : IBenchSubject
         _ => null,
     };
 
-    public IBenchRun? OptimizerMany(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[]? m, byte[]? v, int[] counts) => !Runs(device) ? null : type switch
+    public IBenchRun? OptimizerMany(Device device, string type, OptimizerArgs a, byte[] p, byte[] g, byte[]? m, byte[]? v, int[] counts) => !Runs(device, vulkan: true) ? null : type switch
     {
         "float64" => Optimizer<double, double>(device, a, p, g, m, v, counts, true),
         "float32" => Optimizer<float, float>(device, a, p, g, m, v, counts, true),
@@ -135,7 +137,7 @@ public sealed class NumberSubject : IBenchSubject
     };
 
     // The tables come as float64 for float64, float32 otherwise: the rotation is in that type (TL).
-    public IBenchRun? Rope(Device device, string type, RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y) => !Runs(device) ? null : type switch
+    public IBenchRun? Rope(Device device, string type, RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y) => !Runs(device, vulkan: true) ? null : type switch
     {
         "float64" => Rope<double, double>(device, a, x, cos, sin, positions, y),
         "float32" => Rope<float, float>(device, a, x, cos, sin, positions, y),
@@ -143,7 +145,7 @@ public sealed class NumberSubject : IBenchSubject
         _ => null,
     };
 
-    public IBenchRun? BoxLoss(Device device, string type, BoxOverlap overlap, byte[] predicted, byte[] target, byte[]? dloss, byte[] output, int count) => !Runs(device) ? null : type switch
+    public IBenchRun? BoxLoss(Device device, string type, BoxOverlap overlap, byte[] predicted, byte[] target, byte[]? dloss, byte[] output, int count) => !Runs(device, vulkan: true) ? null : type switch
     {
         "float64" => BoxLoss<double>(device, overlap, predicted, target, dloss, output, count),
         "float32" => BoxLoss<float>(device, overlap, predicted, target, dloss, output, count),
@@ -151,7 +153,7 @@ public sealed class NumberSubject : IBenchSubject
         _ => null,
     };
 
-    public IBenchRun? Ctc(Device device, string type, CtcArgs a, byte[] logits, byte[] loss, byte[]? grad) => !Runs(device) ? null : type switch
+    public IBenchRun? Ctc(Device device, string type, CtcArgs a, byte[] logits, byte[] loss, byte[]? grad) => !Runs(device, vulkan: true) ? null : type switch
     {
         "float64" => Ctc<double>(device, a, logits, loss, grad),
         "float32" => Ctc<float>(device, a, logits, loss, grad),
@@ -166,6 +168,7 @@ public sealed class NumberSubject : IBenchSubject
     {
         int n = source.Length, bytes = n - 2 * offset;
         if (device == Device.Cuda) return MemoryCuda(op, source, output, offset);
+        if (device == Device.Vulkan) return NumberVulkan.Memory(op, source, output, offset);
         if (device != Device.Cpu) return null;
         return op switch
         {
@@ -179,10 +182,11 @@ public sealed class NumberSubject : IBenchSubject
     // An optimizer step over the tensors of counts (one: the single step; many: every gradient clipped together, by
     // min(1, MaxNorm / √Σ g²), the sum in TM). A run is the step alone, from the state the runs before it left; Collect
     // restores p, m, v to the row's state, takes one step and reads them back, so the scored p is one step from it.
-    private static IBenchRun Optimizer<T, TM>(Device device, OptimizerArgs a, byte[] p, byte[] g, byte[]? m, byte[]? v, int[] counts, bool many)
+    private static IBenchRun? Optimizer<T, TM>(Device device, OptimizerArgs a, byte[] p, byte[] g, byte[]? m, byte[]? v, int[] counts, bool many)
         where T : unmanaged, INumberBase<T> where TM : unmanaged, IFloatingPointIeee754<TM>
     {
         if (device == Device.Cuda) return OptimizerCuda<T, TM>(a, p, g, m, v, counts, many);
+        if (device == Device.Vulkan) return NumberVulkan.Optimizer<T, TM>(a, p, g, m, v, counts, many);
         var s = CpuGeneric.Step<TM>.Of(a);
         int tensors = counts.Length;
         var at = new int[tensors + 1];
@@ -211,31 +215,34 @@ public sealed class NumberSubject : IBenchSubject
         }, lane: () => lane, held: () => new(0, null));
     }
 
-    private static IBenchRun Rope<T, TL>(Device device, RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y)
+    private static IBenchRun? Rope<T, TL>(Device device, RopeArgs a, byte[] x, byte[] cos, byte[] sin, int[] positions, byte[] y)
         where T : unmanaged, INumberBase<T> where TL : unmanaged, IFloatingPointIeee754<TL>
     {
         if (device == Device.Cuda) return RopeCuda<T, TL>(a, x, cos, sin, positions, y);
+        if (device == Device.Vulkan) return NumberVulkan.Rope<T, TL>(a, x, cos, sin, positions, y);
         T[] xa = Of<T>(x), ya = new T[xa.Length];
         TL[] ca = Of<TL>(cos), sa = Of<TL>(sin);
         string lane = !a.Interleaved && typeof(T) == typeof(TL) && CpuGeneric.Vectorized<TL>() ? $"Vector<{typeof(TL).Name}>" : $"scalar, in {typeof(TL).Name}";
         return new BenchRun(() => CpuGeneric.Rope(a, xa, ca, sa, positions, ya), () => Back(ya, y), lane: () => lane, held: () => new(0, null));
     }
 
-    private static IBenchRun BoxLoss<T>(Device device, BoxOverlap overlap, byte[] predicted, byte[] target, byte[]? dloss, byte[] output, int count)
+    private static IBenchRun? BoxLoss<T>(Device device, BoxOverlap overlap, byte[] predicted, byte[] target, byte[]? dloss, byte[] output, int count)
         where T : unmanaged, IFloatingPointIeee754<T>
     {
         if (device == Device.Cuda) return BoxLossCuda<T>(overlap, predicted, target, dloss, output, count);
+        if (device == Device.Vulkan) return NumberVulkan.BoxLoss<T>(overlap, predicted, target, dloss, output, count);
         T[] pa = Of<T>(predicted), ta = Of<T>(target), ya = new T[output.Length / Marshal.SizeOf<T>()];
         T[]? da = dloss is null ? null : Of<T>(dloss);
         return new BenchRun(() => CpuGeneric.BoxLoss(overlap, pa, ta, da, ya, count), () => Back(ya, output), lane: () => "scalar", held: () => new(0, null));
     }
 
     // A sequence per Parallel.For iteration, its α (and β: frames × states) and its frames' log-sum-exp kept with the run.
-    private static IBenchRun Ctc<T>(Device device, CtcArgs a, byte[] logits, byte[] loss, byte[]? grad) where T : unmanaged, IFloatingPointIeee754<T>
+    private static IBenchRun? Ctc<T>(Device device, CtcArgs a, byte[] logits, byte[] loss, byte[]? grad) where T : unmanaged, IFloatingPointIeee754<T>
     {
         var offsets = new int[a.B];
         for (int b = 1; b < a.B; b++) offsets[b] = offsets[b - 1] + a.LabelLengths[b - 1];
         if (device == Device.Cuda) return CtcCuda<T>(a, offsets, logits, loss, grad);
+        if (device == Device.Vulkan) return NumberVulkan.Ctc<T>(a, offsets, logits, loss, grad);
         T[] x = Of<T>(logits), la = new T[a.B];
         T[]? ga = grad is null ? null : new T[a.Values];
         T[][] alpha = new T[a.B][], lse = new T[a.B][];
@@ -541,6 +548,7 @@ public sealed class NumberSubject : IBenchSubject
 
     private static IBenchRun Add<T>(Device device, byte[] x, byte[] y, byte[] z, int n) where T : unmanaged, INumberBase<T>
     {
+        if (device == Device.Vulkan) return NumberVulkan.Add<T>(x, y, z, n);
         if (device == Device.Cpu)
         {
             T[] a = Of<T>(x), b = Of<T>(y), c = new T[n];
@@ -556,8 +564,9 @@ public sealed class NumberSubject : IBenchSubject
             () => Gpu.Download<byte>(dc, z), () => { gpu.Return(da); gpu.Return(db); gpu.Return(dc); }, () => entry, () => new(0, 0));
     }
 
-    private static IBenchRun MatMul<T>(Device device, byte[] x, byte[] y, byte[] z, int m, int n, int k) where T : unmanaged, INumberBase<T>
+    private static IBenchRun? MatMul<T>(Device device, byte[] x, byte[] y, byte[] z, int m, int n, int k) where T : unmanaged, INumberBase<T>
     {
+        if (device == Device.Vulkan) return NumberVulkan.MatMul<T>(x, y, z, m, n, k);
         if (device == Device.Cpu)
         {
             T[] a = Of<T>(x), b = Of<T>(y), c = new T[m * n];
@@ -602,6 +611,7 @@ public sealed class NumberSubject : IBenchSubject
 
     private static IBenchRun Rows<T>(Device device, byte[] x, byte[] y, int rows, int cols, float? eps) where T : unmanaged, IFloatingPointIeee754<T>
     {
+        if (device == Device.Vulkan) return NumberVulkan.Rows<T>(x, y, rows, cols, eps);
         if (device == Device.Cpu)
         {
             T[] a = Of<T>(x), d = new T[rows * cols], inv = new T[rows];

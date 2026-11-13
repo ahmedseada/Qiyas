@@ -51,7 +51,7 @@ else
 
 if (!proven)
 {
-    if (!Checks.Run() | !NumberSubject.CheckCudaKernels(options.Devices))
+    if (!Checks.Run() | !NumberSubject.CheckCudaKernels(options.Devices) | !NumberVulkan.Check(options.Devices))
     {
         Console.WriteLine("A check failed: no timing until it is fixed.");
         return 1;
