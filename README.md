@@ -216,6 +216,7 @@ both subjects from that reading. The CPU rows of the operations changed since (r
 down the columns: sum, max and argmax, gemv_t and the norm parameters' backward; cross_entropy, log_softmax_topk and
 sample_rows) are re-timed on build 2f78b26, which carries those changes, both subjects, in one exclusive job of 3
 rounds; where the three processes disagree by more than 10 % (44 rows) the cell carries the one less favourable to Adad.
+The passes down the columns are re-timed again the same way on build 7d4ed27, which pools their blocks' partials.
 `docs/wip/baseline.md` is that assembled file: every row, its builds, and notes naming each re-timed or re-measured row.
 Device bandwidth rows follow the driver's memory P-state (a row timed at P3 reads up to about 1.9× its P1 time); setting
 "Prefer maximum performance" for dotnet.exe in the NVIDIA control panel gives stable readings.

@@ -6,7 +6,7 @@ The readout: `bytes` and `ops` are what the row's operation moves and computes b
 
 Proof: the checks not run: build 059aa0daff05ecf7 had passed them on every device benched.
 
-Builds: the CUDA rows are the full readout of build b36cb4a (2026-11-13 04:57, the CUDA part of a cuda,cpu run), with 11 rows re-timed on that build, the box-loss rows on 8db7cc0 and 22689b7 and the float64 erf rows on 03a6098 (notes at the end); the CPU rows are the CPU-only readout of build f8c57b3 (2026-11-13 07:33, each device in a process of its own), with 97 rows re-timed on that build and the float64 erf rows on 03a6098 (notes at the end). CPU rows re-timed on build 2f78b26 (rope_table 5ad50e6, the box losses 768935a, the column passes 8779aa6, cross_entropy, log_softmax_topk and sample_rows 2f78b26) are named in the notes.
+Builds: the CUDA rows are the full readout of build b36cb4a (2026-11-13 04:57, the CUDA part of a cuda,cpu run), with 11 rows re-timed on that build, the box-loss rows on 8db7cc0 and 22689b7 and the float64 erf rows on 03a6098 (notes at the end); the CPU rows are the CPU-only readout of build f8c57b3 (2026-11-13 07:33, each device in a process of its own), with 97 rows re-timed on that build and the float64 erf rows on 03a6098 (notes at the end). CPU rows re-timed on build 2f78b26 (rope_table 5ad50e6, the box losses 768935a, the column passes 8779aa6, cross_entropy, log_softmax_topk and sample_rows 2f78b26) are named in the notes. CPU rows re-timed on build 7d4ed27 (the column passes' partials pooled and aligned) are named in the notes.
 
 Timing: the first run apart; a warm-up in rounds of at least 30 ms until the last 3 rounds' medians agree within 5 % and the last round compiled no method (at most 2000 ms; a GPU row at least 500 ms of runs); then the median of at least 7 runs and 300 ms (at most 201 runs, 3 s); the runtime's call-counting delay 0 ms.
 
@@ -3026,19 +3026,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:clip_factor | float64 | 16777216 | 3.538 | — | f64 | 0e+0 | — | — | — | — | 268.44 MB | 67.11 Mop | 3.114 ms | memory | 75.87 GB/s | 88 % | 88 B | — | — | — |
 | cpu | sum:whole | float64 | 4096x4096 | 1.215 | — | f64 | 0e+0 | — | — | — | — | 134.22 MB | 16.78 Mop | 1.269 ms | memory | 110.49 GB/s | 104.5 % | 824 B | — | — | — |
 | cpu | sum:rows | float64 | 4096x4096 | 1.253 | — | f64 | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 107.13 GB/s | 101.3 % | 32.79 kB | — | — | — |
-| cpu | sum:cols | float64 | 4096x4096 | 1.422 | — | f64 | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 93.89 GB/s | 89.2 % | 819.25 kB | — | — | — |
+| cpu | sum:cols | float64 | 4096x4096 | 1.379 | — | f64 | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 93.89 GB/s | 92.0 % | 819.25 kB | — | — | — |
 | cpu | sumsq:rows | float64 | 4096x4096 | 1.227 | — | f64 | 2.14e-11 | — | — | — | — | 134.25 MB | 33.55 Mop | 1.269 ms | memory | 109.4 GB/s | 103.4 % | 32.79 kB | — | — | — |
 | cpu | max:whole | float64 | 4096x4096 | 1.220 | — | f64 | 0e+0 | — | — | — | — | 134.22 MB | 16.78 Mop | 1.269 ms | memory | 110.01 GB/s | 104 % | 1.3 kB | — | — | — |
 | cpu | max:rows | float64 | 4096x4096 | 1.239 | — | f64 | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 108.32 GB/s | 102.4 % | 32.79 kB | — | — | — |
-| cpu | max:cols | float64 | 4096x4096 | 1.636 | — | f64 | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 93.86 GB/s | 77.6 % | 819.25 kB | — | — | — |
+| cpu | max:cols | float64 | 4096x4096 | 1.414 | — | f64 | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 93.86 GB/s | 89.7 % | 819.25 kB | — | — | — |
 | cpu | min:rows | float64 | 4096x4096 | 1.236 | — | f64 | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 108.66 GB/s | 102.7 % | 32.79 kB | — | — | — |
 | cpu | argmax:rows | float64 | 4096x4096 | 1.242 | — | s32 index | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 108.12 GB/s | 102.2 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | float64 | 4096x4096 | 1.510 | — | s32 index | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 85.76 GB/s | 84.0 % | 1.2 MB | — | — | — |
+| cpu | argmax:cols | float64 | 4096x4096 | 1.414 | — | s32 index | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 85.76 GB/s | 89.7 % | 1.2 MB | — | — | — |
 | cpu | maprow:add | float64 | 4096x4096 | 4.631 | — | f64 | 0e+0 | — | — | — | — | 268.47 MB | 16.78 Mop | 3.115 ms | memory | 57.97 GB/s | 67.3 % | 720.98 kB | — | — | — |
 | cpu | maprow:mul | float64 | 4096x4096 | 4.701 | — | f64 | 0e+0 | — | — | — | — | 268.47 MB | 16.78 Mop | 3.115 ms | memory | 57.11 GB/s | 66.3 % | 786.52 kB | — | — | — |
 | cpu | transpose | float64 | 4096x4096 | 6.214 | — | f64 | 0e+0 | — | — | — | — | 268.44 MB | 0 op | 3.114 ms | memory | 43.2 GB/s | 50.1 % | 0 B | — | — | — |
 | cpu | gemv | float64 | 8192x8192 | 6.284 | — | f64 | 6.11e-13 | — | — | — | — | 537 MB | 134.22 Mop | 6.197 ms | memory | 85.46 GB/s | 98.6 % | 196.61 kB | — | — | — |
-| cpu | gemv_t | float64 | 8192x8192 | 6.830 | — | f64 | 5.97e-13 | — | — | — | — | 537 MB | 134.22 Mop | 6.197 ms | memory | 77.77 GB/s | 90.7 % | 1.05 MB | — | — | — |
+| cpu | gemv_t | float64 | 8192x8192 | 6.928 | — | f64 | 5.97e-13 | — | — | — | — | 537 MB | 134.22 Mop | 6.197 ms | memory | 77.77 GB/s | 89.4 % | 1.05 MB | — | — | — |
 | cpu | row:log_softmax | float64 | 4096x4096 | 4.756 | — | f64 | 7.11e-15 | — | — | — | — | 268.44 MB | 83.89 Mop | 3.114 ms | memory | 56.44 GB/s | 65.5 % | 786.43 kB | — | — | — |
 | cpu | row:softmax_bwd | float64 | 4096x4096 | 5.321 | — | f64 | 3.27e-13 | — | — | — | — | 402.65 MB | 67.11 Mop | 4.449 ms | memory | 75.68 GB/s | 83.6 % | 753.66 kB | — | — | — |
 | cpu | row:log_softmax_bwd | float64 | 4096x4096 | 5.616 | — | f64 | 2.84e-14 | — | — | — | — | 402.65 MB | 67.11 Mop | 4.449 ms | memory | 71.7 GB/s | 79.2 % | 786.43 kB | — | — | — |
@@ -3055,8 +3055,8 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | row:add_layer_norm | float64 | 4096x4096 | 7.420 | — | f64 | 1.51e-14 | — | — | — | — | 536.94 MB | 134.22 Mop | 6.449 ms | memory | 72.36 GB/s | 86.9 % | 3.01 MB | — | — | — |
 | cpu | row:cross_entropy_bwd | float64 | 4096x4096 | 4.712 | — | f64 | 1.11e-16 | — | — | — | — | 268.44 MB | 83.89 Mop | 3.114 ms | memory | 56.97 GB/s | 66.1 % | 753.66 kB | — | — | — |
 | cpu | row:weighted_cross_entropy_bwd | float64 | 4096x4096 | 4.814 | — | f64 | 5.55e-17 | — | — | — | — | 268.47 MB | 117.44 Mop | 3.115 ms | memory | 55.77 GB/s | 64.7 % | 789.5 kB | — | — | — |
-| cpu | norm_params_bwd:rms | float64 | 4096x4096 | 4.617 | — | f64 | 7.96e-13 | — | — | — | — | 268.5 MB | 100.66 Mop | 3.115 ms | copy | 58.39 GB/s | 67.5 % | 1.64 MB | — | — | — |
-| cpu | norm_params_bwd:layer | float64 | 4096x4096 | 4.590 | — | f64 | 4.97e-13 | — | — | — | — | 268.5 MB | 134.22 Mop | 3.115 ms | copy | 57.25 GB/s | 67.9 % | 1.64 MB | — | — | — |
+| cpu | norm_params_bwd:rms | float64 | 4096x4096 | 4.678 | — | f64 | 7.96e-13 | — | — | — | — | 268.5 MB | 100.66 Mop | 3.115 ms | copy | 58.39 GB/s | 66.6 % | 1.64 MB | — | — | — |
+| cpu | norm_params_bwd:layer | float64 | 4096x4096 | 4.716 | — | f64 | 4.97e-13 | — | — | — | — | 268.5 MB | 134.22 Mop | 3.115 ms | copy | 57.25 GB/s | 66.1 % | 1.64 MB | — | — | — |
 | cpu | layout:strided | float64 | 1x1024x64x256 | 4.006 | — | f64 | 0e+0 | — | — | — | — | 268.44 MB | 0 op | 3.114 ms | memory | 67.01 GB/s | 77.7 % | 655.7 kB | — | — | — |
 | cpu | layout:one_hot | float64 | 16384x1024 | 2.428 | — | f64 | 0e+0 | — | — | — | — | 134.28 MB | 0 op | 1.787 ms | memory | 55.32 GB/s | 73.6 % | 204.51 kB | — | — | — |
 | cpu | layout:gather_rows | float64 | 4096 of 4096x4096 | 3.520 | — | f64 | 0e+0 | — | — | — | — | 268.45 MB | 0 op | 3.115 ms | memory | 76.27 GB/s | 88.5 % | 794.42 kB | — | — | — |
@@ -3222,19 +3222,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:clip_factor | float32 | 16777216 | 1.415 | — | f32 | 8.87e-8 | — | — | — | — | 134.22 MB | 67.11 Mop | 1.379 ms | memory | 94.83 GB/s | 97.4 % | 88 B | — | — | — |
 | cpu | sum:whole | float32 | 4096x4096 | 0.332 | — | f32 | 3.71e-3 | — | — | — | — | 67.11 MB | 16.78 Mop | 0.344 ms | memory | 202.32 GB/s | 103.8 % | 440 B | — | — | — |
 | cpu | sum:rows | float32 | 4096x4096 | 0.335 | — | f32 | 3.58e-5 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 200.3 GB/s | 102.7 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | float32 | 4096x4096 | 0.513 | — | f32 | 3.77e-5 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 133.59 GB/s | 67.1 % | 802.86 kB | — | — | — |
+| cpu | sum:cols | float32 | 4096x4096 | 0.430 | — | f32 | 3.77e-5 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 133.59 GB/s | 80.0 % | 802.86 kB | — | — | — |
 | cpu | sumsq:rows | float32 | 4096x4096 | 0.334 | — | f32 | 2.46e-4 | — | — | — | — | 67.14 MB | 33.55 Mop | 0.344 ms | memory | 201.2 GB/s | 103.2 % | 16.41 kB | — | — | — |
 | cpu | max:whole | float32 | 4096x4096 | 0.351 | — | f32 | 0e+0 | — | — | — | — | 67.11 MB | 16.78 Mop | 0.344 ms | memory | 191.14 GB/s | 98.1 % | 848 B | — | — | — |
 | cpu | max:rows | float32 | 4096x4096 | 0.347 | — | f32 | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 193.72 GB/s | 99.3 % | 16.41 kB | — | — | — |
-| cpu | max:cols | float32 | 4096x4096 | 0.533 | — | f32 | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 127.4 GB/s | 64.5 % | 802.86 kB | — | — | — |
+| cpu | max:cols | float32 | 4096x4096 | 0.470 | — | f32 | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 127.4 GB/s | 73.2 % | 802.86 kB | — | — | — |
 | cpu | min:rows | float32 | 4096x4096 | 0.349 | — | f32 | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 192.44 GB/s | 98.7 % | 16.41 kB | — | — | — |
 | cpu | argmax:rows | float32 | 4096x4096 | 0.414 | — | s32 index | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 162.33 GB/s | 83.2 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | float32 | 4096x4096 | 0.681 | — | s32 index | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 99.35 GB/s | 50.5 % | 1.59 MB | — | — | — |
+| cpu | argmax:cols | float32 | 4096x4096 | 0.534 | — | s32 index | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 99.35 GB/s | 64.4 % | 1.59 MB | — | — | — |
 | cpu | maprow:add | float32 | 4096x4096 | 1.613 | — | f32 | 5.96e-8 | — | — | — | — | 134.23 MB | 16.78 Mop | 1.379 ms | memory | 83.23 GB/s | 85.5 % | 393.3 kB | — | — | — |
 | cpu | maprow:mul | float32 | 4096x4096 | 1.606 | — | f32 | 2.98e-8 | — | — | — | — | 134.23 MB | 16.78 Mop | 1.379 ms | memory | 83.57 GB/s | 85.8 % | 393.3 kB | — | — | — |
 | cpu | transpose | float32 | 4096x4096 | 2.953 | — | f32 | 0e+0 | — | — | — | — | 134.22 MB | 0 op | 1.379 ms | memory | 45.46 GB/s | 46.7 % | 0 B | — | — | — |
 | cpu | gemv | float32 | 8192x8192 | 2.884 | — | f32 | 5.19e-5 | — | — | — | — | 268.5 MB | 134.22 Mop | 2.835 ms | memory | 93.09 GB/s | 98.3 % | 98.3 kB | — | — | — |
-| cpu | gemv_t | float32 | 8192x8192 | 3.245 | — | f32 | 4.74e-5 | — | — | — | — | 268.5 MB | 134.22 Mop | 2.835 ms | memory | 84.88 GB/s | 87.4 % | 917.55 kB | — | — | — |
+| cpu | gemv_t | float32 | 8192x8192 | 3.202 | — | f32 | 4.74e-5 | — | — | — | — | 268.5 MB | 134.22 Mop | 2.835 ms | memory | 84.88 GB/s | 88.5 % | 917.55 kB | — | — | — |
 | cpu | row:log_softmax | float32 | 4096x4096 | 1.817 | — | f32 | 1.36e-6 | — | — | — | — | 134.22 MB | 83.89 Mop | 1.379 ms | memory | 73.88 GB/s | 75.9 % | 376.83 kB | — | — | — |
 | cpu | row:softmax_bwd | float32 | 4096x4096 | 2.288 | — | f32 | 3.02e-5 | — | — | — | — | 201.33 MB | 67.11 Mop | 1.864 ms | memory | 88 GB/s | 81.5 % | 376.83 kB | — | — | — |
 | cpu | row:log_softmax_bwd | float32 | 4096x4096 | 2.444 | — | f32 | 4.67e-5 | — | — | — | — | 201.33 MB | 67.11 Mop | 1.864 ms | memory | 82.37 GB/s | 76.3 % | 376.83 kB | — | — | — |
@@ -3251,8 +3251,8 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | row:add_layer_norm | float32 | 4096x4096 | 3.351 | — | f32 | 1.28e-6 | — | — | — | — | 268.47 MB | 134.22 Mop | 2.892 ms | memory | 80.12 GB/s | 86.3 % | 1.44 MB | — | — | — |
 | cpu | row:cross_entropy_bwd | float32 | 4096x4096 | 1.970 | — | f32 | 2.98e-8 | — | — | — | — | 134.22 MB | 83.89 Mop | 1.379 ms | memory | 68.12 GB/s | 70 % | 393.22 kB | — | — | — |
 | cpu | row:weighted_cross_entropy_bwd | float32 | 4096x4096 | 1.854 | — | f32 | 2.78e-8 | — | — | — | — | 134.23 MB | 117.44 Mop | 1.379 ms | memory | 72.41 GB/s | 74.4 % | 394.75 kB | — | — | — |
-| cpu | norm_params_bwd:rms | float32 | 4096x4096 | 2.017 | — | f32 | 4.45e-5 | — | — | — | — | 134.28 MB | 100.66 Mop | 1.379 ms | copy | 66.58 GB/s | 68.4 % | 1.61 MB | — | — | — |
-| cpu | norm_params_bwd:layer | float32 | 4096x4096 | 2.029 | — | f32 | 3.2e-5 | — | — | — | — | 134.28 MB | 134.22 Mop | 1.379 ms | copy | 65.47 GB/s | 68.0 % | 1.61 MB | — | — | — |
+| cpu | norm_params_bwd:rms | float32 | 4096x4096 | 1.875 | — | f32 | 4.45e-5 | — | — | — | — | 134.28 MB | 100.66 Mop | 1.379 ms | copy | 66.58 GB/s | 73.5 % | 1.61 MB | — | — | — |
+| cpu | norm_params_bwd:layer | float32 | 4096x4096 | 2.266 | — | f32 | 3.2e-5 | — | — | — | — | 134.28 MB | 134.22 Mop | 1.379 ms | copy | 65.47 GB/s | 60.9 % | 1.61 MB | — | — | — |
 | cpu | layout:strided | float32 | 1x1024x64x256 | 1.829 | — | f32 | 0e+0 | — | — | — | — | 134.22 MB | 0 op | 1.379 ms | memory | 73.38 GB/s | 75.4 % | 377.17 kB | — | — | — |
 | cpu | layout:one_hot | float32 | 16384x1024 | 0.529 | — | f32 | 0e+0 | — | — | — | — | 67.17 MB | 0 op | 0.592 ms | memory | 126.96 GB/s | 111.8 % | 106.21 kB | — | — | — |
 | cpu | layout:gather_rows | float32 | 4096 of 4096x4096 | 1.459 | — | f32 | 0e+0 | — | — | — | — | 134.23 MB | 0 op | 1.379 ms | memory | 91.99 GB/s | 94.5 % | 401.2 kB | — | — | — |
@@ -3416,19 +3416,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:clip_factor | float16 | 16777216 | 0.924 | — | f32 | 2.44e-4 | — | — | — | — | 67.11 MB | 67.11 Mop | 0.296 ms | memory | 72.6 GB/s | 32 % | 88 B | — | — | — |
 | cpu | sum:whole | float16 | 4096x4096 | 0.313 | — | f32 | 1.53e-4 | — | — | — | — | 33.55 MB | 16.78 Mop | 0.069 ms | memory | 107.13 GB/s | 22.1 % | 440 B | — | — | — |
 | cpu | sum:rows | float16 | 4096x4096 | 0.336 | — | f32 | 1.05e-5 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 99.87 GB/s | 20.5 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | float16 | 4096x4096 | 0.477 | — | f32 | 3.39e-5 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 66.72 GB/s | 14.5 % | 1.2 MB | — | — | — |
+| cpu | sum:cols | float16 | 4096x4096 | 0.402 | — | f32 | 3.39e-5 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 66.72 GB/s | 17.2 % | 1.2 MB | — | — | — |
 | cpu | sumsq:rows | float16 | 4096x4096 | 0.338 | — | f32 | 2.62e-4 | — | — | — | — | 33.59 MB | 33.55 Mop | 0.069 ms | memory | 99.43 GB/s | 20.4 % | 16.41 kB | — | — | — |
 | cpu | max:whole | float16 | 4096x4096 | 0.365 | — | f32 | 0e+0 | — | — | — | — | 33.55 MB | 16.78 Mop | 0.069 ms | memory | 91.98 GB/s | 18.9 % | 848 B | — | — | — |
 | cpu | max:rows | float16 | 4096x4096 | 0.390 | — | f32 | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 86.21 GB/s | 17.7 % | 16.41 kB | — | — | — |
-| cpu | max:cols | float16 | 4096x4096 | 0.468 | — | f32 | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 71.17 GB/s | 14.7 % | 991.28 kB | — | — | — |
+| cpu | max:cols | float16 | 4096x4096 | 0.409 | — | f32 | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 71.17 GB/s | 16.9 % | 991.28 kB | — | — | — |
 | cpu | min:rows | float16 | 4096x4096 | 0.382 | — | f32 | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 87.95 GB/s | 18.1 % | 16.41 kB | — | — | — |
 | cpu | argmax:rows | float16 | 4096x4096 | 0.805 | — | s32 index | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 41.72 GB/s | 8.6 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | float16 | 4096x4096 | 0.654 | — | s32 index | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 49.91 GB/s | 10.6 % | 1.79 MB | — | — | — |
+| cpu | argmax:cols | float16 | 4096x4096 | 0.527 | — | s32 index | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 49.91 GB/s | 13.1 % | 1.79 MB | — | — | — |
 | cpu | maprow:add | float16 | 4096x4096 | 0.677 | — | f32 | 4.88e-4 | — | — | — | — | 67.12 MB | 16.78 Mop | 0.296 ms | memory | 99.17 GB/s | 43.7 % | 688.22 kB | — | — | — |
 | cpu | maprow:mul | float16 | 4096x4096 | 0.676 | — | f32 | 2.44e-4 | — | — | — | — | 67.12 MB | 16.78 Mop | 0.296 ms | memory | 99.27 GB/s | 43.8 % | 753.75 kB | — | — | — |
 | cpu | transpose | float16 | 4096x4096 | 1.275 | — | f32 | 0e+0 | — | — | — | — | 67.11 MB | 0 op | 0.296 ms | memory | 52.62 GB/s | 23.2 % | 0 B | — | — | — |
 | cpu | gemv | float16 | 8192x8192 | 1.728 | — | f32 | 3.12e-2 | — | — | — | — | 134.25 MB | 134.22 Mop | 1.269 ms | memory | 77.69 GB/s | 73.4 % | 98.3 kB | — | — | — |
-| cpu | gemv_t | float16 | 8192x8192 | 2.131 | — | f32 | 5.38e-2 | — | — | — | — | 134.25 MB | 134.22 Mop | 1.269 ms | memory | 59.64 GB/s | 59.5 % | 1.26 MB | — | — | — |
+| cpu | gemv_t | float16 | 8192x8192 | 2.030 | — | f32 | 5.38e-2 | — | — | — | — | 134.25 MB | 134.22 Mop | 1.269 ms | memory | 59.64 GB/s | 62.5 % | 1.26 MB | — | — | — |
 | cpu | row:log_softmax | float16 | 4096x4096 | 1.673 | — | f32 | 3.91e-3 | — | — | — | — | 67.11 MB | 83.89 Mop | 0.296 ms | memory | 40.11 GB/s | 17.7 % | 786.43 kB | — | — | — |
 | cpu | row:softmax_bwd | float16 | 4096x4096 | 1.071 | — | f32 | 3.12e-2 | — | — | — | — | 100.66 MB | 67.11 Mop | 0.730 ms | memory | 93.95 GB/s | 68.1 % | 1.08 MB | — | — | — |
 | cpu | row:log_softmax_bwd | float16 | 4096x4096 | 1.783 | — | f32 | 3.13e-2 | — | — | — | — | 100.66 MB | 67.11 Mop | 0.730 ms | memory | 56.44 GB/s | 40.9 % | 1.18 MB | — | — | — |
@@ -3445,8 +3445,8 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | row:add_layer_norm | float16 | 4096x4096 | 2.130 | — | f32 | 1.95e-3 | — | — | — | — | 134.23 MB | 134.22 Mop | 1.175 ms | memory | 63.01 GB/s | 55.1 % | 2.34 MB | — | — | — |
 | cpu | row:cross_entropy_bwd | float16 | 4096x4096 | 1.639 | — | f32 | 2.44e-4 | — | — | — | — | 67.11 MB | 83.89 Mop | 0.296 ms | memory | 40.95 GB/s | 18.1 % | 786.43 kB | — | — | — |
 | cpu | row:weighted_cross_entropy_bwd | float16 | 4096x4096 | 1.659 | — | f32 | 1.22e-4 | — | — | — | — | 67.12 MB | 117.44 Mop | 0.296 ms | memory | 40.47 GB/s | 17.8 % | 787.97 kB | — | — | — |
-| cpu | norm_params_bwd:rms | float16 | 4096x4096 | 1.451 | — | f32 | 5.94e-5 | — | — | — | — | 67.17 MB | 100.66 Mop | 0.244 ms | copy | 42.11 GB/s | 16.8 % | 2 MB | — | — | — |
-| cpu | norm_params_bwd:layer | float16 | 4096x4096 | 1.457 | — | f32 | 3.19e-5 | — | — | — | — | 67.17 MB | 134.22 Mop | 0.244 ms | copy | 41.9 GB/s | 16.7 % | 2 MB | — | — | — |
+| cpu | norm_params_bwd:rms | float16 | 4096x4096 | 1.229 | — | f32 | 5.94e-5 | — | — | — | — | 67.17 MB | 100.66 Mop | 0.244 ms | copy | 42.11 GB/s | 19.9 % | 2 MB | — | — | — |
+| cpu | norm_params_bwd:layer | float16 | 4096x4096 | 1.313 | — | f32 | 3.19e-5 | — | — | — | — | 67.17 MB | 134.22 Mop | 0.244 ms | copy | 41.9 GB/s | 18.6 % | 2 MB | — | — | — |
 | cpu | layout:strided | float16 | 1x1024x64x256 | 0.996 | — | u16 | 0e+0 | — | — | — | — | 67.11 MB | 0 op | 0.296 ms | memory | 67.36 GB/s | 29.7 % | 393.55 kB | — | — | — |
 | cpu | layout:one_hot | float16 | 16384x1024 | 0.360 | — | f32 | 0e+0 | — | — | — | — | 33.62 MB | 0 op | 0.100 ms | memory | 93.39 GB/s | 27.8 % | 6.61 MB | — | — | — |
 | cpu | layout:gather_rows | float16 | 4096 of 4096x4096 | 0.294 | — | u16 | 0e+0 | — | — | — | — | 67.13 MB | 0 op | 0.296 ms | memory | 228.55 GB/s | 100.7 % | 188.21 kB | — | — | — |
@@ -3610,19 +3610,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:clip_factor | bfloat16 | 16777216 | 0.570 | — | f32 | 1.95e-3 | — | — | — | — | 67.11 MB | 67.11 Mop | 0.296 ms | memory | 117.84 GB/s | 51.9 % | 88 B | — | — | — |
 | cpu | sum:whole | bfloat16 | 4096x4096 | 0.146 | — | f32 | 1.18e-4 | — | — | — | — | 33.55 MB | 16.78 Mop | 0.069 ms | memory | 229.98 GB/s | 47.3 % | 440 B | — | — | — |
 | cpu | sum:rows | bfloat16 | 4096x4096 | 0.152 | — | f32 | 8.23e-6 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 221.7 GB/s | 45.6 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | bfloat16 | 4096x4096 | 0.332 | — | f32 | 1.86e-5 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 94.13 GB/s | 20.8 % | 1.18 MB | — | — | — |
+| cpu | sum:cols | bfloat16 | 4096x4096 | 0.256 | — | f32 | 1.86e-5 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 94.13 GB/s | 27.0 % | 1.18 MB | — | — | — |
 | cpu | sumsq:rows | bfloat16 | 4096x4096 | 0.151 | — | f32 | 3.08e-4 | — | — | — | — | 33.59 MB | 33.55 Mop | 0.069 ms | memory | 222.87 GB/s | 45.8 % | 16.41 kB | — | — | — |
 | cpu | max:whole | bfloat16 | 4096x4096 | 0.217 | — | f32 | 0e+0 | — | — | — | — | 33.55 MB | 16.78 Mop | 0.069 ms | memory | 154.42 GB/s | 31.8 % | 848 B | — | — | — |
 | cpu | max:rows | bfloat16 | 4096x4096 | 0.219 | — | f32 | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 153.65 GB/s | 31.6 % | 16.41 kB | — | — | — |
-| cpu | max:cols | bfloat16 | 4096x4096 | 0.307 | — | f32 | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 100.92 GB/s | 22.5 % | 983.09 kB | — | — | — |
+| cpu | max:cols | bfloat16 | 4096x4096 | 0.251 | — | f32 | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 100.92 GB/s | 27.5 % | 983.09 kB | — | — | — |
 | cpu | min:rows | bfloat16 | 4096x4096 | 0.215 | — | f32 | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 156.36 GB/s | 32.2 % | 16.41 kB | — | — | — |
 | cpu | argmax:rows | bfloat16 | 4096x4096 | 0.327 | — | s32 index | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 102.71 GB/s | 21.1 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | bfloat16 | 4096x4096 | 0.512 | — | s32 index | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 62.55 GB/s | 13.5 % | 1.74 MB | — | — | — |
+| cpu | argmax:cols | bfloat16 | 4096x4096 | 0.351 | — | s32 index | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 62.55 GB/s | 19.7 % | 1.74 MB | — | — | — |
 | cpu | maprow:add | bfloat16 | 4096x4096 | 0.407 | — | f32 | 3.91e-3 | — | — | — | — | 67.12 MB | 16.78 Mop | 0.296 ms | memory | 164.74 GB/s | 72.6 % | 786.52 kB | — | — | — |
 | cpu | maprow:mul | bfloat16 | 4096x4096 | 0.403 | — | f32 | 1.95e-3 | — | — | — | — | 67.12 MB | 16.78 Mop | 0.296 ms | memory | 166.63 GB/s | 73.4 % | 753.75 kB | — | — | — |
 | cpu | transpose | bfloat16 | 4096x4096 | 0.921 | — | f32 | 0e+0 | — | — | — | — | 67.11 MB | 0 op | 0.296 ms | memory | 72.83 GB/s | 32.1 % | 0 B | — | — | — |
 | cpu | gemv | bfloat16 | 8192x8192 | 1.331 | — | f32 | 2.5e-1 | — | — | — | — | 134.25 MB | 134.22 Mop | 1.269 ms | memory | 100.83 GB/s | 95.3 % | 98.3 kB | — | — | — |
-| cpu | gemv_t | bfloat16 | 8192x8192 | 1.657 | — | f32 | 2.49e-1 | — | — | — | — | 134.25 MB | 134.22 Mop | 1.269 ms | memory | 72.21 GB/s | 76.6 % | 1.28 MB | — | — | — |
+| cpu | gemv_t | bfloat16 | 8192x8192 | 1.630 | — | f32 | 2.49e-1 | — | — | — | — | 134.25 MB | 134.22 Mop | 1.269 ms | memory | 72.21 GB/s | 77.9 % | 1.28 MB | — | — | — |
 | cpu | row:log_softmax | bfloat16 | 4096x4096 | 1.329 | — | f32 | 3.13e-2 | — | — | — | — | 67.11 MB | 83.89 Mop | 0.296 ms | memory | 50.48 GB/s | 22.3 % | 753.66 kB | — | — | — |
 | cpu | row:softmax_bwd | bfloat16 | 4096x4096 | 0.854 | — | f32 | 2.5e-1 | — | — | — | — | 100.66 MB | 67.11 Mop | 0.730 ms | memory | 117.94 GB/s | 85.5 % | 1.13 MB | — | — | — |
 | cpu | row:log_softmax_bwd | bfloat16 | 4096x4096 | 1.311 | — | f32 | 2.5e-1 | — | — | — | — | 100.66 MB | 67.11 Mop | 0.730 ms | memory | 76.78 GB/s | 55.7 % | 1.13 MB | — | — | — |
@@ -3639,8 +3639,8 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | row:add_layer_norm | bfloat16 | 4096x4096 | 1.623 | — | f32 | 1.56e-2 | — | — | — | — | 134.23 MB | 134.22 Mop | 1.175 ms | memory | 82.72 GB/s | 72.4 % | 2.2 MB | — | — | — |
 | cpu | row:cross_entropy_bwd | bfloat16 | 4096x4096 | 1.285 | — | f32 | 1.95e-3 | — | — | — | — | 67.11 MB | 83.89 Mop | 0.296 ms | memory | 52.23 GB/s | 23 % | 753.66 kB | — | — | — |
 | cpu | row:weighted_cross_entropy_bwd | bfloat16 | 4096x4096 | 1.310 | — | f32 | 9.17e-4 | — | — | — | — | 67.12 MB | 117.44 Mop | 0.296 ms | memory | 51.23 GB/s | 22.6 % | 787.97 kB | — | — | — |
-| cpu | norm_params_bwd:rms | bfloat16 | 4096x4096 | 1.046 | — | f32 | 4.96e-5 | — | — | — | — | 67.17 MB | 100.66 Mop | 0.244 ms | copy | 59.56 GB/s | 23.3 % | 1.98 MB | — | — | — |
-| cpu | norm_params_bwd:layer | bfloat16 | 4096x4096 | 1.069 | — | f32 | 3.34e-5 | — | — | — | — | 67.17 MB | 134.22 Mop | 0.244 ms | copy | 57.03 GB/s | 22.8 % | 2 MB | — | — | — |
+| cpu | norm_params_bwd:rms | bfloat16 | 4096x4096 | 0.878 | — | f32 | 4.96e-5 | — | — | — | — | 67.17 MB | 100.66 Mop | 0.244 ms | copy | 59.56 GB/s | 27.8 % | 1.98 MB | — | — | — |
+| cpu | norm_params_bwd:layer | bfloat16 | 4096x4096 | 0.905 | — | f32 | 3.34e-5 | — | — | — | — | 67.17 MB | 134.22 Mop | 0.244 ms | copy | 57.03 GB/s | 27.0 % | 2 MB | — | — | — |
 | cpu | layout:strided | bfloat16 | 1x1024x64x256 | 0.994 | — | u16 | 0e+0 | — | — | — | — | 67.11 MB | 0 op | 0.296 ms | memory | 67.51 GB/s | 29.8 % | 393.55 kB | — | — | — |
 | cpu | layout:one_hot | bfloat16 | 16384x1024 | 0.206 | — | f32 | 0e+0 | — | — | — | — | 33.62 MB | 0 op | 0.100 ms | memory | 163.2 GB/s | 48.7 % | 6.61 MB | — | — | — |
 | cpu | layout:gather_rows | bfloat16 | 4096 of 4096x4096 | 0.308 | — | u16 | 0e+0 | — | — | — | — | 67.13 MB | 0 op | 0.296 ms | memory | 217.87 GB/s | 96 % | 204.59 kB | — | — | — |
@@ -3804,19 +3804,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:clip_factor | float8_e4m3 | 16777216 | 1.495 | — | f32 | 2.8e-2 | — | — | — | — | 33.55 MB | 67.11 Mop | 0.055 ms | memory | 22.44 GB/s | 3.7 % | 88 B | — | — | — |
 | cpu | sum:whole | float8_e4m3 | 4096x4096 | 0.288 | — | f32 | 0e+0 | — | — | — | — | 16.78 MB | 16.78 Mop | 0.026 ms | memory | 58.25 GB/s | 9 % | 440 B | — | — | — |
 | cpu | sum:rows | float8_e4m3 | 4096x4096 | 0.299 | — | f32 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 56.24 GB/s | 8.7 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | float8_e4m3 | 4096x4096 | 0.428 | — | f32 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 33.72 GB/s | 6.1 % | 1.18 MB | — | — | — |
+| cpu | sum:cols | float8_e4m3 | 4096x4096 | 0.364 | — | f32 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 33.72 GB/s | 7.1 % | 1.18 MB | — | — | — |
 | cpu | sumsq:rows | float8_e4m3 | 4096x4096 | 0.300 | — | f32 | 1.6e-4 | — | — | — | — | 16.81 MB | 33.55 Mop | 0.026 ms | memory | 55.96 GB/s | 8.7 % | 16.41 kB | — | — | — |
 | cpu | max:whole | float8_e4m3 | 4096x4096 | 0.343 | — | f32 | 0e+0 | — | — | — | — | 16.78 MB | 16.78 Mop | 0.026 ms | memory | 48.91 GB/s | 7.6 % | 848 B | — | — | — |
 | cpu | max:rows | float8_e4m3 | 4096x4096 | 0.338 | — | f32 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 49.72 GB/s | 7.7 % | 16.41 kB | — | — | — |
-| cpu | max:cols | float8_e4m3 | 4096x4096 | 0.443 | — | f32 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 38.07 GB/s | 5.9 % | 991.28 kB | — | — | — |
+| cpu | max:cols | float8_e4m3 | 4096x4096 | 0.379 | — | f32 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 38.07 GB/s | 6.9 % | 991.28 kB | — | — | — |
 | cpu | min:rows | float8_e4m3 | 4096x4096 | 0.343 | — | f32 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 48.98 GB/s | 7.6 % | 16.41 kB | — | — | — |
 | cpu | argmax:rows | float8_e4m3 | 4096x4096 | 0.583 | — | s32 index | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 28.86 GB/s | 4.5 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | float8_e4m3 | 4096x4096 | 0.659 | — | s32 index | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 24.6 GB/s | 3.9 % | 1.79 MB | — | — | — |
+| cpu | argmax:cols | float8_e4m3 | 4096x4096 | 0.508 | — | s32 index | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 24.6 GB/s | 5.1 % | 1.79 MB | — | — | — |
 | cpu | maprow:add | float8_e4m3 | 4096x4096 | 1.439 | — | f32 | 6.25e-2 | — | — | — | — | 33.56 MB | 16.78 Mop | 0.055 ms | memory | 23.32 GB/s | 3.8 % | 720.98 kB | — | — | — |
 | cpu | maprow:mul | float8_e4m3 | 4096x4096 | 1.441 | — | f32 | 3.13e-2 | — | — | — | — | 33.56 MB | 16.78 Mop | 0.055 ms | memory | 23.3 GB/s | 3.8 % | 786.52 kB | — | — | — |
 | cpu | transpose | float8_e4m3 | 4096x4096 | 2.040 | — | f32 | 0e+0 | — | — | — | — | 33.55 MB | 0 op | 0.055 ms | memory | 16.45 GB/s | 2.7 % | 0 B | — | — | — |
 | cpu | gemv | float8_e4m3 | 8192x8192 | 1.394 | — | f32 | 3.99e+0 | — | — | — | — | 67.13 MB | 134.22 Mop | 0.344 ms | memory | 48.16 GB/s | 24.7 % | 98.3 kB | — | — | — |
-| cpu | gemv_t | float8_e4m3 | 8192x8192 | 1.614 | — | f32 | 7.52e+0 | — | — | — | — | 67.13 MB | 134.22 Mop | 0.344 ms | memory | 36.88 GB/s | 21.3 % | 1.26 MB | — | — | — |
+| cpu | gemv_t | float8_e4m3 | 8192x8192 | 1.545 | — | f32 | 7.52e+0 | — | — | — | — | 67.13 MB | 134.22 Mop | 0.344 ms | memory | 36.88 GB/s | 22.3 % | 1.26 MB | — | — | — |
 | cpu | row:log_softmax | float8_e4m3 | 4096x4096 | 2.405 | — | f32 | 5e-1 | — | — | — | — | 33.55 MB | 83.89 Mop | 0.055 ms | memory | 13.95 GB/s | 2.3 % | 786.43 kB | — | — | — |
 | cpu | row:softmax_bwd | float8_e4m3 | 4096x4096 | 1.846 | — | f32 | 3.99e+0 | — | — | — | — | 50.33 MB | 67.11 Mop | 0.138 ms | memory | 27.26 GB/s | 7.5 % | 1.13 MB | — | — | — |
 | cpu | row:log_softmax_bwd | float8_e4m3 | 4096x4096 | 2.527 | — | f32 | 4e+0 | — | — | — | — | 50.33 MB | 67.11 Mop | 0.138 ms | memory | 19.92 GB/s | 5.5 % | 1.18 MB | — | — | — |
@@ -3833,8 +3833,8 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | row:add_layer_norm | float8_e4m3 | 4096x4096 | 2.813 | — | f32 | 2.5e-1 | — | — | — | — | 67.12 MB | 134.22 Mop | 0.258 ms | memory | 23.86 GB/s | 9.2 % | 2.36 MB | — | — | — |
 | cpu | row:cross_entropy_bwd | float8_e4m3 | 4096x4096 | 2.399 | — | f32 | 2.07e-3 | — | — | — | — | 33.55 MB | 83.89 Mop | 0.055 ms | memory | 13.99 GB/s | 2.3 % | 786.43 kB | — | — | — |
 | cpu | row:weighted_cross_entropy_bwd | float8_e4m3 | 4096x4096 | 2.439 | — | f32 | 1e-3 | — | — | — | — | 33.56 MB | 117.44 Mop | 0.055 ms | memory | 13.76 GB/s | 2.3 % | 755.14 kB | — | — | — |
-| cpu | norm_params_bwd:rms | float8_e4m3 | 4096x4096 | 1.184 | — | f32 | 4.16e-5 | — | — | — | — | 33.62 MB | 100.66 Mop | 0.055 ms | copy | 25.56 GB/s | 4.6 % | 2 MB | — | — | — |
-| cpu | norm_params_bwd:layer | float8_e4m3 | 4096x4096 | 1.215 | — | f32 | 4.01e-5 | — | — | — | — | 33.62 MB | 134.22 Mop | 0.061 ms | f32 | 99.02 Gop/s | 5.0 % | 1.99 MB | — | — | — |
+| cpu | norm_params_bwd:rms | float8_e4m3 | 4096x4096 | 1.013 | — | f32 | 4.16e-5 | — | — | — | — | 33.62 MB | 100.66 Mop | 0.055 ms | copy | 25.56 GB/s | 5.4 % | 2 MB | — | — | — |
+| cpu | norm_params_bwd:layer | float8_e4m3 | 4096x4096 | 1.058 | — | f32 | 4.01e-5 | — | — | — | — | 33.62 MB | 134.22 Mop | 0.061 ms | f32 | 99.02 Gop/s | 5.8 % | 1.99 MB | — | — | — |
 | cpu | layout:strided | float8_e4m3 | 1x1024x64x256 | 0.436 | — | u8 | 0e+0 | — | — | — | — | 33.55 MB | 0 op | 0.055 ms | memory | 77.03 GB/s | 12.7 % | 393.55 kB | — | — | — |
 | cpu | layout:one_hot | float8_e4m3 | 16384x1024 | 0.951 | — | f32 | 0e+0 | — | — | — | — | 16.84 MB | 0 op | 0.044 ms | memory | 17.72 GB/s | 4.7 % | 6.61 MB | — | — | — |
 | cpu | layout:gather_rows | float8_e4m3 | 4096 of 4096x4096 | 0.086 | — | u8 | 0e+0 | — | — | — | — | 33.57 MB | 0 op | 0.055 ms | memory | 391.27 GB/s | 64.3 % | 81.71 kB | — | — | — |
@@ -3998,19 +3998,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:clip_factor | float8_e5m2 | 16777216 | 1.619 | — | f32 | 5.85e-2 | — | — | — | — | 33.55 MB | 67.11 Mop | 0.055 ms | memory | 20.73 GB/s | 3.4 % | 88 B | — | — | — |
 | cpu | sum:whole | float8_e5m2 | 4096x4096 | 0.318 | — | f32 | 3.05e-4 | — | — | — | — | 16.78 MB | 16.78 Mop | 0.026 ms | memory | 52.69 GB/s | 8.2 % | 440 B | — | — | — |
 | cpu | sum:rows | float8_e5m2 | 4096x4096 | 0.348 | — | f32 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 48.25 GB/s | 7.5 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | float8_e5m2 | 4096x4096 | 0.460 | — | f32 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 31.53 GB/s | 5.7 % | 1.18 MB | — | — | — |
+| cpu | sum:cols | float8_e5m2 | 4096x4096 | 0.392 | — | f32 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 31.53 GB/s | 6.6 % | 1.18 MB | — | — | — |
 | cpu | sumsq:rows | float8_e5m2 | 4096x4096 | 0.342 | — | f32 | 1.88e-4 | — | — | — | — | 16.81 MB | 33.55 Mop | 0.026 ms | memory | 49.18 GB/s | 7.6 % | 16.41 kB | — | — | — |
 | cpu | max:whole | float8_e5m2 | 4096x4096 | 0.371 | — | f32 | 0e+0 | — | — | — | — | 16.78 MB | 16.78 Mop | 0.026 ms | memory | 45.22 GB/s | 7 % | 848 B | — | — | — |
 | cpu | max:rows | float8_e5m2 | 4096x4096 | 0.377 | — | f32 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 44.54 GB/s | 6.9 % | 16.41 kB | — | — | — |
-| cpu | max:cols | float8_e5m2 | 4096x4096 | 0.475 | — | f32 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 35.42 GB/s | 5.5 % | 991.28 kB | — | — | — |
+| cpu | max:cols | float8_e5m2 | 4096x4096 | 0.407 | — | f32 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 35.42 GB/s | 6.4 % | 991.28 kB | — | — | — |
 | cpu | min:rows | float8_e5m2 | 4096x4096 | 0.375 | — | f32 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 44.87 GB/s | 6.9 % | 16.41 kB | — | — | — |
 | cpu | argmax:rows | float8_e5m2 | 4096x4096 | 0.638 | — | s32 index | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 26.36 GB/s | 4.1 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | float8_e5m2 | 4096x4096 | 0.658 | — | s32 index | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 24.23 GB/s | 4.0 % | 1.79 MB | — | — | — |
+| cpu | argmax:cols | float8_e5m2 | 4096x4096 | 0.516 | — | s32 index | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 24.23 GB/s | 5.0 % | 1.79 MB | — | — | — |
 | cpu | maprow:add | float8_e5m2 | 4096x4096 | 1.529 | — | f32 | 1.25e-1 | — | — | — | — | 33.56 MB | 16.78 Mop | 0.055 ms | memory | 21.95 GB/s | 3.6 % | 786.52 kB | — | — | — |
 | cpu | maprow:mul | float8_e5m2 | 4096x4096 | 1.528 | — | f32 | 6.25e-2 | — | — | — | — | 33.56 MB | 16.78 Mop | 0.055 ms | memory | 21.96 GB/s | 3.6 % | 753.75 kB | — | — | — |
 | cpu | transpose | float8_e5m2 | 4096x4096 | 2.183 | — | f32 | 0e+0 | — | — | — | — | 33.55 MB | 0 op | 0.055 ms | memory | 15.37 GB/s | 2.5 % | 0 B | — | — | — |
 | cpu | gemv | float8_e5m2 | 8192x8192 | 1.588 | — | f32 | 7.95e+0 | — | — | — | — | 67.13 MB | 134.22 Mop | 0.344 ms | memory | 42.28 GB/s | 21.7 % | 98.3 kB | — | — | — |
-| cpu | gemv_t | float8_e5m2 | 8192x8192 | 1.725 | — | f32 | 1.15e+1 | — | — | — | — | 67.13 MB | 134.22 Mop | 0.344 ms | memory | 34.94 GB/s | 19.9 % | 1.28 MB | — | — | — |
+| cpu | gemv_t | float8_e5m2 | 8192x8192 | 1.666 | — | f32 | 1.15e+1 | — | — | — | — | 67.13 MB | 134.22 Mop | 0.344 ms | memory | 34.94 GB/s | 20.6 % | 1.28 MB | — | — | — |
 | cpu | row:log_softmax | float8_e5m2 | 4096x4096 | 2.523 | — | f32 | 1e+0 | — | — | — | — | 33.55 MB | 83.89 Mop | 0.055 ms | memory | 13.3 GB/s | 2.2 % | 753.66 kB | — | — | — |
 | cpu | row:softmax_bwd | float8_e5m2 | 4096x4096 | 1.995 | — | f32 | 7.49e+0 | — | — | — | — | 50.33 MB | 67.11 Mop | 0.138 ms | memory | 25.23 GB/s | 6.9 % | 1.18 MB | — | — | — |
 | cpu | row:log_softmax_bwd | float8_e5m2 | 4096x4096 | 2.688 | — | f32 | 8e+0 | — | — | — | — | 50.33 MB | 67.11 Mop | 0.138 ms | memory | 18.73 GB/s | 5.1 % | 1.13 MB | — | — | — |
@@ -4027,8 +4027,8 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | row:add_layer_norm | float8_e5m2 | 4096x4096 | 3.126 | — | f32 | 5e-1 | — | — | — | — | 67.12 MB | 134.22 Mop | 0.258 ms | memory | 21.47 GB/s | 8.3 % | 2.36 MB | — | — | — |
 | cpu | row:cross_entropy_bwd | float8_e5m2 | 4096x4096 | 2.502 | — | f32 | 2.05e-3 | — | — | — | — | 33.55 MB | 83.89 Mop | 0.055 ms | memory | 13.41 GB/s | 2.2 % | 720.9 kB | — | — | — |
 | cpu | row:weighted_cross_entropy_bwd | float8_e5m2 | 4096x4096 | 2.578 | — | f32 | 9.92e-4 | — | — | — | — | 33.56 MB | 117.44 Mop | 0.055 ms | memory | 13.02 GB/s | 2.1 % | 787.97 kB | — | — | — |
-| cpu | norm_params_bwd:rms | float8_e5m2 | 4096x4096 | 1.276 | — | f32 | 3.84e-5 | — | — | — | — | 33.62 MB | 100.66 Mop | 0.055 ms | copy | 23.73 GB/s | 4.3 % | 1.98 MB | — | — | — |
-| cpu | norm_params_bwd:layer | float8_e5m2 | 4096x4096 | 1.326 | — | f32 | 3.86e-5 | — | — | — | — | 33.62 MB | 134.22 Mop | 0.061 ms | f32 | 92.85 Gop/s | 4.6 % | 2 MB | — | — | — |
+| cpu | norm_params_bwd:rms | float8_e5m2 | 4096x4096 | 1.107 | — | f32 | 3.84e-5 | — | — | — | — | 33.62 MB | 100.66 Mop | 0.055 ms | copy | 23.73 GB/s | 5.0 % | 1.98 MB | — | — | — |
+| cpu | norm_params_bwd:layer | float8_e5m2 | 4096x4096 | 1.173 | — | f32 | 3.86e-5 | — | — | — | — | 33.62 MB | 134.22 Mop | 0.061 ms | f32 | 92.85 Gop/s | 5.2 % | 2 MB | — | — | — |
 | cpu | layout:strided | float8_e5m2 | 1x1024x64x256 | 0.436 | — | u8 | 0e+0 | — | — | — | — | 33.55 MB | 0 op | 0.055 ms | memory | 76.98 GB/s | 12.7 % | 377.17 kB | — | — | — |
 | cpu | layout:one_hot | float8_e5m2 | 16384x1024 | 1.075 | — | f32 | 0e+0 | — | — | — | — | 16.84 MB | 0 op | 0.044 ms | memory | 15.67 GB/s | 4.1 % | 6.61 MB | — | — | — |
 | cpu | layout:gather_rows | float8_e5m2 | 4096 of 4096x4096 | 0.089 | — | u8 | 0e+0 | — | — | — | — | 33.57 MB | 0 op | 0.055 ms | memory | 378.48 GB/s | 62.2 % | 106.29 kB | — | — | — |
@@ -4147,19 +4147,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:gated_relu_bwd_y | int64 | 16777216 | 6.961 | — | s64 | 0e+0 | — | — | — | — | 536.87 MB | 33.55 Mop | 6.448 ms | memory | 77.12 GB/s | 92.6 % | 88 B | — | — | — |
 | cpu | sum:whole | int64 | 4096x4096 | 2.444 | — | s8dp | 0e+0 | — | — | — | — | 134.22 MB | 16.78 Mop | 1.269 ms | memory | 54.91 GB/s | 51.9 % | 440 B | — | — | — |
 | cpu | sum:rows | int64 | 4096x4096 | 2.478 | — | s8dp | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 54.18 GB/s | 51.2 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | int64 | 4096x4096 | 2.668 | — | s8dp | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 49.74 GB/s | 47.6 % | 1.18 MB | — | — | — |
+| cpu | sum:cols | int64 | 4096x4096 | 2.614 | — | s8dp | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 49.74 GB/s | 48.5 % | 1.18 MB | — | — | — |
 | cpu | sumsq:rows | int64 | 4096x4096 | 2.476 | — | s8dp | 0e+0 | — | — | — | — | 134.25 MB | 33.55 Mop | 1.269 ms | memory | 54.23 GB/s | 51.3 % | 16.41 kB | — | — | — |
 | cpu | max:whole | int64 | 4096x4096 | 1.243 | — | s64 | 0e+0 | — | — | — | — | 134.22 MB | 16.78 Mop | 1.269 ms | memory | 108.02 GB/s | 102.1 % | 1.23 kB | — | — | — |
 | cpu | max:rows | int64 | 4096x4096 | 1.240 | — | s64 | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 108.29 GB/s | 102.4 % | 32.79 kB | — | — | — |
-| cpu | max:cols | int64 | 4096x4096 | 1.448 | — | s64 | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 96.81 GB/s | 87.6 % | 819.25 kB | — | — | — |
+| cpu | max:cols | int64 | 4096x4096 | 1.388 | — | s64 | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 96.81 GB/s | 91.4 % | 819.25 kB | — | — | — |
 | cpu | min:rows | int64 | 4096x4096 | 1.240 | — | s64 | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 108.26 GB/s | 102.3 % | 32.79 kB | — | — | — |
 | cpu | argmax:rows | int64 | 4096x4096 | 1.258 | — | s32 index | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 106.73 GB/s | 100.9 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | int64 | 4096x4096 | 1.483 | — | s32 index | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 92.8 GB/s | 85.6 % | 1.2 MB | — | — | — |
+| cpu | argmax:cols | int64 | 4096x4096 | 1.388 | — | s32 index | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 92.8 GB/s | 91.4 % | 1.2 MB | — | — | — |
 | cpu | maprow:add | int64 | 4096x4096 | 4.634 | — | s64 | 0e+0 | — | — | — | — | 268.47 MB | 16.78 Mop | 3.115 ms | memory | 57.94 GB/s | 67.2 % | 786.52 kB | — | — | — |
 | cpu | maprow:mul | int64 | 4096x4096 | 4.643 | — | s64 | 0e+0 | — | — | — | — | 268.47 MB | 16.78 Mop | 3.115 ms | memory | 57.82 GB/s | 67.1 % | 786.52 kB | — | — | — |
 | cpu | transpose | int64 | 4096x4096 | 6.228 | — | s64 | 0e+0 | — | — | — | — | 268.44 MB | 0 op | 3.114 ms | memory | 43.1 GB/s | 50 % | 0 B | — | — | — |
 | cpu | gemv | int64 | 8192x8192 | 12.458 | — | s8dp | 0e+0 | — | — | — | — | 537 MB | 134.22 Mop | 6.197 ms | memory | 43.11 GB/s | 49.7 % | 65.58 kB | — | — | — |
-| cpu | gemv_t | int64 | 8192x8192 | 13.424 | — | s8dp | 0e+0 | — | — | — | — | 537 MB | 134.22 Mop | 6.197 ms | memory | 39.98 GB/s | 46.2 % | 1.27 MB | — | — | — |
+| cpu | gemv_t | int64 | 8192x8192 | 13.342 | — | s8dp | 0e+0 | — | — | — | — | 537 MB | 134.22 Mop | 6.197 ms | memory | 39.98 GB/s | 46.4 % | 1.27 MB | — | — | — |
 | cpu | layout:strided | int64 | 1x1024x64x256 | 3.969 | — | s64 | 0e+0 | — | — | — | — | 268.44 MB | 0 op | 3.114 ms | memory | 67.63 GB/s | 78.5 % | 786.77 kB | — | — | — |
 | cpu | layout:one_hot | int64 | 16384x1024 | 2.453 | — | s64 | 0e+0 | — | — | — | — | 134.28 MB | 0 op | 1.787 ms | memory | 54.74 GB/s | 72.8 % | 204.51 kB | — | — | — |
 | cpu | layout:gather_rows | int64 | 4096 of 4096x4096 | 3.486 | — | s64 | 0e+0 | — | — | — | — | 268.45 MB | 0 op | 3.115 ms | memory | 77.01 GB/s | 89.3 % | 794.42 kB | — | — | — |
@@ -4230,19 +4230,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:gated_relu_bwd_y | int32 | 16777216 | 3.143 | — | s32 | 0e+0 | — | — | — | — | 268.44 MB | 33.55 Mop | 2.885 ms | memory | 85.4 GB/s | 91.8 % | 88 B | — | — | — |
 | cpu | sum:whole | int32 | 4096x4096 | 0.669 | — | s8dp | 0e+0 | — | — | — | — | 67.11 MB | 16.78 Mop | 0.344 ms | memory | 100.28 GB/s | 51.4 % | 440 B | — | — | — |
 | cpu | sum:rows | int32 | 4096x4096 | 0.676 | — | s8dp | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 99.29 GB/s | 50.9 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | int32 | 4096x4096 | 0.913 | — | s8dp | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 71.47 GB/s | 37.7 % | 1.18 MB | — | — | — |
+| cpu | sum:cols | int32 | 4096x4096 | 0.861 | — | s8dp | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 71.47 GB/s | 40.0 % | 1.18 MB | — | — | — |
 | cpu | sumsq:rows | int32 | 4096x4096 | 0.664 | — | s8dp | 0e+0 | — | — | — | — | 67.14 MB | 33.55 Mop | 0.344 ms | memory | 101.19 GB/s | 51.9 % | 16.41 kB | — | — | — |
 | cpu | max:whole | int32 | 4096x4096 | 0.283 | — | s32 | 0e+0 | — | — | — | — | 67.11 MB | 16.78 Mop | 0.344 ms | memory | 237.22 GB/s | 121.7 % | 848 B | — | — | — |
 | cpu | max:rows | int32 | 4096x4096 | 0.307 | — | s32 | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 218.49 GB/s | 112 % | 16.41 kB | — | — | — |
-| cpu | max:cols | int32 | 4096x4096 | 0.462 | — | s32 | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 137.33 GB/s | 74.5 % | 802.86 kB | — | — | — |
+| cpu | max:cols | int32 | 4096x4096 | 0.413 | — | s32 | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 137.33 GB/s | 83.3 % | 802.86 kB | — | — | — |
 | cpu | min:rows | int32 | 4096x4096 | 0.290 | — | s32 | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 231.28 GB/s | 118.6 % | 16.41 kB | — | — | — |
 | cpu | argmax:rows | int32 | 4096x4096 | 0.290 | — | s32 index | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 231.68 GB/s | 118.8 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | int32 | 4096x4096 | 0.653 | — | s32 index | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 95.88 GB/s | 52.7 % | 1.59 MB | — | — | — |
+| cpu | argmax:cols | int32 | 4096x4096 | 0.517 | — | s32 index | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 95.88 GB/s | 66.5 % | 1.59 MB | — | — | — |
 | cpu | maprow:add | int32 | 4096x4096 | 1.651 | — | s32 | 0e+0 | — | — | — | — | 134.23 MB | 16.78 Mop | 1.379 ms | memory | 81.29 GB/s | 83.5 % | 393.3 kB | — | — | — |
 | cpu | maprow:mul | int32 | 4096x4096 | 1.683 | — | s32 | 0e+0 | — | — | — | — | 134.23 MB | 16.78 Mop | 1.379 ms | memory | 79.77 GB/s | 81.9 % | 376.92 kB | — | — | — |
 | cpu | transpose | int32 | 4096x4096 | 2.651 | — | s32 | 0e+0 | — | — | — | — | 134.22 MB | 0 op | 1.379 ms | memory | 50.64 GB/s | 52 % | 0 B | — | — | — |
 | cpu | gemv | int32 | 8192x8192 | 5.849 | — | s8dp | 0e+0 | — | — | — | — | 268.5 MB | 134.22 Mop | 2.835 ms | memory | 45.91 GB/s | 48.5 % | 65.58 kB | — | — | — |
-| cpu | gemv_t | int32 | 8192x8192 | 6.290 | — | s8dp | 0e+0 | — | — | — | — | 268.5 MB | 134.22 Mop | 2.835 ms | memory | 44.17 GB/s | 45.1 % | 1.27 MB | — | — | — |
+| cpu | gemv_t | int32 | 8192x8192 | 6.340 | — | s8dp | 0e+0 | — | — | — | — | 268.5 MB | 134.22 Mop | 2.835 ms | memory | 44.17 GB/s | 44.7 % | 1.27 MB | — | — | — |
 | cpu | layout:strided | int32 | 1x1024x64x256 | 1.834 | — | s32 | 0e+0 | — | — | — | — | 134.22 MB | 0 op | 1.379 ms | memory | 73.18 GB/s | 75.2 % | 377.17 kB | — | — | — |
 | cpu | layout:one_hot | int32 | 16384x1024 | 0.563 | — | s32 | 0e+0 | — | — | — | — | 67.17 MB | 0 op | 0.592 ms | memory | 119.23 GB/s | 105 % | 98.02 kB | — | — | — |
 | cpu | layout:gather_rows | int32 | 4096 of 4096x4096 | 1.442 | — | s32 | 0e+0 | — | — | — | — | 134.23 MB | 0 op | 1.379 ms | memory | 93.08 GB/s | 95.6 % | 401.2 kB | — | — | — |
@@ -4313,19 +4313,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:gated_relu_bwd_y | int16 | 16777216 | 1.287 | — | s16 | 0e+0 | — | — | — | — | 134.22 MB | 33.55 Mop | 1.157 ms | memory | 104.3 GB/s | 89.9 % | 88 B | — | — | — |
 | cpu | sum:whole | int16 | 4096x4096 | 0.158 | — | s8dp | 0e+0 | — | — | — | — | 33.55 MB | 16.78 Mop | 0.069 ms | memory | 212.24 GB/s | 43.7 % | 440 B | — | — | — |
 | cpu | sum:rows | int16 | 4096x4096 | 0.162 | — | s8dp | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 207.33 GB/s | 42.6 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | int16 | 4096x4096 | 0.329 | — | s8dp | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 90.41 GB/s | 21.0 % | 1.13 MB | — | — | — |
+| cpu | sum:cols | int16 | 4096x4096 | 0.250 | — | s8dp | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 90.41 GB/s | 27.6 % | 1.13 MB | — | — | — |
 | cpu | sumsq:rows | int16 | 4096x4096 | 0.163 | — | s8dp | 0e+0 | — | — | — | — | 33.59 MB | 33.55 Mop | 0.069 ms | memory | 205.55 GB/s | 42.3 % | 16.41 kB | — | — | — |
 | cpu | max:whole | int16 | 4096x4096 | 0.062 | — | s16 | 0e+0 | — | — | — | — | 33.55 MB | 16.78 Mop | 0.069 ms | memory | 537.73 GB/s | 110.7 % | 656 B | — | — | — |
 | cpu | max:rows | int16 | 4096x4096 | 0.068 | — | s16 | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 497.59 GB/s | 102.3 % | 8.22 kB | — | — | — |
-| cpu | max:cols | int16 | 4096x4096 | 0.252 | — | s16 | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 136.98 GB/s | 27.4 % | 794.67 kB | — | — | — |
+| cpu | max:cols | int16 | 4096x4096 | 0.090 | — | s16 | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 136.98 GB/s | 76.7 % | 794.67 kB | — | — | — |
 | cpu | min:rows | int16 | 4096x4096 | 0.069 | — | s16 | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 486.77 GB/s | 100.1 % | 8.22 kB | — | — | — |
 | cpu | argmax:rows | int16 | 4096x4096 | 0.072 | — | s32 index | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 463.91 GB/s | 95.4 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | int16 | 4096x4096 | 1.099 | — | s32 index | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 34.33 GB/s | 6.3 % | 2.38 MB | — | — | — |
+| cpu | argmax:cols | int16 | 4096x4096 | 0.963 | — | s32 index | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 34.33 GB/s | 7.2 % | 2.38 MB | — | — | — |
 | cpu | maprow:add | int16 | 4096x4096 | 0.274 | — | s16 | 0e+0 | — | — | — | — | 67.12 MB | 16.78 Mop | 0.296 ms | memory | 245.04 GB/s | 108 % | 196.7 kB | — | — | — |
 | cpu | maprow:mul | int16 | 4096x4096 | 0.270 | — | s16 | 0e+0 | — | — | — | — | 67.12 MB | 16.78 Mop | 0.296 ms | memory | 248.58 GB/s | 109.6 % | 180.31 kB | — | — | — |
 | cpu | transpose | int16 | 4096x4096 | 0.857 | — | s16 | 0e+0 | — | — | — | — | 67.11 MB | 0 op | 0.296 ms | memory | 78.35 GB/s | 34.5 % | 0 B | — | — | — |
 | cpu | gemv | int16 | 8192x8192 | 2.511 | — | s8dp | 0e+0 | — | — | — | — | 134.25 MB | 134.22 Mop | 1.269 ms | memory | 53.47 GB/s | 50.5 % | 65.58 kB | — | — | — |
-| cpu | gemv_t | int16 | 8192x8192 | 2.819 | — | s8dp | 0e+0 | — | — | — | — | 134.25 MB | 134.22 Mop | 1.269 ms | memory | 46.56 GB/s | 45.0 % | 1.25 MB | — | — | — |
+| cpu | gemv_t | int16 | 8192x8192 | 2.763 | — | s8dp | 0e+0 | — | — | — | — | 134.25 MB | 134.22 Mop | 1.269 ms | memory | 46.56 GB/s | 45.9 % | 1.25 MB | — | — | — |
 | cpu | layout:strided | int16 | 1x1024x64x256 | 1.056 | — | s16 | 0e+0 | — | — | — | — | 67.11 MB | 0 op | 0.296 ms | memory | 63.55 GB/s | 28 % | 377.17 kB | — | — | — |
 | cpu | layout:one_hot | int16 | 16384x1024 | 0.143 | — | s16 | 0e+0 | — | — | — | — | 33.62 MB | 0 op | 0.100 ms | memory | 235.76 GB/s | 70.3 % | 52.96 kB | — | — | — |
 | cpu | layout:gather_rows | int16 | 4096 of 4096x4096 | 0.284 | — | s16 | 0e+0 | — | — | — | — | 67.13 MB | 0 op | 0.296 ms | memory | 236.27 GB/s | 104.1 % | 196.4 kB | — | — | — |
@@ -4396,19 +4396,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:gated_relu_bwd_y | int8 | 16777216 | 0.251 | — | s8 | 0e+0 | — | — | — | — | 67.11 MB | 33.55 Mop | 0.258 ms | memory | 267.37 GB/s | 102.9 % | 88 B | — | — | — |
 | cpu | sum:whole | int8 | 4096x4096 | 0.061 | — | s8dp | 0e+0 | — | — | — | — | 16.78 MB | 16.78 Mop | 0.026 ms | memory | 276.4 GB/s | 42.8 % | 440 B | — | — | — |
 | cpu | sum:rows | int8 | 4096x4096 | 0.029 | — | s8dp | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 581.66 GB/s | 90 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | int8 | 4096x4096 | 0.146 | — | s8dp | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 70.1 GB/s | 17.8 % | 999.47 kB | — | — | — |
+| cpu | sum:cols | int8 | 4096x4096 | 0.095 | — | s8dp | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 70.1 GB/s | 27.4 % | 999.47 kB | — | — | — |
 | cpu | sumsq:rows | int8 | 4096x4096 | 0.029 | — | s8dp | 0e+0 | — | — | — | — | 16.81 MB | 33.55 Mop | 0.026 ms | memory | 577.66 GB/s | 89.3 % | 16.41 kB | — | — | — |
 | cpu | max:whole | int8 | 4096x4096 | 0.029 | — | s8 | 0e+0 | — | — | — | — | 16.78 MB | 16.78 Mop | 0.026 ms | memory | 588.67 GB/s | 91.2 % | 560 B | — | — | — |
 | cpu | max:rows | int8 | 4096x4096 | 0.043 | — | s8 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 387.33 GB/s | 59.9 % | 4.12 kB | — | — | — |
-| cpu | max:cols | int8 | 4096x4096 | 0.149 | — | s8 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 233.15 GB/s | 17.4 % | 397.36 kB | — | — | — |
+| cpu | max:cols | int8 | 4096x4096 | 0.039 | — | s8 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 233.15 GB/s | 66.7 % | 397.36 kB | — | — | — |
 | cpu | min:rows | int8 | 4096x4096 | 0.042 | — | s8 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 404.09 GB/s | 62.5 % | 4.12 kB | — | — | — |
 | cpu | argmax:rows | int8 | 4096x4096 | 0.046 | — | s32 index | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 364.64 GB/s | 56.4 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | int8 | 4096x4096 | 1.214 | — | s32 index | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 16.24 GB/s | 2.1 % | 1.98 MB | — | — | — |
+| cpu | argmax:cols | int8 | 4096x4096 | 1.061 | — | s32 index | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 16.24 GB/s | 2.5 % | 1.98 MB | — | — | — |
 | cpu | maprow:add | int8 | 4096x4096 | 0.074 | — | s8 | 0e+0 | — | — | — | — | 33.56 MB | 16.78 Mop | 0.055 ms | memory | 456.58 GB/s | 75 % | 69.72 kB | — | — | — |
 | cpu | maprow:mul | int8 | 4096x4096 | 0.089 | — | s8 | 0e+0 | — | — | — | — | 33.56 MB | 16.78 Mop | 0.055 ms | memory | 379.19 GB/s | 62.3 % | 86.1 kB | — | — | — |
 | cpu | transpose | int8 | 4096x4096 | 0.557 | — | s8 | 0e+0 | — | — | — | — | 33.55 MB | 0 op | 0.055 ms | memory | 60.26 GB/s | 9.9 % | 0 B | — | — | — |
 | cpu | gemv | int8 | 8192x8192 | 0.679 | — | s8dp | 0e+0 | — | — | — | — | 67.13 MB | 134.22 Mop | 0.344 ms | memory | 98.82 GB/s | 50.7 % | 65.58 kB | — | — | — |
-| cpu | gemv_t | int8 | 8192x8192 | 1.153 | — | s8dp | 0e+0 | — | — | — | — | 67.13 MB | 134.22 Mop | 0.344 ms | memory | 50.85 GB/s | 29.8 % | 1.27 MB | — | — | — |
+| cpu | gemv_t | int8 | 8192x8192 | 1.096 | — | s8dp | 0e+0 | — | — | — | — | 67.13 MB | 134.22 Mop | 0.344 ms | memory | 50.85 GB/s | 31.4 % | 1.27 MB | — | — | — |
 | cpu | layout:strided | int8 | 1x1024x64x256 | 0.436 | — | s8 | 0e+0 | — | — | — | — | 33.55 MB | 0 op | 0.055 ms | memory | 76.96 GB/s | 12.6 % | 328.02 kB | — | — | — |
 | cpu | layout:one_hot | int8 | 16384x1024 | 0.098 | — | s8 | 0e+0 | — | — | — | — | 16.84 MB | 0 op | 0.044 ms | memory | 171.86 GB/s | 45.4 % | 27.36 kB | — | — | — |
 | cpu | layout:gather_rows | int8 | 4096 of 4096x4096 | 0.099 | — | s8 | 0e+0 | — | — | — | — | 33.57 MB | 0 op | 0.055 ms | memory | 340.82 GB/s | 56 % | 98.1 kB | — | — | — |
@@ -4479,19 +4479,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:gated_relu_bwd_y | int4 | 16777216 | 0.152 | — | s8 | 0e+0 | — | — | — | — | 33.55 MB | 33.55 Mop | 0.052 ms | memory | 221.04 GB/s | 34.1 % | 88 B | — | — | — |
 | cpu | sum:whole | int4 | 4096x4096 | 0.032 | — | s8dp | 0e+0 | — | — | — | — | 8.39 MB | 16.78 Mop | 0.013 ms | memory | 263.79 GB/s | 41 % | 440 B | — | — | — |
 | cpu | sum:rows | int4 | 4096x4096 | 0.041 | — | s8dp | 0e+0 | — | — | — | — | 8.42 MB | 16.78 Mop | 0.013 ms | memory | 207.94 GB/s | 32.2 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | int4 | 4096x4096 | 0.261 | — | s8dp | 0e+0 | — | — | — | — | 8.42 MB | 16.78 Mop | 0.013 ms | memory | 33.05 GB/s | 5.0 % | 999.47 kB | — | — | — |
+| cpu | sum:cols | int4 | 4096x4096 | 0.098 | — | s8dp | 0e+0 | — | — | — | — | 8.42 MB | 16.78 Mop | 0.013 ms | memory | 33.05 GB/s | 13.3 % | 999.47 kB | — | — | — |
 | cpu | sumsq:rows | int4 | 4096x4096 | 0.041 | — | s8dp | 0e+0 | — | — | — | — | 8.42 MB | 33.55 Mop | 0.013 ms | memory | 203.41 GB/s | 31.5 % | 16.41 kB | — | — | — |
 | cpu | max:whole | int4 | 4096x4096 | 0.051 | — | s8 | 0e+0 | — | — | — | — | 8.39 MB | 16.78 Mop | 0.019 ms | s32 | 328.97 Gop/s | 36.4 % | 560 B | — | — | — |
 | cpu | max:rows | int4 | 4096x4096 | 0.051 | — | s8 | 0e+0 | — | — | — | — | 8.42 MB | 16.78 Mop | 0.019 ms | s32 | 328.97 Gop/s | 36.4 % | 4.12 kB | — | — | — |
-| cpu | max:cols | int4 | 4096x4096 | 0.102 | — | s8 | 0e+0 | — | — | — | — | 8.42 MB | 16.78 Mop | 0.019 ms | s32 | 189.36 Gop/s | 18.6 % | 495.66 kB | — | — | — |
+| cpu | max:cols | int4 | 4096x4096 | 0.053 | — | s8 | 0e+0 | — | — | — | — | 8.42 MB | 16.78 Mop | 0.019 ms | s32 | 189.36 Gop/s | 35.8 % | 495.66 kB | — | — | — |
 | cpu | min:rows | int4 | 4096x4096 | 0.050 | — | s8 | 0e+0 | — | — | — | — | 8.42 MB | 16.78 Mop | 0.019 ms | s32 | 335.54 Gop/s | 37.1 % | 4.12 kB | — | — | — |
 | cpu | argmax:rows | int4 | 4096x4096 | 0.077 | — | s32 index | 0e+0 | — | — | — | — | 8.42 MB | 16.78 Mop | 0.019 ms | s32 | 219.02 Gop/s | 24.2 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | int4 | 4096x4096 | 1.273 | — | s32 index | 0e+0 | — | — | — | — | 8.42 MB | 16.78 Mop | 0.019 ms | s32 | 16.51 Gop/s | 1.5 % | 2.08 MB | — | — | — |
+| cpu | argmax:cols | int4 | 4096x4096 | 1.106 | — | s32 index | 0e+0 | — | — | — | — | 8.42 MB | 16.78 Mop | 0.019 ms | s32 | 16.51 Gop/s | 1.7 % | 2.08 MB | — | — | — |
 | cpu | maprow:add | int4 | 4096x4096 | 0.105 | — | s8 | 0e+0 | — | — | — | — | 16.78 MB | 16.78 Mop | 0.022 ms | memory | 159.2 GB/s | 21.1 % | 196.7 kB | — | — | — |
 | cpu | maprow:mul | int4 | 4096x4096 | 0.133 | — | s8 | 0e+0 | — | — | — | — | 16.78 MB | 16.78 Mop | 0.022 ms | memory | 125.78 GB/s | 16.7 % | 57.43 kB | — | — | — |
 | cpu | transpose | int4 | 4096x4096 | 0.607 | — | s8 | 0e+0 | — | — | — | — | 16.78 MB | 0 op | 0.022 ms | memory | 27.66 GB/s | 3.7 % | 0 B | — | — | — |
 | cpu | gemv | int4 | 8192x8192 | 0.229 | — | s8dp | 0e+0 | — | — | — | — | 33.56 MB | 134.22 Mop | 0.069 ms | memory | 146.82 GB/s | 30.2 % | 49.15 kB | — | — | — |
-| cpu | gemv_t | int4 | 8192x8192 | 0.558 | — | s8dp | 0e+0 | — | — | — | — | 33.56 MB | 134.22 Mop | 0.069 ms | memory | 40.84 GB/s | 12.4 % | 1.24 MB | — | — | — |
+| cpu | gemv_t | int4 | 8192x8192 | 0.500 | — | s8dp | 0e+0 | — | — | — | — | 33.56 MB | 134.22 Mop | 0.069 ms | memory | 40.84 GB/s | 13.8 % | 1.24 MB | — | — | — |
 | cpu | layout:strided | int4 | 1x1024x64x256 | 0.586 | — | s8 | 0e+0 | — | — | — | — | 16.78 MB | 0 op | 0.022 ms | memory | 28.63 GB/s | 3.8 % | 2.2 MB | — | — | — |
 | cpu | layout:one_hot | int4 | 16384x1024 | 0.090 | — | s8 | 0e+0 | — | — | — | — | 8.45 MB | 0 op | 0.020 ms | memory | 94.46 GB/s | 22.5 % | 1.22 MB | — | — | — |
 | cpu | layout:gather_rows | int4 | 4096 of 4096x4096 | 0.064 | — | s8 | 0e+0 | — | — | — | — | 16.79 MB | 0 op | 0.022 ms | memory | 262.4 GB/s | 34.7 % | 915.98 kB | — | — | — |
@@ -4562,19 +4562,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:gated_relu_bwd_y | int2 | 16777216 | 0.230 | — | s8 | 0e+0 | — | — | — | — | 16.78 MB | 33.55 Mop | 0.037 ms | s32 | 145.83 Gop/s | 16.1 % | 88 B | — | — | — |
 | cpu | sum:whole | int2 | 4096x4096 | 0.053 | — | s8dp | 0e+0 | — | — | — | — | 4.19 MB | 16.78 Mop | 0.005 ms | memory | 79.74 GB/s | 9.4 % | 440 B | — | — | — |
 | cpu | sum:rows | int2 | 4096x4096 | 0.057 | — | s8dp | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.005 ms | memory | 74.03 GB/s | 8.6 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | int2 | 4096x4096 | 0.205 | — | s8dp | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.005 ms | memory | 16.86 GB/s | 2.4 % | 1.18 MB | — | — | — |
+| cpu | sum:cols | int2 | 4096x4096 | 0.115 | — | s8dp | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.005 ms | memory | 16.86 GB/s | 4.3 % | 1.18 MB | — | — | — |
 | cpu | sumsq:rows | int2 | 4096x4096 | 0.059 | — | s8dp | 0e+0 | — | — | — | — | 4.23 MB | 33.55 Mop | 0.007 ms | s8dp | 567.76 Gop/s | 11.4 % | 16.41 kB | — | — | — |
 | cpu | max:whole | int2 | 4096x4096 | 0.080 | — | s8 | 0e+0 | — | — | — | — | 4.19 MB | 16.78 Mop | 0.019 ms | s32 | 208.67 Gop/s | 23.1 % | 560 B | — | — | — |
 | cpu | max:rows | int2 | 4096x4096 | 0.080 | — | s8 | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.019 ms | s32 | 209.19 Gop/s | 23.1 % | 4.12 kB | — | — | — |
-| cpu | max:cols | int2 | 4096x4096 | 0.113 | — | s8 | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.019 ms | s32 | 90.98 Gop/s | 16.8 % | 491.57 kB | — | — | — |
+| cpu | max:cols | int2 | 4096x4096 | 0.078 | — | s8 | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.019 ms | s32 | 90.98 Gop/s | 24.4 % | 491.57 kB | — | — | — |
 | cpu | min:rows | int2 | 4096x4096 | 0.080 | — | s8 | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.019 ms | s32 | 209.98 Gop/s | 23.2 % | 4.12 kB | — | — | — |
 | cpu | argmax:rows | int2 | 4096x4096 | 0.133 | — | s32 index | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.019 ms | s32 | 125.77 Gop/s | 13.9 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | int2 | 4096x4096 | 0.729 | — | s32 index | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.019 ms | s32 | 29.69 Gop/s | 2.6 % | 2.07 MB | — | — | — |
+| cpu | argmax:cols | int2 | 4096x4096 | 0.570 | — | s32 index | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.019 ms | s32 | 29.69 Gop/s | 3.3 % | 2.07 MB | — | — | — |
 | cpu | maprow:add | int2 | 4096x4096 | 0.155 | — | s8 | 0e+0 | — | — | — | — | 8.39 MB | 16.78 Mop | 0.019 ms | s32 | 108.38 Gop/s | 12 % | 102.49 kB | — | — | — |
 | cpu | maprow:mul | int2 | 4096x4096 | 0.155 | — | s8 | 0e+0 | — | — | — | — | 8.39 MB | 16.78 Mop | 0.019 ms | s32 | 108.17 Gop/s | 12 % | 151.64 kB | — | — | — |
 | cpu | transpose | int2 | 4096x4096 | 2.628 | — | s8 | 0e+0 | — | — | — | — | 8.39 MB | 0 op | 0.011 ms | memory | 3.19 GB/s | 0.4 % | 0 B | — | — | — |
 | cpu | gemv | int2 | 8192x8192 | 0.315 | — | s8dp | 0e+0 | — | — | — | — | 16.78 MB | 134.22 Mop | 0.027 ms | s8dp | 426.49 Gop/s | 8.5 % | 49.15 kB | — | — | — |
-| cpu | gemv_t | int2 | 8192x8192 | 0.512 | — | s8dp | 0e+0 | — | — | — | — | 16.78 MB | 134.22 Mop | 0.027 ms | s8dp | 173.65 Gop/s | 5.3 % | 1.25 MB | — | — | — |
+| cpu | gemv_t | int2 | 8192x8192 | 0.417 | — | s8dp | 0e+0 | — | — | — | — | 16.78 MB | 134.22 Mop | 0.027 ms | s8dp | 173.65 Gop/s | 6.5 % | 1.25 MB | — | — | — |
 | cpu | layout:strided | int2 | 1x1024x64x256 | 1.412 | — | s8 | 0e+0 | — | — | — | — | 8.39 MB | 0 op | 0.011 ms | memory | 5.94 GB/s | 0.8 % | 2.2 MB | — | — | — |
 | cpu | layout:one_hot | int2 | 16384x1024 | 0.122 | — | s8 | 0e+0 | — | — | — | — | 4.26 MB | 0 op | 0.009 ms | memory | 35.03 GB/s | 7.4 % | 1.62 MB | — | — | — |
 | cpu | layout:gather_rows | int2 | 4096 of 4096x4096 | 0.098 | — | s8 | 0e+0 | — | — | — | — | 8.4 MB | 0 op | 0.010 ms | memory | 85.42 GB/s | 10.3 % | 1.89 MB | — | — | — |
@@ -4645,19 +4645,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:gated_relu_bwd_y | uint64 | 16777216 | 6.958 | — | u64 | 0e+0 | — | — | — | — | 536.87 MB | 33.55 Mop | 6.448 ms | memory | 77.16 GB/s | 92.7 % | 88 B | — | — | — |
 | cpu | sum:whole | uint64 | 4096x4096 | 2.461 | — | u8dp | 0e+0 | — | — | — | — | 134.22 MB | 16.78 Mop | 1.269 ms | memory | 54.54 GB/s | 51.6 % | 440 B | — | — | — |
 | cpu | sum:rows | uint64 | 4096x4096 | 2.464 | — | u8dp | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 54.48 GB/s | 51.5 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | uint64 | 4096x4096 | 2.663 | — | u8dp | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 49.7 GB/s | 47.7 % | 1.18 MB | — | — | — |
+| cpu | sum:cols | uint64 | 4096x4096 | 2.677 | — | u8dp | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 49.7 GB/s | 47.4 % | 1.18 MB | — | — | — |
 | cpu | sumsq:rows | uint64 | 4096x4096 | 2.475 | — | u8dp | 0e+0 | — | — | — | — | 134.25 MB | 33.55 Mop | 1.269 ms | memory | 54.24 GB/s | 51.3 % | 16.41 kB | — | — | — |
 | cpu | max:whole | uint64 | 4096x4096 | 1.232 | — | u64 | 0e+0 | — | — | — | — | 134.22 MB | 16.78 Mop | 1.269 ms | memory | 108.93 GB/s | 103 % | 1.23 kB | — | — | — |
 | cpu | max:rows | uint64 | 4096x4096 | 1.254 | — | u64 | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 107.09 GB/s | 101.2 % | 32.79 kB | — | — | — |
-| cpu | max:cols | uint64 | 4096x4096 | 1.466 | — | u64 | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 91.33 GB/s | 86.6 % | 819.25 kB | — | — | — |
+| cpu | max:cols | uint64 | 4096x4096 | 1.341 | — | u64 | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 91.33 GB/s | 94.6 % | 819.25 kB | — | — | — |
 | cpu | min:rows | uint64 | 4096x4096 | 1.242 | — | u64 | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 108.08 GB/s | 102.2 % | 32.79 kB | — | — | — |
 | cpu | argmax:rows | uint64 | 4096x4096 | 1.243 | — | s32 index | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 108.01 GB/s | 102.1 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | uint64 | 4096x4096 | 1.472 | — | s32 index | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 91.97 GB/s | 86.2 % | 1.2 MB | — | — | — |
+| cpu | argmax:cols | uint64 | 4096x4096 | 1.373 | — | s32 index | 0e+0 | — | — | — | — | 134.25 MB | 16.78 Mop | 1.269 ms | memory | 91.97 GB/s | 92.4 % | 1.2 MB | — | — | — |
 | cpu | maprow:add | uint64 | 4096x4096 | 4.660 | — | u64 | 0e+0 | — | — | — | — | 268.47 MB | 16.78 Mop | 3.115 ms | memory | 57.61 GB/s | 66.8 % | 786.52 kB | — | — | — |
 | cpu | maprow:mul | uint64 | 4096x4096 | 4.617 | — | u64 | 0e+0 | — | — | — | — | 268.47 MB | 16.78 Mop | 3.115 ms | memory | 58.15 GB/s | 67.5 % | 753.75 kB | — | — | — |
 | cpu | transpose | uint64 | 4096x4096 | 6.253 | — | u64 | 0e+0 | — | — | — | — | 268.44 MB | 0 op | 3.114 ms | memory | 42.93 GB/s | 49.8 % | 0 B | — | — | — |
 | cpu | gemv | uint64 | 8192x8192 | 12.429 | — | u8dp | 0e+0 | — | — | — | — | 537 MB | 134.22 Mop | 6.197 ms | memory | 43.2 GB/s | 49.9 % | 65.58 kB | — | — | — |
-| cpu | gemv_t | uint64 | 8192x8192 | 15.121 | — | u8dp | 0e+0 | — | — | — | — | 537 MB | 134.22 Mop | 6.197 ms | memory | 40.52 GB/s | 41.0 % | 1.27 MB | — | — | — |
+| cpu | gemv_t | uint64 | 8192x8192 | 13.179 | — | u8dp | 0e+0 | — | — | — | — | 537 MB | 134.22 Mop | 6.197 ms | memory | 40.52 GB/s | 47.0 % | 1.27 MB | — | — | — |
 | cpu | layout:strided | uint64 | 1x1024x64x256 | 3.987 | — | u64 | 0e+0 | — | — | — | — | 268.44 MB | 0 op | 3.114 ms | memory | 67.33 GB/s | 78.1 % | 786.77 kB | — | — | — |
 | cpu | layout:one_hot | uint64 | 16384x1024 | 2.384 | — | u64 | 0e+0 | — | — | — | — | 134.28 MB | 0 op | 1.787 ms | memory | 56.34 GB/s | 75 % | 204.51 kB | — | — | — |
 | cpu | layout:gather_rows | uint64 | 4096 of 4096x4096 | 3.501 | — | u64 | 0e+0 | — | — | — | — | 268.45 MB | 0 op | 3.115 ms | memory | 76.68 GB/s | 89 % | 761.65 kB | — | — | — |
@@ -4728,19 +4728,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:gated_relu_bwd_y | uint32 | 16777216 | 3.150 | — | u32 | 0e+0 | — | — | — | — | 268.44 MB | 33.55 Mop | 2.885 ms | memory | 85.23 GB/s | 91.6 % | 88 B | — | — | — |
 | cpu | sum:whole | uint32 | 4096x4096 | 0.669 | — | u8dp | 0e+0 | — | — | — | — | 67.11 MB | 16.78 Mop | 0.344 ms | memory | 100.33 GB/s | 51.5 % | 440 B | — | — | — |
 | cpu | sum:rows | uint32 | 4096x4096 | 0.674 | — | u8dp | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 99.56 GB/s | 51.1 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | uint32 | 4096x4096 | 0.919 | — | u8dp | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 73.79 GB/s | 37.4 % | 1.17 MB | — | — | — |
+| cpu | sum:cols | uint32 | 4096x4096 | 0.850 | — | u8dp | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 73.79 GB/s | 40.5 % | 1.17 MB | — | — | — |
 | cpu | sumsq:rows | uint32 | 4096x4096 | 0.669 | — | u8dp | 0e+0 | — | — | — | — | 67.14 MB | 33.55 Mop | 0.344 ms | memory | 100.42 GB/s | 51.5 % | 16.41 kB | — | — | — |
 | cpu | max:whole | uint32 | 4096x4096 | 0.287 | — | u32 | 0e+0 | — | — | — | — | 67.11 MB | 16.78 Mop | 0.344 ms | memory | 233.91 GB/s | 120 % | 848 B | — | — | — |
 | cpu | max:rows | uint32 | 4096x4096 | 0.305 | — | u32 | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 220.28 GB/s | 113 % | 16.41 kB | — | — | — |
-| cpu | max:cols | uint32 | 4096x4096 | 0.468 | — | u32 | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 139.94 GB/s | 73.5 % | 802.86 kB | — | — | — |
+| cpu | max:cols | uint32 | 4096x4096 | 0.409 | — | u32 | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 139.94 GB/s | 84.1 % | 802.86 kB | — | — | — |
 | cpu | min:rows | uint32 | 4096x4096 | 0.289 | — | u32 | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 232.65 GB/s | 119.3 % | 16.41 kB | — | — | — |
 | cpu | argmax:rows | uint32 | 4096x4096 | 0.295 | — | s32 index | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 227.6 GB/s | 116.7 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | uint32 | 4096x4096 | 0.649 | — | s32 index | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 100.42 GB/s | 53.0 % | 1.59 MB | — | — | — |
+| cpu | argmax:cols | uint32 | 4096x4096 | 0.523 | — | s32 index | 0e+0 | — | — | — | — | 67.14 MB | 16.78 Mop | 0.344 ms | memory | 100.42 GB/s | 65.8 % | 1.59 MB | — | — | — |
 | cpu | maprow:add | uint32 | 4096x4096 | 1.646 | — | u32 | 0e+0 | — | — | — | — | 134.23 MB | 16.78 Mop | 1.379 ms | memory | 81.56 GB/s | 83.8 % | 393.3 kB | — | — | — |
 | cpu | maprow:mul | uint32 | 4096x4096 | 1.625 | — | u32 | 0e+0 | — | — | — | — | 134.23 MB | 16.78 Mop | 1.379 ms | memory | 82.62 GB/s | 84.9 % | 393.3 kB | — | — | — |
 | cpu | transpose | uint32 | 4096x4096 | 3.013 | — | u32 | 0e+0 | — | — | — | — | 134.22 MB | 0 op | 1.379 ms | memory | 44.55 GB/s | 45.8 % | 0 B | — | — | — |
 | cpu | gemv | uint32 | 8192x8192 | 5.786 | — | u8dp | 0e+0 | — | — | — | — | 268.5 MB | 134.22 Mop | 2.835 ms | memory | 46.41 GB/s | 49 % | 65.58 kB | — | — | — |
-| cpu | gemv_t | uint32 | 8192x8192 | 6.137 | — | u8dp | 0e+0 | — | — | — | — | 268.5 MB | 134.22 Mop | 2.835 ms | memory | 43.82 GB/s | 46.2 % | 1.27 MB | — | — | — |
+| cpu | gemv_t | uint32 | 8192x8192 | 6.512 | — | u8dp | 0e+0 | — | — | — | — | 268.5 MB | 134.22 Mop | 2.835 ms | memory | 43.82 GB/s | 43.5 % | 1.27 MB | — | — | — |
 | cpu | layout:strided | uint32 | 1x1024x64x256 | 1.841 | — | u32 | 0e+0 | — | — | — | — | 134.22 MB | 0 op | 1.379 ms | memory | 72.92 GB/s | 74.9 % | 377.17 kB | — | — | — |
 | cpu | layout:one_hot | uint32 | 16384x1024 | 0.543 | — | u32 | 0e+0 | — | — | — | — | 67.17 MB | 0 op | 0.592 ms | memory | 123.76 GB/s | 109 % | 106.21 kB | — | — | — |
 | cpu | layout:gather_rows | uint32 | 4096 of 4096x4096 | 1.440 | — | u32 | 0e+0 | — | — | — | — | 134.23 MB | 0 op | 1.379 ms | memory | 93.23 GB/s | 95.8 % | 384.82 kB | — | — | — |
@@ -4811,19 +4811,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:gated_relu_bwd_y | uint16 | 16777216 | 1.271 | — | u16 | 0e+0 | — | — | — | — | 134.22 MB | 33.55 Mop | 1.157 ms | memory | 105.63 GB/s | 91 % | 88 B | — | — | — |
 | cpu | sum:whole | uint16 | 4096x4096 | 0.164 | — | u8dp | 0e+0 | — | — | — | — | 33.55 MB | 16.78 Mop | 0.069 ms | memory | 205.1 GB/s | 42.2 % | 440 B | — | — | — |
 | cpu | sum:rows | uint16 | 4096x4096 | 0.157 | — | u8dp | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 213.8 GB/s | 44 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | uint16 | 4096x4096 | 0.332 | — | u8dp | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 94.88 GB/s | 20.8 % | 1.18 MB | — | — | — |
+| cpu | sum:cols | uint16 | 4096x4096 | 0.257 | — | u8dp | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 94.88 GB/s | 26.8 % | 1.18 MB | — | — | — |
 | cpu | sumsq:rows | uint16 | 4096x4096 | 0.160 | — | u8dp | 0e+0 | — | — | — | — | 33.59 MB | 33.55 Mop | 0.069 ms | memory | 210.18 GB/s | 43.2 % | 16.41 kB | — | — | — |
 | cpu | max:whole | uint16 | 4096x4096 | 0.062 | — | u16 | 0e+0 | — | — | — | — | 33.55 MB | 16.78 Mop | 0.069 ms | memory | 539.46 GB/s | 111.1 % | 656 B | — | — | — |
 | cpu | max:rows | uint16 | 4096x4096 | 0.066 | — | u16 | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 510.44 GB/s | 105 % | 8.22 kB | — | — | — |
-| cpu | max:cols | uint16 | 4096x4096 | 0.238 | — | u16 | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 236.7 GB/s | 29.0 % | 794.67 kB | — | — | — |
+| cpu | max:cols | uint16 | 4096x4096 | 0.091 | — | u16 | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 236.7 GB/s | 75.8 % | 794.67 kB | — | — | — |
 | cpu | min:rows | uint16 | 4096x4096 | 0.068 | — | u16 | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 491.04 GB/s | 101 % | 8.22 kB | — | — | — |
 | cpu | argmax:rows | uint16 | 4096x4096 | 0.072 | — | s32 index | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 469.09 GB/s | 96.5 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | uint16 | 4096x4096 | 1.053 | — | s32 index | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 38.12 GB/s | 6.6 % | 2.38 MB | — | — | — |
+| cpu | argmax:cols | uint16 | 4096x4096 | 0.921 | — | s32 index | 0e+0 | — | — | — | — | 33.59 MB | 16.78 Mop | 0.069 ms | memory | 38.12 GB/s | 7.5 % | 2.38 MB | — | — | — |
 | cpu | maprow:add | uint16 | 4096x4096 | 0.275 | — | u16 | 0e+0 | — | — | — | — | 67.12 MB | 16.78 Mop | 0.296 ms | memory | 243.71 GB/s | 107.4 % | 196.7 kB | — | — | — |
 | cpu | maprow:mul | uint16 | 4096x4096 | 0.275 | — | u16 | 0e+0 | — | — | — | — | 67.12 MB | 16.78 Mop | 0.296 ms | memory | 243.8 GB/s | 107.5 % | 196.7 kB | — | — | — |
 | cpu | transpose | uint16 | 4096x4096 | 0.826 | — | u16 | 0e+0 | — | — | — | — | 67.11 MB | 0 op | 0.296 ms | memory | 81.28 GB/s | 35.8 % | 0 B | — | — | — |
 | cpu | gemv | uint16 | 8192x8192 | 2.462 | — | u8dp | 0e+0 | — | — | — | — | 134.25 MB | 134.22 Mop | 1.269 ms | memory | 54.53 GB/s | 51.5 % | 65.58 kB | — | — | — |
-| cpu | gemv_t | uint16 | 8192x8192 | 2.836 | — | u8dp | 0e+0 | — | — | — | — | 134.25 MB | 134.22 Mop | 1.269 ms | memory | 46.64 GB/s | 44.7 % | 1.27 MB | — | — | — |
+| cpu | gemv_t | uint16 | 8192x8192 | 2.752 | — | u8dp | 0e+0 | — | — | — | — | 134.25 MB | 134.22 Mop | 1.269 ms | memory | 46.64 GB/s | 46.1 % | 1.27 MB | — | — | — |
 | cpu | layout:strided | uint16 | 1x1024x64x256 | 0.991 | — | u16 | 0e+0 | — | — | — | — | 67.11 MB | 0 op | 0.296 ms | memory | 67.69 GB/s | 29.8 % | 393.55 kB | — | — | — |
 | cpu | layout:one_hot | uint16 | 16384x1024 | 0.130 | — | u16 | 0e+0 | — | — | — | — | 33.62 MB | 0 op | 0.100 ms | memory | 259.61 GB/s | 77.4 % | 32.48 kB | — | — | — |
 | cpu | layout:gather_rows | uint16 | 4096 of 4096x4096 | 0.286 | — | u16 | 0e+0 | — | — | — | — | 67.13 MB | 0 op | 0.296 ms | memory | 234.54 GB/s | 103.4 % | 204.59 kB | — | — | — |
@@ -4894,19 +4894,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:gated_relu_bwd_y | uint8 | 16777216 | 0.228 | — | u8 | 0e+0 | — | — | — | — | 67.11 MB | 33.55 Mop | 0.258 ms | memory | 294.08 GB/s | 113.2 % | 88 B | — | — | — |
 | cpu | sum:whole | uint8 | 4096x4096 | 0.027 | — | u8dp | 0e+0 | — | — | — | — | 16.78 MB | 16.78 Mop | 0.026 ms | memory | 623.69 GB/s | 96.7 % | 440 B | — | — | — |
 | cpu | sum:rows | uint8 | 4096x4096 | 0.028 | — | u8dp | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 600.36 GB/s | 92.9 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | uint8 | 4096x4096 | 0.151 | — | u8dp | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 71.08 GB/s | 17.2 % | 1.18 MB | — | — | — |
+| cpu | sum:cols | uint8 | 4096x4096 | 0.108 | — | u8dp | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 71.08 GB/s | 24.1 % | 1.18 MB | — | — | — |
 | cpu | sumsq:rows | uint8 | 4096x4096 | 0.028 | — | u8dp | 0e+0 | — | — | — | — | 16.81 MB | 33.55 Mop | 0.026 ms | memory | 604.68 GB/s | 93.5 % | 16.41 kB | — | — | — |
 | cpu | max:whole | uint8 | 4096x4096 | 0.029 | — | u8 | 0e+0 | — | — | — | — | 16.78 MB | 16.78 Mop | 0.026 ms | memory | 588.67 GB/s | 91.2 % | 560 B | — | — | — |
 | cpu | max:rows | uint8 | 4096x4096 | 0.041 | — | u8 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 415.06 GB/s | 64.2 % | 4.12 kB | — | — | — |
-| cpu | max:cols | uint8 | 4096x4096 | 0.146 | — | u8 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 266.4 GB/s | 17.8 % | 397.36 kB | — | — | — |
+| cpu | max:cols | uint8 | 4096x4096 | 0.038 | — | u8 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 266.4 GB/s | 68.4 % | 397.36 kB | — | — | — |
 | cpu | min:rows | uint8 | 4096x4096 | 0.041 | — | u8 | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 411 GB/s | 63.6 % | 4.12 kB | — | — | — |
 | cpu | argmax:rows | uint8 | 4096x4096 | 0.042 | — | s32 index | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 396.46 GB/s | 61.3 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | uint8 | 4096x4096 | 1.026 | — | s32 index | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 19.76 GB/s | 2.5 % | 1.98 MB | — | — | — |
+| cpu | argmax:cols | uint8 | 4096x4096 | 0.858 | — | s32 index | 0e+0 | — | — | — | — | 16.81 MB | 16.78 Mop | 0.026 ms | memory | 19.76 GB/s | 3.0 % | 1.98 MB | — | — | — |
 | cpu | maprow:add | uint8 | 4096x4096 | 0.077 | — | u8 | 0e+0 | — | — | — | — | 33.56 MB | 16.78 Mop | 0.055 ms | memory | 434.7 GB/s | 71.4 % | 49.24 kB | — | — | — |
 | cpu | maprow:mul | uint8 | 4096x4096 | 0.082 | — | u8 | 0e+0 | — | — | — | — | 33.56 MB | 16.78 Mop | 0.055 ms | memory | 407.26 GB/s | 66.9 % | 12.38 kB | — | — | — |
 | cpu | transpose | uint8 | 4096x4096 | 0.502 | — | u8 | 0e+0 | — | — | — | — | 33.55 MB | 0 op | 0.055 ms | memory | 66.88 GB/s | 11 % | 0 B | — | — | — |
 | cpu | gemv | uint8 | 8192x8192 | 0.681 | — | u8dp | 0e+0 | — | — | — | — | 67.13 MB | 134.22 Mop | 0.344 ms | memory | 98.63 GB/s | 50.6 % | 65.58 kB | — | — | — |
-| cpu | gemv_t | uint8 | 8192x8192 | 1.167 | — | u8dp | 0e+0 | — | — | — | — | 67.13 MB | 134.22 Mop | 0.344 ms | memory | 50.99 GB/s | 29.5 % | 1.27 MB | — | — | — |
+| cpu | gemv_t | uint8 | 8192x8192 | 1.121 | — | u8dp | 0e+0 | — | — | — | — | 67.13 MB | 134.22 Mop | 0.344 ms | memory | 50.99 GB/s | 30.7 % | 1.27 MB | — | — | — |
 | cpu | layout:strided | uint8 | 1x1024x64x256 | 0.429 | — | u8 | 0e+0 | — | — | — | — | 33.55 MB | 0 op | 0.055 ms | memory | 78.18 GB/s | 12.8 % | 377.17 kB | — | — | — |
 | cpu | layout:one_hot | uint8 | 16384x1024 | 0.101 | — | u8 | 0e+0 | — | — | — | — | 16.84 MB | 0 op | 0.044 ms | memory | 167.42 GB/s | 44.2 % | 29.41 kB | — | — | — |
 | cpu | layout:gather_rows | uint8 | 4096 of 4096x4096 | 0.097 | — | u8 | 0e+0 | — | — | — | — | 33.57 MB | 0 op | 0.055 ms | memory | 345.02 GB/s | 56.7 % | 73.52 kB | — | — | — |
@@ -4980,19 +4980,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:gated_relu_bwd_y | uint2 | 16777216 | 0.201 | — | u8 | 0e+0 | — | — | — | — | 16.78 MB | 33.55 Mop | 0.037 ms | s32 | 167.02 Gop/s | 18.5 % | 88 B | — | — | — |
 | cpu | sum:whole | uint2 | 4096x4096 | 0.057 | — | u8dp | 0e+0 | — | — | — | — | 4.19 MB | 16.78 Mop | 0.005 ms | memory | 73.84 GB/s | 8.7 % | 440 B | — | — | — |
 | cpu | sum:rows | uint2 | 4096x4096 | 0.059 | — | u8dp | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.005 ms | memory | 72.13 GB/s | 8.4 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | uint2 | 4096x4096 | 0.218 | — | u8dp | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.005 ms | memory | 18.1 GB/s | 2.3 % | 1.17 MB | — | — | — |
+| cpu | sum:cols | uint2 | 4096x4096 | 0.108 | — | u8dp | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.005 ms | memory | 18.1 GB/s | 4.6 % | 1.17 MB | — | — | — |
 | cpu | sumsq:rows | uint2 | 4096x4096 | 0.057 | — | u8dp | 0e+0 | — | — | — | — | 4.23 MB | 33.55 Mop | 0.008 ms | u8dp | 586.62 Gop/s | 14 % | 16.41 kB | — | — | — |
 | cpu | max:whole | uint2 | 4096x4096 | 0.068 | — | u8 | 0e+0 | — | — | — | — | 4.19 MB | 16.78 Mop | 0.019 ms | s32 | 245.64 Gop/s | 27.2 % | 560 B | — | — | — |
 | cpu | max:rows | uint2 | 4096x4096 | 0.068 | — | u8 | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.019 ms | s32 | 245.28 Gop/s | 27.1 % | 4.12 kB | — | — | — |
-| cpu | max:cols | uint2 | 4096x4096 | 0.123 | — | u8 | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.019 ms | s32 | 135.3 Gop/s | 15.4 % | 495.66 kB | — | — | — |
+| cpu | max:cols | uint2 | 4096x4096 | 0.068 | — | u8 | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.019 ms | s32 | 135.3 Gop/s | 27.9 % | 495.66 kB | — | — | — |
 | cpu | min:rows | uint2 | 4096x4096 | 0.069 | — | u8 | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.019 ms | s32 | 244.57 Gop/s | 27 % | 4.12 kB | — | — | — |
 | cpu | argmax:rows | uint2 | 4096x4096 | 0.111 | — | s32 index | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.019 ms | s32 | 150.74 Gop/s | 16.7 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | uint2 | 4096x4096 | 0.704 | — | s32 index | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.019 ms | s32 | 29.57 Gop/s | 2.7 % | 2.08 MB | — | — | — |
+| cpu | argmax:cols | uint2 | 4096x4096 | 0.534 | — | s32 index | 0e+0 | — | — | — | — | 4.23 MB | 16.78 Mop | 0.019 ms | s32 | 29.57 Gop/s | 3.6 % | 2.08 MB | — | — | — |
 | cpu | maprow:add | uint2 | 4096x4096 | 0.139 | — | u8 | 0e+0 | — | — | — | — | 8.39 MB | 16.78 Mop | 0.019 ms | s32 | 121.14 Gop/s | 13.4 % | 131.16 kB | — | — | — |
 | cpu | maprow:mul | uint2 | 4096x4096 | 0.153 | — | u8 | 0e+0 | — | — | — | — | 8.39 MB | 16.78 Mop | 0.019 ms | s32 | 109.87 Gop/s | 12.1 % | 65.62 kB | — | — | — |
 | cpu | transpose | uint2 | 4096x4096 | 2.577 | — | u8 | 0e+0 | — | — | — | — | 8.39 MB | 0 op | 0.011 ms | memory | 3.26 GB/s | 0.4 % | 0 B | — | — | — |
 | cpu | gemv | uint2 | 8192x8192 | 0.268 | — | u8dp | 0e+0 | — | — | — | — | 16.78 MB | 134.22 Mop | 0.032 ms | u8dp | 500.63 Gop/s | 12 % | 49.15 kB | — | — | — |
-| cpu | gemv_t | uint2 | 8192x8192 | 0.482 | — | u8dp | 0e+0 | — | — | — | — | 16.78 MB | 134.22 Mop | 0.032 ms | u8dp | 176.65 Gop/s | 6.6 % | 1.25 MB | — | — | — |
+| cpu | gemv_t | uint2 | 8192x8192 | 0.392 | — | u8dp | 0e+0 | — | — | — | — | 16.78 MB | 134.22 Mop | 0.032 ms | u8dp | 176.65 Gop/s | 8.2 % | 1.25 MB | — | — | — |
 | cpu | layout:strided | uint2 | 1x1024x64x256 | 1.253 | — | u8 | 0e+0 | — | — | — | — | 8.39 MB | 0 op | 0.011 ms | memory | 6.7 GB/s | 0.9 % | 2.2 MB | — | — | — |
 | cpu | layout:one_hot | uint2 | 16384x1024 | 0.095 | — | u8 | 0e+0 | — | — | — | — | 4.26 MB | 0 op | 0.009 ms | memory | 44.94 GB/s | 9.5 % | 1.02 MB | — | — | — |
 | cpu | layout:gather_rows | uint2 | 4096 of 4096x4096 | 0.084 | — | u8 | 0e+0 | — | — | — | — | 8.4 MB | 0 op | 0.010 ms | memory | 100.54 GB/s | 12.1 % | 1.54 MB | — | — | — |
@@ -5108,19 +5108,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:clip_factor | q8_0 | 16777216 | 3.654 | — | f32 | 3.94e-3 | — | — | — | — | 35.65 MB | 67.11 Mop | 0.059 ms | memory | 9.76 GB/s | 1.6 % | 88 B | — | — | — |
 | cpu | sum:whole | q8_0 | 4096x4096 | 0.306 | — | f32 | 7.78e-4 | — | — | — | — | 17.83 MB | 16.78 Mop | 0.028 ms | memory | 58.27 GB/s | 9 % | 440 B | — | — | — |
 | cpu | sum:rows | q8_0 | 4096x4096 | 0.310 | — | f32 | 7.63e-6 | — | — | — | — | 17.86 MB | 16.78 Mop | 0.028 ms | memory | 57.53 GB/s | 8.9 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | q8_0 | 4096x4096 | 0.469 | — | f32 | 4.2e-5 | — | — | — | — | 17.86 MB | 16.78 Mop | 0.028 ms | memory | 33.38 GB/s | 6.0 % | 1.2 MB | — | — | — |
+| cpu | sum:cols | q8_0 | 4096x4096 | 0.393 | — | f32 | 4.2e-5 | — | — | — | — | 17.86 MB | 16.78 Mop | 0.028 ms | memory | 33.38 GB/s | 7.1 % | 1.2 MB | — | — | — |
 | cpu | sumsq:rows | q8_0 | 4096x4096 | 0.308 | — | f32 | 2.43e-4 | — | — | — | — | 17.86 MB | 33.55 Mop | 0.028 ms | memory | 58 GB/s | 9 % | 16.41 kB | — | — | — |
 | cpu | max:whole | q8_0 | 4096x4096 | 0.380 | — | f32 | 0e+0 | — | — | — | — | 17.83 MB | 16.78 Mop | 0.028 ms | memory | 46.89 GB/s | 7.3 % | 848 B | — | — | — |
 | cpu | max:rows | q8_0 | 4096x4096 | 0.375 | — | f32 | 0e+0 | — | — | — | — | 17.86 MB | 16.78 Mop | 0.028 ms | memory | 47.64 GB/s | 7.4 % | 16.41 kB | — | — | — |
-| cpu | max:cols | q8_0 | 4096x4096 | 0.467 | — | f32 | 0e+0 | — | — | — | — | 17.86 MB | 16.78 Mop | 0.028 ms | memory | 35.89 GB/s | 6.0 % | 999.47 kB | — | — | — |
+| cpu | max:cols | q8_0 | 4096x4096 | 0.420 | — | f32 | 0e+0 | — | — | — | — | 17.86 MB | 16.78 Mop | 0.028 ms | memory | 35.89 GB/s | 6.7 % | 999.47 kB | — | — | — |
 | cpu | min:rows | q8_0 | 4096x4096 | 0.382 | — | f32 | 0e+0 | — | — | — | — | 17.86 MB | 16.78 Mop | 0.028 ms | memory | 46.8 GB/s | 7.2 % | 16.41 kB | — | — | — |
 | cpu | argmax:rows | q8_0 | 4096x4096 | 0.725 | — | s32 index | 0e+0 | — | — | — | — | 17.86 MB | 16.78 Mop | 0.028 ms | memory | 24.65 GB/s | 3.8 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | q8_0 | 4096x4096 | 0.634 | — | s32 index | 0e+0 | — | — | — | — | 17.86 MB | 16.78 Mop | 0.028 ms | memory | 27.82 GB/s | 4.4 % | 1.79 MB | — | — | — |
+| cpu | argmax:cols | q8_0 | 4096x4096 | 0.497 | — | s32 index | 0e+0 | — | — | — | — | 17.86 MB | 16.78 Mop | 0.028 ms | memory | 27.82 GB/s | 5.6 % | 1.79 MB | — | — | — |
 | cpu | maprow:add | q8_0 | 4096x4096 | 3.640 | — | f32 | 7.87e-3 | — | — | — | — | 35.66 MB | 16.78 Mop | 0.059 ms | memory | 9.8 GB/s | 1.6 % | 720.98 kB | — | — | — |
 | cpu | maprow:mul | q8_0 | 4096x4096 | 3.636 | — | f32 | 3.93e-3 | — | — | — | — | 35.66 MB | 16.78 Mop | 0.059 ms | memory | 9.81 GB/s | 1.6 % | 720.98 kB | — | — | — |
 | cpu | transpose | q8_0 | 4096x4096 | 4.118 | — | f32 | 3.94e-3 | — | — | — | — | 35.65 MB | 0 op | 0.059 ms | memory | 8.66 GB/s | 1.4 % | 0 B | — | — | — |
 | cpu | gemv | q8_0 | 8192x8192 | 1.407 | — | s8dp blocks | 4.75e-1 | — | — | — | — | 71.32 MB | 134.22 Mop | 0.366 ms | memory | 50.71 GB/s | 26 % | 107.64 kB | — | — | — |
-| cpu | gemv_t | q8_0 | 8192x8192 | 1.799 | — | f32 | 5.89e-1 | — | — | — | — | 71.32 MB | 134.22 Mop | 0.366 ms | memory | 34.35 GB/s | 20.3 % | 1.26 MB | — | — | — |
+| cpu | gemv_t | q8_0 | 8192x8192 | 1.656 | — | f32 | 5.89e-1 | — | — | — | — | 71.32 MB | 134.22 Mop | 0.366 ms | memory | 34.35 GB/s | 22.1 % | 1.26 MB | — | — | — |
 | cpu | row:log_softmax | q8_0 | 4096x4096 | 4.486 | — | f32 | 5.63e-2 | — | — | — | — | 35.65 MB | 83.89 Mop | 0.059 ms | memory | 7.95 GB/s | 1.3 % | 786.43 kB | — | — | — |
 | cpu | row:softmax_bwd | q8_0 | 4096x4096 | 3.942 | — | f32 | 3.11e-1 | — | — | — | — | 53.48 MB | 67.11 Mop | 0.147 ms | memory | 13.57 GB/s | 3.7 % | 1.18 MB | — | — | — |
 | cpu | row:log_softmax_bwd | q8_0 | 4096x4096 | 4.582 | — | f32 | 5.06e-1 | — | — | — | — | 53.48 MB | 67.11 Mop | 0.147 ms | memory | 11.67 GB/s | 3.2 % | 1.18 MB | — | — | — |
@@ -5137,8 +5137,8 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | row:add_layer_norm | q8_0 | 4096x4096 | 7.324 | — | f32 | 2.26e-2 | — | — | — | — | 71.31 MB | 134.22 Mop | 0.274 ms | memory | 9.74 GB/s | 3.7 % | 2.36 MB | — | — | — |
 | cpu | row:cross_entropy_bwd | q8_0 | 4096x4096 | 4.447 | — | f32 | 2.08e-3 | — | — | — | — | 35.65 MB | 83.89 Mop | 0.059 ms | memory | 8.02 GB/s | 1.3 % | 786.43 kB | — | — | — |
 | cpu | row:weighted_cross_entropy_bwd | q8_0 | 4096x4096 | 4.498 | — | f32 | 9.93e-4 | — | — | — | — | 35.66 MB | 117.44 Mop | 0.059 ms | memory | 7.93 GB/s | 1.3 % | 787.97 kB | — | — | — |
-| cpu | norm_params_bwd:rms | q8_0 | 4096x4096 | 1.282 | — | f32 | 4.03e-5 | — | — | — | — | 35.72 MB | 100.66 Mop | 0.059 ms | copy | 25.3 GB/s | 4.6 % | 1.98 MB | — | — | — |
-| cpu | norm_params_bwd:layer | q8_0 | 4096x4096 | 1.294 | — | f32 | 3.79e-5 | — | — | — | — | 35.72 MB | 134.22 Mop | 0.061 ms | f32 | 96.76 Gop/s | 4.7 % | 2 MB | — | — | — |
+| cpu | norm_params_bwd:rms | q8_0 | 4096x4096 | 1.113 | — | f32 | 4.03e-5 | — | — | — | — | 35.72 MB | 100.66 Mop | 0.059 ms | copy | 25.3 GB/s | 5.3 % | 1.98 MB | — | — | — |
+| cpu | norm_params_bwd:layer | q8_0 | 4096x4096 | 1.139 | — | f32 | 3.79e-5 | — | — | — | — | 35.72 MB | 134.22 Mop | 0.061 ms | f32 | 96.76 Gop/s | 5.4 % | 2 MB | — | — | — |
 | cpu | layout:strided | q8_0 | 1x1024x64x256 | 5.665 | — | f32 | 3.94e-3 | — | — | — | — | 35.65 MB | 0 op | 0.059 ms | memory | 6.29 GB/s | 1 % | 7.3 MB | — | — | — |
 | cpu | layout:one_hot | q8_0 | 16384x1024 | 2.770 | — | f32 | 6.1e-5 | — | — | — | — | 17.89 MB | 0 op | 0.047 ms | memory | 6.46 GB/s | 1.7 % | 6.34 MB | — | — | — |
 | cpu | layout:gather_rows | q8_0 | 4096 of 4096x4096 | 3.541 | — | f32 | 0e+0 | — | — | — | — | 35.67 MB | 0 op | 0.059 ms | memory | 10.07 GB/s | 1.7 % | 6.9 MB | — | — | — |
@@ -5301,19 +5301,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:clip_factor | q4_0 | 16777216 | 1.792 | — | f32 | 6.25e-2 | — | — | — | — | 18.87 MB | 67.11 Mop | 0.030 ms | f32 | 37.46 Gop/s | 1.7 % | 88 B | — | — | — |
 | cpu | sum:whole | q4_0 | 4096x4096 | 0.293 | — | f32 | 6.1e-5 | — | — | — | — | 9.44 MB | 16.78 Mop | 0.015 ms | memory | 32.24 GB/s | 5 % | 440 B | — | — | — |
 | cpu | sum:rows | q4_0 | 4096x4096 | 0.287 | — | f32 | 0e+0 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.015 ms | memory | 32.96 GB/s | 5.1 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | q4_0 | 4096x4096 | 0.451 | — | f32 | 0e+0 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.015 ms | memory | 18.92 GB/s | 3.3 % | 1.18 MB | — | — | — |
+| cpu | sum:cols | q4_0 | 4096x4096 | 0.380 | — | f32 | 0e+0 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.015 ms | memory | 18.92 GB/s | 3.9 % | 1.18 MB | — | — | — |
 | cpu | sumsq:rows | q4_0 | 4096x4096 | 0.287 | — | f32 | 3.97e-4 | — | — | — | — | 9.47 MB | 33.55 Mop | 0.015 ms | f32 | 116.83 Gop/s | 5.3 % | 16.41 kB | — | — | — |
 | cpu | max:whole | q4_0 | 4096x4096 | 0.366 | — | f32 | 0e+0 | — | — | — | — | 9.44 MB | 16.78 Mop | 0.015 ms | memory | 25.82 GB/s | 4 % | 848 B | — | — | — |
 | cpu | max:rows | q4_0 | 4096x4096 | 0.370 | — | f32 | 0e+0 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.015 ms | memory | 25.6 GB/s | 4 % | 16.41 kB | — | — | — |
-| cpu | max:cols | q4_0 | 4096x4096 | 0.464 | — | f32 | 0e+0 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.015 ms | memory | 20.12 GB/s | 3.2 % | 991.28 kB | — | — | — |
+| cpu | max:cols | q4_0 | 4096x4096 | 0.395 | — | f32 | 0e+0 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.015 ms | memory | 20.12 GB/s | 3.8 % | 991.28 kB | — | — | — |
 | cpu | min:rows | q4_0 | 4096x4096 | 0.364 | — | f32 | 0e+0 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.015 ms | memory | 26.02 GB/s | 4 % | 16.41 kB | — | — | — |
 | cpu | argmax:rows | q4_0 | 4096x4096 | 0.699 | — | s32 index | 0e+0 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.019 ms | s32 | 23.99 Gop/s | 2.7 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | q4_0 | 4096x4096 | 0.627 | — | s32 index | 0e+0 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.019 ms | s32 | 25.31 Gop/s | 3.0 % | 1.79 MB | — | — | — |
+| cpu | argmax:cols | q4_0 | 4096x4096 | 0.492 | — | s32 index | 0e+0 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.019 ms | s32 | 25.31 Gop/s | 3.9 % | 1.79 MB | — | — | — |
 | cpu | maprow:add | q4_0 | 4096x4096 | 1.898 | — | f32 | 2.34e-1 | — | — | — | — | 18.88 MB | 16.78 Mop | 0.025 ms | memory | 9.94 GB/s | 1.3 % | 753.75 kB | — | — | — |
 | cpu | maprow:mul | q4_0 | 4096x4096 | 1.889 | — | f32 | 1.09e-1 | — | — | — | — | 18.88 MB | 16.78 Mop | 0.025 ms | memory | 9.99 GB/s | 1.3 % | 720.98 kB | — | — | — |
 | cpu | transpose | q4_0 | 4096x4096 | 2.489 | — | f32 | 1.25e-1 | — | — | — | — | 18.87 MB | 0 op | 0.025 ms | memory | 7.58 GB/s | 1 % | 0 B | — | — | — |
 | cpu | gemv | q4_0 | 8192x8192 | 1.564 | — | s8dp blocks | 1.03e+1 | — | — | — | — | 37.76 MB | 134.22 Mop | 0.155 ms | memory | 24.14 GB/s | 9.9 % | 107.64 kB | — | — | — |
-| cpu | gemv_t | q4_0 | 8192x8192 | 1.626 | — | f32 | 1.14e+1 | — | — | — | — | 37.76 MB | 134.22 Mop | 0.155 ms | memory | 19.85 GB/s | 9.5 % | 1.26 MB | — | — | — |
+| cpu | gemv_t | q4_0 | 8192x8192 | 1.500 | — | f32 | 1.14e+1 | — | — | — | — | 37.76 MB | 134.22 Mop | 0.155 ms | memory | 19.85 GB/s | 10.3 % | 1.26 MB | — | — | — |
 | cpu | row:log_softmax | q4_0 | 4096x4096 | 2.914 | — | f32 | 8.92e-1 | — | — | — | — | 18.87 MB | 83.89 Mop | 0.038 ms | f32 | 28.79 Gop/s | 1.3 % | 786.43 kB | — | — | — |
 | cpu | row:softmax_bwd | q4_0 | 4096x4096 | 2.241 | — | f32 | 1.89e+0 | — | — | — | — | 28.31 MB | 67.11 Mop | 0.039 ms | memory | 12.63 GB/s | 1.7 % | 1.18 MB | — | — | — |
 | cpu | row:log_softmax_bwd | q4_0 | 4096x4096 | 3.190 | — | f32 | 8.32e+0 | — | — | — | — | 28.31 MB | 67.11 Mop | 0.039 ms | memory | 8.88 GB/s | 1.2 % | 1.13 MB | — | — | — |
@@ -5330,8 +5330,8 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | row:add_layer_norm | q4_0 | 4096x4096 | 3.931 | — | f32 | 6.37e-1 | — | — | — | — | 37.75 MB | 134.22 Mop | 0.116 ms | memory | 9.6 GB/s | 3 % | 2.36 MB | — | — | — |
 | cpu | row:cross_entropy_bwd | q4_0 | 4096x4096 | 2.900 | — | f32 | 2.14e-3 | — | — | — | — | 18.87 MB | 83.89 Mop | 0.038 ms | f32 | 28.93 Gop/s | 1.3 % | 786.43 kB | — | — | — |
 | cpu | row:weighted_cross_entropy_bwd | q4_0 | 4096x4096 | 2.952 | — | f32 | 1.06e-3 | — | — | — | — | 18.88 MB | 117.44 Mop | 0.053 ms | f32 | 39.79 Gop/s | 1.8 % | 787.97 kB | — | — | — |
-| cpu | norm_params_bwd:rms | q4_0 | 4096x4096 | 1.204 | — | f32 | 3.5e-5 | — | — | — | — | 18.94 MB | 100.66 Mop | 0.046 ms | f32 | 74.07 Gop/s | 3.8 % | 2 MB | — | — | — |
-| cpu | norm_params_bwd:layer | q4_0 | 4096x4096 | 1.267 | — | f32 | 3.94e-5 | — | — | — | — | 18.94 MB | 134.22 Mop | 0.061 ms | f32 | 100.47 Gop/s | 4.8 % | 2 MB | — | — | — |
+| cpu | norm_params_bwd:rms | q4_0 | 4096x4096 | 1.021 | — | f32 | 3.5e-5 | — | — | — | — | 18.94 MB | 100.66 Mop | 0.046 ms | f32 | 74.07 Gop/s | 4.5 % | 2 MB | — | — | — |
+| cpu | norm_params_bwd:layer | q4_0 | 4096x4096 | 1.069 | — | f32 | 3.94e-5 | — | — | — | — | 18.94 MB | 134.22 Mop | 0.061 ms | f32 | 100.47 Gop/s | 5.7 % | 2 MB | — | — | — |
 | cpu | layout:strided | q4_0 | 1x1024x64x256 | 4.358 | — | f32 | 1.25e-1 | — | — | — | — | 18.87 MB | 0 op | 0.025 ms | memory | 4.33 GB/s | 0.6 % | 7.3 MB | — | — | — |
 | cpu | layout:one_hot | q4_0 | 16384x1024 | 0.840 | — | f32 | 0e+0 | — | — | — | — | 9.5 MB | 0 op | 0.024 ms | memory | 11.32 GB/s | 2.9 % | 6.61 MB | — | — | — |
 | cpu | layout:gather_rows | q4_0 | 4096 of 4096x4096 | 1.596 | — | f32 | 0e+0 | — | — | — | — | 18.89 MB | 0 op | 0.025 ms | memory | 11.84 GB/s | 1.6 % | 6.9 MB | — | — | — |
@@ -5494,19 +5494,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:clip_factor | q4_k | 16777216 | 3.476 | — | f32 | 3.33e-2 | — | — | — | — | 18.87 MB | 67.11 Mop | 0.030 ms | f32 | 19.31 Gop/s | 0.9 % | 88 B | — | — | — |
 | cpu | sum:whole | q4_k | 4096x4096 | 0.235 | — | f32 | 1.61e-4 | — | — | — | — | 9.44 MB | 16.78 Mop | 0.015 ms | memory | 40.11 GB/s | 6.2 % | 440 B | — | — | — |
 | cpu | sum:rows | q4_k | 4096x4096 | 0.226 | — | f32 | 9.54e-6 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.015 ms | memory | 41.87 GB/s | 6.5 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | q4_k | 4096x4096 | 0.385 | — | f32 | 3.43e-5 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.015 ms | memory | 20.49 GB/s | 3.9 % | 1.18 MB | — | — | — |
+| cpu | sum:cols | q4_k | 4096x4096 | 0.315 | — | f32 | 3.43e-5 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.015 ms | memory | 20.49 GB/s | 4.8 % | 1.18 MB | — | — | — |
 | cpu | sumsq:rows | q4_k | 4096x4096 | 0.228 | — | f32 | 3.36e-4 | — | — | — | — | 9.47 MB | 33.55 Mop | 0.015 ms | f32 | 146.91 Gop/s | 6.7 % | 16.41 kB | — | — | — |
 | cpu | max:whole | q4_k | 4096x4096 | 0.292 | — | f32 | 0e+0 | — | — | — | — | 9.44 MB | 16.78 Mop | 0.015 ms | memory | 32.31 GB/s | 5 % | 848 B | — | — | — |
 | cpu | max:rows | q4_k | 4096x4096 | 0.290 | — | f32 | 0e+0 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.015 ms | memory | 32.62 GB/s | 5.1 % | 16.41 kB | — | — | — |
-| cpu | max:cols | q4_k | 4096x4096 | 0.388 | — | f32 | 0e+0 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.015 ms | memory | 23.62 GB/s | 3.9 % | 991.28 kB | — | — | — |
+| cpu | max:cols | q4_k | 4096x4096 | 0.335 | — | f32 | 0e+0 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.015 ms | memory | 23.62 GB/s | 4.5 % | 991.28 kB | — | — | — |
 | cpu | min:rows | q4_k | 4096x4096 | 0.291 | — | f32 | 0e+0 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.015 ms | memory | 32.53 GB/s | 5 % | 16.41 kB | — | — | — |
 | cpu | argmax:rows | q4_k | 4096x4096 | 0.559 | — | s32 index | 0e+0 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.019 ms | s32 | 30.02 Gop/s | 3.3 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | q4_k | 4096x4096 | 0.553 | — | s32 index | 0e+0 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.019 ms | s32 | 29.78 Gop/s | 3.4 % | 1.79 MB | — | — | — |
+| cpu | argmax:cols | q4_k | 4096x4096 | 0.386 | — | s32 index | 0e+0 | — | — | — | — | 9.47 MB | 16.78 Mop | 0.019 ms | s32 | 29.78 Gop/s | 4.9 % | 1.79 MB | — | — | — |
 | cpu | maprow:add | q4_k | 4096x4096 | 3.137 | — | f32 | 1.32e-1 | — | — | — | — | 18.88 MB | 16.78 Mop | 0.025 ms | memory | 6.02 GB/s | 0.8 % | 720.98 kB | — | — | — |
 | cpu | maprow:mul | q4_k | 4096x4096 | 3.154 | — | f32 | 6.65e-2 | — | — | — | — | 18.88 MB | 16.78 Mop | 0.025 ms | memory | 5.98 GB/s | 0.8 % | 753.75 kB | — | — | — |
 | cpu | transpose | q4_k | 4096x4096 | 3.364 | — | f32 | 6.73e-2 | — | — | — | — | 18.87 MB | 0 op | 0.025 ms | memory | 5.61 GB/s | 0.7 % | 6.32 MB | — | — | — |
 | cpu | gemv | q4_k | 8192x8192 | 1.162 | — | f32 | 6.29e+0 | — | — | — | — | 37.76 MB | 134.22 Mop | 0.155 ms | memory | 32.5 GB/s | 13.4 % | 98.3 kB | — | — | — |
-| cpu | gemv_t | q4_k | 8192x8192 | 1.383 | — | f32 | 6.57e+0 | — | — | — | — | 37.76 MB | 134.22 Mop | 0.155 ms | memory | 23.31 GB/s | 11.2 % | 1.26 MB | — | — | — |
+| cpu | gemv_t | q4_k | 8192x8192 | 1.273 | — | f32 | 6.57e+0 | — | — | — | — | 37.76 MB | 134.22 Mop | 0.155 ms | memory | 23.31 GB/s | 12.2 % | 1.26 MB | — | — | — |
 | cpu | row:log_softmax | q4_k | 4096x4096 | 4.340 | — | f32 | 1.14e-1 | — | — | — | — | 18.87 MB | 83.89 Mop | 0.038 ms | f32 | 19.33 Gop/s | 0.9 % | 753.66 kB | — | — | — |
 | cpu | row:softmax_bwd | q4_k | 4096x4096 | 3.361 | — | f32 | 2.49e+0 | — | — | — | — | 28.31 MB | 67.11 Mop | 0.039 ms | memory | 8.42 GB/s | 1.2 % | 1.18 MB | — | — | — |
 | cpu | row:log_softmax_bwd | q4_k | 4096x4096 | 4.345 | — | f32 | 4.44e+0 | — | — | — | — | 28.31 MB | 67.11 Mop | 0.039 ms | memory | 6.52 GB/s | 0.9 % | 1.13 MB | — | — | — |
@@ -5523,8 +5523,8 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | row:add_layer_norm | q4_k | 4096x4096 | 6.416 | — | f32 | 3.56e-1 | — | — | — | — | 37.75 MB | 134.22 Mop | 0.116 ms | memory | 5.88 GB/s | 1.8 % | 2.36 MB | — | — | — |
 | cpu | row:cross_entropy_bwd | q4_k | 4096x4096 | 4.286 | — | f32 | 2.52e-3 | — | — | — | — | 18.87 MB | 83.89 Mop | 0.038 ms | f32 | 19.57 Gop/s | 0.9 % | 786.43 kB | — | — | — |
 | cpu | row:weighted_cross_entropy_bwd | q4_k | 4096x4096 | 4.349 | — | f32 | 1.29e-3 | — | — | — | — | 18.88 MB | 117.44 Mop | 0.053 ms | f32 | 27.01 Gop/s | 1.2 % | 787.97 kB | — | — | — |
-| cpu | norm_params_bwd:rms | q4_k | 4096x4096 | 0.977 | — | f32 | 4.49e-5 | — | — | — | — | 18.94 MB | 100.66 Mop | 0.046 ms | f32 | 96.54 Gop/s | 4.7 % | 2 MB | — | — | — |
-| cpu | norm_params_bwd:layer | q4_k | 4096x4096 | 0.999 | — | f32 | 3.91e-5 | — | — | — | — | 18.94 MB | 134.22 Mop | 0.061 ms | f32 | 126.73 Gop/s | 6.1 % | 1.98 MB | — | — | — |
+| cpu | norm_params_bwd:rms | q4_k | 4096x4096 | 0.835 | — | f32 | 4.49e-5 | — | — | — | — | 18.94 MB | 100.66 Mop | 0.046 ms | f32 | 96.54 Gop/s | 5.5 % | 2 MB | — | — | — |
+| cpu | norm_params_bwd:layer | q4_k | 4096x4096 | 0.852 | — | f32 | 3.91e-5 | — | — | — | — | 18.94 MB | 134.22 Mop | 0.061 ms | f32 | 126.73 Gop/s | 7.2 % | 1.98 MB | — | — | — |
 | cpu | layout:strided | q4_k | 1x1024x64x256 | 5.906 | — | f32 | 6.72e-2 | — | — | — | — | 18.87 MB | 0 op | 0.025 ms | memory | 3.2 GB/s | 0.4 % | 12.89 MB | — | — | — |
 | cpu | layout:one_hot | q4_k | 16384x1024 | 2.496 | — | f32 | 3.57e-4 | — | — | — | — | 9.5 MB | 0 op | 0.024 ms | memory | 3.81 GB/s | 1 % | 6.61 MB | — | — | — |
 | cpu | layout:gather_rows | q4_k | 4096 of 4096x4096 | 3.121 | — | f32 | 0e+0 | — | — | — | — | 18.89 MB | 0 op | 0.025 ms | memory | 6.05 GB/s | 0.8 % | 6.9 MB | — | — | — |
@@ -5686,19 +5686,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:clip_factor | q6_k | 16777216 | 3.166 | — | f32 | 1.61e-2 | — | — | — | — | 27.53 MB | 67.11 Mop | 0.043 ms | memory | 8.7 GB/s | 1.3 % | 88 B | — | — | — |
 | cpu | sum:whole | q6_k | 4096x4096 | 0.238 | — | f32 | 3.32e-3 | — | — | — | — | 13.76 MB | 16.78 Mop | 0.024 ms | memory | 57.92 GB/s | 10.1 % | 440 B | — | — | — |
 | cpu | sum:rows | q6_k | 4096x4096 | 0.229 | — | f32 | 2.48e-5 | — | — | — | — | 13.8 MB | 16.78 Mop | 0.024 ms | memory | 60.27 GB/s | 10.5 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | q6_k | 4096x4096 | 0.396 | — | f32 | 3.65e-5 | — | — | — | — | 13.8 MB | 16.78 Mop | 0.024 ms | memory | 30.81 GB/s | 6.1 % | 1.07 MB | — | — | — |
+| cpu | sum:cols | q6_k | 4096x4096 | 0.318 | — | f32 | 3.65e-5 | — | — | — | — | 13.8 MB | 16.78 Mop | 0.024 ms | memory | 30.81 GB/s | 7.5 % | 1.07 MB | — | — | — |
 | cpu | sumsq:rows | q6_k | 4096x4096 | 0.232 | — | f32 | 2.93e-4 | — | — | — | — | 13.8 MB | 33.55 Mop | 0.024 ms | memory | 59.57 GB/s | 10.4 % | 16.41 kB | — | — | — |
 | cpu | max:whole | q6_k | 4096x4096 | 0.298 | — | f32 | 0e+0 | — | — | — | — | 13.76 MB | 16.78 Mop | 0.024 ms | memory | 46.21 GB/s | 8.1 % | 848 B | — | — | — |
 | cpu | max:rows | q6_k | 4096x4096 | 0.297 | — | f32 | 0e+0 | — | — | — | — | 13.8 MB | 16.78 Mop | 0.024 ms | memory | 46.45 GB/s | 8.1 % | 16.41 kB | — | — | — |
-| cpu | max:cols | q6_k | 4096x4096 | 0.379 | — | f32 | 0e+0 | — | — | — | — | 13.8 MB | 16.78 Mop | 0.024 ms | memory | 34.78 GB/s | 6.3 % | 966.7 kB | — | — | — |
+| cpu | max:cols | q6_k | 4096x4096 | 0.338 | — | f32 | 0e+0 | — | — | — | — | 13.8 MB | 16.78 Mop | 0.024 ms | memory | 34.78 GB/s | 7.1 % | 966.7 kB | — | — | — |
 | cpu | min:rows | q6_k | 4096x4096 | 0.297 | — | f32 | 0e+0 | — | — | — | — | 13.8 MB | 16.78 Mop | 0.024 ms | memory | 46.48 GB/s | 8.1 % | 16.41 kB | — | — | — |
 | cpu | argmax:rows | q6_k | 4096x4096 | 0.539 | — | s32 index | 0e+0 | — | — | — | — | 13.8 MB | 16.78 Mop | 0.024 ms | memory | 25.62 GB/s | 4.5 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | q6_k | 4096x4096 | 0.550 | — | s32 index | 0e+0 | — | — | — | — | 13.8 MB | 16.78 Mop | 0.024 ms | memory | 24.11 GB/s | 4.4 % | 1.79 MB | — | — | — |
+| cpu | argmax:cols | q6_k | 4096x4096 | 0.401 | — | s32 index | 0e+0 | — | — | — | — | 13.8 MB | 16.78 Mop | 0.024 ms | memory | 24.11 GB/s | 6.0 % | 1.79 MB | — | — | — |
 | cpu | maprow:add | q6_k | 4096x4096 | 2.769 | — | f32 | 3.22e-2 | — | — | — | — | 27.53 MB | 16.78 Mop | 0.043 ms | memory | 9.94 GB/s | 1.5 % | 688.22 kB | — | — | — |
 | cpu | maprow:mul | q6_k | 4096x4096 | 2.774 | — | f32 | 1.58e-2 | — | — | — | — | 27.53 MB | 16.78 Mop | 0.043 ms | memory | 9.92 GB/s | 1.5 % | 753.75 kB | — | — | — |
 | cpu | transpose | q6_k | 4096x4096 | 3.127 | — | f32 | 1.61e-2 | — | — | — | — | 27.53 MB | 0 op | 0.043 ms | memory | 8.8 GB/s | 1.4 % | 6.05 MB | — | — | — |
 | cpu | gemv | q6_k | 8192x8192 | 1.236 | — | f32 | 1.89e+0 | — | — | — | — | 55.06 MB | 134.22 Mop | 0.226 ms | memory | 44.54 GB/s | 18.3 % | 98.3 kB | — | — | — |
-| cpu | gemv_t | q6_k | 8192x8192 | 1.546 | — | f32 | 2.16e+0 | — | — | — | — | 55.06 MB | 134.22 Mop | 0.226 ms | memory | 31.41 GB/s | 14.6 % | 1.26 MB | — | — | — |
+| cpu | gemv_t | q6_k | 8192x8192 | 1.417 | — | f32 | 2.16e+0 | — | — | — | — | 55.06 MB | 134.22 Mop | 0.226 ms | memory | 31.41 GB/s | 15.9 % | 1.26 MB | — | — | — |
 | cpu | row:log_softmax | q6_k | 4096x4096 | 4.018 | — | f32 | 2.31e-1 | — | — | — | — | 27.53 MB | 83.89 Mop | 0.043 ms | memory | 6.85 GB/s | 1.1 % | 753.66 kB | — | — | — |
 | cpu | row:softmax_bwd | q6_k | 4096x4096 | 3.055 | — | f32 | 1.27e+0 | — | — | — | — | 41.29 MB | 67.11 Mop | 0.113 ms | memory | 13.52 GB/s | 3.7 % | 1.18 MB | — | — | — |
 | cpu | row:log_softmax_bwd | q6_k | 4096x4096 | 4.076 | — | f32 | 2.05e+0 | — | — | — | — | 41.29 MB | 67.11 Mop | 0.113 ms | memory | 10.13 GB/s | 2.8 % | 1.18 MB | — | — | — |
@@ -5715,8 +5715,8 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | row:add_layer_norm | q6_k | 4096x4096 | 5.690 | — | f32 | 9.2e-2 | — | — | — | — | 55.06 MB | 134.22 Mop | 0.170 ms | memory | 9.68 GB/s | 3 % | 2.28 MB | — | — | — |
 | cpu | row:cross_entropy_bwd | q6_k | 4096x4096 | 4.027 | — | f32 | 2.1e-3 | — | — | — | — | 27.53 MB | 83.89 Mop | 0.043 ms | memory | 6.83 GB/s | 1.1 % | 786.43 kB | — | — | — |
 | cpu | row:weighted_cross_entropy_bwd | q6_k | 4096x4096 | 4.111 | — | f32 | 1.03e-3 | — | — | — | — | 27.53 MB | 117.44 Mop | 0.053 ms | f32 | 28.57 Gop/s | 1.3 % | 787.97 kB | — | — | — |
-| cpu | norm_params_bwd:rms | q6_k | 4096x4096 | 1.011 | — | f32 | 5.07e-5 | — | — | — | — | 27.59 MB | 100.66 Mop | 0.046 ms | f32 | 94.54 Gop/s | 4.5 % | 2 MB | — | — | — |
-| cpu | norm_params_bwd:layer | q6_k | 4096x4096 | 1.029 | — | f32 | 4.46e-5 | — | — | — | — | 27.59 MB | 134.22 Mop | 0.061 ms | f32 | 125.55 Gop/s | 5.9 % | 1.98 MB | — | — | — |
+| cpu | norm_params_bwd:rms | q6_k | 4096x4096 | 0.863 | — | f32 | 5.07e-5 | — | — | — | — | 27.59 MB | 100.66 Mop | 0.046 ms | f32 | 94.54 Gop/s | 5.3 % | 2 MB | — | — | — |
+| cpu | norm_params_bwd:layer | q6_k | 4096x4096 | 0.887 | — | f32 | 4.46e-5 | — | — | — | — | 27.59 MB | 134.22 Mop | 0.061 ms | f32 | 125.55 Gop/s | 6.9 % | 1.98 MB | — | — | — |
 | cpu | layout:strided | q6_k | 1x1024x64x256 | 5.381 | — | f32 | 1.61e-2 | — | — | — | — | 27.53 MB | 0 op | 0.043 ms | memory | 5.12 GB/s | 0.8 % | 12.89 MB | — | — | — |
 | cpu | layout:one_hot | q6_k | 16384x1024 | 2.346 | — | f32 | 3.34e-4 | — | — | — | — | 13.83 MB | 0 op | 0.036 ms | memory | 5.89 GB/s | 1.5 % | 6.61 MB | — | — | — |
 | cpu | layout:gather_rows | q6_k | 4096 of 4096x4096 | 2.676 | — | f32 | 0e+0 | — | — | — | — | 27.54 MB | 0 op | 0.043 ms | memory | 10.29 GB/s | 1.6 % | 6.36 MB | — | — | — |
@@ -5833,19 +5833,19 @@ Limits measured: cpu: copy 78.0 GB/s past the caches (65.54 kB 172.6, 114.69 kB 
 | cpu | map:gated_relu_bwd_y | bool | 16777216 | 1.926 | — | u8 | 0e+0 | — | — | — | — | 8.39 MB | 33.55 Mop | 0.037 ms | s32 | 17.42 Gop/s | 1.9 % | 88 B | — | — | — |
 | cpu | sum:whole | bool | 4096x4096 | 0.519 | — | f32 | 0e+0 | — | — | — | — | 2.1 MB | 16.78 Mop | 0.008 ms | f32 | 32.34 Gop/s | 1.5 % | 440 B | — | — | — |
 | cpu | sum:rows | bool | 4096x4096 | 0.548 | — | f32 | 0e+0 | — | — | — | — | 2.13 MB | 16.78 Mop | 0.008 ms | f32 | 30.64 Gop/s | 1.4 % | 16.41 kB | — | — | — |
-| cpu | sum:cols | bool | 4096x4096 | 0.798 | — | f32 | 0e+0 | — | — | — | — | 2.13 MB | 16.78 Mop | 0.008 ms | f32 | 23.04 Gop/s | 1.0 % | 1.16 MB | — | — | — |
+| cpu | sum:cols | bool | 4096x4096 | 0.721 | — | f32 | 0e+0 | — | — | — | — | 2.13 MB | 16.78 Mop | 0.008 ms | f32 | 23.04 Gop/s | 1.1 % | 1.16 MB | — | — | — |
 | cpu | sumsq:rows | bool | 4096x4096 | 0.549 | — | f32 | 0e+0 | — | — | — | — | 2.13 MB | 33.55 Mop | 0.015 ms | f32 | 61.09 Gop/s | 2.8 % | 16.41 kB | — | — | — |
 | cpu | max:whole | bool | 4096x4096 | 0.420 | — | u8 | 0e+0 | — | — | — | — | 2.1 MB | 16.78 Mop | 0.019 ms | s32 | 39.95 Gop/s | 4.4 % | 560 B | — | — | — |
 | cpu | max:rows | bool | 4096x4096 | 0.463 | — | u8 | 0e+0 | — | — | — | — | 2.13 MB | 16.78 Mop | 0.019 ms | s32 | 36.21 Gop/s | 4 % | 4.12 kB | — | — | — |
-| cpu | max:cols | bool | 4096x4096 | 0.607 | — | u8 | 0e+0 | — | — | — | — | 2.13 MB | 16.78 Mop | 0.019 ms | s32 | 33.76 Gop/s | 3.1 % | 495.66 kB | — | — | — |
+| cpu | max:cols | bool | 4096x4096 | 0.561 | — | u8 | 0e+0 | — | — | — | — | 2.13 MB | 16.78 Mop | 0.019 ms | s32 | 33.76 Gop/s | 3.4 % | 495.66 kB | — | — | — |
 | cpu | min:rows | bool | 4096x4096 | 0.462 | — | u8 | 0e+0 | — | — | — | — | 2.13 MB | 16.78 Mop | 0.019 ms | s32 | 36.29 Gop/s | 4 % | 4.12 kB | — | — | — |
 | cpu | argmax:rows | bool | 4096x4096 | 0.902 | — | s32 index | 0e+0 | — | — | — | — | 2.13 MB | 16.78 Mop | 0.019 ms | s32 | 18.6 Gop/s | 2.1 % | 16.41 kB | — | — | — |
-| cpu | argmax:cols | bool | 4096x4096 | 0.944 | — | s32 index | 0e+0 | — | — | — | — | 2.13 MB | 16.78 Mop | 0.019 ms | s32 | 21.03 Gop/s | 2.0 % | 2.08 MB | — | — | — |
+| cpu | argmax:cols | bool | 4096x4096 | 0.775 | — | s32 index | 0e+0 | — | — | — | — | 2.13 MB | 16.78 Mop | 0.019 ms | s32 | 21.03 Gop/s | 2.5 % | 2.08 MB | — | — | — |
 | cpu | maprow:add | bool | 4096x4096 | 1.200 | — | u8 | 0e+0 | — | — | — | — | 4.19 MB | 16.78 Mop | 0.019 ms | s32 | 13.98 Gop/s | 1.5 % | 188.5 kB | — | — | — |
 | cpu | maprow:mul | bool | 4096x4096 | 1.206 | — | u8 | 0e+0 | — | — | — | — | 4.19 MB | 16.78 Mop | 0.019 ms | s32 | 13.91 Gop/s | 1.5 % | 196.7 kB | — | — | — |
 | cpu | transpose | bool | 4096x4096 | 1.718 | — | u8 | 0e+0 | — | — | — | — | 4.19 MB | 0 op | 0.005 ms | memory | 2.44 GB/s | 0.3 % | 0 B | — | — | — |
 | cpu | gemv | bool | 8192x8192 | 2.360 | — | f32 | 0e+0 | — | — | — | — | 8.39 MB | 134.22 Mop | 0.061 ms | f32 | 56.88 Gop/s | 2.6 % | 98.3 kB | — | — | — |
-| cpu | gemv_t | bool | 8192x8192 | 2.975 | — | f32 | 0e+0 | — | — | — | — | 8.39 MB | 134.22 Mop | 0.061 ms | f32 | 50.07 Gop/s | 2.1 % | 1.26 MB | — | — | — |
+| cpu | gemv_t | bool | 8192x8192 | 2.789 | — | f32 | 0e+0 | — | — | — | — | 8.39 MB | 134.22 Mop | 0.061 ms | f32 | 50.07 Gop/s | 2.2 % | 1.26 MB | — | — | — |
 | cpu | layout:strided | bool | 1x1024x64x256 | 1.744 | — | u8 | 0e+0 | — | — | — | — | 4.19 MB | 0 op | 0.005 ms | memory | 2.4 GB/s | 0.3 % | 2.2 MB | — | — | — |
 | cpu | layout:one_hot | bool | 16384x1024 | 0.371 | — | u8 | 0e+0 | — | — | — | — | 2.16 MB | 0 op | 0.003 ms | memory | 5.83 GB/s | 0.9 % | 1.75 MB | — | — | — |
 | cpu | layout:gather_rows | bool | 4096 of 4096x4096 | 0.732 | — | u8 | 0e+0 | — | — | — | — | 4.21 MB | 0 op | 0.005 ms | memory | 5.75 GB/s | 0.6 % | 1.89 MB | — | — | — |
@@ -6204,3 +6204,114 @@ Re-timed on build 2f78b26 (rope_table 5ad50e6, the box losses 768935a, the colum
 - cpu sum:cols uint32: adad 0.910 -> 0.919
 - cpu sum:cols uint64: adad 2.701 -> 2.663
 - cpu sum:cols uint8: adad 0.237 -> 0.151
+
+Re-timed on build 7d4ed27 (the column passes' partials pooled and aligned): 108 CPU rows, one exclusive job of 3 rounds, a process a round. Where a row's three readings agree within 10 %, each subject's, their medians replace the readings; where they do not (3 rows), the cell carries the process whose reading is the less favourable to adad, both subjects from it:
+
+- cpu argmax:cols bfloat16: adad 0.512 -> 0.351
+- cpu argmax:cols bool: adad 0.944 -> 0.775
+- cpu argmax:cols float16: adad 0.654 -> 0.527
+- cpu argmax:cols float32: adad 0.681 -> 0.534
+- cpu argmax:cols float64: adad 1.510 -> 1.414
+- cpu argmax:cols float8_e4m3: adad 0.659 -> 0.508
+- cpu argmax:cols float8_e5m2: adad 0.658 -> 0.516
+- cpu argmax:cols int16: adad 1.099 -> 0.963
+- cpu argmax:cols int2: adad 0.729 -> 0.570
+- cpu argmax:cols int32: adad 0.653 -> 0.517
+- cpu argmax:cols int4: adad 1.273 -> 1.106
+- cpu argmax:cols int64: adad 1.483 -> 1.388
+- cpu argmax:cols int8: adad 1.214 -> 1.061
+- cpu argmax:cols q4_0: adad 0.627 -> 0.492
+- cpu argmax:cols q4_k: adad 0.553 -> 0.386
+- cpu argmax:cols q6_k: adad 0.550 -> 0.401
+- cpu argmax:cols q8_0: adad 0.634 -> 0.497
+- cpu argmax:cols uint16: adad 1.053 -> 0.921
+- cpu argmax:cols uint2: adad 0.704 -> 0.534
+- cpu argmax:cols uint32: adad 0.649 -> 0.523
+- cpu argmax:cols uint64: adad 1.472 -> 1.373
+- cpu argmax:cols uint8: adad 1.026 -> 0.858
+- cpu gemv_t bfloat16: adad 1.657 -> 1.630
+- cpu gemv_t bool: adad 2.975 -> 2.789
+- cpu gemv_t float16: adad 2.131 -> 2.030
+- cpu gemv_t float32: adad 3.245 -> 3.202
+- cpu gemv_t float64: adad 6.830 -> 6.928
+- cpu gemv_t float8_e4m3: adad 1.614 -> 1.545
+- cpu gemv_t float8_e5m2: adad 1.725 -> 1.666
+- cpu gemv_t int16: adad 2.819 -> 2.763
+- cpu gemv_t int2: adad 0.512 -> 0.417
+- cpu gemv_t int32: adad 6.290 -> 6.340
+- cpu gemv_t int4: adad 0.558 -> 0.500
+- cpu gemv_t int64: adad 13.424 -> 13.342
+- cpu gemv_t int8: adad 1.153 -> 1.096
+- cpu gemv_t q4_0: adad 1.626 -> 1.500
+- cpu gemv_t q4_k: adad 1.383 -> 1.273
+- cpu gemv_t q6_k: adad 1.546 -> 1.417
+- cpu gemv_t q8_0: adad 1.799 -> 1.656
+- cpu gemv_t uint16: adad 2.836 -> 2.752
+- cpu gemv_t uint2: adad 0.482 -> 0.392
+- cpu gemv_t uint32: adad 6.137 -> 6.512
+- cpu gemv_t uint64: adad 15.121 -> 13.179
+- cpu gemv_t uint8: adad 1.167 -> 1.121
+- cpu max:cols bfloat16: adad 0.307 -> 0.251
+- cpu max:cols bool: adad 0.607 -> 0.561
+- cpu max:cols float16: adad 0.468 -> 0.409
+- cpu max:cols float32: adad 0.533 -> 0.470
+- cpu max:cols float64: adad 1.636 -> 1.414
+- cpu max:cols float8_e4m3: adad 0.443 -> 0.379
+- cpu max:cols float8_e5m2: adad 0.475 -> 0.407
+- cpu max:cols int16: adad 0.252 -> 0.090
+- cpu max:cols int2: adad 0.113 -> 0.078; the processes apart (adad 0.069, 0.072, 0.078): the one less favourable to adad
+- cpu max:cols int32: adad 0.462 -> 0.413
+- cpu max:cols int4: adad 0.102 -> 0.053
+- cpu max:cols int64: adad 1.448 -> 1.388
+- cpu max:cols int8: adad 0.149 -> 0.039
+- cpu max:cols q4_0: adad 0.464 -> 0.395
+- cpu max:cols q4_k: adad 0.388 -> 0.335; the processes apart (adad 0.294, 0.334, 0.335): the one less favourable to adad
+- cpu max:cols q6_k: adad 0.379 -> 0.338
+- cpu max:cols q8_0: adad 0.467 -> 0.420
+- cpu max:cols uint16: adad 0.238 -> 0.091
+- cpu max:cols uint2: adad 0.123 -> 0.068
+- cpu max:cols uint32: adad 0.468 -> 0.409
+- cpu max:cols uint64: adad 1.466 -> 1.341
+- cpu max:cols uint8: adad 0.146 -> 0.038
+- cpu norm_params_bwd:layer bfloat16: adad 1.069 -> 0.905
+- cpu norm_params_bwd:layer float16: adad 1.457 -> 1.313
+- cpu norm_params_bwd:layer float32: adad 2.029 -> 2.266; the processes apart (adad 1.908, 1.979, 2.266): the one less favourable to adad
+- cpu norm_params_bwd:layer float64: adad 4.590 -> 4.716
+- cpu norm_params_bwd:layer float8_e4m3: adad 1.215 -> 1.058
+- cpu norm_params_bwd:layer float8_e5m2: adad 1.326 -> 1.173
+- cpu norm_params_bwd:layer q4_0: adad 1.267 -> 1.069
+- cpu norm_params_bwd:layer q4_k: adad 0.999 -> 0.852
+- cpu norm_params_bwd:layer q6_k: adad 1.029 -> 0.887
+- cpu norm_params_bwd:layer q8_0: adad 1.294 -> 1.139
+- cpu norm_params_bwd:rms bfloat16: adad 1.046 -> 0.878
+- cpu norm_params_bwd:rms float16: adad 1.451 -> 1.229
+- cpu norm_params_bwd:rms float32: adad 2.017 -> 1.875
+- cpu norm_params_bwd:rms float64: adad 4.617 -> 4.678
+- cpu norm_params_bwd:rms float8_e4m3: adad 1.184 -> 1.013
+- cpu norm_params_bwd:rms float8_e5m2: adad 1.276 -> 1.107
+- cpu norm_params_bwd:rms q4_0: adad 1.204 -> 1.021
+- cpu norm_params_bwd:rms q4_k: adad 0.977 -> 0.835
+- cpu norm_params_bwd:rms q6_k: adad 1.011 -> 0.863
+- cpu norm_params_bwd:rms q8_0: adad 1.282 -> 1.113
+- cpu sum:cols bfloat16: adad 0.332 -> 0.256
+- cpu sum:cols bool: adad 0.798 -> 0.721
+- cpu sum:cols float16: adad 0.477 -> 0.402
+- cpu sum:cols float32: adad 0.513 -> 0.430
+- cpu sum:cols float64: adad 1.422 -> 1.379
+- cpu sum:cols float8_e4m3: adad 0.428 -> 0.364
+- cpu sum:cols float8_e5m2: adad 0.460 -> 0.392
+- cpu sum:cols int16: adad 0.329 -> 0.250
+- cpu sum:cols int2: adad 0.205 -> 0.115
+- cpu sum:cols int32: adad 0.913 -> 0.861
+- cpu sum:cols int4: adad 0.261 -> 0.098
+- cpu sum:cols int64: adad 2.668 -> 2.614
+- cpu sum:cols int8: adad 0.146 -> 0.095
+- cpu sum:cols q4_0: adad 0.451 -> 0.380
+- cpu sum:cols q4_k: adad 0.385 -> 0.315
+- cpu sum:cols q6_k: adad 0.396 -> 0.318
+- cpu sum:cols q8_0: adad 0.469 -> 0.393
+- cpu sum:cols uint16: adad 0.332 -> 0.257
+- cpu sum:cols uint2: adad 0.218 -> 0.108
+- cpu sum:cols uint32: adad 0.919 -> 0.850
+- cpu sum:cols uint64: adad 2.663 -> 2.677
+- cpu sum:cols uint8: adad 0.151 -> 0.108
