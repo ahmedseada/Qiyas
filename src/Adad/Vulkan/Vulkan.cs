@@ -75,36 +75,108 @@ public sealed unsafe class Vulkan : IDisposable
         if (properties.MaxPushConstantsSize < Spv.MaxSlots * 8) throw new NotSupportedException($"{Name}: {properties.MaxPushConstantsSize} bytes of push constants (Adad's kernels take {Spv.MaxSlots * 8})");
         Discrete = properties.DeviceType == VkApi.DeviceTypeDiscreteGpu;
 
+        // The extensions whose features the kernels may use: the matrix units (cooperative matrices), the packed 8-bit
+        // integer dot product, bfloat16 elements of the matrix units.
+        var extensions = DeviceExtensions(_physical);
+        bool hasCoop = extensions.Contains("VK_KHR_cooperative_matrix"), hasDot = extensions.Contains("VK_KHR_shader_integer_dot_product"),
+            hasBf16 = extensions.Contains("VK_KHR_shader_bfloat16"), hasAtomic = extensions.Contains("VK_EXT_shader_atomic_float");
+
         var subgroup = new VkPhysicalDeviceSubgroupProperties { SType = VkApi.StructurePhysicalDeviceSubgroupProperties };
         var controls = new VkPhysicalDeviceFloatControlsProperties { SType = VkApi.StructurePhysicalDeviceFloatControlsProperties, PNext = &subgroup };
+        var dot = new VkIntegerDotProductProperties { SType = VkApi.StructurePhysicalDeviceIntegerDotProductProperties };
+        if (hasDot) subgroup.PNext = &dot;
         var properties2 = new VkPhysicalDeviceProperties2 { SType = VkApi.StructurePhysicalDeviceProperties2, PNext = &controls };
         VkApi.vkGetPhysicalDeviceProperties2(_physical, &properties2);
         SubgroupSize = (int)subgroup.SubgroupSize;
 
         var features12 = new VkPhysicalDeviceVulkan12Features { SType = VkApi.StructurePhysicalDeviceVulkan12Features };
-        var features = new VkPhysicalDeviceFeatures2 { SType = VkApi.StructurePhysicalDeviceFeatures2, PNext = &features12 };
+        var features11 = new VkPhysicalDeviceVulkan11Features { SType = VkApi.StructurePhysicalDeviceVulkan11Features, PNext = &features12 };
+        var coopFeatures = new VkFeatureFlags { SType = VkApi.StructurePhysicalDeviceCooperativeMatrixFeatures };
+        var dotFeatures = new VkFeatureFlags { SType = VkApi.StructurePhysicalDeviceIntegerDotProductFeatures };
+        var bf16Features = new VkFeatureFlags { SType = VkApi.StructurePhysicalDeviceBfloat16Features };
+        var atomicFeatures = new VkFeatureFlags { SType = VkApi.StructurePhysicalDeviceAtomicFloatFeatures };
+        void* chain = null;
+        if (hasAtomic) { atomicFeatures.PNext = chain; chain = &atomicFeatures; }
+        if (hasCoop) { coopFeatures.PNext = chain; chain = &coopFeatures; }
+        if (hasDot) { dotFeatures.PNext = chain; chain = &dotFeatures; }
+        if (hasBf16) { bf16Features.PNext = chain; chain = &bf16Features; }
+        features12.PNext = chain;
+        var features = new VkPhysicalDeviceFeatures2 { SType = VkApi.StructurePhysicalDeviceFeatures2, PNext = &features11 };
         VkApi.vkGetPhysicalDeviceFeatures2(_physical, &features);
         bool f64 = features.Features[VkPhysicalDeviceFeatures2.ShaderFloat64] != 0, i64 = features.Features[VkPhysicalDeviceFeatures2.ShaderInt64] != 0;
         bool i16 = features.Features[VkPhysicalDeviceFeatures2.ShaderInt16] != 0, i8 = features12.Features[VkPhysicalDeviceVulkan12Features.ShaderInt8] != 0;
+        bool f16 = features12.Features[VkPhysicalDeviceVulkan12Features.ShaderFloat16] != 0;
+        bool store8 = features12.Features[VkPhysicalDeviceVulkan12Features.StorageBuffer8BitAccess] != 0;
+        bool store16 = features11.Features[VkPhysicalDeviceVulkan11Features.StorageBuffer16BitAccess] != 0;
+        bool coop = hasCoop && coopFeatures.Features[0] != 0, dots = hasDot && dotFeatures.Features[0] != 0;
+        bool bf16 = hasBf16 && bf16Features.Features[0] != 0, bf16Coop = bf16 && bf16Features.Features[2] != 0;
+        bool add32 = hasAtomic && atomicFeatures.Features[1] != 0, add64 = hasAtomic && f64 && atomicFeatures.Features[3] != 0;
         if (features12.Features[VkPhysicalDeviceVulkan12Features.BufferDeviceAddress] == 0) throw new NotSupportedException($"{Name}: no bufferDeviceAddress (Adad's kernels reach memory by address)");
         if (!i64) throw new NotSupportedException($"{Name}: no shaderInt64 (addresses are 64-bit integers)");
         Controls = new FloatControls(controls.RoundingModeRteFloat32 != 0, controls.RoundingModeRteFloat64 != 0, controls.DenormPreserveFloat32 != 0,
-            controls.DenormPreserveFloat64 != 0, controls.SignedZeroInfNanPreserveFloat32 != 0, controls.SignedZeroInfNanPreserveFloat64 != 0, f64, i64);
+            controls.DenormPreserveFloat64 != 0, controls.SignedZeroInfNanPreserveFloat32 != 0, controls.SignedZeroInfNanPreserveFloat64 != 0, f64, i64,
+            f16, f16 && controls.DenormPreserveFloat16 != 0, f16 && controls.SignedZeroInfNanPreserveFloat16 != 0, i8, i16, store8 && i8, store16, bf16, add32, add64);
         Int16 = i16;
         Int8 = i8;
+        Float16 = f16;
+        Storage8 = store8 && i8;
+        Storage16 = store16;
+        IntDot8Signed = dots && dot.Accelerated[VkIntegerDotProductProperties.Packed4x8Signed] != 0;
+        IntDot8Unsigned = dots && dot.Accelerated[VkIntegerDotProductProperties.Packed4x8Unsigned] != 0;
+        CooperativeMatrices = coop ? CooperativeKinds(_instance, _physical, f16, i8, bf16Coop) : [];
 
         // The device: one compute queue; the features the kernels use, enabled only where reported.
         var enable12 = new VkPhysicalDeviceVulkan12Features { SType = VkApi.StructurePhysicalDeviceVulkan12Features };
         enable12.Features[VkPhysicalDeviceVulkan12Features.BufferDeviceAddress] = 1;
         if (i8) enable12.Features[VkPhysicalDeviceVulkan12Features.ShaderInt8] = 1;
-        var enable = new VkPhysicalDeviceFeatures2 { SType = VkApi.StructurePhysicalDeviceFeatures2, PNext = &enable12 };
+        if (f16) enable12.Features[VkPhysicalDeviceVulkan12Features.ShaderFloat16] = 1;
+        if (Storage8) enable12.Features[VkPhysicalDeviceVulkan12Features.StorageBuffer8BitAccess] = 1;
+        var enable11 = new VkPhysicalDeviceVulkan11Features { SType = VkApi.StructurePhysicalDeviceVulkan11Features, PNext = &enable12 };
+        if (store16) enable11.Features[VkPhysicalDeviceVulkan11Features.StorageBuffer16BitAccess] = 1;
+        var enableCoop = new VkFeatureFlags { SType = VkApi.StructurePhysicalDeviceCooperativeMatrixFeatures };
+        var enableDot = new VkFeatureFlags { SType = VkApi.StructurePhysicalDeviceIntegerDotProductFeatures };
+        var enableBf16 = new VkFeatureFlags { SType = VkApi.StructurePhysicalDeviceBfloat16Features };
+        var enableAtomic = new VkFeatureFlags { SType = VkApi.StructurePhysicalDeviceAtomicFloatFeatures };
+        var names = new List<string>();
+        void* enabled = null;
+        if (coop) { enableCoop.Features[0] = 1; enableCoop.PNext = enabled; enabled = &enableCoop; names.Add("VK_KHR_cooperative_matrix"); }
+        if (dots) { enableDot.Features[0] = 1; enableDot.PNext = enabled; enabled = &enableDot; names.Add("VK_KHR_shader_integer_dot_product"); }
+        if (bf16) { enableBf16.Features[0] = 1; enableBf16.Features[2] = bf16Coop ? 1u : 0; enableBf16.PNext = enabled; enabled = &enableBf16; names.Add("VK_KHR_shader_bfloat16"); }
+        if (add32 || add64)
+        {
+            enableAtomic.Features[0] = enableAtomic.Features[1] = add32 ? 1u : 0;
+            enableAtomic.Features[2] = enableAtomic.Features[3] = add64 ? 1u : 0;
+            enableAtomic.PNext = enabled;
+            enabled = &enableAtomic;
+            names.Add("VK_EXT_shader_atomic_float");
+        }
+
+        enable12.PNext = enabled;
+        var enable = new VkPhysicalDeviceFeatures2 { SType = VkApi.StructurePhysicalDeviceFeatures2, PNext = &enable11 };
         enable.Features[VkPhysicalDeviceFeatures2.ShaderInt64] = 1;
         if (f64) enable.Features[VkPhysicalDeviceFeatures2.ShaderFloat64] = 1;
         if (i16) enable.Features[VkPhysicalDeviceFeatures2.ShaderInt16] = 1;
         float priority = 1;
         var queueInfo = new VkDeviceQueueCreateInfo { SType = VkApi.StructureDeviceQueueCreateInfo, QueueFamilyIndex = _family, QueueCount = 1, QueuePriorities = &priority };
-        var deviceInfo = new VkDeviceCreateInfo { SType = VkApi.StructureDeviceCreateInfo, PNext = &enable, QueueCreateInfoCount = 1, QueueCreateInfos = &queueInfo };
-        VkApi.Check(VkApi.vkCreateDevice(_physical, &deviceInfo, null, out _device), "vkCreateDevice");
+        var nameBytes = names.Select(n => Marshal.StringToCoTaskMemUTF8(n)).ToArray();
+        try
+        {
+            fixed (IntPtr* namePointers = nameBytes)
+            {
+                var deviceInfo = new VkDeviceCreateInfo
+                {
+                    SType = VkApi.StructureDeviceCreateInfo, PNext = &enable, QueueCreateInfoCount = 1, QueueCreateInfos = &queueInfo,
+                    EnabledExtensionCount = (uint)nameBytes.Length, EnabledExtensionNames = (byte**)namePointers,
+                };
+                VkApi.Check(VkApi.vkCreateDevice(_physical, &deviceInfo, null, out _device), "vkCreateDevice");
+            }
+        }
+        finally
+        {
+            foreach (var p in nameBytes) Marshal.FreeCoTaskMem(p);
+        }
+
+        Bfloat16 = bf16;
         VkApi.vkGetDeviceQueue(_device, _family, 0, out _queue);
 
         fixed (byte* name = "vkGetBufferDeviceAddress\0"u8)
@@ -160,12 +232,102 @@ public sealed unsafe class Vulkan : IDisposable
 
     public bool Int8 { get; }
 
+    /// <summary>float16 arithmetic in kernels (shaderFloat16).</summary>
+    public bool Float16 { get; }
+
+    /// <summary>bfloat16 values in kernels (VK_KHR_shader_bfloat16's shaderBFloat16Type).</summary>
+    public bool Bfloat16 { get; private set; }
+
+    /// <summary>8-bit and 16-bit loads and stores of device memory (storageBuffer8BitAccess, storageBuffer16BitAccess).</summary>
+    public bool Storage8 { get; }
+
+    public bool Storage16 { get; }
+
+    /// <summary>The packed 4 × 8-bit integer dot product, accelerated by the device (VK_KHR_shader_integer_dot_product), for
+    /// signed and for unsigned bytes.</summary>
+    public bool IntDot8Signed { get; }
+
+    public bool IntDot8Unsigned { get; }
+
+    /// <summary>The atomic add of an f32 and of an f64 in memory (VK_EXT_shader_atomic_float).</summary>
+    public bool AtomicAdd32 => Controls.AtomicAdd32;
+
+    public bool AtomicAdd64 => Controls.AtomicAdd64;
+
+    /// <summary>The matrix units' shapes as the device reports them (VK_KHR_cooperative_matrix, a subgroup's matrices), the
+    /// kinds whose element types its kernels can declare; none when it has no matrix units.</summary>
+    public IReadOnlyList<CooperativeMatrix> CooperativeMatrices { get; }
+
+    /// <summary>The first shape with these element types (A and B, the accumulator C and the result), or null.</summary>
+    public CooperativeMatrix? Cooperative(string ab, string c) => CooperativeMatrices.FirstOrDefault(m => m.A == ab && m.B == ab && m.C == c && m.Result == c) is { M: > 0 } k ? k : null;
+
     /// <summary>The device's facts in one line.</summary>
     public string Facts =>
         $"{Name} (Vulkan {ApiVersion}{(Discrete ? ", discrete" : "")}), subgroup {SubgroupSize}, workgroup up to {MaxWorkgroup}, shared {MaxSharedBytes / 1024} KB, " +
-        $"f64 {(Float64 ? "yes" : "no")}, rounding the driver's (RTE not declared: see Spv.AddControls), denormals f32 {Yes(Controls.Denorm32)}, inf/nan f32 {Yes(Controls.Preserve32)}";
+        $"f64 {(Float64 ? "yes" : "no")}, f16 {(Float16 ? "yes" : "no")}, rounding the driver's (RTE not declared: see Spv.AddControls), denormals f32 {Yes(Controls.Denorm32)}, inf/nan f32 {Yes(Controls.Preserve32)}, " +
+        $"8-bit dot {(IntDot8Signed ? "s8" : "")}{(IntDot8Signed && IntDot8Unsigned ? "/" : "")}{(IntDot8Unsigned ? "u8" : "")}{(IntDot8Signed || IntDot8Unsigned ? "" : "no")}, " +
+        $"matrix units {(CooperativeMatrices.Count == 0 ? "none" : string.Join(" ", CooperativeMatrices.Select(m => m.ToString())))}";
 
     private static string Yes(bool b) => b ? "kept" : "no";
+
+    private static HashSet<string> DeviceExtensions(IntPtr physical)
+    {
+        uint count = 0;
+        VkApi.Check(VkApi.vkEnumerateDeviceExtensionProperties(physical, null, ref count, null), "vkEnumerateDeviceExtensionProperties");
+        var list = new VkExtensionProperties[count];
+        fixed (VkExtensionProperties* p = list) VkApi.Check(VkApi.vkEnumerateDeviceExtensionProperties(physical, null, ref count, p), "vkEnumerateDeviceExtensionProperties");
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        for (int i = 0; i < count; i++)
+        {
+            fixed (byte* name = list[i].ExtensionName) names.Add(Marshal.PtrToStringUTF8((IntPtr)name) ?? "");
+        }
+
+        return names;
+    }
+
+    // The matrix units' subgroup shapes whose element types a kernel can declare here (16-bit floats with shaderFloat16, bfloat16
+    // with its cooperative matrices, 8-bit integers with shaderInt8), as vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR lists them.
+    private static CooperativeMatrix[] CooperativeKinds(IntPtr instance, IntPtr physical, bool f16, bool i8, bool bf16)
+    {
+        IntPtr proc;
+        fixed (byte* name = "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR\0"u8) proc = VkApi.vkGetInstanceProcAddr(instance, name);
+        if (proc == IntPtr.Zero) return [];
+        var get = (delegate* unmanaged<IntPtr, uint*, VkCooperativeMatrixProperties*, int>)proc;
+        uint count = 0;
+        if (get(physical, &count, null) != VkApi.Success || count == 0) return [];
+        var list = new VkCooperativeMatrixProperties[count];
+        for (int i = 0; i < count; i++) list[i].SType = VkApi.StructureCooperativeMatrixProperties;
+        fixed (VkCooperativeMatrixProperties* p = list) VkApi.Check(get(physical, &count, p), "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+        bool Declarable(string t) => t switch { "f16" => f16, "bf16" => bf16 && f16, "s8" or "u8" => i8, "f32" or "s32" or "u32" => true, _ => false };
+        var kinds = new List<CooperativeMatrix>();
+        foreach (var p in list.AsSpan(0, (int)count))
+        {
+            if (p.Scope != VkApi.ScopeSubgroup) continue;
+            var k = new CooperativeMatrix((int)p.MSize, (int)p.NSize, (int)p.KSize, Component(p.AType), Component(p.BType), Component(p.CType), Component(p.ResultType), p.SaturatingAccumulation != 0);
+            if (Declarable(k.A) && Declarable(k.B) && Declarable(k.C) && Declarable(k.Result) && !kinds.Contains(k)) kinds.Add(k);
+        }
+
+        return [.. kinds];
+    }
+
+    private static string Component(uint type) => type switch
+    {
+        VkApi.ComponentFloat16 => "f16",
+        VkApi.ComponentFloat32 => "f32",
+        VkApi.ComponentFloat64 => "f64",
+        VkApi.ComponentSint8 => "s8",
+        VkApi.ComponentSint16 => "s16",
+        VkApi.ComponentSint32 => "s32",
+        VkApi.ComponentSint64 => "s64",
+        VkApi.ComponentUint8 => "u8",
+        VkApi.ComponentUint16 => "u16",
+        VkApi.ComponentUint32 => "u32",
+        VkApi.ComponentUint64 => "u64",
+        VkApi.ComponentBfloat16 => "bf16",
+        VkApi.ComponentFloat8E4M3 => "e4m3",
+        VkApi.ComponentFloat8E5M2 => "e5m2",
+        _ => $"type{type}",
+    };
 
     private static IntPtr CreateInstance()
     {
@@ -525,4 +687,11 @@ public sealed unsafe class Vulkan : IDisposable
     }
 
     public override string ToString() => new StringBuilder(Name).Append(" (Vulkan)").ToString();
+}
+
+/// <summary>One shape of the device's matrix units: a subgroup multiplies an M × K matrix of A by a K × N matrix of B into
+/// an M × N accumulator; the element types by name (f16, bf16, f32, s8, u8, s32, u32, …).</summary>
+public readonly record struct CooperativeMatrix(int M, int N, int K, string A, string B, string C, string Result, bool Saturating)
+{
+    public override string ToString() => $"{A}{(B == A ? "" : "x" + B)}->{Result} {M}x{N}x{K}{(C == Result ? "" : $" (C {C})")}{(Saturating ? " sat" : "")}";
 }

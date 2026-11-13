@@ -81,6 +81,37 @@ internal sealed class SpirvModule
         return Emit(_globals, SpirvOp.TypeFloat, Id(), (uint)bits);
     });
 
+    /// <summary>bfloat16 (SPV_KHR_bfloat16: a 16-bit float of the BFloat16 encoding, for conversions and the matrix units).</summary>
+    public uint TypeBfloat16() => Type("bfloat16", () =>
+    {
+        Capability(Cap.BFloat16Type);
+        Extension("SPV_KHR_bfloat16");
+        return Emit(_globals, SpirvOp.TypeFloat, Id(), 16, 0);                          // FP encoding BFloat16KHR
+    });
+
+    /// <summary>A runtime array of <paramref name="element"/> at <paramref name="stride"/> bytes, inside a Block struct (as a
+    /// buffer's contents are declared): what a pointer into memory by address points at where an instruction needs a
+    /// pointer into an array (the matrix units' loads and stores).</summary>
+    public uint TypeBufferArray(uint element, int stride) => Type($"bufarray:{element}:{stride}", () =>
+    {
+        uint array = Emit(_globals, SpirvOp.TypeRuntimeArray, Id(), element);
+        Decorate(array, Decoration.ArrayStride, (uint)stride);
+        uint block = Emit(_globals, SpirvOp.TypeStruct, Id(), array);
+        Decorate(block, Decoration.Block);
+        MemberDecorate(block, 0, Decoration.Offset, 0);
+        return block;
+    });
+
+    /// <summary>A cooperative matrix type (SPV_KHR_cooperative_matrix): rows × columns of <paramref name="component"/> held by
+    /// a subgroup, for use A (0), B (1) or the accumulator (2).</summary>
+    public uint TypeCooperativeMatrix(uint component, int rows, int columns, int use) => Type($"coop:{component}:{rows}:{columns}:{use}", () =>
+    {
+        Capability(Cap.CooperativeMatrix);
+        Extension("SPV_KHR_cooperative_matrix");
+        uint u32 = TypeInt(32, false);
+        return Emit(_globals, SpirvOp.TypeCooperativeMatrixKHR, Id(), component, Constant(u32, 3), Constant(u32, (uint)rows), Constant(u32, (uint)columns), Constant(u32, (uint)use));
+    });
+
     public uint TypeVector(uint component, uint count) => Type($"vec:{component}:{count}", () => Emit(_globals, SpirvOp.TypeVector, Id(), component, count));
 
     public uint TypeArray(uint element, uint length) => Type($"array:{element}:{length}", () =>
@@ -119,6 +150,9 @@ internal sealed class SpirvModule
 
         return id;
     }
+
+    /// <summary>A composite constant of one constituent (a cooperative matrix every element of which is that value).</summary>
+    public uint ConstantComposite(uint type, uint constituent) => Type($"composite:{type}:{constituent}", () => Emit(_globals, SpirvOp.ConstantComposite, type, Id(), constituent));
 
     public uint ConstantBool(bool value) => Type(value ? "true" : "false",
         () => Emit(_globals, value ? SpirvOp.ConstantTrue : SpirvOp.ConstantFalse, TypeBool(), Id()));
@@ -237,7 +271,10 @@ internal static class Cap
 {
     public const uint Shader = 1, Float16 = 9, Float64 = 10, Int64 = 11, Int64Atomics = 12, Int16 = 22, Int8 = 39,
         GroupNonUniform = 61, GroupNonUniformVote = 62, GroupNonUniformArithmetic = 63, GroupNonUniformBallot = 64, GroupNonUniformShuffle = 65,
-        DenormPreserve = 4464, SignedZeroInfNanPreserve = 4466, RoundingModeRte = 4467, PhysicalStorageBufferAddresses = 5347;
+        StorageBuffer16BitAccess = 4433, StorageBuffer8BitAccess = 4448,
+        DenormPreserve = 4464, SignedZeroInfNanPreserve = 4466, RoundingModeRte = 4467, PhysicalStorageBufferAddresses = 5347,
+        BFloat16Type = 5116, BFloat16CooperativeMatrix = 5118, DotProductInputAll = 6016, DotProductInput4x8Bit = 6017, DotProductInput4x8BitPacked = 6018,
+        DotProduct = 6019, CooperativeMatrix = 6022, AtomicFloat32Add = 6033, AtomicFloat64Add = 6034;
 }
 
 /// <summary>The execution modes of the float controls (each with a width operand).</summary>
@@ -280,6 +317,7 @@ internal enum SpirvOp : ushort
     MemberDecorate = 72,
     CompositeConstruct = 80,
     CompositeExtract = 81,
+    CompositeInsert = 82,
     ConvertFToU = 109,
     ConvertFToS = 110,
     ConvertSToF = 111,
@@ -304,6 +342,7 @@ internal enum SpirvOp : ushort
     SRem = 138,
     SMod = 139,
     FRem = 140,
+    MatrixTimesScalar = 143,
     UMulExtended = 151,
     SMulExtended = 152,
     IsNan = 156,
@@ -367,6 +406,15 @@ internal enum SpirvOp : ushort
     GroupNonUniformShuffle = 345,
     GroupNonUniformShuffleXor = 346,
     GroupNonUniformShuffleDown = 348,
+    SDot = 4450,
+    UDot = 4451,
+    SUDot = 4452,
+    TypeCooperativeMatrixKHR = 4456,
+    CooperativeMatrixLoadKHR = 4457,
+    CooperativeMatrixStoreKHR = 4458,
+    CooperativeMatrixMulAddKHR = 4459,
+    CooperativeMatrixLengthKHR = 4460,
+    AtomicFAddEXT = 6035,
 }
 
 internal enum StorageClass : uint
@@ -398,6 +446,7 @@ internal enum BuiltIn : uint
     GlobalInvocationId = 28,
     LocalInvocationIndex = 29,
     SubgroupSize = 36,
+    SubgroupId = 40,
     SubgroupLocalInvocationId = 41,
 }
 
@@ -410,6 +459,8 @@ internal enum Glsl : uint
     Floor = 8,
     Ceil = 9,
     Fract = 10,
+    Exp2 = 29,
+    Log2 = 30,
     Sqrt = 31,
     InverseSqrt = 32,
     FMin = 37,

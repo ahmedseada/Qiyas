@@ -13,7 +13,8 @@
 // are asked for on every kernel.
 namespace Adad.Vulkan;
 
-/// <summary>The kind of a value: a lane's register type, or a condition.</summary>
+/// <summary>The kind of a value: a lane's register type, or a condition; the 16- and 8-bit kinds for values of those widths
+/// (float16 arithmetic, narrow loads and stores, the matrix units' elements; bfloat16 for conversions and matrices only).</summary>
 internal enum K : byte
 {
     Bool,
@@ -23,17 +24,35 @@ internal enum K : byte
     S64,
     F32,
     F64,
+    F16,
+    BF16,
+    U16,
+    S16,
+    U8,
+    S8,
 }
 
 internal static class Kinds
 {
-    public static bool IsFloat(this K k) => k is K.F32 or K.F64;
+    public static bool IsFloat(this K k) => k is K.F32 or K.F64 or K.F16 or K.BF16;
 
-    public static bool IsSigned(this K k) => k is K.S32 or K.S64;
+    public static bool IsSigned(this K k) => k is K.S32 or K.S64 or K.S16 or K.S8;
 
     public static bool Wide(this K k) => k is K.U64 or K.S64 or K.F64;
 
-    public static int Bytes(this K k) => k == K.Bool ? 4 : k.Wide() ? 8 : 4;
+    /// <summary>The kind's width in bits (a condition's as a 32-bit word's).</summary>
+    public static int Width(this K k) => k switch { K.U64 or K.S64 or K.F64 => 64, K.F16 or K.BF16 or K.U16 or K.S16 => 16, K.U8 or K.S8 => 8, _ => 32 };
+
+    public static int Bytes(this K k) => k.Width() / 8;
+
+    /// <summary>The integer kind of this width and signedness.</summary>
+    public static K Integer(int width, bool signed) => width switch
+    {
+        64 => signed ? K.S64 : K.U64,
+        16 => signed ? K.S16 : K.U16,
+        8 => signed ? K.S8 : K.U8,
+        _ => signed ? K.S32 : K.U32,
+    };
 
     /// <summary>The kind of a lane.</summary>
     public static K Of(Abstraction.Lane lane) => lane.Name switch
@@ -48,7 +67,7 @@ internal static class Kinds
     };
 
     /// <summary>The unsigned kind of the same width (a value's bits).</summary>
-    public static K BitsKind(this K k) => k.Wide() ? K.U64 : K.U32;
+    public static K BitsKind(this K k) => Integer(k.Width(), false);
 }
 
 /// <summary>A generated kernel: its SPIR-V words, workgroup size, argument slots and workgroup memory.</summary>
@@ -139,8 +158,11 @@ internal readonly struct Arr(Spv b, uint variable, K kind, int length, StorageCl
     }
 }
 
-/// <summary>What the device grants a kernel's float arithmetic (the float controls it reports), set by the device once.</summary>
-internal readonly record struct FloatControls(bool Rte32, bool Rte64, bool Denorm32, bool Denorm64, bool Preserve32, bool Preserve64, bool Float64, bool Int64);
+/// <summary>What the device grants a kernel's float arithmetic (the float controls it reports) and the widths it may declare
+/// (f64, f16, 8- and 16-bit integers, 8- and 16-bit loads and stores of memory, bfloat16), set by the device once.</summary>
+internal readonly record struct FloatControls(bool Rte32, bool Rte64, bool Denorm32, bool Denorm64, bool Preserve32, bool Preserve64, bool Float64, bool Int64,
+    bool Float16 = false, bool Denorm16 = false, bool Preserve16 = false, bool Int8 = false, bool Int16 = false, bool Storage8 = false, bool Storage16 = false,
+    bool Bfloat16 = false, bool AtomicAdd32 = false, bool AtomicAdd64 = false);
 
 internal sealed partial class Spv
 {
@@ -154,7 +176,7 @@ internal sealed partial class Spv
     private readonly Dictionary<BuiltIn, uint> _builtIns = [];
     private readonly Dictionary<(BuiltIn, int), V> _builtInValues = [];
     private int _sharedBytes;
-    private bool _usesF64;
+    private bool _usesF64, _usesF16;
 
     /// <summary>The push-constant slots every kernel declares (its arguments are the first ones it reads).</summary>
     public const int MaxSlots = 16;
@@ -191,8 +213,15 @@ internal sealed partial class Spv
         K.U64 => _m.TypeInt(64, false),
         K.S64 => _m.TypeInt(64, true),
         K.F32 => _m.TypeFloat(32),
-        _ => F64Type(),
+        K.F64 => F64Type(),
+        K.F16 => Granted(_controls.Float16, "f16 (shaderFloat16)", () => { _usesF16 = true; return _m.TypeFloat(16); }),
+        K.BF16 => Granted(_controls.Bfloat16, "bfloat16 (VK_KHR_shader_bfloat16)", _m.TypeBfloat16),
+        K.U16 or K.S16 => Granted(_controls.Int16, "16-bit integers (shaderInt16)", () => _m.TypeInt(16, k == K.S16)),
+        _ => Granted(_controls.Int8, "8-bit integers (shaderInt8)", () => _m.TypeInt(8, k == K.S8)),
     };
+
+    private uint Granted(bool granted, string what, Func<uint> type) =>
+        granted ? type() : throw new NotSupportedException($"{_name}: the device has no {what}");
 
     private uint F64Type()
     {
@@ -279,8 +308,24 @@ internal sealed partial class Spv
     private uint Pointer(K kind, V address)
     {
         if (address.Kind != K.U64) throw new InvalidOperationException($"{_name}: an address is a u64, not {address.Kind}");
+        Narrow(kind.Width());
         uint type = _m.TypePointer(StorageClass.PhysicalStorageBuffer, Type(kind));
         return _m.Value(SpirvOp.ConvertUToPtr, type, address.Id);
+    }
+
+    // A load or store of memory of 8 or 16 bits: the device's storage capability for it.
+    private void Narrow(int width)
+    {
+        if (width == 8)
+        {
+            if (!_controls.Storage8) throw new NotSupportedException($"{_name}: the device has no 8-bit loads and stores (storageBuffer8BitAccess)");
+            _m.Capability(Cap.StorageBuffer8BitAccess);
+        }
+        else if (width == 16)
+        {
+            if (!_controls.Storage16) throw new NotSupportedException($"{_name}: the device has no 16-bit loads and stores (storageBuffer16BitAccess)");
+            _m.Capability(Cap.StorageBuffer16BitAccess);
+        }
     }
 
     /// <summary>Atomically adds <paramref name="value"/> (u32 or s32) to the word at <paramref name="address"/>; returns the old value.</summary>
@@ -296,6 +341,19 @@ internal sealed partial class Spv
     {
         uint pointer = Pointer(value.Kind, address);
         return new V(this, _m.Value(SpirvOp.AtomicCompareExchange, Type(value.Kind), pointer, Const(K.U32, 1), Const(K.U32, 0), Const(K.U32, 0), value.Id, comparator.Id), value.Kind);
+    }
+
+    /// <summary>Atomically adds the float <paramref name="value"/> (f32 or f64, where the device has the float atomic add:
+    /// Vulkan.AtomicAdd32, AtomicAdd64) to the value at <paramref name="address"/>; returns the old value.</summary>
+    public V AtomicFAdd(V address, V value)
+    {
+        bool wide = value.Kind == K.F64;
+        if (value.Kind is not (K.F32 or K.F64) || !(wide ? _controls.AtomicAdd64 : _controls.AtomicAdd32))
+            throw new NotSupportedException($"{_name}: the device has no {value.Kind} atomic add (VK_EXT_shader_atomic_float)");
+        _m.Capability(wide ? Cap.AtomicFloat64Add : Cap.AtomicFloat32Add);
+        _m.Extension("SPV_EXT_shader_atomic_float_add");
+        uint pointer = Pointer(value.Kind, address);
+        return new V(this, _m.Value(SpirvOp.AtomicFAddEXT, Type(value.Kind), pointer, Const(K.U32, 1), Const(K.U32, 0), value.Id), value.Kind);
     }
 
     // ---------------------------------------------------------------- built-ins (u32)
@@ -332,10 +390,14 @@ internal sealed partial class Spv
 
     // ---------------------------------------------------------------- constants
 
+    // A constant's bits as SPIR-V takes them: a kind narrower than 32 bits in the low bits of its word, a signed one's sign
+    // extended, the others' high bits 0.
     internal uint Const(K k, ulong bits) => k switch
     {
         K.Bool => _m.ConstantBool(bits != 0),
-        _ => _m.Constant(Type(k), k.Wide() ? bits : bits & 0xFFFFFFFF, k.Wide() ? 2 : 1),
+        _ when k.Wide() => _m.Constant(Type(k), bits, 2),
+        _ when k.Width() < 32 => _m.Constant(Type(k), k.IsSigned() ? (uint)((long)(bits << (64 - k.Width())) >> (64 - k.Width())) : bits & ((1UL << k.Width()) - 1)),
+        _ => _m.Constant(Type(k), bits & 0xFFFFFFFF),
     };
 
     public V U(long value) => new(this, Const(K.U32, (ulong)value), K.U32);
@@ -351,12 +413,24 @@ internal sealed partial class Spv
     {
         K.F32 => F(value),
         K.F64 => D(value),
+        K.F16 => new(this, Const(K.F16, BitConverter.HalfToUInt16Bits((Half)value)), K.F16),
+        K.BF16 => new(this, Const(K.BF16, Bf16Bits((float)value)), K.BF16),
         K.U32 => U((long)value),
         K.S32 => S((long)value),
         K.U64 => UL((ulong)value),
         K.S64 => SL((long)value),
+        K.U16 or K.U8 => new(this, Const(k, (ulong)value), k),
+        K.S16 or K.S8 => new(this, Const(k, (ulong)(long)value), k),
         _ => Bool(value != 0),
     };
+
+    // A float's nearest bfloat16 (ties to even; a NaN stays a NaN).
+    private static ushort Bf16Bits(float value)
+    {
+        uint bits = BitConverter.SingleToUInt32Bits(value);
+        if (float.IsNaN(value)) return (ushort)((bits >> 16) | 0x40);
+        return (ushort)((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16);
+    }
 
     /// <summary>The integer constant <paramref name="bits"/> as kind <paramref name="k"/> (its bits, any kind).</summary>
     public V CBits(K k, ulong bits) => new(this, Const(k, bits), k);
@@ -413,11 +487,17 @@ internal sealed partial class Spv
         var r = Fma(-q, b, a);
         var refined = Fma(r, rcp, q);
         var finite = !IsNan(q) & !IsInf(q) & (q != 0.0);
-        var normal = Abs(q) >= (a.Kind == K.F32 ? 1.1754943508222875e-38 * 4 : 2.2250738585072014e-308 * 4);
+        var normal = Abs(q) >= (a.Kind switch { K.F32 => 1.1754943508222875e-38, K.F16 => 6.103515625e-05, _ => 2.2250738585072014e-308 } * 4);
         return Select(finite & normal & !IsInf(rcp) & !IsNan(refined), refined, q);
     }
 
     /// <summary>√x correctly rounded: the device's root refined (s + r·(0.5/s), r = x − s² exactly).</summary>
+    /// <summary>2^x and log2 x by the device's instructions (GLSL.std.450 Exp2, Log2: an f32's or an f16's, the precision the
+    /// device gives them).</summary>
+    public V Exp2(V x) => Ext(Glsl.Exp2, x);
+
+    public V Log2(V x) => Ext(Glsl.Log2, x);
+
     public V Sqrt(V x)
     {
         var s = Ext(Glsl.Sqrt, x);
@@ -497,8 +577,8 @@ internal sealed partial class Spv
         if (!from.IsFloat() && to.IsFloat()) return new V(this, _m.Value(from.IsSigned() ? SpirvOp.ConvertSToF : SpirvOp.ConvertUToF, Type(to), a.Id), to);
         if (from.IsFloat()) return new V(this, _m.Value(to.IsSigned() ? SpirvOp.ConvertFToS : SpirvOp.ConvertFToU, Type(to), a.Id), to);
         // Integers: the width by the source's sign, then the signedness by the bits.
-        if (from.Wide() == to.Wide()) return Bitcast(a, to);
-        var wid = to.Wide() ? (from.IsSigned() ? K.S64 : K.U64) : (from.IsSigned() ? K.S32 : K.U32);
+        if (from.Width() == to.Width()) return Bitcast(a, to);
+        var wid = Kinds.Integer(to.Width(), from.IsSigned());
         var widened = new V(this, _m.Value(from.IsSigned() ? SpirvOp.SConvert : SpirvOp.UConvert, Type(wid), a.Id), wid);
         return Bitcast(widened, to);
     }
@@ -615,6 +695,7 @@ internal sealed partial class Spv
         // The float controls the device grants, on the widths the kernel computes in.
         AddControls(32, _controls.Rte32, _controls.Denorm32, _controls.Preserve32);
         if (_usesF64) AddControls(64, _controls.Rte64, _controls.Denorm64, _controls.Preserve64);
+        if (_usesF16) AddControls(16, false, _controls.Denorm16, _controls.Preserve16);
         var words = _m.Finish((uint)_localX, (uint)_localY, 1);
         return new SpvKernel(_name, words, _localX, _localY, _slots, _sharedBytes);
     }

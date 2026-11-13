@@ -88,7 +88,17 @@ internal static unsafe partial class VkApi
         StructurePhysicalDeviceVulkan12Features = 51, StructurePhysicalDeviceFeatures2 = 1000059000,
         StructurePhysicalDeviceProperties2 = 1000059001, StructureMemoryAllocateFlagsInfo = 1000060000,
         StructurePhysicalDeviceSubgroupProperties = 1000094000, StructurePhysicalDeviceFloatControlsProperties = 1000197000,
-        StructureBufferDeviceAddressInfo = 1000244001;
+        StructureBufferDeviceAddressInfo = 1000244001, StructurePhysicalDeviceVulkan11Features = 49,
+        StructurePhysicalDeviceIntegerDotProductFeatures = 1000280000, StructurePhysicalDeviceIntegerDotProductProperties = 1000280001,
+        StructurePhysicalDeviceCooperativeMatrixFeatures = 1000506000, StructureCooperativeMatrixProperties = 1000506001,
+        StructurePhysicalDeviceBfloat16Features = 1000141000, StructurePhysicalDeviceAtomicFloatFeatures = 1000260000;
+
+    // VkComponentTypeKHR (a cooperative matrix's element types) and VkScopeKHR.
+    public const uint ComponentFloat16 = 0, ComponentFloat32 = 1, ComponentFloat64 = 2, ComponentSint8 = 3, ComponentSint16 = 4,
+        ComponentSint32 = 5, ComponentSint64 = 6, ComponentUint8 = 7, ComponentUint16 = 8, ComponentUint32 = 9, ComponentUint64 = 10,
+        ComponentBfloat16 = 1000141000, ComponentFloat8E4M3 = 1000491002, ComponentFloat8E5M2 = 1000491003;
+
+    public const uint ScopeDevice = 1, ScopeWorkgroup = 2, ScopeSubgroup = 3;
 
     public static uint MakeVersion(uint major, uint minor) => (major << 22) | (minor << 12);
 
@@ -128,6 +138,8 @@ internal static unsafe partial class VkApi
     [LibraryImport(Library)] public static partial void vkGetDeviceQueue(IntPtr device, uint family, uint index, out IntPtr queue);
     [LibraryImport(Library)] public static partial int vkDeviceWaitIdle(IntPtr device);
     [LibraryImport(Library)] public static partial IntPtr vkGetDeviceProcAddr(IntPtr device, byte* name);
+    [LibraryImport(Library)] public static partial IntPtr vkGetInstanceProcAddr(IntPtr instance, byte* name);
+    [LibraryImport(Library)] public static partial int vkEnumerateDeviceExtensionProperties(IntPtr physicalDevice, byte* layer, ref uint count, VkExtensionProperties* properties);
 
     // ---------------------------------------------------------------- memory and buffers
 
@@ -278,7 +290,7 @@ internal unsafe struct VkPhysicalDeviceFeatures2
     public const int ShaderFloat64 = 39, ShaderInt64 = 40, ShaderInt16 = 41;
 }
 
-/// <summary>VkPhysicalDeviceVulkan12Features: 47 booleans (shaderFloat16 the 8th, shaderInt8 the 9th, bufferDeviceAddress the 39th).</summary>
+/// <summary>VkPhysicalDeviceVulkan12Features: 47 booleans (storageBuffer8BitAccess the 3rd, shaderFloat16 the 8th, shaderInt8 the 9th, bufferDeviceAddress the 39th).</summary>
 [StructLayout(LayoutKind.Sequential)]
 internal unsafe struct VkPhysicalDeviceVulkan12Features
 {
@@ -286,7 +298,59 @@ internal unsafe struct VkPhysicalDeviceVulkan12Features
     public void* PNext;
     public fixed uint Features[47];
 
-    public const int ShaderFloat16 = 7, ShaderInt8 = 8, BufferDeviceAddress = 38;
+    public const int StorageBuffer8BitAccess = 2, ShaderFloat16 = 7, ShaderInt8 = 8, BufferDeviceAddress = 38;
+}
+
+/// <summary>VkPhysicalDeviceVulkan11Features: 12 booleans (storageBuffer16BitAccess the 1st).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VkPhysicalDeviceVulkan11Features
+{
+    public uint SType;
+    public void* PNext;
+    public fixed uint Features[12];
+
+    public const int StorageBuffer16BitAccess = 0;
+}
+
+/// <summary>An extension's feature structure: its booleans in order (VK_KHR_cooperative_matrix's, VK_KHR_shader_integer_dot_product's,
+/// VK_KHR_shader_bfloat16's first boolean the feature; VK_EXT_shader_atomic_float's 2nd and 4th the f32 and f64 adds).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VkFeatureFlags
+{
+    public uint SType;
+    public void* PNext;
+    public fixed uint Features[12];
+}
+
+/// <summary>VkPhysicalDeviceShaderIntegerDotProductProperties: 30 booleans, whether each form of the integer dot product
+/// is accelerated (the 4×8-bit packed forms the 4th to 6th: unsigned, signed, mixed).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VkIntegerDotProductProperties
+{
+    public uint SType;
+    public void* PNext;
+    public fixed uint Accelerated[30];
+
+    public const int Packed4x8Unsigned = 3, Packed4x8Signed = 4, Packed4x8Mixed = 5;
+}
+
+/// <summary>VkCooperativeMatrixPropertiesKHR: one M × N × K shape of the matrix units with its element types and scope.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VkCooperativeMatrixProperties
+{
+    public uint SType;
+    public void* PNext;
+    public uint MSize, NSize, KSize;
+    public uint AType, BType, CType, ResultType;
+    public uint SaturatingAccumulation;
+    public uint Scope;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VkExtensionProperties
+{
+    public fixed byte ExtensionName[256];
+    public uint SpecVersion;
 }
 
 /// <summary>VkPhysicalDeviceMemoryProperties: 32 memory types (flags, heap) and 16 heaps (size, flags).</summary>
