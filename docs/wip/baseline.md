@@ -6002,7 +6002,7 @@ The readings of the readout's process alone, the re-time's medians in the cells:
 - sum:cols bool: readout adad 0.591; re-timed adad 0.724, 0.733, 0.743; the re-time's processes agree and no other process reads the readout's level: the re-time's medians
 - sumsq:rows int2: readout adad 0.070; re-timed adad 0.059, 0.061, 0.064; the re-time's processes agree and no other process reads the readout's level: the re-time's medians
 
-Re-timed on build d56a2f3 (the recurrent steps, the composed attention, the max-pool backwards and scatter_add_rows: their temporaries kept, not allocated each call): 182 CPU rows, one exclusive job of 3 rounds, a process a round. Where a row's three readings agree within 10 %, each subject's, their medians replace the readings; where they do not (17 rows; lstm_step float64, whose slow process measured it first, re-timed with a row ahead of it and its median taken), the other 16 cells carry the process whose reading is the less favourable to adad, both subjects from it:
+Re-timed on build d56a2f3 (the recurrent steps, the composed attention, the max-pool backwards and scatter_add_rows: their temporaries kept, not allocated each call): 182 CPU rows, one exclusive job of 3 rounds, a process a round. Where a row's three readings agree within 10 %, each subject's, their medians replace the readings; where they do not (17 rows; lstm_step float64 apart: three more processes agreed and none read its slow process's level, so its cell takes their median), the other 16 cells carry the process whose reading is the less favourable to adad, both subjects from it:
 
 - cpu attention bfloat16: adad 27.451 -> 25.874
 - cpu attention float16: adad 28.044 -> 26.601
@@ -6169,7 +6169,7 @@ Re-timed on build d56a2f3 (the recurrent steps, the composed attention, the max-
 - cpu lstm_step bfloat16: adad 11.343 -> 9.494
 - cpu lstm_step float16: adad 11.622 -> 9.933
 - cpu lstm_step float32: adad 11.873 -> 10.085
-- cpu lstm_step float64: adad 26.456 -> 22.992; the processes apart (adad 35.237, 24.542, 22.627), the 35.237 the first row its process measured: re-timed on d56a2f3 with a row ahead of it (add), 3 processes (22.992, 23.999, 22.886), their median
+- cpu lstm_step float64: adad 26.456 -> 22.992; the processes apart (adad 35.237, 24.542, 22.627; in each the first recurrent row, after the layouts and the attention group): 3 more processes on d56a2f3 (with add ahead of it) read 22.992, 23.999, 22.886, and none reads 35.2: the one process alone, their median
 - cpu lstm_step float8_e4m3: adad 11.525 -> 9.724
 - cpu lstm_step float8_e5m2: adad 11.623 -> 9.794
 - cpu lstm_step q4_0: adad 12.686 -> 10.571

@@ -219,11 +219,11 @@ disagree with each other, or a 390-row long-process probe read the row as the re
 operations changed since (the recurrent steps, the composed attention, the max-pool backwards and scatter_add_rows,
 whose temporaries are now kept instead of allocated each call) are re-timed on build d56a2f3, which carries that change,
 both subjects, in one exclusive job of 3 rounds (182 rows); where its three processes disagree by more than 10 % (17
-rows) the cell carries the one less favourable to Adad, except lstm_step float64, whose slow process measured it first:
-it is re-timed with a row ahead of it. `docs/wip/baseline.md` is that assembled file: every row, its builds, and notes
-naming each re-timed or re-measured row. Device bandwidth rows follow the driver's memory P-state (a row timed at P3
-reads up to about 1.9× its P1 time); setting "Prefer maximum performance" for dotnet.exe in the NVIDIA control panel
-gives stable readings.
+rows) the cell carries the one less favourable to Adad, except lstm_step float64, which three more processes read alike
+(none at its slow process's level): the cell takes their median. `docs/wip/baseline.md` is that assembled file: every
+row, its builds, and notes naming each re-timed or re-measured row. Device bandwidth rows follow the driver's memory
+P-state (a row timed at P3 reads up to about 1.9× its P1 time); setting "Prefer maximum performance" for dotnet.exe in
+the NVIDIA control panel gives stable readings.
 
 The columns shown here are the `INumberBase<T>` version (`number`, — where .NET has no such type) and Adad. Times are
 medians in ms. Every subject's error is against float64 math (products in double-double). On the core rows Adad's error
