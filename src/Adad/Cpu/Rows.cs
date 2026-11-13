@@ -650,7 +650,7 @@ internal sealed partial class Kernels
     private readonly struct NormParamsTile<TN, TLane, TL>(byte[] x, byte[] dy, TLane[] stats, byte[] dgamma, byte[] dbeta, int cols) : IColumnTile
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
-        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
         public void Tile(int r0, int r1, int c0, int c1, int block)
         {
             int n = c1 - c0, w = Vector<TLane>.Count;
