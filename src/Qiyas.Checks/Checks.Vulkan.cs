@@ -22,6 +22,8 @@ internal static partial class Checks
         ok &= BoxLosses(ops, "vulkan");
         ok &= Layouts(ops, "vulkan");
         ok &= Products(ops, "vulkan");
+        ok &= VulkanChoices(ops);
+        ok &= VulkanSliced(ops);
         ok &= Optimizers(ops, "vulkan");
         ok &= Routings(ops, "vulkan");
         ok &= ExpertsCheck(ops, "vulkan");

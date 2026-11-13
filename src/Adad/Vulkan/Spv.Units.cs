@@ -100,6 +100,21 @@ internal sealed partial class Spv
         return new M(this, _m.Value(SpirvOp.CooperativeMatrixLoadKHR, type.Id, pointer, Const(K.U32, columnMajor ? 1UL : 0), stride.Id), type);
     }
 
+    /// <summary>A matrix loaded from a workgroup array of scalars (its first row, or column, at element <paramref name="index"/>,
+    /// the next <paramref name="stride"/> elements on: both in the array's elements, whatever the matrix's components).</summary>
+    public M Load(CoopType type, Arr array, V index, V stride, bool columnMajor = false)
+    {
+        uint pointer = _m.Value(SpirvOp.AccessChain, _m.TypePointer(array.Storage, Type(array.Kind)), array.Variable, index.Id);
+        return new M(this, _m.Value(SpirvOp.CooperativeMatrixLoadKHR, type.Id, pointer, Const(K.U32, columnMajor ? 1UL : 0), stride.Id), type);
+    }
+
+    /// <summary>Stores a matrix into a workgroup array of scalars (rows, or columns, <paramref name="stride"/> elements apart).</summary>
+    public void Store(M matrix, Arr array, V index, V stride, bool columnMajor = false)
+    {
+        uint pointer = _m.Value(SpirvOp.AccessChain, _m.TypePointer(array.Storage, Type(array.Kind)), array.Variable, index.Id);
+        _m.Code(SpirvOp.CooperativeMatrixStoreKHR, pointer, matrix.Id, Const(K.U32, columnMajor ? 1UL : 0), stride.Id);
+    }
+
     /// <summary>A matrix loaded from memory by address: values of <paramref name="element"/> (the matrix's own component, or
     /// words of them), its first row (column) at <paramref name="address"/>, the next <paramref name="stride"/> elements on;
     /// <paramref name="align"/> the bytes every row's start is aligned to.</summary>
@@ -159,6 +174,14 @@ internal sealed partial class Spv
     {
         if (scalar.Kind != m.Type.Component) throw new InvalidOperationException($"{_name}: a {m.Type.Component} matrix scaled by a {scalar.Kind}");
         var v = new M(this, _m.Value(SpirvOp.MatrixTimesScalar, m.Type.Id, m.Id, scalar.Id), m.Type);
+        _m.Decorate(v.Id, Decoration.NoContraction);
+        return v;
+    }
+
+    /// <summary>a · b element by element (float components).</summary>
+    public M Mul(M a, M b)
+    {
+        var v = new M(this, _m.Value(SpirvOp.FMul, a.Type.Id, a.Id, b.Id), a.Type);
         _m.Decorate(v.Id, Decoration.NoContraction);
         return v;
     }

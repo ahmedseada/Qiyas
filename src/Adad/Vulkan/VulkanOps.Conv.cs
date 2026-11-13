@@ -158,7 +158,11 @@ public sealed partial class VulkanOps
         // The columns' values are the image's and 0 (padding): the image's range, with 0, bounds them.
         var (wLo, wHi) = Range<TN>(w, (int)a.WValues);
         var (xLo, xHi) = Range<TN>(x, (int)a.XValues);
-        var lane = SumLane(f, new Bounds(wLo, wHi, Math.Min(xLo, 0), Math.Max(xHi, 0), a.Rows));
+        var bounds = new Bounds(wLo, wHi, Math.Min(xLo, 0), Math.Max(xHi, 0), a.Rows);
+        var lane = SumLane(f, bounds);
+        // A product on the matrix units, or float64's that may take the sliced product: the composition (the columns as the
+        // type, then the product's measured route), whichever mode (the fused path and the composition then the same sums).
+        if (!f.IsBlock && a.ColValues <= int.MaxValue && (UnitsKind(f, bounds) is not null || (f.Is("float64") && SlicedProven))) return ConvComposed<TN>(a, x, w, y);
         // The composition's columns past 2^31 values: fused.
         if (FusedConv == true || f.IsBlock || a.ColValues > int.MaxValue) return ConvFused(f, a, x, w, y, lane);
         string key = $"{f.Name}: {a.Shape}";
@@ -219,14 +223,34 @@ public sealed partial class VulkanOps
     private void ConvProduct(Fmt fa, Fmt fb, Lane lane, ulong a, ulong x, ulong c, int m, int n, int k, ConvArgs conv, bool transB)
     {
         if (m == 0 || n == 0) return;
-        var fn = vk.Cached($"matmul_conv:{fa.Name}:{fb.Name}:{lane.Name}:{transB}", () => VkKernels.MatMulConv(vk, fa, fb, lane, transB));
-        // im2col's parameters as the kernels take them (every pad, the dilations, OH and OW) two a slot.
-        var p = LayoutArgs.KernelP("im2col", conv.P);
-        var args = new ulong[6 + (p.Length + 1) / 2];
-        args[0] = a; args[1] = x; args[2] = c;
-        args[3] = Vulkan.U(m); args[4] = Vulkan.U(n); args[5] = Vulkan.U(k);
-        for (int j = 0; 2 * j < p.Length; j++) args[6 + j] = (uint)p[2 * j] | (2 * j + 1 < p.Length ? (ulong)(uint)p[2 * j + 1] << 32 : 0);
-        vk.Launch(fn, Groups(n, VkKernels.TileN), (uint)((m + VkKernels.TileM - 1) / VkKernels.TileM), args);
+        var t = Tiling(lane, m, n, k, 1, tt => ConvLaunch(tt, fa, fb, lane, a, x, c, m, n, k, conv, transB));
+        ConvLaunch(t, fa, fb, lane, a, x, c, m, n, k, conv, transB);
+    }
+
+    // ConvProduct at a tiling (the plain product's: Tiling); split, each slice's partial C into lane storage, then added in order.
+    private void ConvLaunch(PlainTiling t, Fmt fa, Fmt fb, Lane lane, ulong a, ulong x, ulong c, int m, int n, int k, ConvArgs conv, bool transB)
+    {
+        var fn = vk.Cached($"matmul_conv:{fa.Name}:{fb.Name}:{lane.Name}:{transB}:{t.Micro}", () => VkKernels.MatMulConv(vk, fa, fb, lane, transB, t.Micro));
+        int tile = VkKernels.Tile(t.Micro), tilesM = (m + tile - 1) / tile;
+        if (k == 0) t = t with { Slices = 1 };
+        int kslice = t.Slices > 1 ? ((k + t.Slices - 1) / t.Slices + VkKernels.TileK - 1) / VkKernels.TileK * VkKernels.TileK : Math.Max(1, k);
+        int slices = t.Slices > 1 ? (k + kslice - 1) / kslice : 1;
+        long mn = (long)m * n;
+        ulong parts = slices > 1 ? vk.Rent(slices * mn * lane.Size) : 0;
+        try
+        {
+            // im2col's parameters as the kernels take them (every pad, the dilations, OH and OW) two a slot; then tilesM, kslice.
+            var p = LayoutArgs.KernelP("im2col", conv.P);
+            var args = new ulong[6 + (p.Length + 1) / 2 + 2];
+            args[0] = a; args[1] = x; args[2] = slices > 1 ? parts : c;
+            args[3] = Vulkan.U(m); args[4] = Vulkan.U(n); args[5] = Vulkan.U(k);
+            for (int j = 0; 2 * j < p.Length; j++) args[6 + j] = (uint)p[2 * j] | (2 * j + 1 < p.Length ? (ulong)(uint)p[2 * j + 1] << 32 : 0);
+            args[^2] = Vulkan.U(tilesM);
+            args[^1] = Vulkan.U(kslice);
+            vk.Launch(fn, Groups(n, tile), (uint)(tilesM * slices), args);
+            if (slices > 1) JoinSlices(lane, parts, c, mn, slices);
+        }
+        finally { if (parts != 0) vk.Return(parts); }
     }
 
     /// <summary>dx and dw from dy (one image of one group) in the backward's lanes (BackwardLanes); returns their names.</summary>

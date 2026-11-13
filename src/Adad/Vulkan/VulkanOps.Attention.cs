@@ -183,11 +183,22 @@ public sealed partial class VulkanOps
     private void Product(ProductView v, Lane lane, ulong a, Fmt fa, long aOffset, ulong b, Fmt fb, long bOffset, ulong c)
     {
         if (v.M == 0 || v.N == 0) return;
-        if (aOffset > uint.MaxValue || bOffset > uint.MaxValue) throw new NotSupportedException("vulkan: a product's operand past 2^32 values");
-        var fn = vk.Cached($"matmul:{fa.Name}:{fb.Name}:{lane.Name}:{v.TransA}:{v.TransB}", () => VkKernels.MatMul(vk, fa, fb, lane, v.TransA, v.TransB));
-        int tilesM = (v.M + VkKernels.TileM - 1) / VkKernels.TileM;
-        vk.Launch(fn, Groups(v.N, VkKernels.TileN), (uint)tilesM, a, b, c, Vulkan.U(v.M), Vulkan.U(v.N), Vulkan.U(v.K), 0, 0, 0, Vulkan.U(tilesM),
-            Vulkan.U(aOffset), Vulkan.U(bOffset));
+        void Plain()
+        {
+            var t = Tiling(lane, v.M, v.N, v.K, 1, tt => PlainLaunch(tt, v, lane, a, fa, aOffset, b, fb, bOffset, c));
+            PlainLaunch(t, v, lane, a, fa, aOffset, b, fb, bOffset, c);
+        }
+
+        // float64 operands in the f64 lane: the sliced product where it is proven and measured faster; two operands of a
+        // 16-bit kind (the 16-bit and 8-bit floats) in the f32 lane: the matrix units.
+        if (lane == Lane.F64 && fa.Is("float64") && fb.Is("float64") && Sliced(v, a, aOffset, b, bOffset, c, Plain)) return;
+        if (lane == Lane.F32 && UnitsKindOf(fa, fb) is string kind)
+        {
+            UnitsProduct(v, kind, a, fa, aOffset, b, fb, bOffset, c);
+            return;
+        }
+
+        Plain();
     }
 
     // A formula of Map over lane values (the lane's own type).

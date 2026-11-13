@@ -32,7 +32,7 @@ internal static partial class VkKernels
         V M = b.Arg(3, K.U32), N = b.Arg(4, K.U32), Kd = b.Arg(5, K.U32);
         V ps = b.Arg(6), pz = b.Arg(7);
         V br = b.Arg(8, K.U32), bc = b.Arg(9, K.U32), sc = b.Arg(10, K.U32);
-        ProductTiles(b, lane, false, true, M, N, Kd, b.GroupY * TileM, pc, b.U(0),
+        ProductTiles(b, lane, false, true, M, N, b.U(0), Kd, b.GroupY * TileM, pc, b.U(0),
             (gr, gk, inside) => Codec.UnpackAt(b, fa, pa, b.Select(inside, gr * Kd + gk, b.U(0)), lane),
             (gk, gc, inside) => ScaleCode(b, fa, lane, Codec.UnpackAt(b, fw, pw, b.Select(inside, gc * Kd + gk, b.U(0)), lane), ps, zeros ? pz : null, gc, gk, br, bc, sc, inside));
         return b.Build();

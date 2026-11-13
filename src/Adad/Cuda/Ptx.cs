@@ -1507,17 +1507,30 @@ internal static partial class Ptx
 
     private static string Exponent(PtxBuilder b, string absMax)
     {
-        // floor(log2 x) + 3 for a normal x (a subnormal or zero: as if the smallest normal), held to what the slicing scale can take.
-        string bits = b.RD(), exp = b.R(), e = b.R(), p = b.P();
+        // floor(log2 x) + 3 for a normal x (a subnormal or zero: as if the smallest normal), held to what the slicing scale can
+        // take; a value that is not finite (its magnitude read as +∞: NonFinite) an exponent past every scale, 4000, so the
+        // product refuses the route and the f64 lane gives IEEE's ∞ and NaN.
+        string bits = b.RD(), exp = b.R(), e = b.R(), p = b.P(), inf = b.P();
         b.L($"mov.b64 {bits}, {absMax};");
         b.L($"shr.u64 {bits}, {bits}, 52;");
         b.L($"cvt.u32.u64 {exp}, {bits};");
         b.L($"and.b32 {exp}, {exp}, 0x7FF;");
+        b.L($"setp.eq.u32 {inf}, {exp}, 0x7FF;");
         b.L($"setp.eq.u32 {p}, {exp}, 0;");
         b.L($"@{p} mov.u32 {exp}, 1;");
         b.L($"sub.s32 {e}, {exp}, 1020;");
         b.L($"max.s32 {e}, {e}, -959;");
+        b.L($"@{inf} mov.u32 {e}, 4000;");
         return e;
+    }
+
+    // |v| with a NaN read as +∞ (max.f64 would drop a NaN: the exponent must see it).
+    private static void NonFinite(PtxBuilder b, string v)
+    {
+        string p = b.P();
+        b.L($"abs.f64 {v}, {v};");
+        b.L($"testp.notanumber.f64 {p}, {v};");
+        b.L($"@{p} mov.f64 {v}, 0d7FF0000000000000;");
     }
 
     /// <summary>e[i] for each row of A (m × k float64): the slicing exponent of the row's largest magnitude; a block per row.</summary>
@@ -1542,7 +1555,7 @@ internal static partial class Ptx
         b.L($"mul.wide.u32 {off}, {p2}, 8;");
         b.L($"add.u64 {addr}, {rowBase}, {off};");
         b.L($"ld.global.f64 {v}, [{addr}];");
-        b.L($"abs.f64 {v}, {v};");
+        NonFinite(b, v);
         b.L($"max.f64 {max}, {max}, {v};");
         b.L($"add.u32 {p2}, {p2}, 256;");
         b.L("bra LOOP;");
@@ -1580,7 +1593,7 @@ internal static partial class Ptx
         b.L($"@{pLoop} bra DONE;");
         string v = b.FD();
         b.L($"ld.global.f64 {v}, [{addr}];");
-        b.L($"abs.f64 {v}, {v};");
+        NonFinite(b, v);
         b.L($"max.f64 {max}, {max}, {v};");
         b.L($"add.u64 {addr}, {addr}, {stride};");
         b.L($"add.u32 {p2}, {p2}, 1;");

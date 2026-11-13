@@ -138,9 +138,9 @@ internal static partial class VkKernels
     /// <summary>The grouped product: every expert's rows of x (stored as f) times its weights (f; K × N, or N × K with
     /// transB, expert e's from e·K·N) into lane values, the workgroup's y over the experts' tiles (tiles: their prefix) and
     /// past them. Slots: x, w, c, n, k, offsets, tiles, experts; workgroups (⌈n/64⌉, ⌈rows/64⌉ + experts).</summary>
-    public static SpvKernel MatMulGrouped(Vulkan vk, Fmt f, Lane lane, bool transB)
+    public static SpvKernel MatMulGrouped(Vulkan vk, Fmt f, Lane lane, bool transB, int micro = 4)
     {
-        var b = new Spv($"matmul_grouped_{f.Name}_{lane.Name}{(transB ? "_tb" : "")}", TileSide, vk.Controls, TileSide);
+        var b = new Spv($"matmul_grouped_{f.Name}_{lane.Name}{(transB ? "_tb" : "")}{(micro == 4 ? "" : $"_x{micro}")}", TileSide, vk.Controls, TileSide);
         V pa = b.Arg(0), pw = b.Arg(1), pc = b.Arg(2);
         V N = b.Arg(3, K.U32), Kd = b.Arg(4, K.U32);
         V po = b.Arg(5), pt = b.Arg(6);
@@ -151,27 +151,29 @@ internal static partial class VkKernels
         b.If(gy < b.Load(K.U32, b.At(pt, E, 4)), () =>
         {
             var e = ex.V;
-            var row0 = b.Load(K.U32, b.At(po, e, 4)) + (gy - b.Load(K.U32, b.At(pt, e, 4))) * (double)TileM;
+            var row0 = b.Load(K.U32, b.At(po, e, 4)) + (gy - b.Load(K.U32, b.At(pt, e, 4))) * (double)Tile(micro);
             var end = b.Load(K.U32, b.At(po, e + 1.0, 4));
             var baseB = e * (Kd * N);
-            ProductTiles(b, lane, false, transB, end, N, Kd, row0, pc, b.U(0),
+            ProductTiles(b, lane, false, transB, end, N, b.U(0), Kd, row0, pc, b.U(0),
                 (gr, gk, inside) => Codec.UnpackAt(b, f, pa, b.Select(inside, gr * Kd + gk, b.U(0)), lane),
-                (gk, gc, inside) => Codec.UnpackAt(b, f, pw, baseB + b.Select(inside, transB ? gc * Kd + gk : gk * N + gc, b.U(0)), lane));
+                (gk, gc, inside) => Codec.UnpackAt(b, f, pw, baseB + b.Select(inside, transB ? gc * Kd + gk : gk * N + gc, b.U(0)), lane), micro);
         });
         return b.Build();
     }
 
     private readonly record struct ExpertPointers(V G, V GB, V U, V UB, V RowExpert, V Cols, V Experts);
 
-    /// <summary>y = gate(g + gb[e], u + ub[e]) (no gate: g + gb[e]) of the lane sums, e the row's expert (0 outside every
-    /// expert's rows). Slots: g, gb, u, ub, rowExpert, y, n, cols, experts.</summary>
-    public static SpvKernel ExpertStore(Vulkan vk, Fmt f, Lane lane, string? gate, bool gateBias, bool upBias)
+    /// <summary>y = gate(g + gb[e], u + ub[e]) (no gate: g + gb[e]) of the sums in the lane, e the row's expert (0 outside
+    /// every expert's rows); the sums stored in `sums` (the lane when null; a narrower integer lane widened exactly).
+    /// Slots: g, gb, u, ub, rowExpert, y, n, cols, experts.</summary>
+    public static SpvKernel ExpertStore(Vulkan vk, Fmt f, Lane lane, string? gate, bool gateBias, bool upBias, Lane? sums = null)
     {
         var k = Kinds.Of(lane);
-        var b = new Spv($"expert_store_{f.Name}_{lane.Name}_{gate ?? "none"}{(gateBias ? "_gb" : "")}{(upBias ? "_ub" : "")}", Threads, vk.Controls);
+        var sl = sums ?? lane;
+        var b = new Spv($"expert_store_{f.Name}_{lane.Name}{(sl == lane ? "" : $"_from_{sl.Name}")}_{gate ?? "none"}{(gateBias ? "_gb" : "")}{(upBias ? "_ub" : "")}", Threads, vk.Controls);
         V pg = b.Arg(0), pgb = b.Arg(1), pu = b.Arg(2), pub = b.Arg(3), pre = b.Arg(4), py = b.Arg(5);
         V n = b.Arg(6, K.U32), cols = b.Arg(7, K.U32), E = b.Arg(8, K.U32);
-        StoreEach(b, f, lane, py, n, at => ExpertValue(b, f, lane, k, gate, gateBias, upBias, new ExpertPointers(pg, pgb, pu, pub, pre, cols, E), at));
+        StoreEach(b, f, lane, py, n, at => ExpertValue(b, f, lane, k, gate, gateBias, upBias, new ExpertPointers(pg, pgb, pu, pub, pre, cols, E), at, sl));
         return b.Build();
     }
 
@@ -181,22 +183,23 @@ internal static partial class VkKernels
         {
             V pg = b.Arg(0), pgb = b.Arg(1), pu = b.Arg(2), pub = b.Arg(3), pre = b.Arg(4);
             V cols = b.Arg(5, K.U32), E = b.Arg(6, K.U32);
-            return (at, _) => ExpertValue(b, f, Lane.F32, K.F32, gate, gateBias, upBias, new ExpertPointers(pg, pgb, pu, pub, pre, cols, E), at);
+            return (at, _) => ExpertValue(b, f, Lane.F32, K.F32, gate, gateBias, upBias, new ExpertPointers(pg, pgb, pu, pub, pre, cols, E), at, Lane.F32);
         });
 
-    private static V ExpertValue(Spv b, Fmt f, Lane lane, K k, string? gate, bool gateBias, bool upBias, ExpertPointers p, V at)
+    private static V ExpertValue(Spv b, Fmt f, Lane lane, K k, string? gate, bool gateBias, bool upBias, ExpertPointers p, V at, Lane sums)
     {
+        V Sum(V pointer) => Codec.Convert(b, sums, b.Load(Kinds.Of(sums), b.At(pointer, at, sums.Size)), lane);
         var r = at / p.Cols;
         var c = at - r * p.Cols;
         var e = b.Load(K.U32, b.At(p.RowExpert, r, 4));
         var inside = e < p.Experts;
         var bi = b.Select(inside, e, b.U(0)) * p.Cols + c;
-        var g = b.Load(k, b.At(p.G, at, lane.Size));
+        var g = Sum(p.G);
         if (gateBias) g = g + Codec.UnpackAt(b, f, p.GB, bi, lane);
         var v = g;
         if (gate is not null)
         {
-            var u = b.Load(k, b.At(p.U, at, lane.Size));
+            var u = Sum(p.U);
             if (upBias) u = u + Codec.UnpackAt(b, f, p.UB, bi, lane);
             v = Formula(b, k, gate, g, u, u, b.C(k, 0), b.C(k, 0));
         }

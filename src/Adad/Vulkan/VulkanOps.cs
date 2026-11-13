@@ -105,7 +105,7 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
 
     public string Report() => vk.Facts;
 
-    public string Measured() => "";
+    public string Measured() => UnitsMeasured();
 
     // ---------------------------------------------------------------- element-wise
 

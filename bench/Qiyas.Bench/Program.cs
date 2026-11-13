@@ -65,6 +65,7 @@ if (!proven)
 // MatMulSliced declines it at use). Without this a proven run never took it: matmul float64 22.6 ms in the plain f64
 // lane against 4.1 in the sliced one.
 if (proven && options.Devices.Contains(Device.Cuda) && Devices.HasCuda) Devices.Ops.SlicedProven = true;
+if (proven && options.Devices.Contains(Device.Vulkan) && Devices.HasVulkan) Devices.Vk.SlicedProven = true;
 
 if (options.Report) Console.WriteLine(Adad.Cpu.Kernels.Report());
 
@@ -165,6 +166,7 @@ if (options.Report)
     Console.WriteLine("measured during the run");
     Console.Write(Adad.Cpu.Kernels.Measured());
     if (options.Devices.Contains(Device.Cuda) && Devices.HasCuda) Console.Write(Devices.Ops.Measured());
+    if (options.Devices.Contains(Device.Vulkan) && Devices.HasVulkan && Devices.Vk.Measured() is { Length: > 0 } vm) Console.WriteLine(vm);
 }
 return 0;
 

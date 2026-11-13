@@ -1515,11 +1515,19 @@ internal static partial class Checks
             return true;
         }
 
-        var ops = (GpuOps?)device;
+        var ops = device as GpuOps;
+        var vulkan = device as Adad.Vulkan.VulkanOps;
 
         bool ok = true;
         const int M = 37, N = 29;
-        if (ops is null) Kernels.BlockProducts = true; else ops.BlockProducts = true;
+        void Force(bool? on)
+        {
+            if (device is null) Kernels.BlockProducts = on;
+            else if (ops is not null) ops.BlockProducts = on;
+            else if (vulkan is not null) vulkan.BlockProducts = on;
+        }
+
+        Force(true);
         try
         {
             foreach (var type in new[] { "q8_0", "q4_0" })
@@ -1531,7 +1539,7 @@ internal static partial class Checks
                     var b = Bench.Registry.Make(type, N * K, 35, -1, 1);
                     var c = Bench.Registry.Poisoned(type, M * N);
                     var want = v.Reference(Bench.Registry.Values(type, a, M * K), Bench.Registry.Values(type, b, N * K));
-                    Bench.Registry.With(type, new ProductRun(ops, v, a, b, c, null, null));
+                    Bench.Registry.With(type, new ProductRun(device, v, a, b, c, null, null));
                     ok &= Close(type, $"product Bᵀ blocks k{K}", where, c, want, M * N, K);
                 }
 
@@ -1539,13 +1547,13 @@ internal static partial class Checks
                 var gx = Bench.Registry.Make(type, 64, 45, -1, 1);
                 var gy = Bench.Registry.Poisoned(type, M);
                 var gwant = References.Gemv(Bench.Registry.Values(type, ga, M * 64), Bench.Registry.Values(type, gx, 64), M, 64, false);
-                Bench.Registry.With(type, new GemvRun(ops, ga, gx, gy, M, 64, false));
+                Bench.Registry.With(type, new GemvRun(device, ga, gx, gy, M, 64, false));
                 ok &= Close(type, "gemv blocks k64", where, gy, gwant, M, 64);
             }
         }
         finally
         {
-            if (ops is null) Kernels.BlockProducts = null; else ops.BlockProducts = null;
+            Force(null);
         }
 
         if (ok) Console.WriteLine($"check block products         {where,-6} Q8_0, Q4_0: A·Bᵀ at 37 × 29 × 64 and × 320, the block-scaled product forced, and gemv at 37 × 64: within the product's rounding");
@@ -3010,6 +3018,24 @@ internal static partial class Checks
             string name = scaled ? "sliced float64 (rows, columns scaled)" : "sliced float64 product";
             Console.WriteLine($"check {name,-36} {M * N,9} values: worst {worst:0.000} ulp at {worstAt}{(worst <= 1 ? "" : "  DIFFERS: too far")}");
             ok &= worst <= 1;
+        }
+
+        // A value that is not finite (an infinity in A, a NaN in B): refused, nothing computed (the f64 lane gives IEEE's).
+        foreach (bool nanInB in new[] { false, true })
+        {
+            var a = new double[8 * 64];
+            var b = new double[64 * 8];
+            Array.Fill(a, 1.0);
+            Array.Fill(b, 1.0);
+            if (nanInB) b[100] = double.NaN; else a[100] = double.PositiveInfinity;
+            var gpu = ops.Gpu;
+            ulong da = gpu.Rent(a.Length * 8L), db = gpu.Rent(b.Length * 8L), dc = gpu.Rent(64 * 8);
+            Adad.Cuda.Gpu.Upload<double>(a, da);
+            Adad.Cuda.Gpu.Upload<double>(b, db);
+            bool ran = ops.MatMulSliced(da, db, dc, 8, 8, 64);
+            Adad.Cuda.Gpu.Synchronize();
+            gpu.Return(da); gpu.Return(db); gpu.Return(dc);
+            if (ran) { Console.WriteLine($"check {"sliced float64 not finite",-36} FAILS: {(nanInB ? "a NaN" : "an infinity")} was not refused"); ok = false; }
         }
 
         ops.SlicedProven = ok;

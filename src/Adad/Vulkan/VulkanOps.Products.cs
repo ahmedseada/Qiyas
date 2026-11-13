@@ -21,17 +21,26 @@ public sealed partial class VulkanOps
         var f = Fmt.Of<TN>();
         var (aLo, aHi) = Range<TN>(a, (int)v.ValuesA);
         var (bLo, bHi) = Range<TN>(b, (int)v.ValuesB);
-        var lane = SumLane(f, new Bounds(aLo, aHi, bLo, bHi, v.K));
+        var bounds = new Bounds(aLo, aHi, bLo, bHi, v.K);
+        var lane = SumLane(f, bounds);
         if (v.M == 0 || v.N == 0 || v.Batch == 0) return lane.Name;
+        if (UnitsKind(f, bounds) is string kind) return MatMulUnits<TN>(v, kind, a, b, c);
+        if (UseBlocks(f, v, () => MatMulViewBlocks<TN>(v, a, b, c), () => MatMulPlain(f, lane, v, a, b, c))) return MatMulViewBlocks<TN>(v, a, b, c);
+        if (f.Is("float64") && lane == Lane.F64 && Sliced(v, a, 0, b, 0, c, () => MatMulPlain(f, lane, v, a, b, c))) return "f64x";
+        return MatMulPlain(f, lane, v, a, b, c);
+    }
+
+    // C = op(A)·op(B) over the view's batches in the lane by the plain product kernel (FMAs), the operands read where they
+    // are stored; returns the lane's name.
+    private string MatMulPlain(Fmt f, Lane lane, ProductView v, ulong a, ulong b, ulong c)
+    {
         bool direct = f.Natural.Name == lane.Name && f.Bits == lane.Size * 8;
         long valuesC = v.ValuesC;
         ulong lanes = direct ? c : vk.Rent(valuesC * lane.Size);
         try
         {
-            var fn = vk.Cached($"matmul:{f.Name}:{lane.Name}:{v.TransA}:{v.TransB}", () => VkKernels.MatMul(vk, f, lane, v.TransA, v.TransB));
-            int tilesM = (v.M + VkKernels.TileM - 1) / VkKernels.TileM;
-            vk.Launch(fn, Groups(v.N, VkKernels.TileN), (uint)((long)tilesM * v.Batch), a, b, lanes, Vulkan.U(v.M), Vulkan.U(v.N), Vulkan.U(v.K),
-                Vulkan.U(v.StrideAOrDefault), Vulkan.U(v.StrideBOrDefault), Vulkan.U(v.StrideCOrDefault), Vulkan.U(tilesM), 0, 0);
+            var t = Tiling(lane, v.M, v.N, v.K, v.Batch, tt => PlainLaunch(tt, v, lane, a, f, 0, b, f, 0, lanes));
+            PlainLaunch(t, v, lane, a, f, 0, b, f, 0, lanes);
             if (!direct)
             {
                 // C's values between the batches' regions (a stride past m·n) kept as they are stored.
@@ -45,6 +54,92 @@ public sealed partial class VulkanOps
         }
 
         return lane.Name;
+    }
+
+    /// <summary>A plain product's tiling: values a side each invocation holds (8: a 128 × 128 tile a workgroup; 4: 64 × 64)
+    /// and the slices k is split in (1: none).</summary>
+    internal readonly record struct PlainTiling(int Micro, int Slices);
+
+    /// <summary>The gate's override of the measured tiling (null: measured); a split applies to a single product's k.</summary>
+    internal PlainTiling? TilingForced;
+
+    private readonly Dictionary<string, PlainTiling> _tilings = [];
+
+    // The plain product's tiling for a shape and lane: the one this device runs fastest, measured once by run (the product
+    // at a tiling into its real output), among 8 or 4 values a side (8 in a 32-bit lane: 64 accumulators of 64 bits would be
+    // 128 registers) and, for a single product whose C has fewer than 256 tiles, k split in 2 to 16 slices of at least 256.
+    // Every route over the same shape and lane takes the same tiling (the fused convolution and its composition: the same
+    // slices, so the same sums).
+    private PlainTiling Tiling(Lane lane, int m, int n, int k, int batch, Action<PlainTiling> run)
+    {
+        if (TilingForced is PlainTiling forced) return forced with { Micro = lane.Wide ? 4 : forced.Micro, Slices = batch == 1 ? forced.Slices : 1 };
+        string key = $"{lane.Name}:{m}x{n}x{k}:{batch}";
+        if (_tilings.TryGetValue(key, out var known)) return known;
+        var candidates = new List<PlainTiling>();
+        foreach (int micro in lane.Wide ? new[] { 4 } : new[] { 8, 4 })
+        {
+            candidates.Add(new(micro, 1));
+            long tiles = (long)Groups(n, VkKernels.Tile(micro)) * Groups(m, VkKernels.Tile(micro));
+            if (batch == 1 && tiles < 256)
+                for (int s = 2; s <= 16 && k / s >= 256; s *= 2) candidates.Add(new(micro, s));
+        }
+
+        if (candidates.Count == 1) return _tilings[key] = candidates[0];
+        var best = candidates[0];
+        double bestMs = double.MaxValue;
+        var times = new List<string>();
+        foreach (var t in candidates)
+        {
+            run(t);
+            vk.Synchronize();
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            for (int i = 0; i < 3; i++) run(t);
+            vk.Synchronize();
+            double ms = System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds / 3;
+            times.Add($"{t.Micro}/{t.Slices} {ms:0.000}");
+            if (ms < bestMs) (bestMs, best) = (ms, t);
+        }
+
+        _unitsTimes.Add($"plain product {key} (micro/slices ms): {string.Join(", ", times)}: {best.Micro}/{best.Slices}");
+        return _tilings[key] = best;
+    }
+
+    // C (lane values at c, the view's batches C's stride apart) = op(A)·op(B) by the plain kernel at a tiling, A stored as
+    // fa from value aOff, B as fb from bOff; split, each slice's partial C into lane storage and the slices added in order.
+    private void PlainLaunch(PlainTiling t, ProductView v, Lane lane, ulong a, Fmt fa, long aOff, ulong b, Fmt fb, long bOff, ulong c)
+    {
+        if (aOff > uint.MaxValue || bOff > uint.MaxValue) throw new NotSupportedException("vulkan: a product's operand past 2^32 values");
+        int tile = VkKernels.Tile(t.Micro), tilesM = (v.M + tile - 1) / tile;
+        bool split = t.Slices > 1 && v.K > 0;
+        // A block format's operand read as runs of values where its stored rows, offset and batch stride are whole runs of 8.
+        bool runsA = fa.IsBlock && (v.TransA ? v.M : v.K) % 8 == 0 && aOff % 8 == 0 && v.StrideAOrDefault % 8 == 0;
+        bool runsB = fb.IsBlock && (v.TransB ? v.K : v.N) % 8 == 0 && bOff % 8 == 0 && v.StrideBOrDefault % 8 == 0;
+        var fn = vk.Cached($"matmul:{fa.Name}:{fb.Name}:{lane.Name}:{v.TransA}:{v.TransB}:{t.Micro}:{split}:{runsA}:{runsB}",
+            () => VkKernels.MatMul(vk, fa, fb, lane, v.TransA, v.TransB, t.Micro, split, runsA, runsB));
+        if (!split)
+        {
+            vk.Launch(fn, Groups(v.N, tile), (uint)((long)tilesM * v.Batch), a, b, c, Vulkan.U(v.M), Vulkan.U(v.N), Vulkan.U(v.K),
+                Vulkan.U(v.StrideAOrDefault), Vulkan.U(v.StrideBOrDefault), Vulkan.U(v.StrideCOrDefault), Vulkan.U(tilesM), Vulkan.U(aOff), Vulkan.U(bOff));
+            return;
+        }
+
+        long mn = (long)v.M * v.N;
+        int kslice = ((v.K + t.Slices - 1) / t.Slices + VkKernels.TileK - 1) / VkKernels.TileK * VkKernels.TileK, slices = (v.K + kslice - 1) / kslice;
+        ulong parts = vk.Rent(slices * mn * lane.Size);
+        try
+        {
+            vk.Launch(fn, Groups(v.N, tile), (uint)(tilesM * slices), a, b, parts, Vulkan.U(v.M), Vulkan.U(v.N), Vulkan.U(v.K), 0, 0, Vulkan.U(mn), Vulkan.U(tilesM),
+                Vulkan.U(aOff), Vulkan.U(bOff), Vulkan.U(kslice));
+            JoinSlices(lane, parts, c, mn, slices);
+        }
+        finally { vk.Return(parts); }
+    }
+
+    // c = the slices' partial sums (count values each, consecutive) added in order.
+    private void JoinSlices(Lane lane, ulong parts, ulong c, long count, int slices)
+    {
+        var join = vk.Cached($"join_slices:{lane.Name}", () => VkKernels.JoinSlices(vk, lane));
+        vk.Launch(join, Groups(count, VkKernels.Threads), 1, parts, c, Vulkan.U(count), Vulkan.U(slices));
     }
 
     // A product's lane values into C as the type: the values at positions p with p mod period below span (and below
@@ -234,8 +329,56 @@ public sealed partial class VulkanOps
         return lane;
     }
 
-    public string MatMulViewBlocks<TN>(ProductView v, ulong a, ulong b, ulong c) where TN : struct, IAdad<TN> =>
-        throw new NotSupportedException("vulkan: the block-scaled product has no Vulkan kernels (the decoded route, MatMulView, stands)");
+    /// <summary>C = A·Bᵀ by the block-scaled product (Kernels.BlockProducts.cs) of two Q8_0 / Q4_0 operands, k in whole
+    /// blocks, C encoded to the type by blocks; returns the lane's name.</summary>
+    public string MatMulViewBlocks<TN>(ProductView v, ulong a, ulong b, ulong c) where TN : struct, IAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        if (f.Name is not ("q8_0" or "q4_0") || v.K % 32 != 0 || v.TransA || !v.TransB)
+            throw new NotSupportedException($"{f.Name}: the block product takes Q8_0 or Q4_0, A·Bᵀ, with k in whole blocks");
+        if (!BlockProductAvailable) throw new NotSupportedException("vulkan: the block product needs the s8 matrix unit at k = 32 and 16-bit loads");
+        if (v.M == 0 || v.N == 0 || v.Batch == 0) return "s8mma blocks";
+        if (v.Batch > 1 && (v.StrideAOrDefault % 32 != 0 || v.StrideBOrDefault % 32 != 0))
+            throw new NotSupportedException("vulkan: the block product's batches at whole blocks");
+        var fn = vk.Cached($"matmul_blocks:{f.Name}", () => VkKernels.MatMulBlocks(vk, f));
+        long mn = (long)v.M * v.N;
+        ulong lanes = vk.Rent(v.ValuesC * 4);
+        try
+        {
+            if (v.K == 0) vk.Clear(lanes, v.ValuesC * 4);                     // no terms: the empty sums (the kernel reads a block)
+            for (int z = 0; z < v.Batch && v.K > 0; z++)
+            {
+                ulong az = a + (ulong)(z * v.StrideAOrDefault / 32 * f.BlockBytes), bz = b + (ulong)(z * v.StrideBOrDefault / 32 * f.BlockBytes);
+                vk.Launch(fn, Groups(v.N, VkKernels.BlocksTile), Groups(v.M, VkKernels.BlocksTile), az, bz, lanes + (ulong)(z * v.StrideCOrDefault * 4),
+                    Vulkan.U(v.M), Vulkan.U(v.N), Vulkan.U(v.K / 32));
+            }
 
-    public bool BlockProductAvailable => false;
+            long period = v.Batch > 1 ? Math.Max(mn, v.StrideCOrDefault) : mn;
+            BackKeep(f, Lane.F32, lanes, c, v.ValuesC, period, mn);
+        }
+        finally { vk.Return(lanes); }
+
+        return "s8mma blocks";
+    }
+
+    public bool BlockProductAvailable => VkKernels.BlocksRun(vk);
+
+    /// <summary>The gate's override: true takes the block product wherever the view allows it, false never, null as measured.</summary>
+    internal bool? BlockProducts;
+
+    private readonly Dictionary<string, bool> _blocksFaster = [];
+
+    // The block product or the decoded route for a view A·Bᵀ of Q8_0 / Q4_0 (k whole blocks), whichever this device
+    // measures faster at the shape and format (once).
+    private bool UseBlocks(Fmt f, ProductView v, Func<string> blocks, Func<string> decoded)
+    {
+        if (f.Name is not ("q8_0" or "q4_0") || v.TransA || !v.TransB || v.K % 32 != 0 || v.K == 0 || !BlockProductAvailable
+            || (v.Batch > 1 && (v.StrideAOrDefault % 32 != 0 || v.StrideBOrDefault % 32 != 0))) return false;
+        if (BlockProducts is bool forced) return forced;
+        string key = $"{f.Name}:{v.M}x{v.N}x{v.K}:{v.Batch}";
+        if (_blocksFaster.TryGetValue(key, out bool known)) return known;
+        var (tb, td) = Measure.Faster(() => blocks(), () => decoded(), vk.Synchronize);
+        _unitsTimes.Add($"product {key} A·Bᵀ: block-scaled {tb:0.000} ms, decoded {td:0.000} ms");
+        return _blocksFaster[key] = tb <= td;
+    }
 }
