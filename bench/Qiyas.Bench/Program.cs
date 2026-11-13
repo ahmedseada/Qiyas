@@ -11,6 +11,8 @@
 // Usage: Qiyas.dll [cpu|cuda|cuda,cpu] [--subjects a,b] [--types t1,t2] [--ops add,matmul,softmax,rms_norm] [--baseline name]
 //                  [--proven] [--repeat N] [--profile] [--settle PCT] [--settle-rounds N] [--warmup-round MS] [--warmup MS]
 //        Qiyas.dll profile | gpuprofile | team       (Qiyas's own diagnostics)
+//        Several devices (cuda,cpu) run one after another, each in a process of its own (DeviceProcesses), their
+//        results merged into one file.
 //
 // Every proof in Checks must pass before anything is timed. Times are medians over an adaptive number of runs after a
 // warm-up that settles (Timing; --profile adds what the runtime did meanwhile). A run
@@ -31,6 +33,7 @@ CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;
 FullSpeed.Process();                                                   // every subject timed on the hardware, not Windows' policy
 Watched.Install();                                                     // a failing line keeps the run's proofs unwritten (Proof.cs)
 var options = Options.Parse(args);
+if (options.Mode == "bench" && options.Devices.Count > 1) return DeviceProcesses.Run(args, options);
 Bench.Odd = options.Shapes == "odd";
 Console.WriteLine($"bench: {Environment.ProcessorCount} logical processors, .NET {Environment.Version}");
 Console.WriteLine($"timing: {Timing.Describe()}");
@@ -156,7 +159,7 @@ foreach (var device in options.Devices)
 }
 
 // The results at the repository's root (from bench/Qiyas.Bench/bin/<configuration>/<framework>/).
-bench.Write(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", $"results-qiyas-{string.Join('-', options.Devices.Select(d => d.ToString().ToLowerInvariant()))}.md"));
+bench.Write(Bench.ResultsPath(options.Devices));
 if (options.Report)
 {
     Console.WriteLine("measured during the run");
@@ -171,6 +174,9 @@ internal sealed class Options
 {
     public string Mode = "bench";
     public List<Device> Devices = [Device.Cpu];
+
+    /// <summary>Where in the command line the devices were named (-1: not named, the CPU).</summary>
+    public int DevicesArg = -1;
     public List<string> Types = [.. Registry.Names];
     public List<string> Ops = ["add", "matmul", "softmax", "rms_norm"];
 
@@ -258,6 +264,7 @@ internal sealed class Options
                 case "--warmup": Timing.Settle = Timing.Settle with { BudgetMs = Timing.Number(a, args[++i], 0) }; break;
                 case "profile" or "gpuprofile" or "team": o.Mode = a; break;
                 default:
+                    o.DevicesArg = i;
                     o.Devices = [.. a.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                         .Select(d => d switch { "cpu" => Device.Cpu, "cuda" => Device.Cuda, "vulkan" => Device.Vulkan, _ => throw new ArgumentException($"unknown device {d}") })];
                     break;
@@ -311,6 +318,11 @@ internal sealed class Bench(IReadOnlyList<IBenchSubject> subjects, Options optio
 
     /// <summary>What proved the build before this run's timing: its checks, or the proofs it found (Proof.cs).</summary>
     public string Proof = "";
+
+    /// <summary>The results file of a run of <paramref name="devices"/>, at the repository's root (from
+    /// bench/Qiyas.Bench/bin/&lt;configuration&gt;/&lt;framework&gt;/).</summary>
+    public static string ResultsPath(IEnumerable<Device> devices) =>
+        Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", $"results-qiyas-{string.Join('-', devices.Select(d => d.ToString().ToLowerInvariant()))}.md"));
 
     public static int Rows => Odd ? 4093 : 4096;
     public static int Cols => Odd ? 4091 : 4096;
@@ -1854,6 +1866,80 @@ internal static class Timing
 
     private static double Variable(string name, double fallback, double least) =>
         Environment.GetEnvironmentVariable(name) is { Length: > 0 } text ? Number(name, text, least) : fallback;
+}
+
+// ---------------------------------------------------------------------------------------------- several devices
+
+// A run of several devices (cuda,cpu) runs each device in a process of its own, one after another as named, with the
+// same command line but that one device; their output passes through as it comes, and their results are merged into the
+// one file a run of those devices writes. A device's rows never follow another device's in the same process: after the
+// CUDA rows had run, CPU rows read up to 2x slower than in a process of their own (quantize_rows 2.3-2.4 ms against
+// 1.1-1.2, matmul_batched int16 0.53 against 0.36; the same with the JIT's profile off or the runtime's call-counting
+// delay back at 100 ms, and with no other thread of the process busy), so each device reads as a run of it alone does.
+internal static class DeviceProcesses
+{
+    public static int Run(string[] args, Options options)
+    {
+        string names = string.Join(", ", options.Devices.Select(Name));
+        Console.WriteLine($"devices: {names}, each in a process of its own");
+        var files = new List<string>();
+        foreach (var device in options.Devices)
+        {
+            var start = new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = false };
+            // Under the dotnet host the assembly is named first; an apphost is the program itself.
+            if (Path.GetFileNameWithoutExtension(Environment.ProcessPath!).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
+                start.ArgumentList.Add(typeof(DeviceProcesses).Assembly.Location);
+            for (int i = 0; i < args.Length; i++) start.ArgumentList.Add(i == options.DevicesArg ? Name(device) : args[i]);
+            Console.Out.Flush();
+            using var process = Process.Start(start) ?? throw new InvalidOperationException($"the {Name(device)} process did not start");
+            process.WaitForExit();
+            if (process.ExitCode != 0) return process.ExitCode;
+            files.Add(Bench.ResultsPath([device]));
+        }
+
+        string path = Bench.ResultsPath(options.Devices);
+        Merge(files, path, names);
+        Console.WriteLine($"results: {path}");
+        return 0;
+    }
+
+    private static string Name(Device device) => device.ToString().ToLowerInvariant();
+
+    // The devices' results as one file: the first file's header (its date, readout, proof and timing notes), a line saying
+    // each device ran in its own process, every file's measured limits, and every file's rows under the one table header.
+    private static void Merge(List<string> files, string path, string names)
+    {
+        var head = new List<string>();
+        var limits = new List<string>();
+        var table = new List<string>();
+        var rows = new List<string>();
+        foreach (var file in files)
+        {
+            var lines = File.ReadAllLines(file);
+            int at = Array.FindIndex(lines, l => l.StartsWith("| device |", StringComparison.Ordinal));
+            if (at < 0) throw new InvalidDataException($"{file}: no results table");
+            for (int i = 0; i < at; i++)
+            {
+                if (lines[i].StartsWith("Limits measured:", StringComparison.Ordinal)) limits.Add(lines[i]);
+                else if (table.Count == 0) head.Add(lines[i]);
+            }
+
+            if (table.Count == 0) table.AddRange(lines.Skip(at).Take(2));
+            rows.AddRange(lines.Skip(at + 2).Where(l => l.StartsWith('|')));
+        }
+
+        while (head.Count > 0 && head[^1].Length == 0) head.RemoveAt(head.Count - 1);
+        var sb = new StringBuilder();
+        foreach (var l in head) sb.AppendLine(l);
+        sb.AppendLine();
+        sb.AppendLine($"Devices: {names}, each timed in a process of its own, one after another: no device's rows follow another's in the same process.");
+        sb.AppendLine();
+        foreach (var l in limits) sb.AppendLine(l);
+        sb.AppendLine();
+        foreach (var l in table) sb.AppendLine(l);
+        foreach (var l in rows) sb.AppendLine(l);
+        File.WriteAllText(path, sb.ToString());
+    }
 }
 
 // The bench opts its whole process out of Windows' execution-speed throttling (EcoQoS) at start: a windowless process the
