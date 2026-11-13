@@ -14,12 +14,14 @@ for line in open(path, encoding='utf-8'):
     # Each subject's ms column by the header's names; the library's is "adad" ("qiyas" in files from before it was Adad).
     if line.startswith('| device'):
         at = {c[:-3]: i for i, c in enumerate(cells) if c.endswith(' ms')}
+        extra = {c: i for i, c in enumerate(cells) if c.endswith(' err') or c.endswith(' lane')}
         continue
     if not line.startswith('| c') or at is None: continue
     device, op, typ, shape = cells[:4]
     subj = {name: cells[i] for name, i in at.items()}
     if 'adad' not in subj and 'qiyas' in subj: subj['adad'] = subj['qiyas']
     subj.setdefault('number', '—')
+    for name, i in extra.items(): subj[name] = cells[i]
     rows[(device, typ, op)] = subj
     if typ not in types: types.append(typ)
 ops = ['add', 'matmul', 'softmax', 'rms_norm']
@@ -36,7 +38,16 @@ for device in ('cuda', 'cpu'):
             num, q = r['number'], r['adad']
             try: x = f"{float(num) / float(q):.2f}×"
             except ValueError: x = '—'
-            cells.append(f"{num} / **{q}** / {x}")
+            # A float64 cell where number's error is a float32 lane's (above 1e-12 and 100 times Adad's): each subject's
+            # error beside its time, so the reader sees why number is faster there.
+            def err(name):
+                try: return float(r.get(name + ' err', ''))
+                except ValueError: return None
+            ne, ae = err('number'), err('adad')
+            if typ == 'float64' and ne is not None and ae is not None and ne > 1e-12 and ne > 100 * ae:
+                cells.append(f"{num} (err {r.get('number err', '?')}) / **{q}** (err {r.get('adad err', '?')}) / {x}")
+            else:
+                cells.append(f"{num} / **{q}** / {x}")
         print(f"| {typ} | " + " | ".join(cells) + " |")
     print()
 
