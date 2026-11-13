@@ -12,9 +12,11 @@
 //                      invocations share it: each scores Bc / tpr keys of the tile and owns d / tpr of the row's output
 //                      dimensions (sub, sub + tpr, …). The row's max and sum: its invocations' values in workgroup memory,
 //                      each invocation joining them in the same order (the same result for all of them).
-//   AttentionDecode    a workgroup per (head, query); the query in workgroup memory; the keys in chunks of 256, an
-//                      invocation a key: its score, the chunk's max and sum by the workgroup tree with the running
-//                      softmax rescaled, then an invocation per output dimension accumulating p_j · v_j over the chunk.
+//   AttentionDecode    a workgroup per (head, query), or per (head, query, part of its keys) (split: each part's running
+//                      max, sum and unnormalized context into partials, DecodeCombine joining the parts in order); the
+//                      query in workgroup memory; the keys in chunks of 256, an invocation a key: its score, the chunk's
+//                      max and sum by the workgroup tree with the running softmax rescaled, then an invocation per output
+//                      dimension accumulating p_j · v_j over the chunk.
 //   AttentionBackRows  (dQ) a workgroup per (Br query rows, head): pass 1 the forward itself → the row's m, 1/l and
 //                      D = dO · O; pass 2 over the same key tiles: P = e^(s − m)/l, dP = dO·Vᵀ, dS = scale·P·(dP − D),
 //                      dQ += dS·K. m, 1/l, D stored per row.
@@ -265,15 +267,18 @@ internal static partial class VkKernels
     /// <summary>The decode kernel. Arguments: q, k, v, o (lane values), limits, starts, lq, lk, d, scale (a lane slot);
     /// workgroups heads · lq. Over caches: lq is the rows a head of K and V serves (a group's query heads × lq0 queries),
     /// limits the position (an s32 at the device): row r's query i = r mod lq0 sees keys [max(0, limit − window) when a
-    /// window, limit), limit = p + i + 1 held to [0, lk]; then lq0, the window, the cap (a lane slot).</summary>
+    /// window, limit), limit = p + i + 1 held to [0, lk]; then lq0, the window, the cap (a lane slot). split: workgroups
+    /// (heads · lq, parts), part s taking its row's keys [start + s·part, start + (s + 1)·part) (part: slot 13), its running
+    /// max m, sum l and unnormalized context into the partials at slot 14 (m, then l, each rows · parts; then the contexts,
+    /// rows · parts · d: lane values), o untouched (DecodeCombine).</summary>
     /// runs (K and V a block format, d a multiple of 8): a key's row read in runs of 8 values (Codec.UnpackRun), each
     /// value's arithmetic and the sum's order as without.
-    public static SpvKernel AttentionDecode(Vulkan vk, Fmt f, Lane lane, int dims, DecodeCache? cache = null, bool runs = false)
+    public static SpvKernel AttentionDecode(Vulkan vk, Fmt f, Lane lane, int dims, DecodeCache? cache = null, bool runs = false, bool split = false)
     {
         var k = Kinds.Of(lane);
         int nd = (dims + DecodeThreads - 1) / DecodeThreads, cap = nd * DecodeThreads;
         var fk = cache?.Fc ?? f;                                                 // K and V's stored format
-        var b = new Spv($"attention_decode_{f.Name}_{lane.Name}_d{cap}{(cache is null ? "" : "_at_" + cache.Key)}{(runs ? "_runs" : "")}", DecodeThreads, vk.Controls);
+        var b = new Spv($"attention_decode_{f.Name}_{lane.Name}_d{cap}{(cache is null ? "" : "_at_" + cache.Key)}{(runs ? "_runs" : "")}{(split ? "_split" : "")}", DecodeThreads, vk.Controls);
         var q = b.Arg(0);
         var kp = b.Arg(1);
         var vp = b.Arg(2);
@@ -302,6 +307,16 @@ internal static partial class VkKernels
             var seen = b.Min(b.Max(b.Load(K.S32, lim) + b.Convert(i % lq0, K.S32) + 1.0, b.S(0)), b.Convert(lk, K.S32));
             limit = b.Convert(seen, K.U32);
             start = b.Select(window == 0.0, b.U(0), b.Convert(b.Max(seen - b.Convert(window, K.S32), b.S(0)), K.U32));
+        }
+
+        var parts = b.GroupsY;
+        var part = b.GroupY;
+        if (split)
+        {
+            var len = b.Arg(13, K.U32);
+            var from = b.Min(start + part * len, limit);
+            limit = b.Min(from + len, limit);
+            start = from;
         }
 
         var qOff = hq * d;
@@ -362,12 +377,82 @@ internal static partial class VkKernels
             b.Barrier();
         });
 
+        if (split)
+        {
+            // The part's m, l and unnormalized context into the partials.
+            var pm = b.Arg(14);
+            var rowsParts = b.GroupsX * parts;
+            var at = hq * parts + part;
+            b.If(tid == 0, () =>
+            {
+                b.Store(b.At(pm, at, lane.Size), m.V);
+                b.Store(b.At(pm, rowsParts + at, lane.Size), l.V);
+            });
+            for (int j = 0; j < nd; j++)
+            {
+                var dim = tid + b.U(DecodeThreads * j);
+                var value = acc[j].V;
+                b.If(dim < d, () => b.Store(b.At(pm, b.Convert(rowsParts, K.U64) * 2 + b.Convert(at, K.U64) * b.Convert(d, K.U64) + b.Convert(dim, K.U64), lane.Size), value));
+            }
+
+            return b.Build();
+        }
+
         var inv = b.Select(l.V > 0, b.C(k, 1) / l.V, zero);
         for (int j = 0; j < nd; j++)
         {
             var dim = tid + b.U(DecodeThreads * j);
             var value = acc[j].V * inv;
             b.If(dim < d, () => b.Store(b.At(o, qOff + dim, lane.Size), value));
+        }
+
+        return b.Build();
+    }
+
+    /// <summary>The split decode's parts joined (AttentionDecode's partials), a workgroup a row: the largest of the parts'
+    /// maxima M, L = Σ_s l_s·e^(m_s − M) and o = Σ_s c_s·e^(m_s − M) / L over the parts in order (a part that saw no key,
+    /// m = −∞, adds nothing; a row that saw none 0). Arguments: partials, o, rows, parts, d.</summary>
+    public static SpvKernel DecodeCombine(Vulkan vk, Lane lane, int dims)
+    {
+        var k = Kinds.Of(lane);
+        int nd = (dims + DecodeThreads - 1) / DecodeThreads;
+        var b = new Spv($"attention_decode_combine_{lane.Name}_d{nd * DecodeThreads}", DecodeThreads, vk.Controls);
+        var pm = b.Arg(0);
+        var o = b.Arg(1);
+        var rows = b.Arg(2, K.U32);
+        var parts = b.Arg(3, K.U32);
+        var d = b.Arg(4, K.U32);
+        var tid = b.LocalIdX;
+        var row = b.GroupX;
+        var zero = b.C(k, 0);
+        var negInf = b.C(k, double.NegativeInfinity);
+        var rowsParts = rows * parts;
+        var big = b.Local(negInf);
+        b.For(b.U(0), parts, s => big.V = b.Max(big.V, b.Load(k, b.At(pm, row * parts + s, lane.Size))));
+        var mUse = b.Select(big.V == double.NegativeInfinity, zero, big.V);
+        var sum = b.Local(zero);
+        var acc = new Var[nd];
+        for (int j = 0; j < nd; j++) acc[j] = b.Local(zero);
+        b.For(b.U(0), parts, s =>
+        {
+            var at = row * parts + s;
+            var ms = b.Load(k, b.At(pm, at, lane.Size));
+            var w = b.Select(ms == double.NegativeInfinity, zero, Fn.Exp(b, ms - mUse));
+            sum.V = b.Fma(b.Load(k, b.At(pm, rowsParts + at, lane.Size)), w, sum.V);
+            for (int j = 0; j < nd; j++)
+            {
+                var dim = tid + b.U(DecodeThreads * j);
+                var col = b.Select(dim < d, dim, b.U(0));
+                var c = b.Load(k, b.At(pm, b.Convert(rowsParts, K.U64) * 2 + b.Convert(at, K.U64) * b.Convert(d, K.U64) + b.Convert(col, K.U64), lane.Size));
+                acc[j].V = b.Fma(c, w, acc[j].V);
+            }
+        });
+        var inv = b.Select(sum.V > 0, b.C(k, 1) / sum.V, zero);
+        for (int j = 0; j < nd; j++)
+        {
+            var dim = tid + b.U(DecodeThreads * j);
+            var value = acc[j].V * inv;
+            b.If(dim < d, () => b.Store(b.At(o, row * d + dim, lane.Size), value));
         }
 
         return b.Build();

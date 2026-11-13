@@ -3,8 +3,8 @@
 
 // Attention on Vulkan (Attention.cs, Kernels.Attention.cs), CUDA's routes on the FMA lanes: the fused rows or the
 // composition for rows of queries (whichever this device measures faster; the composition past the fused kernel's head
-// dimension), the fused decode kernel, the backward's fused kernels where both fit the device's workgroup memory or its
-// composition. Q, K, V and dO are read where they are stored by every route; the scores and their gradients are lane
+// dimension), the fused decode kernel, the backward's fused kernels (where both fit the device's workgroup memory) or its
+// composition, whichever this device measures faster. Q, K, V and dO are read where they are stored by every route; the scores and their gradients are lane
 // storage (intermediates), the outputs lane values: the type's own storage for float32 and float64, else lane storage
 // stored as the type once after (a block format's by its encoder). Grouped heads run as KvHeads heads of Group·Lq rows
 // (AttentionArgs.Grouped) by every route; a cap on the scores takes the composition (the map's softcap, softcap_bwd).
@@ -100,6 +100,15 @@ public sealed partial class VulkanOps
         return fused ? AttentionRows<TN>(a, q, k, v, o) : AttentionComposed<TN>(a, q, k, v, o);
     }
 
+    // The matrix unit a format's fused rows take (its 16-bit kind's into f32 sums), where it runs at this head capacity
+    // within the workgroup memory; null: the FMA rows.
+    private CooperativeMatrix? AttentionUnit(Fmt f, int dCap)
+    {
+        if (Units == false || VkKernels.AttentionKind(f) is not string kind || vk.Cooperative(kind, "f32") is not CooperativeMatrix unit) return null;
+        return VkKernels.AttentionUnitsFit(unit, dCap, vk.SubgroupSize) && VkKernels.AttentionUnitsShared(unit, dCap, vk.SubgroupSize) <= vk.MaxSharedBytes
+            && VkKernels.UnitsAttnWarps * vk.SubgroupSize <= vk.MaxWorkgroup ? unit : null;
+    }
+
     private bool RowsFit(Lane lane, int d) => VkKernels.AttentionRowsShared(lane, VkKernels.AttentionCap(d)) <= vk.MaxSharedBytes;
 
     /// <summary>O for rows of queries by the fused rows (no scores in memory); d ≤ 128. Returns the lane's name.</summary>
@@ -119,8 +128,20 @@ public sealed partial class VulkanOps
         {
             ulong lo = Own(f) ? o : vk.Rent(a.QValues * lane.Size);
             if (!Own(f)) rented.Add(lo);
+            ulong limits = PerQuery(a, a.Limit, rented), starts = PerQuery(a, a.Start, rented);
+            if (AttentionUnit(f, dCap) is CooperativeMatrix unit)
+            {
+                // A 16-bit kind's types on the matrix units (Kernels.AttentionUnits.cs): 4·M rows a workgroup.
+                int bu = VkKernels.UnitsAttnWarps * unit.M;
+                ulong unitRanges = KeyRanges(a, bu, rented);
+                var fu = vk.Cached($"attention_rows_units:{f.Name}:{unit}:{dCap}", () => VkKernels.AttentionRowsUnits(vk, f, unit, dCap));
+                vk.Launch(fu, (uint)((a.Lq + bu - 1) / bu), (uint)a.Heads, q, k, v, lo, limits, starts, unitRanges, Vulkan.U(a.Lq), Vulkan.U(a.Lk), Vulkan.U(a.D), Slot(lane, a.Scale));
+                if (!Own(f)) Back(f, lane, lo, o, a.QValues);
+                return unit.A + "mma";
+            }
+
             var (br, _) = VkKernels.AttentionTile(lane);
-            ulong limits = PerQuery(a, a.Limit, rented), starts = PerQuery(a, a.Start, rented), ranges = KeyRanges(a, br, rented);
+            ulong ranges = KeyRanges(a, br, rented);
             var fn = vk.Cached($"attention_rows:{f.Name}:{dCap}", () => VkKernels.AttentionRows(vk, f, lane, dCap));
             vk.Launch(fn, (uint)((a.Lq + br - 1) / br), (uint)a.Heads, q, k, v, lo, limits, starts, ranges, Vulkan.U(a.Lq), Vulkan.U(a.Lk), Vulkan.U(a.D), Slot(lane, a.Scale));
             if (!Own(f)) Back(f, lane, lo, o, a.QValues);
@@ -244,8 +265,32 @@ public sealed partial class VulkanOps
             if (!Own(f)) rented.Add(lo);
             ulong limits = PerQuery(a, a.Limit, rented), starts = PerQuery(a, a.Start, rented);
             bool runs = f.IsBlock && a.D % 8 == 0;                              // a block format's keys in runs of 8 values
-            var fn = vk.Cached($"attention_decode:{f.Name}:{dims}{(runs ? ":runs" : "")}", () => VkKernels.AttentionDecode(vk, f, lane, dims, null, runs));
-            vk.Launch(fn, (uint)(a.Heads * a.Lq), 1, q, k, v, lo, limits, starts, Vulkan.U(a.Lq), Vulkan.U(a.Lk), Vulkan.U(a.D), Slot(lane, a.Scale));
+            int rows = a.Heads * a.Lq;
+            void Run(int parts)
+            {
+                if (parts == 1)
+                {
+                    var fn = vk.Cached($"attention_decode:{f.Name}:{dims}{(runs ? ":runs" : "")}", () => VkKernels.AttentionDecode(vk, f, lane, dims, null, runs));
+                    vk.Launch(fn, (uint)rows, 1, q, k, v, lo, limits, starts, Vulkan.U(a.Lq), Vulkan.U(a.Lk), Vulkan.U(a.D), Slot(lane, a.Scale));
+                    return;
+                }
+
+                // The keys in parts of whole chunks; each part's m, l and context, then the parts joined.
+                int len = (a.Lk + parts - 1) / parts;
+                len = (len + VkKernels.DecodeThreads - 1) / VkKernels.DecodeThreads * VkKernels.DecodeThreads;
+                ulong partials = vk.Rent((long)rows * parts * (2 + a.D) * lane.Size);
+                try
+                {
+                    var fs = vk.Cached($"attention_decode:{f.Name}:{dims}{(runs ? ":runs" : "")}:split", () => VkKernels.AttentionDecode(vk, f, lane, dims, null, runs, split: true));
+                    vk.Launch(fs, (uint)rows, (uint)parts, q, k, v, lo, limits, starts, Vulkan.U(a.Lq), Vulkan.U(a.Lk), Vulkan.U(a.D), Slot(lane, a.Scale), 0, 0, 0,
+                        Vulkan.U(len), partials);
+                    var join = vk.Cached($"attention_decode_combine:{lane.Name}:{dims}", () => VkKernels.DecodeCombine(vk, lane, dims));
+                    vk.Launch(join, (uint)rows, 1, partials, lo, Vulkan.U(rows), Vulkan.U(parts), Vulkan.U(a.D));
+                }
+                finally { vk.Return(partials); }
+            }
+
+            Run(DecodeParts(f, a, rows, Run));
             if (!Own(f)) Back(f, lane, lo, o, a.QValues);
             return lane.Name;
         }
@@ -253,6 +298,35 @@ public sealed partial class VulkanOps
         {
             foreach (var p in rented) vk.Return(p);
         }
+    }
+
+    private readonly Dictionary<string, int> _decodeParts = [];
+
+    /// <summary>The gate's override of the decode's parts (null: measured).</summary>
+    internal int? DecodePartsForced;
+
+    // The parts a decode's keys are split in: 1, or 2 to 64 of whole chunks of 256 keys, the one this device runs fastest
+    // (measured once a shape and type; few rows leave the device idle with a workgroup a row).
+    private int DecodeParts(Fmt f, AttentionArgs a, int rows, Action<int> run)
+    {
+        int most = Math.Max(1, (a.Lk + VkKernels.DecodeThreads - 1) / VkKernels.DecodeThreads);
+        if (DecodePartsForced is int forced) return Math.Clamp(forced, 1, most);
+        string key = $"{f.Name}:{rows}x{a.Lk}x{a.D}";
+        if (_decodeParts.TryGetValue(key, out int known)) return known;
+        int best = 1;
+        double bestMs = double.MaxValue;
+        for (int parts = 1; parts <= Math.Min(64, most); parts *= 2)
+        {
+            run(parts);
+            vk.Synchronize();
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            for (int i = 0; i < 3; i++) run(parts);
+            vk.Synchronize();
+            double ms = System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds / 3;
+            if (ms < bestMs) (bestMs, best) = (ms, parts);
+        }
+
+        return _decodeParts[key] = best;
     }
 
     // ---- backward
@@ -271,7 +345,9 @@ public sealed partial class VulkanOps
             ulong Rent(long bytes) { ulong p = vk.Rent(bytes); rented.Add(p); return p; }
             bool own = Own(f);
             ulong ldq = own ? dq : Rent(Math.Max(1, a.QValues) * lane.Size), ldk = own ? dk : Rent(Math.Max(1, a.KValues) * lane.Size), ldv = own ? dv : Rent(Math.Max(1, a.KValues) * lane.Size);
-            if (FusedBackward != false && a.D <= VkKernels.FusedHeadMax && a.Softcap == 0 && BackwardFits(lane, a.D)) { BackwardFused(f, lane, a, q, k, v, dO, ldq, ldk, ldv, rented); BackwardRoute = "fused"; }
+            bool fits = a.D <= VkKernels.FusedHeadMax && a.Softcap == 0 && BackwardFits(lane, a.D);
+            bool fused = FusedBackward ?? (fits && BackwardFusedFaster(f, lane, a, q, k, v, dO, ldq, ldk, ldv, rented));
+            if (fused && fits) { BackwardFused(f, lane, a, q, k, v, dO, ldq, ldk, ldv, rented); BackwardRoute = "fused"; }
             else { BackwardComposed(f, lane, a, q, k, v, dO, ldq, ldk, ldv, rented); BackwardRoute = "composed"; }
             if (!own)
             {
@@ -286,6 +362,18 @@ public sealed partial class VulkanOps
         {
             foreach (var p in rented) vk.Return(p);
         }
+    }
+
+    private readonly Dictionary<string, bool> _backFusedFaster = [];
+
+    // Whether the backward's fused kernels run faster than its composition at this shape and type (measured once, both into
+    // the gradients' buffers: the route taken then writes them again).
+    private bool BackwardFusedFaster(Fmt f, Lane lane, AttentionArgs a, ulong q, ulong k, ulong v, ulong dO, ulong dq, ulong dk, ulong dv, List<ulong> rented)
+    {
+        string key = $"{f.Name}:{a.Heads}x{a.Lq}x{a.Lk}x{a.D}:{a.Causal}:{a.Spans is not null}:{a.HasStarts}";
+        if (_backFusedFaster.TryGetValue(key, out bool known)) return known;
+        var (tf, tc) = Measure.Faster(() => BackwardFused(f, lane, a, q, k, v, dO, dq, dk, dv, rented), () => BackwardComposed(f, lane, a, q, k, v, dO, dq, dk, dv, rented), vk.Synchronize);
+        return _backFusedFaster[key] = tf <= tc;
     }
 
     private bool BackwardFits(Lane lane, int d)

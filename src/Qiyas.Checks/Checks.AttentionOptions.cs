@@ -60,9 +60,9 @@ internal static partial class Checks
                 foreach (int mode in cuda is null ? new[] { 0, 1 } : [0, 1, 2])
                 {
                     // CPU: 0 the fused passes, 1 the composition. CUDA: 0 the default, 1 the composition, 2 the FMA fused
-                    // kernels. Vulkan: 0 the default, 1 the composition.
+                    // kernels. Vulkan: 0 the fused kernels where they fit (forced), 1 the composition.
                     if (cuda is not null) { cuda.FusedBackward = mode == 1 ? false : null; cuda.MmaBackward = mode == 2 ? false : null; cuda.BackwardRoute = null; }
-                    else if (vulkan is not null) { vulkan.FusedBackward = mode == 1 ? false : null; vulkan.BackwardRoute = null; }
+                    else if (vulkan is not null) { vulkan.FusedBackward = mode != 1; vulkan.BackwardRoute = null; }
                     else Kernels.FusedBackwardCpu = mode == 0;
                     byte[] dq = Bench.Registry.Poisoned(type, a.QValues), dk = Bench.Registry.Poisoned(type, a.KValues), dv = Bench.Registry.Poisoned(type, a.KValues);
                     Bench.Registry.WithFloat(type, new AttentionRun(ops, a, q, k, v, dO, false, dq, dk, dv));

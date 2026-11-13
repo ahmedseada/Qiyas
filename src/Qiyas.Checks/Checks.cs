@@ -1223,10 +1223,11 @@ internal static partial class Checks
                 // CPU: 0 the fused passes, 1 the composition. CUDA: 0 the default (the tensor backward for a type with a
                 // tensor kind), 1 the composition, 2 the FMA fused kernels, 3 the default as on a device whose blocks may
                 // opt into 48 KB of shared memory only (a kernel past it not taken: the next route instead). Vulkan: 0 the
-                // default (the fused kernels where both fit its workgroup memory), 1 the composition.
+                // fused kernels where both fit its workgroup memory (forced: a run measures them against the composition),
+                // 1 the composition.
                 bool? fusedBack = mode == 0 ? (ops is null ? true : null) : mode == 1 ? false : true;
                 if (cuda is not null) { cuda.FusedBackward = mode == 1 ? false : null; cuda.MmaBackward = mode == 2 ? false : null; cuda.AttentionSharedLimit = mode == 3 ? Limited : null; cuda.BackwardRoute = null; }
-                else if (vulkan is not null) { vulkan.FusedBackward = mode == 1 ? false : null; vulkan.BackwardRoute = null; }
+                else if (vulkan is not null) { vulkan.FusedBackward = mode != 1; vulkan.BackwardRoute = null; }
                 else Kernels.FusedBackwardCpu = fusedBack;
                 var q = Bench.Registry.Make(type, (int)a.QValues, 41, -1, 1);
                 var k = Bench.Registry.Make(type, (int)a.KValues, 42, -1, 1);
