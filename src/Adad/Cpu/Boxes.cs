@@ -9,6 +9,7 @@
 
 using System.Buffers;
 using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Adad.Abstraction;
 
@@ -47,13 +48,19 @@ internal sealed partial class Kernels
             int tile = Math.Max(1, 512 / w) * w;
             while (tile * per % g != 0) tile += w;
             int tiles = (count + tile - 1) / tile;
-            Team.For(tiles, Math.Max(1, tiles / (Threads * 4)), (long)count * per * 64, new BoxBody<TN, TLane, TL>(overlap, predicted, target, dloss, output, count, tile, TL.From(eps)));
+            bool stream = Streams.Past(TN.Bytes(8L * count) + TN.Bytes((long)count * (dloss is null ? 1 : 5)));
+            Team.For(tiles, Math.Max(1, tiles / (Threads * 4)), (long)count * per * 64, new BoxBody<TN, TLane, TL>(overlap, predicted, target, dloss, output, count, tile, TL.From(eps), stream));
         }
     }
 
-    private readonly struct BoxBody<TN, TLane, TL>(BoxOverlap overlap, byte[] predicted, byte[] target, byte[]? dloss, byte[] output, int count, int tile, TLane eps) : Team.IBody
+    // stream: each tile's outputs made in lanes (and stored as the type) apart, then copied into the output past the caches
+    // (Streams), the output's lines written whole and not read first.
+    private readonly struct BoxBody<TN, TLane, TL>(BoxOverlap overlap, byte[] predicted, byte[] target, byte[]? dloss, byte[] output, int count, int tile, TLane eps, bool stream) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
+        // At the final tier from the first call, and the pairs' math too (BoxMath.Pair, not inlined): which tier a run
+        // times, and what the runtime's profile made of this loop, must not decide the kernel's speed.
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public void Run(int first, int last)
         {
             int w = Vector<TLane>.Count, per = dloss is null ? 1 : 4;
@@ -62,13 +69,14 @@ internal sealed partial class Kernels
             var tr = TN.Direct ? null : pool.Rent(4 * tile);
             var dr = dloss is null || TN.Direct ? null : pool.Rent(tile);
             var parts = pool.Rent(9 * w);                                   // the pairs' corners by component, and dloss
-            var outs = TN.Direct ? null : pool.Rent(tile * per);            // a tile's outputs in lanes, stored as the type once
+            var outs = TN.Direct && !stream ? null : pool.Rent(tile * per); // a tile's outputs in lanes, stored as the type once
+            var bytes = stream && !TN.Direct ? ArrayPool<byte>.Shared.Rent((int)TN.Bytes(tile * per)) : null;
             try
             {
                 for (int k0 = first; k0 < last; k0++)
                 {
                     int p0 = k0 * tile, pairs = Math.Min(tile, count - p0);
-                    var lanes = TN.Direct ? MemoryMarshal.Cast<byte, TLane>(output.AsSpan()).Slice(p0 * per, pairs * per) : outs.AsSpan(0, pairs * per);
+                    var lanes = TN.Direct && !stream ? MemoryMarshal.Cast<byte, TLane>(output.AsSpan()).Slice(p0 * per, pairs * per) : outs.AsSpan(0, pairs * per);
                     ReadOnlySpan<TLane> pt, tt, dt = default;                // the tile's corners and dloss in lanes
                     if (TN.Direct)
                     {
@@ -126,11 +134,26 @@ internal sealed partial class Kernels
                         }
                     }
 
-                    if (!TN.Direct) TN.Store(lanes, output, p0 * per);
+                    // A tile that ends in part of a block (the last) is stored in place: the block's other values are the output's.
+                    if (stream && pairs * per % TN.Granularity == 0)
+                    {
+                        int at = (int)TN.Bytes(p0 * per), len = (int)TN.Bytes(pairs * per);
+                        if (TN.Direct) Streams.Copy(MemoryMarshal.AsBytes(lanes), output.AsSpan(at, len));
+                        else
+                        {
+                            TN.Store(lanes, bytes.AsSpan(0, len), 0);
+                            Streams.Copy(bytes.AsSpan(0, len), output.AsSpan(at, len));
+                        }
+                    }
+                    else if (stream && TN.Direct) lanes.CopyTo(MemoryMarshal.Cast<byte, TLane>(output.AsSpan()).Slice(p0 * per, pairs * per));
+                    else if (!TN.Direct) TN.Store(lanes, output, p0 * per);
                 }
+
+                if (stream) Streams.Fence();
             }
             finally
             {
+                if (bytes is not null) ArrayPool<byte>.Shared.Return(bytes);
                 if (pr is not null) pool.Return(pr);
                 if (tr is not null) pool.Return(tr);
                 if (dr is not null) pool.Return(dr);
@@ -152,6 +175,7 @@ internal sealed partial class Kernels
 
         private static Vector<T> Below(Vector<T> a, Vector<T> b) => Above(b, a);
 
+        [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
         public static (Vector<T> Loss, Vector<T> G0, Vector<T> G1, Vector<T> G2, Vector<T> G3) Pair(BoxOverlap overlap, bool grad,
             Vector<T> x1, Vector<T> y1, Vector<T> x2, Vector<T> y2, Vector<T> gx1, Vector<T> gy1, Vector<T> gx2, Vector<T> gy2, Vector<T> eps)
         {

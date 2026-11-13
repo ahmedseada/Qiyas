@@ -46,15 +46,30 @@ internal static partial class Checks
                 Bench.Registry.WithFloat(type, new BoxRun(ops, overlap, p, t, null, loss, count));
                 double bad = Excess(type, $"box {name}", loss, want, i => scale[i], 16);
                 if (bad > 0) { Console.WriteLine($"check box {name,-5} loss {where,-6} {type,-12} DIFFERS by {bad:0.##}"); ok = false; }
+                if (ops is null) ok &= BoxStreamed(type, overlap, p, t, null, loss, count);
                 var grad = new byte[Bench.Registry.Bytes(type, 4 * count)];
                 Bench.Registry.WithFloat(type, new BoxRun(ops, overlap, p, t, dl, grad, count));
                 bad = Excess(type, $"box {name} bwd", grad, wantGrad, i => gradScale[i], 32);
                 if (bad > 0) { Console.WriteLine($"check box {name,-5} grad {where,-6} {type,-12} DIFFERS by {bad:0.##}"); ok = false; }
+                if (ops is null) ok &= BoxStreamed(type, overlap, p, t, dl, grad, count);
             }
         }
 
-        if (ok) Console.WriteLine($"check box losses             {where,-6} every float type{(blocks ? "" : " but the block formats")}: iou, giou, diou, ciou and their gradients over overlapping, apart, enclosing, equal and tied pairs, within the lane's rounding of their terms{(ops is null ? "; the reference's gradient by central differences" : "")}");
+        if (ok) Console.WriteLine($"check box losses             {where,-6} every float type{(blocks ? "" : " but the block formats")}: iou, giou, diou, ciou and their gradients over overlapping, apart, enclosing, equal and tied pairs, within the lane's rounding of their terms{(ops is null ? "; streamed past the caches equal to the plain results bit for bit; the reference's gradient by central differences" : "")}");
         return ok;
+    }
+
+    // The CPU's pass with its outputs streamed past the caches (Streams.Force, as a pass past the caches' size takes them)
+    // equal to the plain pass bit for bit.
+    private static bool BoxStreamed(string type, BoxOverlap overlap, byte[] p, byte[] t, byte[]? dl, byte[] plain, int count)
+    {
+        var y = new byte[plain.Length];
+        Adad.Cpu.Streams.Force = true;
+        try { Bench.Registry.WithFloat(type, new BoxRun(null, overlap, p, t, dl, y, count)); }
+        finally { Adad.Cpu.Streams.Force = null; }
+        if (y.AsSpan().SequenceEqual(plain)) return true;
+        Console.WriteLine($"check box {Boxes.Name(overlap),-5} {(dl is null ? "loss" : "grad")} cpu    {type,-12} DIFFERS: the streamed result from the plain one");
+        return false;
     }
 
     // Pairs of corner boxes within (−8, 8), every side at least 2 (a side stays positive at every float type's rounding):
