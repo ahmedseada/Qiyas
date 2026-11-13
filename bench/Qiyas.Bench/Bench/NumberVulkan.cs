@@ -240,7 +240,7 @@ internal static partial class NumberVulkan
             }
         }
 
-        foreach (var (cell, type, run) in Cases())
+        foreach (var (cell, type, run) in Cases().Concat(ProductCases()))
         {
             string? fault;
             try { fault = run(); }
