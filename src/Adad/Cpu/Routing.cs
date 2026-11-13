@@ -417,7 +417,7 @@ internal sealed partial class Kernels
         var cells = ArrayPool<int>.Shared.Rent(buckets * tasks);
         try
         {
-            Team.For(tasks, 1, (long)n * 4, new RouteCount(index, buckets, tasks, slice, cells));
+            Team.For(tasks, 1, (long)n * 4, new RouteCount(index, buckets, slice, cells));
             // cells[t·buckets + b]: task t's count in bucket b, then its first place there.
             offsets[0] = 0;
             int at = 0;
@@ -435,7 +435,7 @@ internal sealed partial class Kernels
                 offsets[b + 1] = at;
             }
 
-            Team.For(tasks, 1, (long)n * 4, new RoutePlace(index, buckets, tasks, slice, cells, order));
+            Team.For(tasks, 1, (long)n * 4, new RoutePlace(index, buckets, slice, cells, order));
             order.AsSpan(offsets[buckets], n - offsets[buckets]).Fill(-1);
         }
         finally
@@ -447,7 +447,7 @@ internal sealed partial class Kernels
     // Route's team: a task at least this many sources.
     private const int RouteSlice = 1 << 15;
 
-    private readonly struct RouteCount(int[] index, int buckets, int tasks, int slice, int[] cells) : Team.IBody
+    private readonly struct RouteCount(int[] index, int buckets, int slice, int[] cells) : Team.IBody
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public void Run(int first, int last)
@@ -465,7 +465,7 @@ internal sealed partial class Kernels
         }
     }
 
-    private readonly struct RoutePlace(int[] index, int buckets, int tasks, int slice, int[] cells, int[] order) : Team.IBody
+    private readonly struct RoutePlace(int[] index, int buckets, int slice, int[] cells, int[] order) : Team.IBody
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public void Run(int first, int last)
