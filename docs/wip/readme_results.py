@@ -23,7 +23,8 @@ for line in open(path, encoding='utf-8'):
     subj.setdefault('number', '—')
     for name, i in extra.items(): subj[name] = cells[i]
     rows[(device, typ, op)] = subj
-    if typ not in types: types.append(typ)
+    # The core tables' types: those with a core row (route's rows name their index type, s32, which has none).
+    if typ not in types and op in ('add', 'matmul', 'softmax', 'rms_norm'): types.append(typ)
 ops = ['add', 'matmul', 'softmax', 'rms_norm']
 titles = {'cuda': 'CUDA (2048³ product, 16M-value add, 4096×4096 rows)', 'cpu': 'CPU (1024³ product, 16M-value add, 4096×4096 rows)'}
 for device in ('cuda', 'cpu'):

@@ -206,20 +206,15 @@ the runtime reports; 64 GB; NVIDIA GeForce RTX 5070 Ti: 70 multiprocessors, comp
 610.88, PTX target sm_80; Windows 11, .NET 10.0.12), by the bench as it now times: each row at its final tier (the
 runtime's call-counting delay at 0 and a warm-up in rounds that settles), the bench's process opted out of Windows'
 power throttling, each device in a process of its own. The tables are two readouts of 2026-11-13: the CUDA rows from the
-CUDA part of build b36cb4a's `cuda,cpu` readout, the CPU rows from a CPU-only readout of build f8c57b3. Rows measured
-since on the build that changed them: the CUDA box losses (8db7cc0 forward, 22689b7 backward) and the float64 erf rows
-of both devices (03a6098, erf and erfc in float64 by a fitted tail instead of the continued fraction, at no worse
-error). Rows re-timed on their own build in one exclusive job of 3 rounds: 11 CUDA rows (off their earlier reading or at
-a lower memory clock) and the 97 CPU rows that read more than 10 % slower than the CPU's previous full readout. Where a
-re-time and its readout disagree by more than 10 % (40 CPU rows) the cell carries the reading less favourable to Adad,
-both subjects from that reading. The CPU rows of the operations changed since (rope_table; the box losses; the passes
-down the columns: sum, max and argmax, gemv_t and the norm parameters' backward; cross_entropy, log_softmax_topk and
-sample_rows) are re-timed on build 2f78b26, which carries those changes, both subjects, in one exclusive job of 3
-rounds; where the three processes disagree by more than 10 % (44 rows) the cell carries the one less favourable to Adad.
-The passes down the columns are re-timed again the same way on build 7d4ed27, which pools their blocks' partials.
-`docs/wip/baseline.md` is that assembled file: every row, its builds, and notes naming each re-timed or re-measured row.
-Device bandwidth rows follow the driver's memory P-state (a row timed at P3 reads up to about 1.9× its P1 time); setting
-"Prefer maximum performance" for dotnet.exe in the NVIDIA control panel gives stable readings.
+CUDA part of build b36cb4a's `cuda,cpu` readout, the CPU rows from a CPU-only readout of build ac1f23a. Rows measured
+since on the build that changed them: the CUDA box losses (8db7cc0 forward, 22689b7 backward) and the CUDA float64 erf
+rows (03a6098, erf and erfc in float64 by a fitted tail instead of the continued fraction, at no worse error). Rows
+re-timed on their own build in one exclusive job of 3 rounds: 11 CUDA rows (off their earlier reading or at a lower
+memory clock) and the 226 CPU rows that read more than 10 % off the CPU's previous table. Where a re-time and its
+readout disagree by more than 10 % (77 CPU rows) the cell carries the reading less favourable to Adad, both subjects
+from that process. `docs/wip/baseline.md` is that assembled file: every row, its builds, and notes naming each re-timed
+or re-measured row. Device bandwidth rows follow the driver's memory P-state (a row timed at P3 reads up to about 1.9×
+its P1 time); setting "Prefer maximum performance" for dotnet.exe in the NVIDIA control panel gives stable readings.
 
 The columns shown here are the `INumberBase<T>` version (`number`, — where .NET has no such type) and Adad. Times are
 medians in ms. Every subject's error is against float64 math (products in double-double). On the core rows Adad's error
@@ -235,7 +230,6 @@ subject's error stands beside its time. The narrow floats, the sub-byte integers
 | type | add | matmul | softmax | rms_norm |
 |---|---|---|---|---|
 | float64 | 0.519 / **0.517** / 1.00× | 22.845 / **4.157** / 5.50× | 0.393 (err 1.88e-10) / **1.744** (err 1.13e-17) / 0.23× | 0.370 / **0.355** / 1.04× |
-| s32 |  |  |  |  |
 | float32 | 0.261 / **0.262** / 1.00× | 0.837 / **0.699** / 1.20× | 0.182 / **0.180** / 1.01× | 0.182 / **0.178** / 1.02× |
 | float16 | 0.140 / **0.125** / 1.12× | 0.660 / **0.231** / 2.86× | 0.092 / **0.075** / 1.23× | 0.088 / **0.079** / 1.11× |
 | bfloat16 | — / **0.127** / — | — / **0.228** / — | — / **0.077** / — | — / **0.079** / — |
@@ -262,54 +256,54 @@ subject's error stands beside its time. The narrow floats, the sub-byte integers
 
 | type | add | matmul | softmax | rms_norm |
 |---|---|---|---|---|
-| float64 | 6.828 / **5.109** / 1.34× | 16.413 / **2.403** / 6.83× | 4.747 / **4.795** / 0.99× | 3.903 / **3.588** / 1.09× |
-| s32 |  |  |  |  |
-| float32 | 2.921 / **2.184** / 1.34× | 3.427 / **1.235** / 2.77× | 3.420 / **2.057** / 1.66× | 1.682 / **1.370** / 1.23× |
-| float16 | 3.959 / **0.912** / 4.34× | 597.855 / **1.157** / 516.73× | 36.628 / **1.757** / 20.85× | 15.336 / **0.642** / 23.89× |
-| bfloat16 | — / **0.816** / — | — / **1.167** / — | — / **1.392** / — | — / **0.374** / — |
-| float8_e4m3 | — / **1.492** / — | — / **1.253** / — | — / **2.489** / — | — / **1.322** / — |
-| float8_e5m2 | — / **1.646** / — | — / **1.254** / — | — / **2.635** / — | — / **1.497** / — |
-| int64 | 6.503 / **5.128** / 1.27× | 17.840 / **0.462** / 38.61× |  |  |
-| int32 | 2.907 / **2.232** / 1.30× | 4.954 / **0.367** / 13.50× |  |  |
-| int16 | 0.803 / **0.850** / 0.94× | 1.883 / **0.332** / 5.67× |  |  |
-| int8 | 0.173 / **0.121** / 1.43× | 2.394 / **0.309** / 7.75× |  |  |
-| int4 | — / **0.094** / — | — / **0.301** / — |  |  |
-| int2 | — / **0.145** / — | — / **0.315** / — |  |  |
-| uint64 | 6.624 / **5.120** / 1.29× | 19.054 / **0.469** / 40.63× |  |  |
-| uint32 | 2.866 / **2.231** / 1.28× | 3.557 / **0.350** / 10.16× |  |  |
-| uint16 | 0.876 / **0.835** / 1.05× | 1.624 / **0.324** / 5.01× |  |  |
-| uint8 | 0.179 / **0.120** / 1.49× | 2.093 / **0.311** / 6.73× |  |  |
-| uint2 | — / **0.130** / — | — / **0.289** / — |  |  |
-| q8_0 | — / **3.488** / — | — / **7.826** / — | — / **4.609** / — | — / **3.623** / — |
-| q4_0 | — / **2.121** / — | — / **7.759** / — | — / **3.007** / — | — / **1.670** / — |
-| q4_k | — / **3.294** / — | — / **8.013** / — | — / **4.423** / — | — / **3.165** / — |
-| q6_k | — / **2.975** / — | — / **7.979** / — | — / **4.149** / — | — / **2.727** / — |
-| bool | — / **3.829** / — | — / **1.302** / — |  |  |
+| float64 | 6.797 / **5.153** / 1.32× | 15.057 / **2.403** / 6.27× | 4.783 / **4.736** / 1.01× | 3.866 / **3.467** / 1.12× |
+| float32 | 2.866 / **2.186** / 1.31× | 3.034 / **1.159** / 2.62× | 3.345 / **1.921** / 1.74× | 1.670 / **1.471** / 1.14× |
+| float16 | 3.882 / **0.901** / 4.31× | 592.750 / **1.124** / 527.36× | 35.861 / **1.703** / 21.06× | 15.254 / **0.634** / 24.06× |
+| bfloat16 | — / **0.800** / — | — / **1.145** / — | — / **1.375** / — | — / **0.385** / — |
+| float8_e4m3 | — / **1.480** / — | — / **1.241** / — | — / **2.490** / — | — / **1.328** / — |
+| float8_e5m2 | — / **1.607** / — | — / **1.241** / — | — / **2.632** / — | — / **1.487** / — |
+| int64 | 6.636 / **5.105** / 1.30× | 13.914 / **0.443** / 31.41× |  |  |
+| int32 | 3.001 / **2.224** / 1.35× | 3.556 / **0.337** / 10.55× |  |  |
+| int16 | 0.838 / **0.835** / 1.00× | 1.095 / **0.328** / 3.34× |  |  |
+| int8 | 0.179 / **0.121** / 1.48× | 2.282 / **0.299** / 7.63× |  |  |
+| int4 | — / **0.080** / — | — / **0.299** / — |  |  |
+| int2 | — / **0.144** / — | — / **0.311** / — |  |  |
+| uint64 | 6.496 / **5.112** / 1.27× | 15.143 / **0.424** / 35.71× |  |  |
+| uint32 | 2.866 / **2.238** / 1.28× | 3.387 / **0.345** / 9.82× |  |  |
+| uint16 | 0.821 / **0.790** / 1.04× | 2.389 / **0.319** / 7.49× |  |  |
+| uint8 | 0.174 / **0.132** / 1.32× | 2.427 / **0.310** / 7.83× |  |  |
+| uint2 | — / **0.126** / — | — / **0.296** / — |  |  |
+| q8_0 | — / **3.453** / — | — / **7.776** / — | — / **4.556** / — | — / **3.554** / — |
+| q4_0 | — / **2.093** / — | — / **7.755** / — | — / **3.001** / — | — / **1.589** / — |
+| q4_k | — / **3.241** / — | — / **8.020** / — | — / **4.420** / — | — / **3.091** / — |
+| q6_k | — / **2.959** / — | — / **8.006** / — | — / **4.160** / — | — / **2.727** / — |
+| bool | — / **3.805** / — | — / **1.294** / — |  |  |
 
 **Every family** — rows measured (operation × type) and, where number has the row, the geometric mean of number ÷ adad
 
 | family | operations | CUDA rows | CUDA vs number | CPU rows | CPU vs number |
 |---|---:|---:|---|---:|---|
-| core | 4 | 64 | 2.28× (ahead on 24 of 28) | 64 | 4.11× (ahead on 26 of 28) |
+| core | 4 | 64 | 2.28× (ahead on 24 of 28) | 64 | 4.00× (ahead on 28 of 28) |
 | map (element-wise formulas) | 77 | 1153 | — | 1153 | — |
 | reductions, broadcasts, transpose, gemv | 15 | 330 | — | 330 | — |
 | rows | 18 | 180 | — | 180 | — |
 | layout and indexing | 23 | 422 | — | 422 | — |
 | products on views | 8 | 156 | — | 156 | — |
-| attention | 8 | 80 | 1.25× (ahead on 2 of 3) | 80 | 1.87× (ahead on 3 of 3) |
-| optimizers | 5 | 50 | 1.17× (ahead on 7 of 15) | 50 | 1.40× (ahead on 12 of 15) |
-| convolution | 2 | 44 | 2.72× (ahead on 22 of 22) | 44 | 14.06× (ahead on 22 of 22) |
+| attention | 8 | 80 | 1.25× (ahead on 2 of 3) | 80 | 1.73× (ahead on 3 of 3) |
+| optimizers | 5 | 50 | 1.17× (ahead on 7 of 15) | 50 | 1.33× (ahead on 11 of 15) |
+| convolution | 2 | 44 | 2.72× (ahead on 22 of 22) | 44 | 13.29× (ahead on 22 of 22) |
 | recurrent | 8 | 72 | — | 72 | — |
-| routing, losses | 8 | 86 | 1.33× (ahead on 4 of 6) | 86 | 4.43× (ahead on 6 of 6) |
+| routing, losses | 8 | 86 | 1.33× (ahead on 4 of 6) | 86 | 4.19× (ahead on 6 of 6) |
 | draws and decoding | 6 | 115 | — | 115 | — |
 | caches | 4 | 36 | — | 36 | — |
 | experts | 3 | 54 | — | 54 | — |
-| box losses | 8 | 80 | 0.96× (ahead on 9 of 24) | 80 | 4.12× (ahead on 23 of 24) |
-| memory | 3 | 3 | 2.89× (ahead on 1 of 3) | 3 | 4.13× (ahead on 3 of 3) |
+| box losses | 8 | 80 | 0.96× (ahead on 9 of 24) | 80 | 4.40× (ahead on 24 of 24) |
+| memory | 3 | 3 | 2.89× (ahead on 1 of 3) | 3 | 3.50× (ahead on 3 of 3) |
 
-Where Adad is not ahead of `number` on the core rows: the memory-bound adds that move the same bytes (CUDA float32,
-int64 and uint32, within 1 %; CPU int16, 0.850 against 0.803); CPU float64 softmax (4.795 against 4.747);
-and CUDA float64 softmax (1.744 against 0.393), where `number` computes in float32 (its error 1.88e-10 against 1.13e-17).
+Where Adad is not ahead of `number` on the core rows: the memory-bound CUDA adds that move the same bytes (float32,
+int64 and uint32, within 1 %) and CUDA float64 softmax (1.744 against 0.393), where `number` computes in float32 (its
+error 1.88e-10 against 1.13e-17). On the CPU Adad is ahead on all 28; the closest are int16 add (0.835 against 0.838)
+and float64 softmax (4.736 against 4.783).
 The CUDA float64 product is exact, through the sliced 8-bit tensor route.
 
 The core tables above and the family table are taken from `docs/wip/baseline.md` (its `number` and Adad columns), the
