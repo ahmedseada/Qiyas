@@ -3099,7 +3099,7 @@ Limits measured: cpu: copy 78.3 GB/s past the caches (65.54 kB 171.8, 114.69 kB 
 | cpu | optimizer_many | float64 | 64 x 262144 | 13.825 | — | f64 | 1.11e-16 | 15.111 | 0.91 | Vector<Double> | 1.11e-16 | 939.52 MB | 318.77 Mop | 11.153 ms | memory | 67.96 GB/s | 80.7 % | 39.1 kB | 62.17 GB/s | 73.8 % | 272.66 kB |
 | cpu | conv | float64 | 64x128x128 by 128 of 3x3 | 4.445 | — | f64 | 7.11e-14 | 16.852 | 0.26 | Vector<Double> | 7.11e-14 | 25.76 MB | 2.42 Gop | 2.242 ms | f64 | 543.46 Gop/s | 50.4 % | 14.68 MB | 143.36 Gop/s | 13.3 % | 75.51 MB |
 | cpu | conv_bwd | float64 | 64x128x128 by 128 of 3x3 | 37.225 | — | f64 | 2.13e-14 | 54.642 | 0.68 | Vector<Double> | 2.13e-14 | 34.73 MB | 4.83 Gop | 4.484 ms | f64 | 129.8 Gop/s | 12.0 % | 166.27 MB | 88.43 Gop/s | 8.2 % | 227.12 MB |
-| cpu | lstm_step | float64 | B1024 D1024 H1024 | 35.237 | — | f64 | 7.22e-16 | — | — | — | — | 109.08 MB | 17.21 Gop | 15.970 ms | f64 | 430.85 Gop/s | 45.3 % | 156.75 MB | — | — | — |
+| cpu | lstm_step | float64 | B1024 D1024 H1024 | 22.992 | — | f64 | 7.22e-16 | — | — | — | — | 109.08 MB | 17.21 Gop | 15.970 ms | f64 | 430.85 Gop/s | 69.5 % | 156.75 MB | — | — | — |
 | cpu | gru_step | float64 | B1024 D1024 H1024 | 16.513 | — | f64 | 9.99e-16 | — | — | — | — | 75.55 MB | 12.91 Gop | 11.980 ms | f64 | 424.64 Gop/s | 72.5 % | 139.98 MB | — | — | — |
 | cpu | lstm_step_bwd | float64 | B1024 D1024 H1024 | 64.366 | — | f64 | 1.67e-15 | — | — | — | — | 218.17 MB | 34.42 Gop | 31.939 ms | f64 | 471.74 Gop/s | 49.6 % | 192.23 MB | — | — | — |
 | cpu | gru_step_bwd | float64 | B1024 D1024 H1024 | 47.813 | — | f64 | 7.77e-16 | — | — | — | — | 151.09 MB | 25.82 Gop | 23.960 ms | f64 | 429.06 Gop/s | 50.1 % | 217.27 MB | — | — | — |
@@ -6002,7 +6002,7 @@ The readings of the readout's process alone, the re-time's medians in the cells:
 - sum:cols bool: readout adad 0.591; re-timed adad 0.724, 0.733, 0.743; the re-time's processes agree and no other process reads the readout's level: the re-time's medians
 - sumsq:rows int2: readout adad 0.070; re-timed adad 0.059, 0.061, 0.064; the re-time's processes agree and no other process reads the readout's level: the re-time's medians
 
-Re-timed on build d56a2f3 (the recurrent steps, the composed attention, the max-pool backwards and scatter_add_rows: their temporaries kept, not allocated each call): 182 CPU rows, one exclusive job of 3 rounds, a process a round. Where a row's three readings agree within 10 %, each subject's, their medians replace the readings; where they do not (17 rows), the cell carries the process whose reading is the less favourable to adad, both subjects from it:
+Re-timed on build d56a2f3 (the recurrent steps, the composed attention, the max-pool backwards and scatter_add_rows: their temporaries kept, not allocated each call): 182 CPU rows, one exclusive job of 3 rounds, a process a round. Where a row's three readings agree within 10 %, each subject's, their medians replace the readings; where they do not (17 rows; lstm_step float64, whose slow process measured it first, re-timed with a row ahead of it and its median taken), the other 16 cells carry the process whose reading is the less favourable to adad, both subjects from it:
 
 - cpu attention bfloat16: adad 27.451 -> 25.874
 - cpu attention float16: adad 28.044 -> 26.601
@@ -6169,7 +6169,7 @@ Re-timed on build d56a2f3 (the recurrent steps, the composed attention, the max-
 - cpu lstm_step bfloat16: adad 11.343 -> 9.494
 - cpu lstm_step float16: adad 11.622 -> 9.933
 - cpu lstm_step float32: adad 11.873 -> 10.085
-- cpu lstm_step float64: adad 26.456 -> 35.237; the processes apart (adad 35.237, 24.542, 22.627): the one less favourable to adad
+- cpu lstm_step float64: adad 26.456 -> 22.992; the processes apart (adad 35.237, 24.542, 22.627), the 35.237 the first row its process measured: re-timed on d56a2f3 with a row ahead of it (add), 3 processes (22.992, 23.999, 22.886), their median
 - cpu lstm_step float8_e4m3: adad 11.525 -> 9.724
 - cpu lstm_step float8_e5m2: adad 11.623 -> 9.794
 - cpu lstm_step q4_0: adad 12.686 -> 10.571
