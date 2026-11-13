@@ -201,21 +201,24 @@ names it must not use, the license header); run it before every build. A clone r
 
 ## Results
 
-Measured on one machine (Intel Core Ultra 9 285: 24 logical processors, 256-bit vectors, the s8/u8/s16/u16 dot
-lanes, as the runtime reports; 64 GB; NVIDIA GeForce RTX 5070 Ti: 70 multiprocessors, compute capability 12.0, 16 GB,
-driver 610.88, PTX target sm_80; Windows 11, .NET 10.0.12), by the bench as it now times: each row at its final tier (the
+Measured on one machine (Intel Core Ultra 9 285: 24 logical processors, 256-bit vectors, the s8/u8/s16/u16 dot lanes, as
+the runtime reports; 64 GB; NVIDIA GeForce RTX 5070 Ti: 70 multiprocessors, compute capability 12.0, 16 GB, driver
+610.88, PTX target sm_80; Windows 11, .NET 10.0.12), by the bench as it now times: each row at its final tier (the
 runtime's call-counting delay at 0 and a warm-up in rounds that settles), the bench's process opted out of Windows'
 power throttling, each device in a process of its own. The tables are two readouts of 2026-11-13: the CUDA rows from the
 CUDA part of build b36cb4a's `cuda,cpu` readout, the CPU rows from a CPU-only readout of build f8c57b3. Rows measured
-since on the build that changed them: the CUDA box losses (8db7cc0 forward, 22689b7 backward) and the float64 erf
-rows of both devices (03a6098, erf and erfc in float64 by a fitted tail instead of the continued fraction, at no worse
-error). Rows re-timed on their own build in one exclusive job of 3 rounds: 11 CUDA rows (off their earlier reading or
-at a lower memory clock) and the 97 CPU rows that read more than 10 % slower than the CPU's previous full readout. Where
-a re-time and its readout disagree by more than 10 % (40 CPU rows) the cell carries the reading less favourable to Adad,
-both subjects from that reading. `docs/wip/baseline.md` is that assembled file: every row, its builds, and notes naming
-each re-timed or re-measured row. Device bandwidth rows follow the driver's memory P-state (a row timed at P3 reads up to
-about 1.9× its P1 time); setting "Prefer maximum performance" for dotnet.exe in the NVIDIA control panel gives stable
-readings.
+since on the build that changed them: the CUDA box losses (8db7cc0 forward, 22689b7 backward) and the float64 erf rows
+of both devices (03a6098, erf and erfc in float64 by a fitted tail instead of the continued fraction, at no worse
+error). Rows re-timed on their own build in one exclusive job of 3 rounds: 11 CUDA rows (off their earlier reading or at
+a lower memory clock) and the 97 CPU rows that read more than 10 % slower than the CPU's previous full readout. Where a
+re-time and its readout disagree by more than 10 % (40 CPU rows) the cell carries the reading less favourable to Adad,
+both subjects from that reading. The CPU rows of the operations changed since (rope_table; the box losses; the passes
+down the columns: sum, max and argmax, gemv_t and the norm parameters' backward; cross_entropy, log_softmax_topk and
+sample_rows) are re-timed on build 2f78b26, which carries those changes, both subjects, in one exclusive job of 3
+rounds; where the three processes disagree by more than 10 % (44 rows) the cell carries the one less favourable to Adad.
+`docs/wip/baseline.md` is that assembled file: every row, its builds, and notes naming each re-timed or re-measured row.
+Device bandwidth rows follow the driver's memory P-state (a row timed at P3 reads up to about 1.9× its P1 time); setting
+"Prefer maximum performance" for dotnet.exe in the NVIDIA control panel gives stable readings.
 
 The columns shown here are the `INumberBase<T>` version (`number`, — where .NET has no such type) and Adad. Times are
 medians in ms. Every subject's error is against float64 math (products in double-double). On the core rows Adad's error
@@ -292,7 +295,7 @@ subject's error stands beside its time. The narrow floats, the sub-byte integers
 | rows | 18 | 180 | — | 180 | — |
 | layout and indexing | 23 | 422 | — | 422 | — |
 | products on views | 8 | 156 | — | 156 | — |
-| attention | 8 | 80 | 1.25× (ahead on 2 of 3) | 80 | 0.84× (ahead on 1 of 3) |
+| attention | 8 | 80 | 1.25× (ahead on 2 of 3) | 80 | 1.87× (ahead on 3 of 3) |
 | optimizers | 5 | 50 | 1.17× (ahead on 7 of 15) | 50 | 1.40× (ahead on 12 of 15) |
 | convolution | 2 | 44 | 2.72× (ahead on 22 of 22) | 44 | 14.06× (ahead on 22 of 22) |
 | recurrent | 8 | 72 | — | 72 | — |
@@ -300,7 +303,7 @@ subject's error stands beside its time. The narrow floats, the sub-byte integers
 | draws and decoding | 6 | 115 | — | 115 | — |
 | caches | 4 | 36 | — | 36 | — |
 | experts | 3 | 54 | — | 54 | — |
-| box losses | 8 | 80 | 0.96× (ahead on 9 of 24) | 80 | 4.01× (ahead on 23 of 24) |
+| box losses | 8 | 80 | 0.96× (ahead on 9 of 24) | 80 | 4.12× (ahead on 23 of 24) |
 | memory | 3 | 3 | 2.89× (ahead on 1 of 3) | 3 | 4.13× (ahead on 3 of 3) |
 
 Where Adad is not ahead of `number` on the core rows: the memory-bound adds that move the same bytes (CUDA float32,
