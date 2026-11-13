@@ -183,14 +183,19 @@ internal sealed partial class Kernels
     }
 
     /// <summary>The output rows computed by the team: tasks of whole rows, or — where the rows that share an output storage
-    /// unit are too many to give the team its tasks (a block format's rows far shorter than its block) — tasks of whole
-    /// storage units, a row crossing a task's edge computed by both and each storing its own values.</summary>
+    /// unit are too many to give the team its tasks (a block format's rows far shorter than its block), or where a block
+    /// format's rows end inside its blocks — tasks of whole storage units, a row crossing a task's edge computed by both
+    /// and each storing its own values.</summary>
     private static void Move<TN, TLane, TL>(LayoutArgs k, int rows, int cols, long[]? at, bool inLanes = false)
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
     {
         if ((long)rows * cols == 0) return;                                        // no outputs (a window longer than its image)
         int wanted = Math.Max(1, rows / (Threads * 4)), chunk = RowChunk<TN>(rows, cols, wanted), g = TN.Granularity;
-        if (g <= 1 || chunk <= 2 * wanted)
+        // A block format's values share their block's scales: a block stored in parts is re-encoded with the values already
+        // in it, which before the last part are whatever the output held. Where rows end inside blocks, every block is
+        // stored once, whole, from its values gathered in lanes (the array's last block with its values past the end kept).
+        bool shared = TN.IsFloat && g > 1 && cols % g != 0;
+        if (g <= 1 || (!shared && chunk <= 2 * wanted))
         {
             Team.For(rows, chunk, Work(k), new MoveBody<TN, TLane, TL>(k, rows, cols, at, inLanes));
             return;

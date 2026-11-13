@@ -1831,10 +1831,17 @@ internal static partial class Checks
     {
         public bool Visit<TN>() where TN : struct, IAdad<TN, float>
         {
+            // The output starts as values no layout writes by chance, on the host and on the device, so every value the check
+            // reads, a zero included, is one the layout wrote: 0xFF in every byte (NaN for the floats, -1 or the largest value
+            // for the integers, true for bool); a block format's values 1000 each and the last block's values past the output
+            // 0, as its contract asks of a buffer whose blocks the output does not cover whole.
+            if (Bench.Registry.IsBlock(TN.Name)) Bench.Registry.Encode(TN.Name, Enumerable.Repeat(1000.0, k.Count).ToArray()).CopyTo(k.Output, 0);
+            else Array.Fill(k.Output, (byte)0xFF);
             if (ops is null) { Kernels.Layout<TN>(k); return true; }
             ulong dx = ops.Rent(k.X.Length + 16), dout = ops.Rent(k.Output.Length + 16), didx = k.Index is null ? 0 : ops.RentIndices(k.Index.Length), dx2 = k.X2 is null ? 0 : ops.Rent(k.X2.Length + 16);
             try
             {
+                ops.Upload(k.Output, dout);
                 ops.Upload(k.X, dx);
                 if (k.Index is not null) ops.UploadIndices(k.Index, didx);
                 if (k.X2 is not null) ops.Upload(k.X2, dx2);
