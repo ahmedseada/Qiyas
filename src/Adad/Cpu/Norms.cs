@@ -275,6 +275,7 @@ internal sealed partial class Kernels
             var yl = direct ? null : pool.Rent(n);
             var ct = MemoryMarshal.Cast<byte, TLane>(cos.AsSpan());
             var st = MemoryMarshal.Cast<byte, TLane>(sin.AsSpan());
+            var store = new UnitStore<TN, TLane>(y, n);
             try
             {
                 for (int r = first; r < last; r++)
@@ -294,8 +295,10 @@ internal sealed partial class Kernels
 
                     int pos = a.Position(positions, r);
                     Row(xs, ys, ct.Slice(pos * a.Half, a.Half), st.Slice(pos * a.Half, a.Half));
-                    if (!direct) TN.Store(ys, y, r * n);
+                    if (!direct) store.Put(ys, (long)r * n);
                 }
+
+                store.Done();
             }
             finally
             {

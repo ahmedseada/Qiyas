@@ -147,7 +147,7 @@ internal static partial class Checks
 
             var q = Bench.Registry.Make(type, (int)a.QValues, 73, -1, 1);
             var want = CacheRule.AtPosition(a, p).Reference(Bench.Registry.Values(type, q, (int)a.QValues), k, v);
-            var o = new byte[q.Length];
+            var o = Bench.Registry.Poisoned(type, a.QValues);
             Bench.Registry.WithFloat(type, new CacheAttentionRun(ops, cacheType, a, p, q, kc, vc, o));
             ok &= Close(type, $"attention_cached {name}, {cacheType}", where, o, want, (int)a.QValues, a.Lk + a.D);
         }

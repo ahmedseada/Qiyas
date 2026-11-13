@@ -54,7 +54,7 @@ internal static partial class Checks
                 var wv = w.Reference(cv, sv, zv);
 
                 // The expansion: each value within its two roundings (the zero's subtraction, the scale's product).
-                var expanded = new byte[Bench.Registry.Bytes(type, w.Values)];
+                var expanded = Bench.Registry.Poisoned(type, w.Values);
                 Bench.Registry.WithFloat(type, new ScaledRun(ops, c.Codes, w, m, e, null, codes, scales, zeros, expanded, default));
                 var termsW = new double[w.Values];
                 for (int i = 0; i < termsW.Length; i++)

@@ -165,7 +165,7 @@ public sealed class RecurrentCase
         var wantH = new double[a.B * a.H];
         var wantC = lstm ? new double[a.B * a.H] : null;
         if (lstm) a.LstmCell(g, cv!, wantH, wantC!); else a.GruCell(gx, gh, hv, wantH);
-        var k0 = new RecurrentCase { X = x, H = h, C = c, W = w, U = u, Bias = bias, BiasH = biasH, WantH = wantH, WantC = wantC, COut = lstm ? new byte[h.Length] : null };
+        var k0 = new RecurrentCase { X = x, H = h, C = c, W = w, U = u, Bias = bias, BiasH = biasH, WantH = wantH, WantC = wantC, COut = lstm ? Registry.Poisoned(type, a.B * a.H) : null };
         if (!backward) return k0;
         var dhOut = Registry.Make(type, a.B * a.H, 88, -1, 1);
         var dcOut = lstm ? Registry.Make(type, a.B * a.H, 89, -1, 1) : null;
@@ -188,7 +188,7 @@ public sealed class RecurrentCase
 
         if (!lstm) for (int i = 0; i < dh.Length; i++) dh[i] += dstate[i];
         k0.DhOut = dhOut; k0.DcOut = dcOut;
-        k0.Dh = new byte[h.Length]; k0.Dc = lstm ? new byte[h.Length] : null; k0.Dw = new byte[w.Length]; k0.Du = new byte[u.Length]; k0.Db = new byte[bias.Length]; k0.Dbh = lstm ? null : new byte[bias.Length];
+        k0.Dh = Registry.Poisoned(type, a.B * a.H); k0.Dc = lstm ? Registry.Poisoned(type, a.B * a.H) : null; k0.Dw = Registry.Poisoned(type, (long)GH * a.D); k0.Du = Registry.Poisoned(type, (long)GH * a.H); k0.Db = Registry.Poisoned(type, GH); k0.Dbh = lstm ? null : Registry.Poisoned(type, GH);
         k0.WantDx = dx; k0.WantDh = dh; k0.WantDc = lstm ? dstate : null; k0.WantDw = dw; k0.WantDu = du; k0.WantDb = db; k0.WantDbh = dbh;
         return k0;
     }

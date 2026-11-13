@@ -41,8 +41,8 @@ internal static partial class Checks
             string what = $"log_softmax_topk {rows}x{cols} k {k}";
             var x = Bench.Registry.Make(type, rows * cols, 91, -4, 4);
             var (want, wantAt) = Routing.LogSoftmaxTopKReference(Bench.Registry.Values(type, x, rows * cols), rows, cols, k);
-            var values = new byte[Bench.Registry.Bytes(type, rows * k)];
-            var indices = new int[rows * k];
+            var values = Bench.Registry.Poisoned(type, rows * k);
+            var indices = Bench.Registry.PoisonedIndices(rows * k);
             Bench.Registry.WithFloat(type, new LogTopKRun(ops, x, rows, cols, k, values, indices));
             string? wrong = null;
             for (int i = 0; i < rows * k && wrong is null; i++) if (indices[i] != wantAt[i]) wrong = $"index [{i}] {indices[i]}, not {wantAt[i]}";

@@ -30,8 +30,8 @@ internal static partial class Checks
             {
                 string what = $"quantize {codeType}{(zeros ? " with zeros" : "")}, {layout}";
                 var (min, max) = Bench.Registry.With(codeType, new CodeRange());
-                byte[] codes = new byte[Bench.Registry.Bytes(codeType, w.Values)], scales = new byte[Bench.Registry.Bytes(type, w.Scales)];
-                byte[]? zp = zeros ? new byte[Bench.Registry.Bytes(type, w.Scales)] : null;
+                byte[] codes = Bench.Registry.Poisoned(codeType, w.Values), scales = Bench.Registry.Poisoned(type, w.Scales);
+                byte[]? zp = zeros ? Bench.Registry.Poisoned(type, w.Scales) : null;
                 Bench.Registry.WithFloat(type, new QuantizeRun(ops, codeType, w, x, codes, scales, zp));
                 var (wantScales, lows) = w.QuantizeReference(values, min, max, zeros);
                 double bad = Excess(type, what + " scales", scales, wantScales, i => Math.Abs(wantScales[i]), 2);

@@ -38,7 +38,7 @@ internal static partial class Checks
                 }
 
                 double wantSum = a.ReferenceMany(wantP, gv, wantM, wantV);
-                var sum = withSum ? new byte[size] : null;
+                var sum = withSum ? Bench.Registry.Poisoned(size) : null;
                 Bench.Registry.WithFloat(type, new OptimizerManyRun(ops, a, p, g, m, v, counts, sum));
                 if (sum is not null)
                 {

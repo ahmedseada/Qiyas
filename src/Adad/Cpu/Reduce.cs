@@ -878,6 +878,7 @@ internal sealed partial class Kernels
             var xl = TN.Direct ? null : pool.Rent(cols);
             Span<TLane> px = stackalloc TLane[w];
             Span<TLane> py = stackalloc TLane[w];
+            var store = new UnitStore<TN, TLane>(output, cols);
             try
             {
                 TN.Load(v, 0, vl.AsSpan(0, cols));
@@ -900,9 +901,11 @@ internal sealed partial class Kernels
                     if (!TN.Direct)
                     {
                         if (!TN.IsFloat && TN.Bits < 8 * Unsafe.SizeOf<TLane>()) MapWrap(o, TN.Bits, TN.Min < 0);
-                        TN.Store(o, output, r * cols);
+                        store.Put(o, (long)r * cols);
                     }
                 }
+
+                store.Done();
             }
             finally
             {

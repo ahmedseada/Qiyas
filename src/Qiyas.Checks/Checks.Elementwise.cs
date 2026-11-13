@@ -94,7 +94,7 @@ internal static partial class Checks
                 {
                     var x = wide ? Wide64(type, n, 71) : Bench.Registry.Make(type, n, 71, -4, 4);
                     var r = !residual ? null : wide ? Wide64(type, n, 72) : Bench.Registry.Make(type, n, 72, -2, 2);
-                    var cpu = new byte[Bench.Registry.Bytes(type, n)];
+                    var cpu = Bench.Registry.Poisoned(type, n);
                     Bench.Registry.With(type, new DropoutRun(null, x, r, cpu, n, P, Seed));
                     string what = residual ? "dropout+residual" : "dropout";
                     if (ops is null)
@@ -134,7 +134,7 @@ internal static partial class Checks
                         continue;
                     }
 
-                    var dev = new byte[cpu.Length];
+                    var dev = Bench.Registry.Poisoned(type, n);
                     Bench.Registry.With(type, new DropoutRun(ops, x, r, dev, n, P, Seed));
                     ok &= SameValues(type, $"{what} n={n}", where, dev, cpu, n);
                 }
@@ -152,7 +152,7 @@ internal static partial class Checks
             ulong dx = ops.Rent(x.Length + 16), dr = r is null ? 0 : ops.Rent(r.Length + 16), dout = ops.Rent(output.Length + 16);
             try
             {
-                ops.Upload(x, dx);
+                ops.Upload(x, dx); ops.Upload(output, dout);
                 if (r is not null) ops.Upload(r, dr);
                 ops.Dropout<TN>(dx, dr, dout, n, p, seed);
                 ops.Synchronize();
@@ -369,11 +369,11 @@ internal static partial class Checks
             {
                 pairs++;
                 var x = ConvertSource(from, N, 90 + pairs, finite: Bench.Registry.IsBlock(to));
-                var cpu = new byte[Bench.Registry.Bytes(to, N)];
+                var cpu = Bench.Registry.Poisoned(to, N);
                 Bench.Registry.With(from, new ConvertRun(null, to, x, cpu, N));
                 if (ops is not null)
                 {
-                    var dev = new byte[cpu.Length];
+                    var dev = Bench.Registry.Poisoned(to, N);
                     Bench.Registry.With(from, new ConvertRun(ops, to, x, dev, N));
                     if (!SameValues(to, $"convert {from}->{to}", where, dev, cpu, N)) ok = false;
                     continue;
@@ -419,7 +419,7 @@ internal static partial class Checks
                 ulong dx = ops.Rent(x.Length + 16), dout = ops.Rent(output.Length + 16);
                 try
                 {
-                    ops.Upload(x, dx);
+                    ops.Upload(x, dx); ops.Upload(output, dout);
                     ops.Convert<TF, TT>(dx, dout, n);
                     ops.Synchronize();
                     ops.Download(dout, output);
@@ -447,8 +447,8 @@ internal static partial class Checks
             var v = Bench.Registry.Make(type, C, 86, -1, 1);
             var vv = Bench.Registry.Values(type, v, C);
             var repeated = Bench.Registry.Encode(type, Enumerable.Range(0, R * C).Select(i => vv[i % C]).ToArray());
-            var row = new byte[x.Length];
-            var whole = new byte[x.Length];
+            var row = Bench.Registry.Poisoned(type, R * C);
+            var whole = Bench.Registry.Poisoned(type, R * C);
             Bench.Registry.WithFloat(type, new RowFloatRun(ops, op, x, v, repeated, row, whole, R, C));
             // A block format: v repeated and encoded again is not v (its blocks fall elsewhere), and the CPU stores a row at a
             // time (a block two rows share encoded again with its kept values): against the reference, within the block's steps.
@@ -482,6 +482,7 @@ internal static partial class Checks
                 ops.Upload(x, dx);
                 ops.Upload(v, dv);
                 ops.Upload(repeated, dr);
+                ops.Upload(row, d1); ops.Upload(whole, d2);
                 ops.MapRowFloat<TN>(op, dx, dv, d1, rows, cols);
                 ops.MapFloat<TN>(op, dx, dr, 0, d2, n, 0, 0);
                 ops.Synchronize();

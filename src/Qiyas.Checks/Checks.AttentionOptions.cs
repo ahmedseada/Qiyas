@@ -46,7 +46,7 @@ internal static partial class Checks
                 // O by every form: the measured choice, the fused rows, the composition, decode.
                 foreach (string form in new[] { "measured", "fused", "composed", "decode" })
                 {
-                    var o = new byte[q.Length];
+                    var o = Bench.Registry.Poisoned(type, a.QValues);
                     Bench.Registry.WithFloat(type, new AttentionRun(ops, a, q, k, v, o, form == "decode", null, null, null, fused: form == "fused", composed: form == "composed"));
                     ok &= CloseNumbers(type, $"attention {name} {form}", where, o, want, (int)a.QValues, terms);
                 }
@@ -64,7 +64,7 @@ internal static partial class Checks
                     if (cuda is not null) { cuda.FusedBackward = mode == 1 ? false : null; cuda.MmaBackward = mode == 2 ? false : null; cuda.BackwardRoute = null; }
                     else if (vulkan is not null) { vulkan.FusedBackward = mode == 1 ? false : null; vulkan.BackwardRoute = null; }
                     else Kernels.FusedBackwardCpu = mode == 0;
-                    byte[] dq = new byte[q.Length], dk = new byte[k.Length], dv = new byte[v.Length];
+                    byte[] dq = Bench.Registry.Poisoned(type, a.QValues), dk = Bench.Registry.Poisoned(type, a.KValues), dv = Bench.Registry.Poisoned(type, a.KValues);
                     Bench.Registry.WithFloat(type, new AttentionRun(ops, a, q, k, v, dO, false, dq, dk, dv));
                     string tag = $" {name}{(mode == 1 ? " composed" : mode == 2 ? " fma" : "")}";
                     int rows = a.Group * a.Lq;
@@ -93,9 +93,9 @@ internal static partial class Checks
     // rounding over the keys.
     private static bool LseCase(IDevice<ulong, ulong>? ops, string where, string type, string what, AttentionArgs a, byte[] q, byte[] k, byte[] v, double[] want, double[] lseWant, int terms)
     {
-        var o = new byte[q.Length];
+        var o = Bench.Registry.Poisoned(type, a.QValues);
         int n = a.Heads * a.Lq;
-        var lse = new byte[Bench.Registry.Bytes(type, n)];
+        var lse = Bench.Registry.Poisoned(type, n);
         Bench.Registry.WithFloat(type, new AttentionLseRun(ops, a, q, k, v, o, lse));
         bool ok = CloseNumbers(type, what + " O", where, o, want, (int)a.QValues, terms);
         ok &= Close(type, what, where, lse, lseWant, n, terms);

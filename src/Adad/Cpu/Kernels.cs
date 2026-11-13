@@ -793,6 +793,7 @@ internal sealed partial class Kernels
             TLane[]? rented = own || cols <= 4096 ? null : ArrayPool<TLane>.Shared.Rent(cols);
             Span<TLane> row = own ? default : rented is null ? stackalloc TLane[cols] : rented.AsSpan(0, cols);
             var stored = stream && !TN.Direct ? ArrayPool<byte>.Shared.Rent((int)TN.Bytes(cols)) : null;
+            var store = new UnitStore<TN, TLane>(y, cols);
             try
             {
                 for (int r = first; r < last; r++)
@@ -808,12 +809,13 @@ internal sealed partial class Kernels
                     {
                         TN.Load(x, r * cols, v);
                         Softmax<TLane, TL>(v, v);
-                        if (!stream) TN.Store(v, y, r * cols);
+                        if (!stream) store.Put(v, (long)r * cols);
                     }
 
                     if (stream) StreamRow<TN, TLane>(v, y, r, cols, stored);
                 }
 
+                store.Done();
                 if (stream) Streams.Fence();
             }
             finally
@@ -901,6 +903,7 @@ internal sealed partial class Kernels
             Span<TLane> row = own ? default : rented is null ? stackalloc TLane[cols] : rented.AsSpan(0, cols);
             var stored = stream && !TN.Direct ? ArrayPool<byte>.Shared.Rent((int)TN.Bytes(cols)) : null;
             TLane count = TL.From(cols);
+            var store = new UnitStore<TN, TLane>(y, cols);
             try
             {
                 for (int r = first; r < last; r++)
@@ -945,9 +948,10 @@ internal sealed partial class Kernels
                     for (; q < vec; q += w) (Vector.LoadUnsafe(ref rs, (nuint)q) * sv).StoreUnsafe(ref rd, (nuint)q);
                     for (; q < cols; q++) dst[q] = TL.Mul(src[q], scale);
                     if (stream) StreamRow<TN, TLane>(dst, y, r, cols, stored);
-                    else if (!TN.Direct) TN.Store(row, y, r * cols);
+                    else if (!TN.Direct) store.Put(row, (long)r * cols);
                 }
 
+                store.Done();
                 if (stream) Streams.Fence();
             }
             finally

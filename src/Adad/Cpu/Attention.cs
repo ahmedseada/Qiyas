@@ -482,6 +482,7 @@ internal sealed partial class Kernels
         {
             int d = a.D, w = Vector<TLane>.Count;
             var acc = ArrayPool<TLane>.Shared.Rent(d);
+            var store = new UnitStore<TN, TLane>(o, d);
             try
             {
                 for (int r = first; r < last; r++)
@@ -513,8 +514,10 @@ internal sealed partial class Kernels
 
                     TLane inv = any ? TL.Div(TL.From(1), sum) : TL.Zero;
                     RowMath<TLane, TL>.Scale(row, TL.Zero, inv, row);
-                    TN.Store(row, o, r * d);
+                    store.Put(row, (long)r * d);
                 }
+
+                store.Done();
             }
             finally { ArrayPool<TLane>.Shared.Return(acc); }
         }

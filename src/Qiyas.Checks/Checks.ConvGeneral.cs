@@ -56,7 +56,7 @@ internal static partial class Checks
                 var dyv = Bench.Registry.Values(type, dy, (int)a.YValues);
                 var (wantX, wantW, wantB) = a.ReferenceBackward(xv, wv, dyv);
                 var (sx, sw, sb) = a.ReferenceBackward(xv.Select(Math.Abs).ToArray(), wv.Select(Math.Abs).ToArray(), dyv.Select(Math.Abs).ToArray());
-                byte[] dx = new byte[x.Length], dw = new byte[w.Length], db = new byte[Bench.Registry.Bytes(type, a.OC)];
+                byte[] dx = Bench.Registry.Poisoned(type, a.XValues), dw = Bench.Registry.Poisoned(type, a.WValues), db = Bench.Registry.Poisoned(type, a.OC);
                 Bench.Registry.With(type, new ConvGeneralBackwardRun(ops, a, x, w, dy, dx, dw, db));
                 int kx = a.OCg * a.Kh * a.Kw + 2, kw = a.N * a.Cols + 2;
                 foreach (var (what, got, reference, s, k) in new[] { ("dx", dx, wantX, sx, kx), ("dw", dw, wantW, sw, kw), ("db", db, wantB, sb, kw) })
@@ -91,10 +91,10 @@ internal static partial class Checks
         var inputs = Made(c.ActInputs, n, 72);
         var a2 = Made(e.Second is not null, e.Second?.ValuesA ?? 0, 73);
         var b2 = Made(e.Second is not null, e.Second?.ValuesB ?? 0, 74);
-        // y's values before: read by β, else zeros.
-        var y = e.Beta != 0 ? Bench.Registry.Make(type, n, 75, -1, 1) : new byte[Bench.Registry.Bytes(type, a.YValues)];
-        var y0 = Bench.Registry.Values(type, y, n);
-        var sums = c.Keep ? new byte[Bench.Registry.Bytes(type, a.YValues)] : null;
+        // y's values before: read by β; with β 0 not read, so the output starts poisoned and the reference takes zeros.
+        var y = e.Beta != 0 ? Bench.Registry.Make(type, n, 75, -1, 1) : Bench.Registry.Poisoned(type, a.YValues);
+        var y0 = e.Beta != 0 ? Bench.Registry.Values(type, y, n) : new double[n];
+        var sums = c.Keep ? Bench.Registry.Poisoned(type, a.YValues) : null;
         double[]? bv = Of(bias, a.OC), a2v = Of(a2, e.Second?.ValuesA ?? 0), b2v = Of(b2, e.Second?.ValuesB ?? 0);
         var (want, s) = a.Reference(e, xv, wv, y0, bv, Of(residual, n), Of(inputs, n), a2v, b2v);
 

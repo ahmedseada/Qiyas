@@ -205,8 +205,18 @@ internal sealed partial class Kernels
             var colsp = new byte[a.ColValues * size];
             LayoutToLanes<TN, TAcc, TP>(new LayoutArgs { Name = "strided", X = dy, P = [1, a.OC, a.N, P, 0, P, a.OC * P, 1, 0], Output = dyp, Count = a.OC * NP, InputCount = (int)a.YValues });
             LayoutToLanes<TS, TAcc, TP>(new LayoutArgs { Name = "strided", X = cols, P = [1, G * R, a.N, P, 0, P, G * R * P, 1, 0], Output = colsp, Count = (int)a.ColValues, InputCount = (int)a.ColValues });
+            // A block format whose groups' dw end inside its blocks: every group's dw in lanes, stored once (a block two groups
+            // share stored whole, not re-encoded a group at a time with what dw held).
+            bool apart = TN.IsFloat && TN.Granularity > 1 && (long)a.OCg * R % TN.Granularity != 0;
+            var dwl = apart ? new byte[(long)a.OC * R * size] : null;
             for (int g = 0; g < G; g++)
-                MatMul<TS, TS, TN, TAcc, TAcc, TP>(dyp, colsp, dw, a.OCg, R, NP, new Operands(AOff: g * a.OCg * NP, BOff: g * R * NP, TransB: true, COff: g * a.OCg * R));   // dy_g · cols_gᵀ
+            {
+                var operands = new Operands(AOff: g * a.OCg * NP, BOff: g * R * NP, TransB: true, COff: g * a.OCg * R);
+                if (apart) MatMul<TS, TS, TS, TAcc, TAcc, TP>(dyp, colsp, dwl!, a.OCg, R, NP, operands);   // dy_g · cols_gᵀ
+                else MatMul<TS, TS, TN, TAcc, TAcc, TP>(dyp, colsp, dw, a.OCg, R, NP, operands);
+            }
+
+            if (apart) StoreLanes<TN, TAcc>(dwl!, dw, 0, (long)a.OC * R);
             if (db is not null)
             {
                 var rows = MemoryMarshal.Cast<byte, TAcc>(dyp.AsSpan());

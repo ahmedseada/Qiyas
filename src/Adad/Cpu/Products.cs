@@ -57,28 +57,59 @@ internal sealed partial class Kernels
     /// <summary>C = op(A)·op(B) by the strided copies and the product kernel.</summary>
     private static string MatMulViewCopies<TN>(ProductView v, byte[] a, byte[] b, byte[] c) where TN : struct, IAdad<TN>
     {
-        string lane = "";
-        bool direct = v.Batch == 1 && !v.TransA && !v.TransB;
-        var ca = direct ? a : new byte[BytesOf<TN>((long)v.M * v.K)];
-        var cb = direct ? b : new byte[BytesOf<TN>((long)v.K * v.N)];
-        var cc = direct ? c : new byte[BytesOf<TN>((long)v.M * v.N)];
-        for (int i = 0; i < v.Batch; i++)
+        var copies = new ViewCopies(v, a, b, c);
+        TN.Elementwise(ref copies);
+        return copies.Lane;
+    }
+
+    // Each batch's product into a C of its own, then into the view's C. A block format's batch that ends inside a block goes
+    // through a UnitStore: the block two batches share is stored once, whole, from both batches' values (stored a batch at a
+    // time it was re-encoded first with what C held past the batch).
+    private struct ViewCopies(ProductView v, byte[] a, byte[] b, byte[] c) : ILaneVisitor
+    {
+        public string Lane = "";
+
+        public void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
         {
-            if (!direct)
+            bool direct = v.Batch == 1 && !v.TransA && !v.TransB;
+            long values = (long)v.M * v.N;
+            var ca = direct ? a : new byte[BytesOf<TN>((long)v.M * v.K)];
+            var cb = direct ? b : new byte[BytesOf<TN>((long)v.K * v.N)];
+            var cc = direct ? c : new byte[BytesOf<TN>(values)];
+            int g = TN.Granularity;
+            var store = new UnitStore<TN, TLane>(c, values % g != 0 || v.StrideCOrDefault % g != 0);
+            var lanes = direct ? null : ArrayPool<TLane>.Shared.Rent(4096);
+            try
             {
-                Layout<TN>(new LayoutArgs { Name = "strided", X = a, P = v.ViewA(i), Output = ca, Count = v.M * v.K, InputCount = (int)v.ValuesA });
-                Layout<TN>(new LayoutArgs { Name = "strided", X = b, P = v.ViewB(i), Output = cb, Count = v.K * v.N, InputCount = (int)v.ValuesB });
+                for (int i = 0; i < v.Batch; i++)
+                {
+                    if (!direct)
+                    {
+                        Layout<TN>(new LayoutArgs { Name = "strided", X = a, P = v.ViewA(i), Output = ca, Count = v.M * v.K, InputCount = (int)v.ValuesA });
+                        Layout<TN>(new LayoutArgs { Name = "strided", X = b, P = v.ViewB(i), Output = cb, Count = v.K * v.N, InputCount = (int)v.ValuesB });
+                    }
+
+                    var (aLo, aHi) = TN.IsFloat ? (0, 0) : TN.Range(ca, v.M * v.K);
+                    var (bLo, bHi) = TN.IsFloat ? (0, 0) : TN.Range(cb, v.K * v.N);
+                    var product = new MatMulVisitor(ca, cb, cc, v.M, v.N, v.K);
+                    TN.Sum(ref product, new Bounds(aLo, aHi, bLo, bHi, v.K));
+                    Lane = product.Lane;
+                    if (direct) continue;
+                    for (long at = 0; at < values; at += 4096)
+                    {
+                        int len = (int)Math.Min(4096, values - at);
+                        TN.Load(cc, (int)at, lanes.AsSpan(0, len));
+                        store.Put(lanes.AsSpan(0, len), i * v.StrideCOrDefault + at);
+                    }
+                }
+
+                store.Done();
             }
-
-            var (aLo, aHi) = TN.IsFloat ? (0, 0) : TN.Range(ca, v.M * v.K);
-            var (bLo, bHi) = TN.IsFloat ? (0, 0) : TN.Range(cb, v.K * v.N);
-            var product = new MatMulVisitor(ca, cb, cc, v.M, v.N, v.K);
-            TN.Sum(ref product, new Bounds(aLo, aHi, bLo, bHi, v.K));
-            lane = product.Lane;
-            if (!direct) CopyValues<TN>(cc, 0, c, i * v.StrideCOrDefault, (long)v.M * v.N);
+            finally
+            {
+                if (lanes is not null) ArrayPool<TLane>.Shared.Return(lanes);
+            }
         }
-
-        return lane;
     }
 
     /// <summary>dA = dC·Bᵀ (m × k) and dB = Aᵀ·dC (k × n) for C = A·B (A m × k, B k × n, dC m × n); returns dA's lane.</summary>
@@ -87,33 +118,5 @@ internal sealed partial class Kernels
         string lane = MatMulView<TN>(new ProductView(m, k, n, false, true), dc, b, da);
         MatMulView<TN>(new ProductView(k, n, m, true, false), a, dc, db);
         return lane;
-    }
-
-    /// <summary>count values of src from srcOffset into dst at dstOffset (any offsets, through the lane).</summary>
-    public static void CopyValues<TN>(byte[] src, long srcOffset, byte[] dst, long dstOffset, long count) where TN : struct, IAdad<TN>
-    {
-        var v = new CopyVisitor(src, srcOffset, dst, dstOffset, count);
-        TN.Elementwise(ref v);
-    }
-
-    private struct CopyVisitor(byte[] src, long srcOffset, byte[] dst, long dstOffset, long count) : ILaneVisitor
-    {
-        public readonly void Run<TN, TLane, TL>() where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
-        {
-            var buffer = ArrayPool<TLane>.Shared.Rent(4096);
-            try
-            {
-                for (long at = 0; at < count; at += 4096)
-                {
-                    int len = (int)Math.Min(4096, count - at);
-                    TN.Load(src, (int)(srcOffset + at), buffer.AsSpan(0, len));
-                    TN.Store(buffer.AsSpan(0, len), dst, (int)(dstOffset + at));
-                }
-            }
-            finally
-            {
-                ArrayPool<TLane>.Shared.Return(buffer);
-            }
-        }
     }
 }

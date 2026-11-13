@@ -52,7 +52,7 @@ internal static partial class Checks
                         }
 
                         var (ry, scale) = Resampling.Reference(a, xv, bounds, weights, values);
-                        var y = new byte[Bench.Registry.Bytes(type, a.Count)];
+                        var y = Bench.Registry.Poisoned(type, a.Count);
                         var vb = values is null ? null : Resampling.LaneBytes(values, f64);
                         string lane = Bench.Registry.With(input, new ResampleRun(ops, type, a, x, bounds, Resampling.LaneBytes(weights, f64), vb, y));
                         string what = $"resample {k.Name} {input}{(wide ? " past 2^53" : "")}{(norm ? " scaled" : "")}";

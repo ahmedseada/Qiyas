@@ -42,12 +42,12 @@ internal static partial class Checks
                     for (int k = 0; k < 4; k++) { g[k] *= ds[i]; gradScale[4 * i + k] *= Math.Abs(ds[i]); }
                 }
 
-                var loss = new byte[Bench.Registry.Bytes(type, count)];
+                var loss = Bench.Registry.Poisoned(type, count);
                 Bench.Registry.WithFloat(type, new BoxRun(ops, overlap, p, t, null, loss, count));
                 double bad = Excess(type, $"box {name}", loss, want, i => scale[i], 16);
                 if (bad > 0) { Console.WriteLine($"check box {name,-5} loss {where,-6} {type,-12} DIFFERS by {bad:0.##}"); ok = false; }
                 if (ops is null) ok &= BoxStreamed(type, overlap, p, t, null, loss, count);
-                var grad = new byte[Bench.Registry.Bytes(type, 4 * count)];
+                var grad = Bench.Registry.Poisoned(type, 4 * count);
                 Bench.Registry.WithFloat(type, new BoxRun(ops, overlap, p, t, dl, grad, count));
                 bad = Excess(type, $"box {name} bwd", grad, wantGrad, i => gradScale[i], 32);
                 if (bad > 0) { Console.WriteLine($"check box {name,-5} grad {where,-6} {type,-12} DIFFERS by {bad:0.##}"); ok = false; }
@@ -63,7 +63,7 @@ internal static partial class Checks
     // equal to the plain pass bit for bit.
     private static bool BoxStreamed(string type, BoxOverlap overlap, byte[] p, byte[] t, byte[]? dl, byte[] plain, int count)
     {
-        var y = new byte[plain.Length];
+        var y = Bench.Registry.Poisoned(type, dl is null ? count : 4 * count);
         Adad.Cpu.Streams.Force = true;
         try { Bench.Registry.WithFloat(type, new BoxRun(null, overlap, p, t, dl, y, count)); }
         finally { Adad.Cpu.Streams.Force = null; }

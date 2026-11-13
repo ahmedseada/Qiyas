@@ -232,14 +232,14 @@ internal static partial class Checks
                 var vb = Bench.Registry.Values(type, bb, R * C);
                 var sum = new double[R * C];
                 for (int i = 0; i < R * C; i++) sum[i] = va[i] + vb[i];
-                // A fresh output each (a block format's partial-block store keeps the buffer's other values in the block's scale).
-                var output = new byte[a.Length];
+                // Each output poisoned (Registry.Poisoned): every value read is one the operation wrote.
+                var output = Bench.Registry.Poisoned(type, R * C);
                 Bench.Registry.WithFloat(type, new CoreRun(ops, "add", a, bb, output, R, C));
                 ok &= Close(type, "add", where, output, sum, R * C);
-                output = new byte[a.Length];
+                output = Bench.Registry.Poisoned(type, R * C);
                 Bench.Registry.WithFloat(type, new CoreRun(ops, "softmax", a, null, output, R, C));
                 ok &= Close(type, "softmax", where, output, References.Softmax(va, R, C), R * C, terms: C);
-                output = new byte[a.Length];
+                output = Bench.Registry.Poisoned(type, R * C);
                 Bench.Registry.WithFloat(type, new CoreRun(ops, "rms_norm", a, null, output, R, C));
                 ok &= Close(type, "rms_norm", where, output, References.RmsNorm(va, R, C, 1e-5), R * C, terms: C);
             }
@@ -395,6 +395,7 @@ internal static partial class Checks
             {
                 ops.Upload(x, dx);
                 if (x2 is not null) ops.Upload(x2, dx2);
+                ops.Upload(output, dy);
                 if (what == "add") ops.Add<TN>(dx, dx2, dy, n);
                 else if (what == "softmax") ops.Softmax<TN>(dx, dy, rows, cols);
                 else ops.RmsNorm<TN>(dx, dy, rows, cols, 1e-5);
@@ -450,8 +451,8 @@ internal static partial class Checks
             var x = Bench.Registry.Make(type, rows * cols, 95, -4, 4);
             var xv = Bench.Registry.Values(type, x, rows * cols);
             var (wantV, wantI) = Routing.TopKReference(xv, rows, cols, k);
-            var values = new byte[Bench.Registry.Bytes(type, rows * k)];
-            var indices = new int[rows * k];
+            var values = Bench.Registry.Poisoned(type, rows * k);
+            var indices = Bench.Registry.PoisonedIndices(rows * k);
             Bench.Registry.With(type, new TopKRun(ops, x, rows, cols, k, values, indices, null, null));
             // Ties (the narrow types have many): the values and the columns exactly, an equal value by the lower column.
             ok &= Close(type, "topk values", where, values, wantV, rows * k);
@@ -459,7 +460,7 @@ internal static partial class Checks
             for (int i = 0; i < rows * k; i++) if (indices[i] != wantI[i]) bad++;
             if (bad > 0) { Console.WriteLine($"check topk indices  {where,-6} {type,-12} DIFFERS at {bad} places"); ok = false; }
             var index = Enumerable.Range(0, rows).Select(_ => random.Next(cols)).ToArray();
-            var picked = new byte[Bench.Registry.Bytes(type, rows)];
+            var picked = Bench.Registry.Poisoned(type, rows);
             Bench.Registry.With(type, new TopKRun(ops, x, rows, cols, 0, null, null, index, picked));
             ok &= Close(type, "pick", where, picked, Routing.PickReference(xv, rows, cols, index), rows);
             // k = cols (3 of 3 columns, the first row among them): the whole row in order; k past the row refused (the k
@@ -469,8 +470,8 @@ internal static partial class Checks
                 var px = Bench.Registry.Make(type, pr * pc, 99, -4, 4);
                 var pxv = Bench.Registry.Values(type, px, pr * pc);
                 var (pv, pi) = Routing.TopKReference(pxv, pr, pc, pk);
-                var pvalues = new byte[Bench.Registry.Bytes(type, pr * pk)];
-                var pindices = new int[pr * pk];
+                var pvalues = Bench.Registry.Poisoned(type, pr * pk);
+                var pindices = Bench.Registry.PoisonedIndices(pr * pk);
                 Bench.Registry.With(type, new TopKRun(ops, px, pr, pc, pk, pvalues, pindices, null, null));
                 ok &= Close(type, "topk values of the whole row", where, pvalues, pv, pr * pk);
                 int pbad = 0;
@@ -482,7 +483,7 @@ internal static partial class Checks
                 catch (ArgumentException) { refused = true; }
                 if (!refused) { Console.WriteLine($"check topk past the row {where,-6} {type,-12} FAILS: k = {pc + 2} of {pc} columns was not refused"); ok = false; }
                 var outside = Enumerable.Range(0, pr).Select(r => r % 3 == 0 ? -1 : r % 3 == 1 ? pc : r % pc).ToArray();
-                var ppicked = new byte[Bench.Registry.Bytes(type, pr)];
+                var ppicked = Bench.Registry.Poisoned(type, pr);
                 Bench.Registry.With(type, new TopKRun(ops, px, pr, pc, 0, null, null, outside, ppicked));
                 ok &= Close(type, "pick outside the row", where, ppicked, Routing.PickReference(pxv, pr, pc, outside), pr);
             }
@@ -492,7 +493,7 @@ internal static partial class Checks
                 ok &= TopKOrder(ops, where, type);
                 ok &= SampleRule(ops, where, type, rows, cols);
                 // The cross-entropy loss per row: the type's step at the loss plus the lane's rounding of a sum of cols terms.
-                var loss = new byte[Bench.Registry.Bytes(type, rows)];
+                var loss = Bench.Registry.Poisoned(type, rows);
                 using (var ce = new Bench.AdadSubject().CrossEntropy(DeviceOf(ops), type, x, rows, cols, index, loss)!) { ce.Run(); ce.Collect(); }
                 ok &= Close(type, "cross_entropy", where, loss, Routing.CrossEntropyReference(xv, rows, cols, index), rows, terms: cols);
                 // Weighted (a token's weight a row, as the type; 0 among them, a masked token).
@@ -509,9 +510,9 @@ internal static partial class Checks
         {
             var index = Enumerable.Range(0, 1001).Select(_ => random.Next(7)).ToArray();
             var (wc, wo, worder) = Routing.RouteReference(index, 7);
-            var counts = new int[7];
-            var offsets = new int[8];
-            var order = new int[1001];
+            var counts = Bench.Registry.PoisonedIndices(7);
+            var offsets = Bench.Registry.PoisonedIndices(8);
+            var order = Bench.Registry.PoisonedIndices(1001);
             var subject = new Bench.AdadSubject();
             using var run = subject.Route(DeviceOf(ops), index, 7, counts, offsets, order)!;
             run.Run(); run.Collect();
@@ -540,9 +541,9 @@ internal static partial class Checks
                 _ => Enumerable.Range(0, n).Select(_ => random.Next(buckets)).ToArray(),
             };
             var (wc, wo, worder) = Routing.RouteReference(index, buckets);
-            var counts = new int[buckets];
-            var offsets = new int[buckets + 1];
-            var order = new int[n];
+            var counts = Bench.Registry.PoisonedIndices(buckets);
+            var offsets = Bench.Registry.PoisonedIndices(buckets + 1);
+            var order = Bench.Registry.PoisonedIndices(n);
             using var run = new Bench.AdadSubject().Route(DeviceOf(ops), index, buckets, counts, offsets, order)!;
             run.Run(); run.Collect();
             if (!counts.SequenceEqual(wc) || !offsets.SequenceEqual(wo) || !order.SequenceEqual(worder)) { Console.WriteLine($"check route {n} into {buckets} ({kind}{(table == false ? ", counting atomics" : "")}) {where,-6} DIFFERS"); ok = false; }
@@ -585,8 +586,8 @@ internal static partial class Checks
         bool ok = true;
         bool Same(double a, double b) => a.Equals(b) || (double.IsNaN(a) && double.IsNaN(b));
         var (wantV, wantI) = Routing.TopKReference(xv, rows, cols, k);
-        var values = new byte[Bench.Registry.Bytes(type, rows * k)];
-        var indices = new int[rows * k];
+        var values = Bench.Registry.Poisoned(type, rows * k);
+        var indices = Bench.Registry.PoisonedIndices(rows * k);
         Bench.Registry.With(type, new TopKRun(ops, x, rows, cols, k, values, indices, null, null));
         var got = Bench.Registry.Values(type, values, rows * k);
         int badI = 0, badV = 0;
@@ -599,8 +600,8 @@ internal static partial class Checks
         if (badI + badV > 0) { Console.WriteLine($"check topk order (NaN, ±0, ±inf, ties) {where,-6} {type,-12} DIFFERS: {badI} columns, {badV} values"); ok = false; }
         var (wantL, wantLI) = Routing.LogSoftmaxTopKReference(xv, rows, cols, k);
         var wantLs = Bench.Registry.Values(type, Bench.Registry.Encode(type, wantL), rows * k);
-        var lvalues = new byte[Bench.Registry.Bytes(type, rows * k)];
-        var lindices = new int[rows * k];
+        var lvalues = Bench.Registry.Poisoned(type, rows * k);
+        var lindices = Bench.Registry.PoisonedIndices(rows * k);
         Bench.Registry.WithFloat(type, new LogTopKRun(ops, x, rows, cols, k, lvalues, lindices));
         var gotL = Bench.Registry.Values(type, lvalues, rows * k);
         badI = badV = 0;
@@ -657,7 +658,7 @@ internal static partial class Checks
         var u = Bench.Registry.Encode(type, uv);
         wv = Bench.Registry.Values(type, w, rows * cols);
         uv = Bench.Registry.Values(type, u, rows);
-        var picks = new int[rows];
+        var picks = Bench.Registry.PoisonedIndices(rows);
         Bench.Registry.WithFloat(type, new SampleRun(ops, w, rows, cols, u, picks));
         var errors = Routing.SampleErrors(wv, rows, cols, uv, picks);
         var want = Routing.SampleReference(wv, rows, cols, uv);
@@ -705,14 +706,14 @@ internal static partial class Checks
                         int GH = a.Gates * H;
                         if (!backward)
                         {
-                            var hOut = new byte[k.H.Length];
+                            var hOut = Bench.Registry.Poisoned(type, B * H);
                             Bench.Registry.WithFloat(type, new RecurrentRun(ops, a, k, hOut));
                             ok &= Close(type, $"{kind}_step h", where, hOut, k.WantH, B * H, D + H);
                             if (k.COut is not null) ok &= Close(type, $"{kind}_step c", where, k.COut, k.WantC!, B * H, D + H);
                             continue;
                         }
 
-                        var dx = new byte[k.X.Length];
+                        var dx = Bench.Registry.Poisoned(type, B * D);
                         Bench.Registry.WithFloat(type, new RecurrentRun(ops, a, k, dx));
                         ok &= Close(type, $"{kind}_step_bwd dx", where, dx, k.WantDx!, B * D, 4 * (D + H + GH));
                         ok &= Close(type, $"{kind}_step_bwd dh", where, k.Dh!, k.WantDh!, B * H, 4 * (D + H + GH));
@@ -742,7 +743,7 @@ internal static partial class Checks
             double[] V(byte[] s, int n) => Bench.Registry.Values(type, s, n);
             var (wantH, wantC) = Bench.RecurrentCase.LstmSequenceReference(a, T, Flip(V(x, T * a.B * a.D), T, reverse), V(h0, a.B * a.H), V(c0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH));
             (wantH, wantC) = (Flip(wantH, T, reverse), Flip(wantC, T, reverse));
-            var hOut = new byte[Bench.Registry.Bytes(type, T * a.B * a.H)]; var cOut = new byte[hOut.Length];
+            var hOut = Bench.Registry.Poisoned(type, T * a.B * a.H); var cOut = Bench.Registry.Poisoned(type, T * a.B * a.H);
             var subject = new Bench.AdadSubject();
             using (var run = subject.LstmSequence(dev, type, a, T, x, h0, c0, w, u, b, hOut, cOut, null, null, null, null, null, null)!) { run.Run(); run.Collect(); }
             ok &= Close(type, "lstm_seq h" + dir, where, hOut, wantH, T * a.B * a.H, T * (a.D + a.H));
@@ -751,7 +752,7 @@ internal static partial class Checks
             var (wdx, wdh0, wdc0, wdw, wdu, wdb) = Bench.RecurrentCase.LstmSequenceBackwardReference(a, T, Flip(V(x, T * a.B * a.D), T, reverse), V(h0, a.B * a.H), V(c0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH),
                 Flip(V(dhOut, T * a.B * a.H), T, reverse), V(dcLast, a.B * a.H));
             wdx = Flip(wdx, T, reverse);
-            var dx = new byte[x.Length]; var dh0 = new byte[h0.Length]; var dc0 = new byte[c0.Length]; var dw = new byte[w.Length]; var du = new byte[u.Length]; var db = new byte[b.Length];
+            var dx = Bench.Registry.Poisoned(type, T * a.B * a.D); var dh0 = Bench.Registry.Poisoned(type, a.B * a.H); var dc0 = Bench.Registry.Poisoned(type, a.B * a.H); var dw = Bench.Registry.Poisoned(type, GH * a.D); var du = Bench.Registry.Poisoned(type, GH * a.H); var db = Bench.Registry.Poisoned(type, GH);
             using (var run = subject.LstmSequence(dev, type, a, T, x, h0, c0, w, u, b, dhOut, dcLast, dx, dh0, dc0, dw, du, db)!) { run.Run(); run.Collect(); }
             int terms = 8 * T * (a.D + a.H + GH + a.B);
             ok &= Close(type, "lstm_seq_bwd dx" + dir, where, dx, wdx, T * a.B * a.D, terms);
@@ -776,7 +777,7 @@ internal static partial class Checks
             var b = Bench.Registry.Make(type, GH, 96, -0.1, 0.1); var bh = Bench.Registry.Make(type, GH, 97, -0.1, 0.1);
             double[] V(byte[] s, int n) => Bench.Registry.Values(type, s, n);
             var wantH = Flip(Bench.RecurrentCase.GruSequenceReference(a, T, Flip(V(x, T * a.B * a.D), T, reverse), V(h0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH), V(bh, GH)), T, reverse);
-            var hOut = new byte[Bench.Registry.Bytes(type, T * a.B * a.H)];
+            var hOut = Bench.Registry.Poisoned(type, T * a.B * a.H);
             using (var run = new Bench.AdadSubject().GruSequence(dev, type, a, T, x, h0, w, u, b, bh, hOut)!) { run.Run(); run.Collect(); }
             ok &= Close(type, "gru_seq h" + (reverse ? " reversed" : ""), where, hOut, wantH, T * a.B * a.H, T * (a.D + a.H));
         }
@@ -833,7 +834,7 @@ internal static partial class Checks
             var (wdx, wdh0, wdw, wdu, wdb, wdbh) = Bench.RecurrentCase.GruSequenceBackwardReference(a, T, Flip(V(x, T * a.B * a.D), T, reverse), V(h0, a.B * a.H), V(w, GH * a.D), V(u, GH * a.H), V(b, GH), V(bh, GH),
                 Flip(V(dhOut, T * a.B * a.H), T, reverse));
             wdx = Flip(wdx, T, reverse);
-            var dx = new byte[x.Length]; var dh0 = new byte[h0.Length]; var dw = new byte[w.Length]; var du = new byte[u.Length]; var db = new byte[b.Length]; var dbh = new byte[bh.Length];
+            var dx = Bench.Registry.Poisoned(type, T * a.B * a.D); var dh0 = Bench.Registry.Poisoned(type, a.B * a.H); var dw = Bench.Registry.Poisoned(type, GH * a.D); var du = Bench.Registry.Poisoned(type, GH * a.H); var db = Bench.Registry.Poisoned(type, GH); var dbh = Bench.Registry.Poisoned(type, GH);
             using (var run = new Bench.AdadSubject().GruSequenceBackward(dev, type, a, T, x, h0, w, u, b, bh, dhOut, dx, dh0, dw, du, db, dbh)!) { run.Run(); run.Collect(); }
             int terms = 8 * T * (a.D + a.H + GH + a.B);
             ok &= Close(type, "gru_seq_bwd dx" + dir, where, dx, wdx, T * a.B * a.D, terms);
@@ -891,14 +892,14 @@ internal static partial class Checks
             {
                 var x = Bench.Registry.Make(type, (int)a.XValues, 61, -1, 1);
                 var w = Bench.Registry.Make(type, (int)a.WValues, 62, -1, 1);
-                var y = new byte[Bench.Registry.Bytes(type, a.YValues)];
+                var y = Bench.Registry.Poisoned(type, a.YValues);
                 var want = a.Reference(Bench.Registry.Values(type, x, (int)a.XValues), Bench.Registry.Values(type, w, (int)a.WValues));
                 Bench.Registry.With(type, new ConvRun(ops, a, x, w, y));
                 ok &= Close(type, $"conv {a.Kh}x{a.Kw} s{a.Sh} p{a.PadTop}{a.PadLeft}{a.PadBottom}{a.PadRight}", where, y, want, (int)a.YValues, a.Rows);
                 var dy = Bench.Registry.Make(type, (int)a.YValues, 63, -1, 1);
                 var (wantX, wantW, _) = a.ReferenceBackward(Bench.Registry.Values(type, x, (int)a.XValues), Bench.Registry.Values(type, w, (int)a.WValues), Bench.Registry.Values(type, dy, (int)a.YValues));
-                var dx = new byte[x.Length];
-                var dw = new byte[w.Length];
+                var dx = Bench.Registry.Poisoned(type, a.XValues);
+                var dw = Bench.Registry.Poisoned(type, a.WValues);
                 Bench.Registry.With(type, new ConvBackwardRun(ops, a, x, w, dy, dx, dw));
                 ok &= Close(type, $"conv_bwd dx {a.Kh}x{a.Kw} p{a.PadTop}{a.PadLeft}{a.PadBottom}{a.PadRight}", where, dx, wantX, (int)a.XValues, a.OC * a.Kh * a.Kw);
                 ok &= Close(type, $"conv_bwd dw {a.Kh}x{a.Kw} p{a.PadTop}{a.PadLeft}{a.PadBottom}{a.PadRight}", where, dw, wantW, (int)a.WValues, a.Cols);
@@ -928,8 +929,8 @@ internal static partial class Checks
                 var x = Bench.Registry.Make(type, (int)a.XValues, 64, -1, 1);
                 var w = Bench.Registry.Make(type, (int)a.WValues, 65, -1, 1);
                 var want = a.Reference(Bench.Registry.Values(type, x, (int)a.XValues), Bench.Registry.Values(type, w, (int)a.WValues));
-                var fused = new byte[Bench.Registry.Bytes(type, a.YValues)];
-                var composed = new byte[fused.Length];
+                var fused = Bench.Registry.Poisoned(type, a.YValues);
+                var composed = Bench.Registry.Poisoned(type, a.YValues);
                 var run = new ConvModeRun(ops, a, x, w, fused, composed);
                 Bench.Registry.With(type, run);
                 string name = $"conv fused {a.C}x{a.H}x{a.W}>{a.OC} {a.Kh}x{a.Kw} s{a.Sh} d{a.Dh} p{a.PadTop}{a.PadLeft}{a.PadBottom}{a.PadRight}";
@@ -945,7 +946,7 @@ internal static partial class Checks
                 if (ops is not null) continue;
                 var dy = Bench.Registry.Make(type, (int)a.YValues, 66, -1, 1);
                 var (_, wantW, _) = a.ReferenceBackward(Bench.Registry.Values(type, x, (int)a.XValues), Bench.Registry.Values(type, w, (int)a.WValues), Bench.Registry.Values(type, dy, (int)a.YValues));
-                byte[] dxF = new byte[x.Length], dwF = new byte[w.Length], dxC = new byte[x.Length], dwC = new byte[w.Length];
+                byte[] dxF = Bench.Registry.Poisoned(type, a.XValues), dwF = Bench.Registry.Poisoned(type, a.WValues), dxC = Bench.Registry.Poisoned(type, a.XValues), dwC = Bench.Registry.Poisoned(type, a.WValues);
                 Bench.Registry.With(type, new ConvBackwardModeRun(a, x, w, dy, dxF, dwF, dxC, dwC));
                 string back = $"conv_bwd fused {a.C}x{a.H}x{a.W}>{a.OC} {a.Kh}x{a.Kw} s{a.Sh} d{a.Dh} p{a.PadTop}{a.PadLeft}{a.PadBottom}{a.PadRight}";
                 ok &= Close(type, back, where, dwF, wantW, (int)a.WValues, a.Cols);
@@ -1001,7 +1002,7 @@ internal static partial class Checks
 
             ulong dX = ops.Rent(x.Length + 16), dW = ops.Rent(w.Length + 16), dY = ops.Rent(fused.Length + 16), dC = ops.Rent(composed.Length + 16);
             ops.Upload(x, dX); ops.Upload(w, dW);
-            // Both outputs start as the host's (zero) bytes: the bits of y's last word past its values are kept as stored,
+            // Both outputs start as the host's (poisoned) bytes: the bits of y's last word past its values are kept as stored,
             // so the comparison is of the same bytes as the CPU's.
             ops.Upload(fused, dY); ops.Upload(composed, dC);
             if (ops is GpuOps cuda)
@@ -1050,7 +1051,7 @@ internal static partial class Checks
         {
             if (ops is null) { Kernels.Conv<TN>(a, x, w, y); return true; }
             ulong dX = ops.Rent(x.Length + 16), dW = ops.Rent(w.Length + 16), dY = ops.Rent(y.Length + 16);
-            ops.Upload(x, dX); ops.Upload(w, dW);
+            ops.Upload(x, dX); ops.Upload(w, dW); ops.Upload(y, dY);
             ops.Conv<TN>(a, new ProductEpilogue(), dX, dW, dY, default);
             ops.Synchronize();
             ops.Download(dY, y);
@@ -1065,7 +1066,7 @@ internal static partial class Checks
         {
             if (ops is null) { Kernels.ConvBackward<TN>(a, x, w, dy, dx, dw); return true; }
             ulong dX = ops.Rent(x.Length + 16), dW = ops.Rent(w.Length + 16), dY = ops.Rent(dy.Length + 16), gx = ops.Rent(dx.Length + 16), gw = ops.Rent(dw.Length + 16);
-            ops.Upload(x, dX); ops.Upload(w, dW); ops.Upload(dy, dY);
+            ops.Upload(x, dX); ops.Upload(w, dW); ops.Upload(dy, dY); ops.Upload(dx, gx); ops.Upload(dw, gw);
             ops.ConvBackward<TN>(a, dX, dW, dY, gx, gw, 0);
             ops.Synchronize();
             ops.Download(gx, dx); ops.Download(gw, dw);
@@ -1186,7 +1187,7 @@ internal static partial class Checks
                 var q = Bench.Registry.Make(type, (int)a.QValues, 41, -1, 1);
                 var k = Bench.Registry.Make(type, (int)a.KValues, 42, -1, 1);
                 var v = Bench.Registry.Make(type, (int)a.KValues, 43, -1, 1);
-                var o = new byte[q.Length];
+                var o = Bench.Registry.Poisoned(type, a.QValues);
                 var want = a.Reference(Bench.Registry.Values(type, q, (int)a.QValues), Bench.Registry.Values(type, k, (int)a.KValues), Bench.Registry.Values(type, v, (int)a.KValues));
                 Bench.Registry.WithFloat(type, new AttentionRun(ops, a, q, k, v, o, decode, null, null, null));
                 ok &= Close(type, $"attention{(decode ? " decode" : "")}{(a.Causal ? " causal" : "")}{(a.Spans is not null ? " spans" : "")} d{a.D}", where, o, want, (int)a.QValues, a.Lk + a.D);
@@ -1207,7 +1208,7 @@ internal static partial class Checks
                 var q = Bench.Registry.Make(type, (int)a.QValues, 41, -1, 1);
                 var k = Bench.Registry.Make(type, (int)a.KValues, 42, -1, 1);
                 var v = Bench.Registry.Make(type, (int)a.KValues, 43, -1, 1);
-                var o = new byte[q.Length];
+                var o = Bench.Registry.Poisoned(type, a.QValues);
                 var want = a.Reference(Bench.Registry.Values(type, q, (int)a.QValues), Bench.Registry.Values(type, k, (int)a.KValues), Bench.Registry.Values(type, v, (int)a.KValues));
                 Bench.Registry.WithFloat(type, new AttentionRun(ops, a, q, k, v, o, false, null, null, null, fused: !composed, composed: composed));
                 ok &= Close(type, $"attention {(composed ? "composed" : "fused")}{(a.Causal ? " causal" : "")}{(a.Spans is not null ? " spans" : "")}{(a.SpanStarts is not null ? " starts" : "")} {a.Heads}h {a.Lq}x{a.Lk} d{a.D}", where, o, want, (int)a.QValues, a.Lk + a.D);
@@ -1232,9 +1233,9 @@ internal static partial class Checks
                 var v = Bench.Registry.Make(type, (int)a.KValues, 43, -1, 1);
                 var dO = Bench.Registry.Make(type, (int)a.QValues, 44, -1, 1);
                 var (wq, wk, wv) = a.ReferenceBackward(Bench.Registry.Values(type, q, (int)a.QValues), Bench.Registry.Values(type, k, (int)a.KValues), Bench.Registry.Values(type, v, (int)a.KValues), Bench.Registry.Values(type, dO, (int)a.QValues));
-                var dq = new byte[q.Length];
-                var dk = new byte[k.Length];
-                var dv = new byte[v.Length];
+                var dq = Bench.Registry.Poisoned(type, a.QValues);
+                var dk = Bench.Registry.Poisoned(type, a.KValues);
+                var dv = Bench.Registry.Poisoned(type, a.KValues);
                 Bench.Registry.WithFloat(type, new AttentionRun(ops, a, q, k, v, dO, false, dq, dk, dv));
                 string tag = $"{(mode == 1 ? " composed" : cuda is not null && mode == 2 ? " fma" : mode == 3 ? " shared 48 KB" : "")}{(a.Causal ? " causal" : "")}{(a.Spans is not null ? " spans" : "")}{(a.SpanStarts is not null ? " starts" : "")} {a.Heads}h {a.Lq}x{a.Lk} d{a.D}";
                 ok &= Close(type, "attention_bwd dQ" + tag, where, dq, wq, (int)a.QValues, 2 * (a.Lk + a.D));
@@ -1302,6 +1303,7 @@ internal static partial class Checks
             {
                 ops.Upload(o, dO);
                 ulong gq = ops.Rent(dq!.Length + 16), gk = ops.Rent(dk!.Length + 16), gv = ops.Rent(dv!.Length + 16);
+                ops.Upload(dq, gq); ops.Upload(dk, gk); ops.Upload(dv, gv);
                 ops.AttentionBackward<TN>(a, dQ, dK, dV, dO, gq, gk, gv);
                 ops.Synchronize();
                 ops.Download(gq, dq); ops.Download(gk, dk); ops.Download(gv, dv);
@@ -1309,6 +1311,7 @@ internal static partial class Checks
             }
             else
             {
+                ops.Upload(o, dO);
                 if (decode) ops.AttentionDecode<TN>(a, dQ, dK, dV, dO); else if (fused) ops.AttentionRows<TN>(a, dQ, dK, dV, dO); else if (composed) ops.AttentionComposed<TN>(a, dQ, dK, dV, dO); else ops.Attention<TN>(a, dQ, dK, dV, dO);
                 ops.Synchronize();
                 ops.Download(dO, o);
@@ -1378,11 +1381,11 @@ internal static partial class Checks
                 int terms = a.T * (int)Math.Ceiling(logP + 1);
                 string name = $"ctc T{a.T} B{a.B} C{a.C}{(impossible ? " no alignment" : "")}{(one == false ? " (general kernel)" : "")}";
                 int scored = impossible ? 1 : a.B;                            // the impossible case: its first sequence scored, the second checked for +∞
-                var loss = new byte[Bench.Registry.Bytes(type, a.B)];
+                var loss = Bench.Registry.Poisoned(type, a.B);
                 Bench.Registry.WithFloat(type, new CtcRun(ops, a, x, loss, null));
                 ok &= Close(type, name + " loss", where, loss, wantLoss, scored, terms);
-                var loss2 = new byte[loss.Length];
-                var grad = new byte[Bench.Registry.Bytes(type, a.Values)];
+                var loss2 = Bench.Registry.Poisoned(type, a.B);
+                var grad = Bench.Registry.Poisoned(type, a.Values);
                 Bench.Registry.WithFloat(type, new CtcRun(ops, a, x, loss2, grad));
                 ok &= Close(type, name + " loss (bwd)", where, loss2, wantLoss, scored, terms);
                 ok &= Close(type, name + " grad", where, grad, wantGrad, (int)a.Values, terms);
@@ -1425,7 +1428,8 @@ internal static partial class Checks
         {
             if (ops is null) { Kernels.Ctc<TN>(a, x, loss, grad); return true; }
             ulong dx = ops.Rent(x.Length + 16), dl = ops.Rent(loss.Length + 16), dg = grad is null ? 0 : ops.Rent(grad.Length + 16);
-            ops.Upload(x, dx);
+            ops.Upload(x, dx); ops.Upload(loss, dl);
+            if (grad is not null) ops.Upload(grad, dg);
             ops.Ctc<TN>(a, dx, dl, dg);
             ops.Synchronize();
             ops.Download(dl, loss);
@@ -1525,7 +1529,7 @@ internal static partial class Checks
                     var v = new ProductView(M, N, K, false, true);
                     var a = Bench.Registry.Make(type, M * K, 34, -1, 1);
                     var b = Bench.Registry.Make(type, N * K, 35, -1, 1);
-                    var c = new byte[Bench.Registry.Bytes(type, M * N)];
+                    var c = Bench.Registry.Poisoned(type, M * N);
                     var want = v.Reference(Bench.Registry.Values(type, a, M * K), Bench.Registry.Values(type, b, N * K));
                     Bench.Registry.With(type, new ProductRun(ops, v, a, b, c, null, null));
                     ok &= Close(type, $"product Bᵀ blocks k{K}", where, c, want, M * N, K);
@@ -1533,7 +1537,7 @@ internal static partial class Checks
 
                 var ga = Bench.Registry.Make(type, M * 64, 44, -1, 1);
                 var gx = Bench.Registry.Make(type, 64, 45, -1, 1);
-                var gy = new byte[Bench.Registry.Bytes(type, M)];
+                var gy = Bench.Registry.Poisoned(type, M);
                 var gwant = References.Gemv(Bench.Registry.Values(type, ga, M * 64), Bench.Registry.Values(type, gx, 64), M, 64, false);
                 Bench.Registry.With(type, new GemvRun(ops, ga, gx, gy, M, 64, false));
                 ok &= Close(type, "gemv blocks k64", where, gy, gwant, M, 64);
@@ -1570,7 +1574,7 @@ internal static partial class Checks
                         var v = new ProductView(M, N, K, false, false);
                         var a = Bench.Registry.Make(type, M * K, 34, -1, 1);
                         var b = Bench.Registry.Make(type, K * N, 35, -1, 1);
-                        var c = new byte[Bench.Registry.Bytes(type, M * N)];
+                        var c = Bench.Registry.Poisoned(type, M * N);
                         var want = v.Reference(Bench.Registry.Values(type, a, M * K), Bench.Registry.Values(type, b, K * N));
                         Bench.Registry.With(type, new ProductRun(ops, v, a, b, c, null, null));
                         ok &= Close(type, $"product k{K} [{kindName}; rows {cfg.RowBytes} B x {cfg.Stages} stages x {cfg.Bn} wide{(cfg.Swizzle ? " swizzled" : "")}]", "device", c, want, M * N, K);
@@ -1650,7 +1654,7 @@ internal static partial class Checks
             {
                 var a = Bench.Registry.Make(type, (int)v.ValuesA, 34, -1, 1);
                 var b = Bench.Registry.Make(type, (int)v.ValuesB, 35, -1, 1);
-                var c = new byte[Bench.Registry.Bytes(type, v.ValuesC)];
+                var c = Bench.Registry.Poisoned(type, v.ValuesC);
                 var want = v.Reference(Bench.Registry.Values(type, a, (int)v.ValuesA), Bench.Registry.Values(type, b, (int)v.ValuesB));
                 Bench.Registry.With(type, new ProductRun(ops, v, a, b, c, null, null));
                 ok &= Close(type, $"product{(v.TransA ? " Aᵀ" : "")}{(v.TransB ? " Bᵀ" : "")}{(v.Batch > 1 ? $" x{v.Batch}" : "")}{kindName}", where, c, want, (int)v.ValuesC, K);
@@ -1660,8 +1664,8 @@ internal static partial class Checks
                 var a = Bench.Registry.Make(type, M * K, 34, -1, 1);
                 var b = Bench.Registry.Make(type, K * N, 35, -1, 1);
                 var dc = Bench.Registry.Make(type, M * N, 36, -1, 1);
-                var da = new byte[Bench.Registry.Bytes(type, M * K)];
-                var db = new byte[Bench.Registry.Bytes(type, K * N)];
+                var da = Bench.Registry.Poisoned(type, M * K);
+                var db = Bench.Registry.Poisoned(type, K * N);
                 var wantA = new ProductView(M, K, N, false, true).Reference(Bench.Registry.Values(type, dc, M * N), Bench.Registry.Values(type, b, K * N));
                 var wantB = new ProductView(K, N, M, true, false).Reference(Bench.Registry.Values(type, a, M * K), Bench.Registry.Values(type, dc, M * N));
                 Bench.Registry.With(type, new ProductRun(ops, new ProductView(M, N, K, false, false), a, b, dc, da, db));
@@ -1754,6 +1758,7 @@ internal static partial class Checks
             {
                 ops.Upload(c, dC);
                 ulong dDa = ops.Rent(da!.Length + 16), dDb = ops.Rent(db!.Length + 16);
+                ops.Upload(da, dDa); ops.Upload(db, dDb);
                 ops.MatMulBackward<TN>(dA, dB, dC, dDa, dDb, v.M, v.N, v.K);
                 ops.Synchronize();
                 ops.Download(dDa, da); ops.Download(dDb, db);
@@ -1831,12 +1836,9 @@ internal static partial class Checks
     {
         public bool Visit<TN>() where TN : struct, IAdad<TN, float>
         {
-            // The output starts as values no layout writes by chance, on the host and on the device, so every value the check
-            // reads, a zero included, is one the layout wrote: 0xFF in every byte (NaN for the floats, -1 or the largest value
-            // for the integers, true for bool); a block format's values 1000 each and the last block's values past the output
-            // 0, as its contract asks of a buffer whose blocks the output does not cover whole.
-            if (Bench.Registry.IsBlock(TN.Name)) Bench.Registry.Encode(TN.Name, Enumerable.Repeat(1000.0, k.Count).ToArray()).CopyTo(k.Output, 0);
-            else Array.Fill(k.Output, (byte)0xFF);
+            // The output starts poisoned (Registry.Poisoned), on the host and on the device: every value the check reads, a
+            // zero included, is one the layout wrote.
+            Bench.Registry.Poisoned(TN.Name, k.Count).CopyTo(k.Output, 0);
             if (ops is null) { Kernels.Layout<TN>(k); return true; }
             ulong dx = ops.Rent(k.X.Length + 16), dout = ops.Rent(k.Output.Length + 16), didx = k.Index is null ? 0 : ops.RentIndices(k.Index.Length), dx2 = k.X2 is null ? 0 : ops.Rent(k.X2.Length + 16);
             try
@@ -2040,7 +2042,7 @@ internal static partial class Checks
             byte[] x = M(a.B * a.D, 91, -1, 1), h = M(a.B * a.H, 92, -1, 1), c = M(a.B * a.H, 93, -1, 1), w = M(GH * a.D, 94, -0.3, 0.3), u = M(GH * a.H, 95, -0.3, 0.3), b = M(GH, 96, -0.1, 0.1), bh = M(GH, 97, -0.1, 0.1);
             byte[] Step(byte[] ww, byte[] uu)
             {
-                var hOut = new byte[h.Length]; var cOut = new byte[h.Length];
+                var hOut = Bench.Registry.Poisoned(type, a.B * a.H); var cOut = Bench.Registry.Poisoned(type, a.B * a.H);
                 Bench.Registry.WithFloat(type, new WeightsStep(a, x, h, c, ww, uu, b, bh, hOut, cOut));
                 return [.. hOut, .. cOut];
             }
@@ -2098,8 +2100,8 @@ internal static partial class Checks
                 foreach (var op in RowOps.All)
                     {
                         var k = Bench.RowCase.Make(op, type, rows, cols, positions: true);
-                        var y = new byte[k.X.Length];
-                        var y2 = op.SecondOut ? new byte[k.X.Length] : op.RowOut ? new byte[rows * (type == "float64" ? 8 : 4)] : null;
+                        var y = Bench.Registry.Poisoned(type, rows * cols);
+                        var y2 = op.SecondOut ? Bench.Registry.Poisoned(type, rows * cols) : op.RowOut ? Bench.Registry.Poisoned(rows * (type == "float64" ? 8 : 4)) : null;
                         Bench.Registry.WithFloat(type, new RowOpRun(ops, op, k, y, y2));
                         double worst = Math.Max(k.Worst(y), y2 is null ? 0 : op.RowOut ? k.WorstRow(y2) : k.Worst(y2, second: true));
                         if (worst > 0) { Console.WriteLine($"check row {op.Name,-18} {where,-6} {type,-12} DIFFERS by {worst:0.##} steps ({rows} x {cols})"); ok = false; }
@@ -2125,10 +2127,10 @@ internal static partial class Checks
                     // The core softmax and rms_norm at the wide rows too: their row-in-registers kernels past a block's registers loop instead.
                     var x = Bench.Registry.Make(type, rows * cols, 61, -2, 2);
                     var vx = Bench.Registry.Values(type, x, rows * cols);
-                    var output = new byte[x.Length];
+                    var output = Bench.Registry.Poisoned(type, rows * cols);
                     Bench.Registry.WithFloat(type, new CoreRun(ops, "softmax", x, null, output, rows, cols));
                     ok &= Close(type, "softmax", where, output, References.Softmax(vx, rows, cols), rows * cols, terms: cols);
-                    output = new byte[x.Length];
+                    output = Bench.Registry.Poisoned(type, rows * cols);
                     Bench.Registry.WithFloat(type, new CoreRun(ops, "rms_norm", x, null, output, rows, cols));
                     ok &= Close(type, "rms_norm", where, output, References.RmsNorm(vx, rows, cols, 1e-5), rows * cols, terms: cols);
                 }
@@ -2151,6 +2153,8 @@ internal static partial class Checks
             ulong dy = ops.Rent(y.Length + 16), dy2 = y2 is null ? 0 : ops.Rent(y2.Length + 16);
             rented.Add(dy);
             if (dy2 != 0) rented.Add(dy2);
+            ops.Upload(y, dy);
+            if (y2 is not null) ops.Upload(y2, dy2);
             ops.RowOp<TN>(op, dx, dx2, dg, dbt, ds, dpos, dy, dy2, k.Rows, k.Cols, op.A, op.B);
             ops.Synchronize();
             ops.Download(dy, y);
@@ -2166,14 +2170,14 @@ internal static partial class Checks
         public (byte[], string) Visit<TN>() where TN : struct, IFloatAdad<TN>, IAdad<TN, float>
         {
             int size = TN.Bits == 64 ? 8 : 4;
-            var dgamma = new byte[cols * size];
-            var dbeta = new byte[cols * size];
+            var dgamma = Bench.Registry.Poisoned(cols * size);
+            var dbeta = Bench.Registry.Poisoned(cols * size);
             string lane;
             if (ops is null) lane = Kernels.NormParamsBwd<TN>(x, dy, dgamma, dbeta, rows, cols, 1e-5, centered);
             else
             {
                 ulong dx = ops.Rent(x.Length + 16), ddy = ops.Rent(dy.Length + 16), dg = ops.Rent(dgamma.Length + 16), db = ops.Rent(dbeta.Length + 16);
-                ops.Upload(x, dx); ops.Upload(dy, ddy);
+                ops.Upload(x, dx); ops.Upload(dy, ddy); ops.Upload(dgamma, dg); ops.Upload(dbeta, db);
                 lane = ops.NormParamsBwd<TN>(dx, ddy, dg, db, rows, cols, 1e-5, centered);
                 ops.Synchronize();
                 ops.Download(dg, dgamma); ops.Download(db, dbeta);
@@ -2245,7 +2249,7 @@ internal static partial class Checks
                 var op = Adad.Abstraction.Ops.Find(opName);
                 var v = Bench.Registry.Make(type, C, 42, -1, 1);
                 var want = References.MapRow(type, op, values, Bench.Registry.Values(type, v, C), R, C);
-                var output = new byte[data.Length];
+                var output = Bench.Registry.Poisoned(type, R * C);
                 Bench.Registry.With(type, new MapRowRun(ops, op, data, v, output, R, C));
                 ok &= Close(type, $"maprow:{opName}", where, output, want, R * C);
             }
@@ -2253,7 +2257,7 @@ internal static partial class Checks
             // The transpose of a block format repeated: its column tasks once shared blocks and re-encoded them in schedule order.
             for (int rep = 0, reps = Bench.Registry.IsBlock(type) ? Stress : 1; rep < reps; rep++)
             {
-                var output = new byte[data.Length];
+                var output = Bench.Registry.Poisoned(type, R * C);
                 Bench.Registry.With(type, new TransposeRun(ops, data, output, R, C));
                 if (!Close(type, rep == 0 ? "transpose" : $"transpose (repetition {rep + 1})", where, output, References.Transpose(values, R, C), R * C)) { ok = false; break; }
             }
@@ -2264,7 +2268,7 @@ internal static partial class Checks
             {
                 const int TR = 512, TC = 67;
                 var tall = Bench.Registry.Make(type, TR * TC, 44, -1, 1);
-                var output = new byte[tall.Length];
+                var output = Bench.Registry.Poisoned(type, TR * TC);
                 Bench.Registry.With(type, new TransposeRun(ops, tall, output, TR, TC));
                 if (!Close(type, rep == 0 ? "transpose 512x67" : $"transpose 512x67 (repetition {rep + 1})", where, output, References.Transpose(Bench.Registry.Values(type, tall, TR * TC), TR, TC), TR * TC)) { ok = false; break; }
             }
@@ -2273,7 +2277,7 @@ internal static partial class Checks
             {
                 var x = Bench.Registry.Make(type, t ? R : C, 43, -1, 1);
                 var want = References.Gemv(values, Bench.Registry.Values(type, x, t ? R : C), R, C, t);
-                var y = new byte[Bench.Registry.Bytes(type, t ? C : R)];
+                var y = Bench.Registry.Poisoned(type, t ? C : R);
                 Bench.Registry.With(type, new GemvRun(ops, data, x, y, R, C, t));
                 ok &= Close(type, t ? "gemv_t" : "gemv", where, y, want, t ? C : R, terms: t ? R : C);
             }
@@ -2492,7 +2496,7 @@ internal static partial class Checks
             if (ops is null) return Kernels.Reduce<TN>(op, axis, x, rows, cols);
             int count = axis == Axis.Whole ? 1 : axis == Axis.Rows ? rows : cols;
             ulong dx = ops.Rent(x.Length + 16), dout = ops.Rent(count * 8L + 16);
-            ops.Upload(x, dx);
+            ops.Upload(x, dx); ops.Upload(Bench.Registry.Poisoned(count * 8L), dout);
             string lane = ops.Reduce<TN>(op, axis, dx, rows, cols, dout);
             ops.Synchronize();
             var output = new byte[count * 8];
@@ -2508,7 +2512,7 @@ internal static partial class Checks
         {
             if (ops is null) { Kernels.MapRow<TN>(op.Name, x, v, output, rows, cols); return true; }
             ulong dx = ops.Rent(x.Length + 16), dv = ops.Rent(v.Length + 16), dout = ops.Rent(output.Length + 16);
-            ops.Upload(x, dx); ops.Upload(v, dv);
+            ops.Upload(x, dx); ops.Upload(v, dv); ops.Upload(output, dout);
             ops.MapRow<TN>(op, dx, dv, dout, rows, cols);
             ops.Synchronize();
             ops.Download(dout, output);
@@ -2524,7 +2528,7 @@ internal static partial class Checks
             if (ops is null) { Kernels.Transpose<TN>(x, output, rows, cols); return true; }
             ulong dx = ops.Rent(x.Length + 16), dout = ops.Rent(output.Length + 16);
             ops.Upload(x, dx);
-            ops.Upload(new byte[output.Length + 16], dout);
+            ops.Upload(output, dout);
             ops.Transpose<TN>(dx, dout, rows, cols);
             ops.Synchronize();
             ops.Download(dout, output);
@@ -2539,7 +2543,7 @@ internal static partial class Checks
         {
             if (ops is null) { Kernels.Gemv<TN>(a, x, y, rows, cols, transposed); return true; }
             ulong da = ops.Rent(a.Length + 16), dx = ops.Rent(x.Length + 16), dy = ops.Rent(y.Length + 16);
-            ops.Upload(a, da); ops.Upload(x, dx);
+            ops.Upload(a, da); ops.Upload(x, dx); ops.Upload(y, dy);
             ops.Gemv<TN>(da, dx, dy, rows, cols, transposed);
             ops.Synchronize();
             ops.Download(dy, y);
@@ -2629,7 +2633,7 @@ internal static partial class Checks
                     z = op.Inputs >= 3 ? Bench.Registry.Make(type, N, 33, op.YRange.Low, op.YRange.High) : null;
                 }
 
-                var output = new byte[Bench.Registry.Bytes(type, N)];
+                var output = Bench.Registry.Poisoned(type, N);
                 var reference = References.Map(type, op, x, y, z, N, wrap: false);
                 if (ops is null) Bench.Registry.With(type, new CpuMap(op, x, y, z, output, N));
                 else Bench.Registry.With(type, new DeviceMap(ops, op, x, y, z, output, N));
@@ -2734,7 +2738,7 @@ internal static partial class Checks
                 return r;
             }
 
-            byte[] x = Encode(xv), y = Encode(yv), output = new byte[Bench.Registry.Bytes(type, n)];
+            byte[] x = Encode(xv), y = Encode(yv), output = Bench.Registry.Poisoned(type, n);
             xv = Decode(x);
             yv = Decode(y);
             if (ops is null) Bench.Registry.With(type, new CpuMap(div, x, y, null, output, n));
@@ -2876,8 +2880,7 @@ internal static partial class Checks
                 return d;
             }
 
-            ulong dx = Up(x), dy = Up(y), dz = Up(z), dout = ops.Rent(output.Length + 16);
-            rented.Add(dout);
+            ulong dx = Up(x), dy = Up(y), dz = Up(z), dout = Up(output);
             ops.Map<TN>(op, dx, dy, dz, dout, n, op.A, op.B);
             ops.Synchronize();
             ops.Download(dout, output);

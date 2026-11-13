@@ -136,7 +136,7 @@ internal static partial class Checks
             }
 
             var picks = Enumerable.Repeat(-9, a.Rows).ToArray();
-            var probability = withProbability ? new byte[a.Rows * 8] : null;
+            var probability = withProbability ? Bench.Registry.Poisoned(a.Rows * 8) : null;
             string lane = Bench.Registry.With(type, new SampleFilteredRun(ops, a, x, step, picks, probability));
             string? wrong = lane == laneName ? null : $"the lane {lane}, not {laneName}";
             var key = Draws.Key(a.Seed);

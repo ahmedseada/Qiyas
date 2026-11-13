@@ -49,8 +49,8 @@ internal static partial class Checks
             {
                 var a = Bench.Registry.Make(type, n, 51, -100, 100);
                 var b = Bench.Registry.Make(type, n, 52, -100, 100);
-                var cpu = new byte[Bench.Registry.Bytes(type, n)];
-                var dev = new byte[cpu.Length];
+                var cpu = Bench.Registry.Poisoned(type, n);
+                var dev = Bench.Registry.Poisoned(type, n);
                 Bench.Registry.With(type, new AddRun(null, a, b, cpu, n));
                 Bench.Registry.With(type, new AddRun(ops, a, b, dev, n));
                 var want = Bench.Registry.Values(type, cpu, n);
@@ -75,7 +75,7 @@ internal static partial class Checks
         {
             if (ops is null) { CpuDevice.Device.Add<TN>(a, b, c, n); return true; }
             ulong da = ops.Rent(a.Length + 16), db = ops.Rent(b.Length + 16), dc = ops.Rent(c.Length + 16);
-            ops.Upload(a, da); ops.Upload(b, db);
+            ops.Upload(a, da); ops.Upload(b, db); ops.Upload(c, dc);
             ops.Add<TN>(da, db, dc, n);
             ops.Synchronize();
             ops.Download(dc, c);

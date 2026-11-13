@@ -83,7 +83,7 @@ internal static partial class Checks
             }
 
             var want = a.Reference(xv, history, length);
-            var y = new byte[Bench.Registry.Bytes(type, a.Values)];
+            var y = Bench.Registry.Poisoned(type, a.Values);
             Bench.Registry.With(type, new PenalizeRun(ops, a, x, history, length, y));
             // A penalized score's terms: the score scaled, the presence and the frequency times its occurrences.
             double terms = 4 * Math.Max(a.Repeat, 1 / a.Repeat) + Math.Abs(a.Presence) + Math.Abs(a.Frequency) * a.Capacity;

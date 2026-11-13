@@ -59,12 +59,12 @@ internal static partial class Checks
                     foreach (bool affine in new[] { true, false })
                     {
                         string what = $"group_norm {name}{(affine ? "" : " plain")}{(given ? " given" : "")}";
-                        var mean = given ? LaneBytes(lane, runMean) : new byte[s.Groups * (lane == "f64" ? 8 : 4)];
-                        var variance = given ? LaneBytes(lane, runVar) : new byte[mean.Length];
+                        var mean = given ? LaneBytes(lane, runMean) : Bench.Registry.Poisoned(s.Groups * (lane == "f64" ? 8 : 4));
+                        var variance = given ? LaneBytes(lane, runVar) : Bench.Registry.Poisoned(mean.Length);
                         double[] rm = given ? (double[])runMean.Clone() : new double[s.Groups], rv = given ? (double[])runVar.Clone() : new double[s.Groups];
                         var ry = new double[n];
                         var scale = RowOps.GroupNormReference(xv, affine ? gv : null, affine ? bv : null, s, Eps, given, rm, rv, ry);
-                        var y = new byte[x.Length];
+                        var y = Bench.Registry.Poisoned(type, n);
                         Bench.Registry.WithFloat(type, new GroupNormRun(ops, x, affine ? gamma : null, affine ? beta : null, mean, variance, y, s, Eps, given));
                         double worst = Excess(type, what, y, ry, i => scale[s.GroupOf(i)], 8);
                         if (!given)
@@ -89,9 +89,9 @@ internal static partial class Checks
                         var rdg = new double[s.Channels];
                         var rdb = new double[s.Channels];
                         var (sdx, sp) = RowOps.GroupNormBwdReference(xv, dyv, affine ? gv : null, s, Eps, given, bm, bvr, rdx, rdg, rdb);
-                        var dx = new byte[x.Length];
-                        var dg = new byte[s.Channels * (lane == "f64" ? 8 : 4)];
-                        var db = new byte[dg.Length];
+                        var dx = Bench.Registry.Poisoned(type, n);
+                        var dg = Bench.Registry.Poisoned(s.Channels * (lane == "f64" ? 8 : 4));
+                        var db = Bench.Registry.Poisoned(dg.Length);
                         Bench.Registry.WithFloat(type, new GroupNormBwdRun(ops, x, dy, affine ? gamma : null, given ? mean : null, given ? variance : null, dx, dg, db, s, Eps, given));
                         worst = Excess(type, what, dx, rdx, i => sdx[s.GroupOf(i)], 8);
                         var gdg = Bench.LaneValues.Decode(lane, dg, s.Channels);
@@ -285,7 +285,7 @@ internal static partial class Checks
                 var x = Bench.Registry.Make(type, rows * k.Cols, 81, -4, 4);
                 var ry = new double[rows * k.Cols];
                 var scale = RowOps.RopeReference(Bench.Registry.Values(type, x, rows * k.Cols), cos, sin, positions, a, ry);
-                var y = new byte[x.Length];
+                var y = Bench.Registry.Poisoned(type, rows * k.Cols);
                 Bench.Registry.WithFloat(type, new RopeRun(ops, a, x, LaneBytes(lane, cos), LaneBytes(lane, sin), positions, y));
                 string what = $"rope {rows}x{k.Cols} half {k.Half}{(k.Interleaved ? " interleaved" : "")}{(k.Inverse ? " inverse" : "")}";
                 double worst = Excess(type, what, y, ry, i => scale[i / k.Cols], 8);

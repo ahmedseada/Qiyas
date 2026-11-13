@@ -165,6 +165,35 @@ public static class Registry
     /// exactly or by its own rounding), integers uniform over the small range the bench uses.</summary>
     public static byte[] Make(string name, int count, int seed, double low, double high) => With(name, new MakeVisitor(count, seed, low, high));
 
+    /// <summary>An output of `count` values of the type as it stands before the operation that writes it: values no operation
+    /// writes by chance, so a check reads only values the operation wrote. 0xFF in every byte (NaN for the floats, -1 or the
+    /// largest value for the integers, true for bool); a block format's values 1000 each, and the last block's values past
+    /// the count 0, as Blocks.Store asks of a buffer whose blocks an output does not cover whole.</summary>
+    public static byte[] Poisoned(string name, long count)
+    {
+        if (IsBlock(name)) return Encode(name, Enumerable.Repeat(1000.0, (int)count).ToArray());
+        var a = new byte[Bytes(name, count)];
+        Array.Fill(a, (byte)0xFF);
+        return a;
+    }
+
+    /// <summary>An output in lanes (float32 or float64 values, int32 indices) before the operation that writes it: 0xFF in every
+    /// byte (NaN, -1).</summary>
+    public static byte[] Poisoned(long bytes)
+    {
+        var a = new byte[bytes];
+        Array.Fill(a, (byte)0xFF);
+        return a;
+    }
+
+    /// <summary>Indices before the operation that writes them: -1 each.</summary>
+    public static int[] PoisonedIndices(int count)
+    {
+        var a = new int[count];
+        Array.Fill(a, -1);
+        return a;
+    }
+
     private sealed class BitsVisitor : ITypeVisitor<int>
     {
         public int Visit<TN>() where TN : struct, IAdad<TN, float> => TN.Bits;

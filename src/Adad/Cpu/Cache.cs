@@ -201,6 +201,7 @@ internal sealed partial class Kernels
             var acc = pool.Rent(d);
             var s = pool.Rent(Math.Max(1, a.Lk));
             var raw = ArrayPool<TLW>.Shared.Rent(d);
+            var store = new UnitStore<TN, TLane>(o, d);
             try
             {
                 TLane scale = TL.From(a.Scale);
@@ -265,8 +266,10 @@ internal sealed partial class Kernels
 
                     TLane inv = n <= 0 ? TL.Zero : TL.Div(TL.From(1), sum);
                     RowMath<TLane, TL>.Scale(acc.AsSpan(0, d), TL.Zero, inv, acc.AsSpan(0, d));
-                    TN.Store(acc.AsSpan(0, d), o, (int)qi);
+                    store.Put(acc.AsSpan(0, d), qi);
                 }
+
+                store.Done();
             }
             finally
             {

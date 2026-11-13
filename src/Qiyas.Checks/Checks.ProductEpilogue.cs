@@ -60,7 +60,7 @@ internal static partial class Checks
                 double[]? Read(byte[]? x, long count) => x is null ? null : Bench.Registry.Values(type, x, (int)count);
                 byte[] a = Draw(v.ValuesA), b = Draw(v.ValuesB), y0 = Draw(n);
                 byte[]? bias = hasBias ? Draw(v.N) : null, residual = hasResidual ? Draw(n) : null;
-                byte[]? inputs = e.Grad is not null ? Draw(n, -3, 3) : null, kept = keep ? new byte[Bench.Registry.Bytes(type, n)] : null;
+                byte[]? inputs = e.Grad is not null ? Draw(n, -3, 3) : null, kept = keep ? Bench.Registry.Poisoned(type, n) : null;
                 byte[]? a2 = s2 is null ? null : Draw(s2.ValuesA), b2 = s2 is null ? null : Draw(s2.ValuesB);
                 double[] av = Read(a, v.ValuesA)!, bv = Read(b, v.ValuesB)!, yv = Read(y0, n)!;
                 double[]? biasV = Read(bias, v.N), resV = Read(residual, n), inputsV = Read(inputs, n), a2v = Read(a2, s2?.ValuesA ?? 0), b2v = Read(b2, s2?.ValuesB ?? 0);
@@ -113,7 +113,7 @@ internal static partial class Checks
                 double[]? Read(byte[]? x, long count) => x is null ? null : Bench.Registry.Values(type, x, (int)count);
                 byte[] a = Draw(v.ValuesA), b = Draw(v.ValuesB), y0 = Draw(n);
                 byte[]? bias = hasBias ? Draw(v.N) : null, residual = hasResidual ? Draw(n) : null;
-                byte[]? inputs = e.Grad is not null ? Draw(n) : null, kept = keep ? new byte[Bench.Registry.Bytes(type, n)] : null;
+                byte[]? inputs = e.Grad is not null ? Draw(n) : null, kept = keep ? Bench.Registry.Poisoned(type, n) : null;
                 byte[]? a2 = s2 is null ? null : Draw(s2.ValuesA), b2 = s2 is null ? null : Draw(s2.ValuesB);
                 var (want, sums) = e.Reference(v, Read(a, v.ValuesA)!, Read(b, v.ValuesB)!, Read(y0, n)!, Read(bias, v.N), Read(residual, n), Read(inputs, n),
                     Read(a2, s2?.ValuesA ?? 0), Read(b2, s2?.ValuesB ?? 0));

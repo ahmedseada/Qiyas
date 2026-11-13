@@ -85,7 +85,7 @@ internal static partial class Checks
             double[] Queries(double[] t) => AttentionLayout.FromHeads(t, a.ORows, a.Heads, a.Lq, a.D);
             foreach (string form in new[] { "measured", "fused", "composed", "decode" })
             {
-                var o = new byte[Bench.Registry.Bytes(type, nq)];
+                var o = Bench.Registry.Poisoned(type, nq);
                 Bench.Registry.WithFloat(type, new AttentionRun(ops, a, q, k, v, o, form == "decode", null, null, null, fused: form == "fused", composed: form == "composed"));
                 ok &= CloseMoved(type, $"attention laid {name} {form}", where, o, want, Queries, terms);
             }
@@ -94,7 +94,7 @@ internal static partial class Checks
             var dO = Bench.Registry.Make(type, nq, 44, -1, 1);
             var gh = Stored(AttentionLayout.ToHeads(Bench.Registry.Values(type, dO, nq), a.ORows, a.Heads, a.Lq, a.D), a.ORows, a.D);
             var (wq, wk, wv) = h.ReferenceBackward(qh, kh, vh, gh);
-            byte[] dq = new byte[q.Length], dk = new byte[k.Length], dv = new byte[v.Length];
+            byte[] dq = Bench.Registry.Poisoned(type, nq), dk = Bench.Registry.Poisoned(type, nk), dv = Bench.Registry.Poisoned(type, nk);
             Bench.Registry.WithFloat(type, new AttentionRun(ops, a, q, k, v, dO, false, dq, dk, dv));
             int rows = a.Group * a.Lq;
             ok &= CloseMoved(type, $"attention_bwd laid dQ {name}", where, dq, wq, Queries, 2 * (a.Lk + a.D));
@@ -111,7 +111,7 @@ internal static partial class Checks
             byte[] q = Bench.Registry.Make(type, nq, 45, -1, 1), k = Bench.Registry.Make(cacheType, nk, 46, -1, 1), v = Bench.Registry.Make(cacheType, nk, 47, -1, 1);
             double[] qh = Stored(AttentionLayout.ToHeads(Bench.Registry.Values(type, q, nq), a.QRows, a.Heads, a.Lq, a.D), a.QRows, a.D);
             var wantH = CacheRule.AtPosition(a0, p).Reference(qh, Bench.Registry.Values(cacheType, k, nk), Bench.Registry.Values(cacheType, v, nk));
-            var o = new byte[q.Length];
+            var o = Bench.Registry.Poisoned(type, nq);
             Bench.Registry.WithFloat(type, new CacheAttentionRun(ops, cacheType, a, p, q, k, v, o));
             ok &= CloseMoved(type, "attention_cached laid", where, o, wantH, t => AttentionLayout.FromHeads(t, a.ORows, a.Heads, a.Lq, a.D), a.Lk + a.D);
         }

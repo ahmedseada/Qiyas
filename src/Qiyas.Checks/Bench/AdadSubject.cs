@@ -50,9 +50,11 @@ public sealed class AdadSubject : IBenchSubject
 
         public TB? InOrNone(byte[]? data, int pad = 0) => data is null ? default : In(data, pad);
 
+        /// <summary>An output: uploaded as the host holds it (a check's poisoned values, so every value read back is one the
+        /// operation wrote), and read back on Collect.</summary>
         public TB Out(byte[] data, int pad = 0)
         {
-            var b = Rent(data.Length + pad);
+            var b = In(data, pad);
             Collect(b, data);
             return b;
         }
@@ -85,10 +87,10 @@ public sealed class AdadSubject : IBenchSubject
 
         public TI? IndexOrNone(int[]? data) => data is null ? default : Index(data);
 
+        /// <summary>Indices written by the operation: uploaded as the host holds them (as Out), and read back on Collect.</summary>
         public TI IndexOut(int[] data)
         {
-            var i = device.RentIndices(data.Length);
-            _indices.Add(i);
+            var i = Index(data);
             _collect.Add(() => device.DownloadIndices(i, data));
             return i;
         }

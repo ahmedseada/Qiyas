@@ -52,8 +52,8 @@ internal static partial class Checks
             foreach (bool normalize in new[] { false, true })
             {
                 var (want, _, wantOffsets, wantTokens, wantSlots) = Experts.RouteTopKReference(p, tokens, experts, k, normalize);
-                var weights = new byte[Bench.Registry.Bytes(type, tokens * k)];
-                int[] offsets = new int[experts + 1], tokenOfRow = new int[tokens * k], slotRow = new int[tokens * k];
+                var weights = Bench.Registry.Poisoned(type, tokens * k);
+                int[] offsets = Bench.Registry.PoisonedIndices(experts + 1), tokenOfRow = Bench.Registry.PoisonedIndices(tokens * k), slotRow = Bench.Registry.PoisonedIndices(tokens * k);
                 Bench.Registry.WithFloat(type, new RouteTopKRun(ops, stored, tokens, experts, k, normalize, weights, offsets, tokenOfRow, slotRow));
                 string what = $"route top-{k} of {experts}{(special ? " NaN ±0" : "")}{(normalize ? " normalized" : "")}";
                 if (!offsets.SequenceEqual(wantOffsets) || !tokenOfRow.SequenceEqual(wantTokens) || !slotRow.SequenceEqual(wantSlots))
@@ -129,7 +129,7 @@ internal static partial class Checks
                 }
             }
 
-            var y = new byte[Bench.Registry.Bytes(type, v.YValues)];
+            var y = Bench.Registry.Poisoned(type, v.YValues);
             Bench.Registry.With(type, new ExpertRunCase(ops, v, gate, x, offsets, gw, gb, uw, ub, y));
             double bad = Excess(type, $"experts {name}", y, want, i => scale[i], 1);
             if (bad > 0) { Console.WriteLine($"check experts {name,-44} {where,-6} {type,-12} DIFFERS by {bad:0.##}"); ok = false; }
@@ -193,7 +193,7 @@ internal static partial class Checks
                 want = g.Select((gi, i) => op.Reference(gi, u[i], 0, 0, 0)).ToArray();
             }
 
-            var y = new byte[Bench.Registry.Bytes(type, v.YValues)];
+            var y = Bench.Registry.Poisoned(type, v.YValues);
             string lane = Bench.Registry.With(type, new ExpertRunCase(ops, v, gate, x, offsets, gw, gb, uw, ub, y));
             var got = Bench.Registry.Values(type, y, (int)v.YValues);
             var held = Bench.Registry.Values(type, Bench.Registry.Encode(type, want), (int)v.YValues);
