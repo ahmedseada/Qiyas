@@ -608,13 +608,24 @@ internal sealed partial class Kernels
             Team.For(rows, Math.Max(1, rows / (Threads * 4)), (long)rows * cols, new RowStatsBody<TN, TLane, TL>(x, stats, cols, TL.From(eps), centered));
             // The columns as tiles (Reduce.cs ColumnPlan), the blocks' sums joined in block order.
             var plan = ColumnPlan.Of<TLane>(rows, cols, 1);
-            var dg = plan.Blocks == 1 ? dgamma : plan.Partials<TLane>(cols);
-            var db = plan.Blocks == 1 ? dbeta : plan.Partials<TLane>(cols);
-            Team.For(plan.Tasks, 1, (long)rows * cols * 2, new ColumnTiles<NormParamsTile<TN, TLane, TL>>(new(x, dy, stats, dg, db, cols), plan, rows, cols));
-            if (plan.Blocks > 1)
+            var dg = plan.Blocks == 1 ? ColumnSlots.Whole(dgamma, cols) : plan.Partials<TLane>(cols);
+            var db = plan.Blocks == 1 ? ColumnSlots.Whole(dbeta, cols) : plan.Partials<TLane>(cols);
+            try
             {
-                Join<TLane, TL>(dg, plan.Blocks, cols, dgamma, JoinOp.Add);
-                Join<TLane, TL>(db, plan.Blocks, cols, dbeta, JoinOp.Add);
+                Team.For(plan.Tasks, 1, (long)rows * cols * 2, new ColumnTiles<NormParamsTile<TN, TLane, TL>>(new(x, dy, stats, dg, db, cols), plan, rows, cols));
+                if (plan.Blocks > 1)
+                {
+                    Join<TLane, TL>(dg, plan.Blocks, cols, dgamma, JoinOp.Add);
+                    Join<TLane, TL>(db, plan.Blocks, cols, dbeta, JoinOp.Add);
+                }
+            }
+            finally
+            {
+                if (plan.Blocks > 1)
+                {
+                    dg.Return();
+                    db.Return();
+                }
             }
         }
     }
@@ -647,15 +658,15 @@ internal sealed partial class Kernels
     }
 
     // dgamma and dbeta of a tile: Σ dy·(x − mean)·rstd and Σ dy over its rows, in place where the stored values are the lane's.
-    private readonly struct NormParamsTile<TN, TLane, TL>(byte[] x, byte[] dy, TLane[] stats, byte[] dgamma, byte[] dbeta, int cols) : IColumnTile
+    private readonly struct NormParamsTile<TN, TLane, TL>(byte[] x, byte[] dy, TLane[] stats, ColumnSlots dgamma, ColumnSlots dbeta, int cols) : IColumnTile
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
         [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
         public void Tile(int r0, int r1, int c0, int c1, int block)
         {
             int n = c1 - c0, w = Vector<TLane>.Count;
-            var ag = MemoryMarshal.Cast<byte, TLane>(dgamma.AsSpan()).Slice(block * cols + c0, n);
-            var ab = MemoryMarshal.Cast<byte, TLane>(dbeta.AsSpan()).Slice(block * cols + c0, n);
+            var ag = dgamma.Slot<TLane>(block, c0, n);
+            var ab = dbeta.Slot<TLane>(block, c0, n);
             ag.Clear();
             ab.Clear();
             var pool = ArrayPool<TLane>.Shared;

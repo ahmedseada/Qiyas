@@ -104,9 +104,17 @@ internal sealed partial class Kernels
             // Tiles of a strip of columns by a block of rows (ColumnPlan), g rows at a time (one word of g values per
             // column); the blocks' sums joined in block order.
             var plan = ColumnPlan.Of<TAcc>(rows, cols, g);
-            var dst = plan.Blocks == 1 ? result : plan.Partials<TAcc>(cols);
-            Team.For(plan.Tasks, 1, (long)rows * cols, new ColumnTiles<ColumnSumTile<TN, TIn, TAcc, TL>>(new(x, dst, cols, g, squares), plan, rows, cols));
-            if (plan.Blocks > 1) Join<TAcc, TL>(dst, plan.Blocks, cols, result, JoinOp.Add);
+            var dst = plan.Blocks == 1 ? ColumnSlots.Whole(result, cols) : plan.Partials<TAcc>(cols);
+            try
+            {
+                Team.For(plan.Tasks, 1, (long)rows * cols, new ColumnTiles<ColumnSumTile<TN, TIn, TAcc, TL>>(new(x, dst, cols, g, squares), plan, rows, cols));
+                if (plan.Blocks > 1) Join<TAcc, TL>(dst, plan.Blocks, cols, result, JoinOp.Add);
+            }
+            finally
+            {
+                if (plan.Blocks > 1) dst.Return();
+            }
+
             return result;
         }
 
@@ -289,8 +297,63 @@ internal sealed partial class Kernels
             return new ColumnPlan(strip, strips, rowBlock, blocks);
         }
 
-        /// <summary>Blocks × cols lanes for the blocks' results (every value written by its tile).</summary>
-        public byte[] Partials<TAcc>(int cols) where TAcc : unmanaged => new byte[checked((long)Blocks * cols * Unsafe.SizeOf<TAcc>())];
+        /// <summary>The blocks' slots for their results, cols values each (every value written by its tile), given back
+        /// to ColumnSlots' pool after the join.</summary>
+        public ColumnSlots Partials<TAcc>(int cols) where TAcc : unmanaged => ColumnSlots.Rent<TAcc>(Blocks, cols);
+    }
+
+    /// <summary>A column pass's results by block: block b's values from Pitch·b on, past the first At bytes of Bytes. A pass of
+    /// one block writes the result itself (Whole). Several blocks write the slots of a pinned array kept for the process
+    /// (a few held, taken and given back whole), each slot on 128-byte lines of its own (a line and the line the processor
+    /// fetches with it). A new zeroed array of some 800 kB a call (on the large-object heap, its pages and the lines at the
+    /// slots' edges as each process placed it) read the same pass at two speeds by process (max:cols int16 0.15 or
+    /// 0.24 ms).</summary>
+    private readonly struct ColumnSlots(byte[] bytes, int at, int pitch)
+    {
+        private static readonly byte[]?[] s_kept = new byte[4][];
+
+        public byte[] Bytes => bytes;
+
+        /// <summary>Values from one block's slot to the next.</summary>
+        public int Pitch => pitch;
+
+        public Span<T> Slot<T>(int block, int c0, int n) where T : unmanaged =>
+            MemoryMarshal.Cast<byte, T>(bytes.AsSpan(at)).Slice(block * pitch + c0, n);
+
+        public ReadOnlySpan<T> All<T>() where T : unmanaged => MemoryMarshal.Cast<byte, T>(bytes.AsSpan(at));
+
+        public static ColumnSlots Whole(byte[] result, int cols) => new(result, 0, cols);
+
+        public static unsafe ColumnSlots Rent<T>(int blocks, int cols) where T : unmanaged
+        {
+            int size = Unsafe.SizeOf<T>();
+            long pitchBytes = ((long)cols * size + 127) / 128 * 128;
+            int need = checked((int)(blocks * pitchBytes + 128));
+            byte[]? bytes = null;
+            for (int i = 0; i < s_kept.Length && bytes is null; i++)
+            {
+                var kept = Interlocked.Exchange(ref s_kept[i], null);
+                if (kept is null) continue;
+                if (kept.Length >= need) bytes = kept;
+                else Interlocked.CompareExchange(ref s_kept[i], kept, null);
+            }
+
+            bytes ??= GC.AllocateUninitializedArray<byte>(need, pinned: true);
+            nuint address = (nuint)Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(bytes));
+            return new ColumnSlots(bytes, (int)((128 - (address & 127)) & 127), (int)(pitchBytes / size));
+        }
+
+        /// <summary>The array back to the pool: to an empty place, else in place of a smaller one, else dropped.</summary>
+        public void Return()
+        {
+            for (int i = 0; i < s_kept.Length; i++)
+                if (Interlocked.CompareExchange(ref s_kept[i], bytes, null) is null) return;
+            for (int i = 0; i < s_kept.Length; i++)
+            {
+                var kept = Volatile.Read(ref s_kept[i]);
+                if (kept is not null && kept.Length < bytes.Length && Interlocked.CompareExchange(ref s_kept[i], bytes, kept) == kept) return;
+            }
+        }
     }
 
     private interface IColumnTile
@@ -318,20 +381,21 @@ internal sealed partial class Kernels
     private enum JoinOp { Add, Max, Min }
 
     // The blocks' results joined in block order into dst (cols lanes): the sums added, the extremes compared as the rows were.
-    private static void Join<TAcc, TL>(byte[] partials, int blocks, int cols, byte[] dst, JoinOp op) where TAcc : unmanaged where TL : struct, ILane<TL, TAcc>
+    private static void Join<TAcc, TL>(ColumnSlots partials, int blocks, int cols, byte[] dst, JoinOp op) where TAcc : unmanaged where TL : struct, ILane<TL, TAcc>
     {
         int w = Vector<TAcc>.Count, chunk = Math.Max(16 * w, cols / (Threads * 2) / w * w);
-        Team.For(cols, chunk, (long)blocks * cols, new JoinBody<TAcc, TL>(partials, blocks, cols, dst, op));
+        Team.For(cols, chunk, (long)blocks * cols, new JoinBody<TAcc, TL>(partials, blocks, dst, op));
     }
 
-    private struct JoinBody<TAcc, TL>(byte[] partials, int blocks, int cols, byte[] dst, JoinOp op) : Team.IBody
+    private struct JoinBody<TAcc, TL>(ColumnSlots partials, int blocks, byte[] dst, JoinOp op) : Team.IBody
         where TAcc : unmanaged where TL : struct, ILane<TL, TAcc>
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public readonly void Run(int first, int last)
         {
             int w = Vector<TAcc>.Count;
-            var p = MemoryMarshal.Cast<byte, TAcc>(partials.AsSpan());
+            var p = partials.All<TAcc>();
+            int pitch = partials.Pitch;
             var o = MemoryMarshal.Cast<byte, TAcc>(dst.AsSpan());
             ref TAcc rp = ref MemoryMarshal.GetReference(p);
             ref TAcc ro = ref MemoryMarshal.GetReference(o);
@@ -341,7 +405,7 @@ internal sealed partial class Kernels
                 var v = Vector.LoadUnsafe(ref rp, (nuint)i);
                 for (int b = 1; b < blocks; b++)
                 {
-                    var u = Vector.LoadUnsafe(ref rp, (nuint)((long)b * cols + i));
+                    var u = Vector.LoadUnsafe(ref rp, (nuint)((long)b * pitch + i));
                     v = op == JoinOp.Add ? TL.Add(v, u) : op == JoinOp.Max ? First(v, u) : Last(v, u);
                 }
 
@@ -353,7 +417,7 @@ internal sealed partial class Kernels
                 TAcc v = p[i];
                 for (int b = 1; b < blocks; b++)
                 {
-                    TAcc u = p[b * cols + i];
+                    TAcc u = p[b * pitch + i];
                     v = op == JoinOp.Add ? TL.Add(v, u) : op == JoinOp.Max ? (Widths.Compare(u, v) > 0 ? u : v) : (Widths.Compare(u, v) < 0 ? u : v);
                 }
 
@@ -364,14 +428,14 @@ internal sealed partial class Kernels
 
     // Column sums (or sums of squares) of a tile: g rows a word (loaded and interleaved), or in place where the stored
     // values are the lane's (g = 1).
-    private readonly struct ColumnSumTile<TN, TIn, TAcc, TL>(byte[] x, byte[] dst, int cols, int g, bool squares) : IColumnTile
+    private readonly struct ColumnSumTile<TN, TIn, TAcc, TL>(byte[] x, ColumnSlots dst, int cols, int g, bool squares) : IColumnTile
         where TN : struct, IAdad<TN, TIn>, IAdad<TN, TAcc> where TIn : unmanaged where TAcc : unmanaged where TL : struct, ILane<TL, TAcc>
     {
         [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
         public void Tile(int r0, int r1, int c0, int c1, int block)
         {
             int n = c1 - c0, w = Vector<TAcc>.Count;
-            var acc = MemoryMarshal.Cast<byte, TAcc>(dst.AsSpan()).Slice(block * cols + c0, n);
+            var acc = dst.Slot<TAcc>(block, c0, n);
             acc.Clear();
             var ones = new Vector<TAcc>(Ones<TIn, TAcc>());
             bool direct = g == 1 && Lanes.Direct<TN, TIn>();
@@ -442,8 +506,17 @@ internal sealed partial class Kernels
                 var plan = ColumnPlan.Of<TLane>(r, c, 1);
                 var values = plan.Partials<TLane>(c);
                 var rowsAt = plan.Partials<int>(c);
-                Team.For(plan.Tasks, 1, (long)r * c, new ColumnTiles<ColumnArgmaxTile<TN, TLane, TL>>(new(x, values, rowsAt, c), plan, r, c));
-                Team.For(c, Math.Max(256, c / (Threads * 2)), (long)plan.Blocks * c, new ArgmaxJoinBody<TLane>(values, rowsAt, plan.Blocks, c, Result));
+                try
+                {
+                    Team.For(plan.Tasks, 1, (long)r * c, new ColumnTiles<ColumnArgmaxTile<TN, TLane, TL>>(new(x, values, rowsAt, c), plan, r, c));
+                    Team.For(c, Math.Max(256, c / (Threads * 2)), (long)plan.Blocks * c, new ArgmaxJoinBody<TLane>(values, rowsAt, plan.Blocks, Result));
+                }
+                finally
+                {
+                    values.Return();
+                    rowsAt.Return();
+                }
+
                 return;
             }
 
@@ -452,9 +525,17 @@ internal sealed partial class Kernels
                 // Tiles (ColumnPlan), the blocks' extremes joined in block order.
                 Result = new byte[c * Unsafe.SizeOf<TLane>()];
                 var plan = ColumnPlan.Of<TLane>(r, c, 1);
-                var dst = plan.Blocks == 1 ? Result : plan.Partials<TLane>(c);
-                Team.For(plan.Tasks, 1, (long)r * c, new ColumnTiles<ColumnCompareTile<TN, TLane, TL>>(new(x, dst, c, max), plan, r, c));
-                if (plan.Blocks > 1) Join<TLane, TL>(dst, plan.Blocks, c, Result, max ? JoinOp.Max : JoinOp.Min);
+                var dst = plan.Blocks == 1 ? ColumnSlots.Whole(Result, c) : plan.Partials<TLane>(c);
+                try
+                {
+                    Team.For(plan.Tasks, 1, (long)r * c, new ColumnTiles<ColumnCompareTile<TN, TLane, TL>>(new(x, dst, c, max), plan, r, c));
+                    if (plan.Blocks > 1) Join<TLane, TL>(dst, plan.Blocks, c, Result, max ? JoinOp.Max : JoinOp.Min);
+                }
+                finally
+                {
+                    if (plan.Blocks > 1) dst.Return();
+                }
+
                 return;
             }
 
@@ -619,15 +700,15 @@ internal sealed partial class Kernels
     /// far. A vector compare a row gives exactly those lanes (above by the lane's compare, or the value a NaN and the best
     /// not): 4-byte lanes take value and row by it; other lanes take the vectors it marks by the order, value by value. In
     /// place where the stored values are the lane's.</summary>
-    private readonly struct ColumnArgmaxTile<TN, TLane, TL>(byte[] x, byte[] values, byte[] rowsAt, int cols) : IColumnTile
+    private readonly struct ColumnArgmaxTile<TN, TLane, TL>(byte[] x, ColumnSlots values, ColumnSlots rowsAt, int cols) : IColumnTile
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
     {
         [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
         public void Tile(int r0, int r1, int c0, int c1, int block)
         {
             int n = c1 - c0, w = Vector<TLane>.Count;
-            var best = MemoryMarshal.Cast<byte, TLane>(values.AsSpan()).Slice(block * cols + c0, n);
-            var at = MemoryMarshal.Cast<byte, int>(rowsAt.AsSpan()).Slice(block * cols + c0, n);
+            var best = values.Slot<TLane>(block, c0, n);
+            var at = rowsAt.Slot<int>(block, c0, n);
             var row = TN.Direct ? null : ArrayPool<TLane>.Shared.Rent(n);
             ReadOnlySpan<TLane> stored = TN.Direct ? MemoryMarshal.Cast<byte, TLane>(x.AsSpan()) : default;
             if (TN.Direct) stored.Slice(r0 * cols + c0, n).CopyTo(best); else TN.Load(x, r0 * cols + c0, best);
@@ -674,12 +755,13 @@ internal sealed partial class Kernels
     }
 
     // The blocks' first-ranked joined in block order: a later block's only when it ranks strictly above.
-    private struct ArgmaxJoinBody<TLane>(byte[] values, byte[] rowsAt, int blocks, int cols, byte[] result) : Team.IBody where TLane : unmanaged
+    private struct ArgmaxJoinBody<TLane>(ColumnSlots values, ColumnSlots rowsAt, int blocks, byte[] result) : Team.IBody where TLane : unmanaged
     {
         public readonly void Run(int first, int last)
         {
-            var v = MemoryMarshal.Cast<byte, TLane>(values.AsSpan());
-            var a = MemoryMarshal.Cast<byte, int>(rowsAt.AsSpan());
+            var v = values.All<TLane>();
+            var a = rowsAt.All<int>();
+            int pv = values.Pitch, pa = rowsAt.Pitch;
             var o = MemoryMarshal.Cast<byte, int>(result.AsSpan());
             for (int c = first; c < last; c++)
             {
@@ -687,7 +769,7 @@ internal sealed partial class Kernels
                 int at = a[c];
                 for (int b = 1; b < blocks; b++)
                 {
-                    if (Widths.Compare(v[b * cols + c], best) > 0) { best = v[b * cols + c]; at = a[b * cols + c]; }
+                    if (Widths.Compare(v[b * pv + c], best) > 0) { best = v[b * pv + c]; at = a[b * pa + c]; }
                 }
 
                 o[c] = at;
@@ -697,14 +779,14 @@ internal sealed partial class Kernels
 
     // A tile's column extremes in Adad's order: First / Last on whole vectors, Widths.Compare on the rest (as the rows'
     // pass), in place where the stored values are the lane's.
-    private readonly struct ColumnCompareTile<TN, TLane, TL>(byte[] x, byte[] dst, int cols, bool max) : IColumnTile
+    private readonly struct ColumnCompareTile<TN, TLane, TL>(byte[] x, ColumnSlots dst, int cols, bool max) : IColumnTile
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, ILane<TL, TLane>
     {
         [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
         public void Tile(int r0, int r1, int c0, int c1, int block)
         {
             int n = c1 - c0, w = Vector<TLane>.Count;
-            var o = MemoryMarshal.Cast<byte, TLane>(dst.AsSpan()).Slice(block * cols + c0, n);
+            var o = dst.Slot<TLane>(block, c0, n);
             var row = TN.Direct ? null : ArrayPool<TLane>.Shared.Rent(n);
             ReadOnlySpan<TLane> stored = TN.Direct ? MemoryMarshal.Cast<byte, TLane>(x.AsSpan()) : default;
             if (TN.Direct) stored.Slice(r0 * cols + c0, n).CopyTo(o); else TN.Load(x, r0 * cols + c0, o);
@@ -1035,9 +1117,16 @@ internal sealed partial class Kernels
                 // Tiles (ColumnPlan), the blocks' sums joined in block order.
                 var plan = ColumnPlan.Of<TAcc>(rows, cols, g);
                 var sums = new byte[cols * Unsafe.SizeOf<TAcc>()];
-                var dst = plan.Blocks == 1 ? sums : plan.Partials<TAcc>(cols);
-                Team.For(plan.Tasks, 1, (long)rows * cols, new ColumnTiles<GemvColumnTile<TN, TIn, TAcc, TL>>(new(a, xw, dst, cols, g), plan, rows, cols));
-                if (plan.Blocks > 1) Join<TAcc, TL>(dst, plan.Blocks, cols, sums, JoinOp.Add);
+                var dst = plan.Blocks == 1 ? ColumnSlots.Whole(sums, cols) : plan.Partials<TAcc>(cols);
+                try
+                {
+                    Team.For(plan.Tasks, 1, (long)rows * cols, new ColumnTiles<GemvColumnTile<TN, TIn, TAcc, TL>>(new(a, xw, dst, cols, g), plan, rows, cols));
+                    if (plan.Blocks > 1) Join<TAcc, TL>(dst, plan.Blocks, cols, sums, JoinOp.Add);
+                }
+                finally
+                {
+                    if (plan.Blocks > 1) dst.Return();
+                }
                 MemoryMarshal.Cast<byte, TAcc>(sums.AsSpan()).CopyTo(yl);
             }
 
@@ -1104,14 +1193,14 @@ internal sealed partial class Kernels
 
     // y's columns of a tile: Σ over the tile's rows of A's row (g rows a word) times x's word, in place where the stored
     // values are the lane's (g = 1).
-    private readonly struct GemvColumnTile<TN, TIn, TAcc, TL>(byte[] a, TAcc[] xw, byte[] dst, int cols, int g) : IColumnTile
+    private readonly struct GemvColumnTile<TN, TIn, TAcc, TL>(byte[] a, TAcc[] xw, ColumnSlots dst, int cols, int g) : IColumnTile
         where TN : struct, IAdad<TN, TIn>, IAdad<TN, TAcc> where TIn : unmanaged where TAcc : unmanaged where TL : struct, ILane<TL, TAcc>
     {
         [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
         public void Tile(int r0, int r1, int c0, int c1, int block)
         {
             int n = c1 - c0, w = Vector<TAcc>.Count;
-            var acc = MemoryMarshal.Cast<byte, TAcc>(dst.AsSpan()).Slice(block * cols + c0, n);
+            var acc = dst.Slot<TAcc>(block, c0, n);
             acc.Clear();
             bool direct = g == 1 && Lanes.Direct<TN, TIn>();
             var rowsIn = direct ? null : ArrayPool<TIn>.Shared.Rent(g * n);
