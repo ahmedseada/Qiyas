@@ -123,7 +123,7 @@ internal static partial class Checks
         ok &= Function32("atan f32 wide", Funcs.Atan, Math.Atan, -1e6, 1e6, 3, atanRandom);
         ok &= Function64("atan f64 wide", Funcs.Atan, Math.Atan, -1e6, 1e6, 3, atanRandom);
         ok &= Function32("erfc f32", Funcs.Erfc, Funcs.ErfcReference, -4, 9, 4, random);
-        ok &= Function64("erfc f64", Funcs.Erfc, Funcs.ErfcReference, -4, 26, 4, random);
+        ok &= Function64("erfc f64", Funcs.Erfc, Funcs.ErfcReference, -6, 26.5, 4, random);          // every normal erfc: its tail (ErfcTail64) over the whole of it
         ok &= ErfFour(new Random(74));
         ok &= Maps(null);
         ok &= Maps(null, special: true);

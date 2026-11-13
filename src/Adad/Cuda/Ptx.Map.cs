@@ -267,6 +267,53 @@ internal static partial class Ptx
             return y;
         }
 
+        // erfc |x| past its bound: e^(−x²) (x² carried with its rounding) times, on the f64 lane, S(u)/x (Funcs.ErfcTail64:
+        // u = 1.5/x − 1), on the f32 lane 1/√π over the continued fraction `depth` deep, bottom-up.
+        private static string ErfcTail(PtxBuilder b, Lane lane, string ax, string x2, int depth = Funcs.ErfDepth32)
+        {
+            string op = lane.Op, factor = lane.NewReg(b);
+            bool divide = lane.Wide;
+            if (lane.Wide)
+            {
+                string t = lane.NewReg(b), u = lane.NewReg(b);
+                b.L($"div.rn.{op} {t}, {L(lane, 1)}, {ax};");
+                b.L($"fma.rn.{op} {u}, {t}, {L(lane, 1.5)}, {L(lane, -1)};");
+                factor = Poly(b, lane, u, Funcs.ErfcTail64, Funcs.ErfcTail64.Length, 0);
+            }
+            else
+            {
+                string q = lane.NewReg(b);
+                b.L($"mov.{lane.Reg} {factor}, {ax};");
+                for (int d = depth; d >= 1; d--)
+                {
+                    b.L($"div.rn.{op} {q}, {L(lane, d * 0.5)}, {factor};");
+                    b.L($"add.rn.{op} {factor}, {ax}, {q};");
+                }
+            }
+
+            string nx2 = lane.NewReg(b), tail = lane.NewReg(b), x2lo = lane.NewReg(b), corr = lane.NewReg(b), nx2b = lane.NewReg(b), pcorr = b.P();
+            b.L($"neg.{op} {nx2b}, {x2};");
+            b.L($"fma.rn.{op} {x2lo}, {ax}, {ax}, {nx2b};");
+            b.L($"sub.rn.{op} {corr}, {L(lane, 1)}, {x2lo};");
+            b.L($"testp.notanumber.{op} {pcorr}, {corr};");                    // x² infinite: its low part ∞ − ∞, e^(−x²) 0: no correction
+            b.L($"selp.{op} {corr}, {L(lane, 1)}, {corr}, {pcorr};");
+            b.L($"neg.{op} {nx2}, {x2};");
+            string e = Codec.Exp(b, lane, nx2);
+            b.L($"mul.rn.{op} {e}, {e}, {corr};");
+            if (divide)
+            {
+                b.L($"mul.rn.{op} {tail}, {e}, {factor};");
+                b.L($"div.rn.{op} {tail}, {tail}, {ax};");
+            }
+            else
+            {
+                b.L($"mul.rn.{op} {tail}, {e}, {L(lane, Funcs.InvSqrtPi)};");
+                b.L($"div.rn.{op} {tail}, {tail}, {factor};");
+            }
+
+            return tail;
+        }
+
         public static string Erf(PtxBuilder b, Lane lane, string x)
         {
             bool w = lane.Wide;
@@ -275,27 +322,7 @@ internal static partial class Ptx
             b.L($"mul.rn.{op} {x2}, {ax}, {ax};");
             string series = Poly(b, lane, x2, Funcs.ErfSeries, w ? Funcs.ErfTerms64 : Funcs.ErfTerms32, 0);
             b.L($"mul.rn.{op} {series}, {series}, {ax};");
-            string f = lane.NewReg(b), q = lane.NewReg(b);
-            b.L($"mov.{lane.Reg} {f}, {ax};");
-            for (int d = (w ? Funcs.ErfDepth64 : Funcs.ErfDepth32); d >= 1; d--)
-            {
-                b.L($"div.rn.{op} {q}, {L(lane, d * 0.5)}, {f};");
-                b.L($"add.rn.{op} {f}, {ax}, {q};");
-            }
-
-            string nx2 = lane.NewReg(b), tail = lane.NewReg(b), y = lane.NewReg(b), ny = lane.NewReg(b), pb = b.P(), pn = b.P(), pneg = b.P();
-            string x2lo = lane.NewReg(b), corr = lane.NewReg(b), nx2b = lane.NewReg(b);
-            b.L($"neg.{op} {nx2b}, {x2};");
-            b.L($"fma.rn.{op} {x2lo}, {ax}, {ax}, {nx2b};");
-            b.L($"sub.rn.{op} {corr}, {L(lane, 1)}, {x2lo};");
-            string pcorr = b.P();                                              // x² infinite: its low part ∞ − ∞, e^(−x²) 0: no correction
-            b.L($"testp.notanumber.{op} {pcorr}, {corr};");
-            b.L($"selp.{op} {corr}, {L(lane, 1)}, {corr}, {pcorr};");
-            b.L($"neg.{op} {nx2}, {x2};");
-            string e = Codec.Exp(b, lane, nx2);
-            b.L($"mul.rn.{op} {e}, {e}, {corr};");
-            b.L($"mul.rn.{op} {tail}, {e}, {L(lane, Funcs.InvSqrtPi)};");
-            b.L($"div.rn.{op} {tail}, {tail}, {f};");
+            string tail = ErfcTail(b, lane, ax, x2), y = lane.NewReg(b), ny = lane.NewReg(b), pb = b.P(), pn = b.P(), pneg = b.P();
             b.L($"sub.rn.{op} {tail}, {L(lane, 1)}, {tail};");
             b.L($"setp.lt.{op} {pb}, {ax}, {L(lane, w ? Funcs.ErfBound64 : Funcs.ErfBound32)};");
             b.L($"selp.{op} {y}, {series}, {tail}, {pb};");
@@ -323,27 +350,7 @@ internal static partial class Ptx
             b.L($"mul.rn.{op} {x2}, {ax}, {ax};");
             string series = Poly(b, lane, x2, Funcs.ErfSeries, w ? Funcs.ErfTerms64 : Funcs.ErfTerms32, 0);
             b.L($"mul.rn.{op} {series}, {series}, {x};");
-            string f = lane.NewReg(b), q = lane.NewReg(b);
-            b.L($"mov.{lane.Reg} {f}, {ax};");
-            for (int d = (w ? Funcs.ErfcDepth64 : Funcs.ErfcDepth32); d >= 1; d--)
-            {
-                b.L($"div.rn.{op} {q}, {L(lane, d * 0.5)}, {f};");
-                b.L($"add.rn.{op} {f}, {ax}, {q};");
-            }
-
-            string nx2 = lane.NewReg(b), tail = lane.NewReg(b), mid = lane.NewReg(b), two = lane.NewReg(b), y = lane.NewReg(b), pb = b.P(), pn = b.P(), pneg = b.P();
-            string x2lo = lane.NewReg(b), corr = lane.NewReg(b), nx2b = lane.NewReg(b);
-            b.L($"neg.{op} {nx2b}, {x2};");
-            b.L($"fma.rn.{op} {x2lo}, {ax}, {ax}, {nx2b};");
-            b.L($"sub.rn.{op} {corr}, {L(lane, 1)}, {x2lo};");
-            string pcorr = b.P();                                              // x² infinite: its low part ∞ − ∞, e^(−x²) 0: no correction
-            b.L($"testp.notanumber.{op} {pcorr}, {corr};");
-            b.L($"selp.{op} {corr}, {L(lane, 1)}, {corr}, {pcorr};");
-            b.L($"neg.{op} {nx2}, {x2};");
-            string e = Codec.Exp(b, lane, nx2);
-            b.L($"mul.rn.{op} {e}, {e}, {corr};");
-            b.L($"mul.rn.{op} {tail}, {e}, {L(lane, Funcs.InvSqrtPi)};");
-            b.L($"div.rn.{op} {tail}, {tail}, {f};");
+            string tail = ErfcTail(b, lane, ax, x2, Funcs.ErfcDepth32), mid = lane.NewReg(b), two = lane.NewReg(b), y = lane.NewReg(b), pb = b.P(), pn = b.P(), pneg = b.P();
             b.L($"sub.rn.{op} {mid}, {L(lane, 1)}, {series};");
             b.L($"sub.rn.{op} {two}, {L(lane, 2)}, {tail};");
             b.L($"setp.lt.{op} {pneg}, {x}, {L(lane, 0)};");

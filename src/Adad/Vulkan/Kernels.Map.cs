@@ -175,18 +175,34 @@ internal static partial class VkKernels
             return b.Select(x < 0.0, -r, r);
         }
 
+        // erfc |x| past its bound: e^(−x²) (x² carried with its rounding) times, on the f64 lane, S(u)/x (Funcs.ErfcTail64:
+        // u = 1.5/x − 1), on the f32 lane 1/√π over the continued fraction `depth` deep, bottom-up.
+        private static V ErfcTail(Spv b, V ax, V x2, int depth)
+        {
+            bool w = ax.Kind == K.F64;
+            var corr = b.C(ax.Kind, 1) - b.Fma(ax, ax, -x2);
+            corr = b.Select(b.IsNan(corr), b.C(ax.Kind, 1), corr);             // x² infinite: its low part ∞ − ∞, e^(−x²) 0: no correction
+            if (w)
+            {
+                var u = b.Fma(b.C(ax.Kind, 1) / ax, b.C(ax.Kind, 1.5), b.C(ax.Kind, -1));
+                var sp = Poly(b, u, Funcs.ErfcTail64, Funcs.ErfcTail64.Length, 0);
+                var e = Exp(b, -x2) * corr;
+                return (e * sp) / ax;
+            }
+
+            var f = ax;
+            for (int d = depth; d >= 1; d--) f = ax + b.C(ax.Kind, d * 0.5) / f;
+            var e32 = Exp(b, -x2) * corr;
+            return (e32 * Funcs.InvSqrtPi) / f;
+        }
+
         public static V Erf(Spv b, V x)
         {
             bool w = x.Kind == K.F64;
             var ax = b.Abs(x);
             var x2 = ax * ax;
             var series = Poly(b, x2, Funcs.ErfSeries, w ? Funcs.ErfTerms64 : Funcs.ErfTerms32, 0) * ax;
-            var f = ax;
-            for (int d = w ? Funcs.ErfDepth64 : Funcs.ErfDepth32; d >= 1; d--) f = ax + b.C(x.Kind, d * 0.5) / f;
-            var corr = b.C(x.Kind, 1) - b.Fma(ax, ax, -x2);
-            corr = b.Select(b.IsNan(corr), b.C(x.Kind, 1), corr);              // x² infinite: its low part ∞ − ∞, e^(−x²) 0: no correction
-            var e = Exp(b, -x2) * corr;
-            var tail = b.C(x.Kind, 1) - (e * Funcs.InvSqrtPi) / f;
+            var tail = b.C(x.Kind, 1) - ErfcTail(b, ax, x2, Funcs.ErfDepth32);
             var y = b.Select(ax < (w ? Funcs.ErfBound64 : Funcs.ErfBound32), series, tail);
             y = b.Min(y, b.C(x.Kind, 1));
             y = b.Select(x < 0, -y, y);
@@ -199,12 +215,7 @@ internal static partial class VkKernels
             var ax = b.Abs(x);
             var x2 = ax * ax;
             var series = Poly(b, x2, Funcs.ErfSeries, w ? Funcs.ErfTerms64 : Funcs.ErfTerms32, 0) * x;
-            var f = ax;
-            for (int d = w ? Funcs.ErfcDepth64 : Funcs.ErfcDepth32; d >= 1; d--) f = ax + b.C(x.Kind, d * 0.5) / f;
-            var corr = b.C(x.Kind, 1) - b.Fma(ax, ax, -x2);
-            corr = b.Select(b.IsNan(corr), b.C(x.Kind, 1), corr);              // x² infinite: its low part ∞ − ∞, e^(−x²) 0: no correction
-            var e = Exp(b, -x2) * corr;
-            var tail = (e * Funcs.InvSqrtPi) / f;
+            var tail = ErfcTail(b, ax, x2, Funcs.ErfcDepth32);
             var mid = b.C(x.Kind, 1) - series;
             var two = b.C(x.Kind, 2) - tail;
             var y = b.Select(x < 0, two, tail);

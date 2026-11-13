@@ -9,10 +9,10 @@
 //   Sin, Cos x = k·π/2 + r (π/2 in three parts: the reduction is exact to |x| < 2^20 (f32) / 2^30 (f64)), the series on r
 //   Expm1    e^x − 1 with the constant term left out of the exp polynomial, so small x keep their bits
 //   Tanh     expm1(2x) / (expm1(2x) + 2); Sigmoid 1 / (1 + e^−x)
-//   Erf      the series Σ (−1)^k x^(2k+1) / (k! (2k+1)) · 2/√π for |x| below a bound, else 1 − erfc by the continued
-//            fraction erfc x = e^(−x²)/√π · 1/(x + ½/(x + 1/(x + 3/2/(x + …)))) evaluated bottom-up a fixed depth (the
-//            device; the CPU's f64 lane as a ratio of two recurrences); the CPU's f32 lane takes erfc's tail as
-//            e^(−x²)·t·S(t), t = 1/x, S a polynomial fitted to 3e-9 (ErfcTail32)
+//   Erf      the series Σ (−1)^k x^(2k+1) / (k! (2k+1)) · 2/√π for |x| below a bound, else 1 − erfc; erfc's tail (|x| past
+//            its bound) on the f64 lane e^(−x²)·S(t)/x, t = 1/x, S a polynomial fitted to 6.3e-17 (ErfcTail64), on every
+//            device; on the f32 lane the CPU's e^(−x²)·t·S(t) (ErfcTail32), the device's the continued fraction
+//            erfc x = e^(−x²)/√π · 1/(x + ½/(x + 1/(x + 3/2/(x + …)))) evaluated bottom-up a fixed depth
 using System.Numerics;
 
 namespace Adad.Abstraction;
@@ -54,7 +54,7 @@ public static class Funcs
     public const int ExpTerms32 = 8, ExpTerms64 = 14, AtanhTerms32 = 6, AtanhTerms64 = 12, SinTerms32 = 6, SinTerms64 = 11;
     /// <summary>atan's terms: the first left out is below 2^−26 (f32) and 2^−58 (f64) of the result at tan(π/12).</summary>
     public const int AtanTerms32 = 6, AtanTerms64 = 14;
-    public const int ErfTerms32 = 16, ErfTerms64 = 30, ErfDepth32 = 48, ErfDepth64 = 100;
+    public const int ErfTerms32 = 16, ErfTerms64 = 30, ErfDepth32 = 48;
     public const float ErfBound32 = 1.0f;
     public const double ErfBound64 = 1.5;
 
@@ -66,8 +66,15 @@ public static class Funcs
     public static readonly double[] ErfcTail32 = [0.4823781246814764, -0.11422653907699147, 0.003084741801664283, 0.017759010812733424, -0.013435622651384071, 0.006117608127435746, -0.0013524073877195708, -0.0007986113371849265, 0.0012025644360486776, -0.0006279183665454736, 0.00031967429535662565, -0.0006445173610058078, 0.0003125770636888739, 0.000514276050142984, -0.0004131862318729763, -8.64806258308527e-05, 9.994421419212651e-05];
     public const double ErfcTailSpan = 4.0 / 3.0;
 
+    /// <summary>erfc's tail on the f64 lane, every device: S(t) = x·e^(x²)·erfc x, t = 1/x in [0, 4/3] (x ≥ 0.75), as a polynomial
+    /// in u = 1.5·t − 1 (coefficient k of u^k): S interpolated at the 41 Chebyshev nodes of the interval (S at 40 digits), within
+    /// 6.3e-17 of S everywhere in it (local/erf/fit.py). erfc x = e^(−x²) · S / x: two divisions and 41 multiply-adds where the
+    /// continued fraction took 100 (erf) and 400 (erfc) levels of a division each; against erfc at 30 digits over 72 000
+    /// values of [0.75, 27.3] its worst 3.77 ulp, the fraction's 3.97.</summary>
+    public static readonly double[] ErfcTail64 = [0.4823781246814763, -0.11422655978321611, 0.0030847543971922026, 0.017759999555634187, -0.013436227291945987, 0.0061039438608561725, -0.0013439442141137603, -0.0007147457249016516, 0.0011494978643724041, -0.0008959364314937305, 0.0004948953014102612, -0.00017564271525386842, -9.583498742993935e-06, 8.46848474905137e-05, -9.264468470325167e-05, 7.047224486285331e-05, -4.1537611169995586e-05, 1.6160720426845348e-05, 8.849842502353517e-07, -4.411641125058762e-06, 1.2469865117226472e-06, -1.309613661185913e-05, 2.7484060664809906e-05, 4.612504558563784e-06, -4.704535973536538e-05, -4.140003697812916e-06, 7.9949470856811e-05, -9.712610662098297e-06, -0.00010206542523302866, 3.314851258905504e-05, 9.260281692627065e-05, -4.640796860989371e-05, -5.929970231014169e-05, 4.1383979746813566e-05, 2.336705303566087e-05, -2.3297481387232848e-05, -3.6101198146452892e-06, 7.359089203460391e-06, -6.892050995755141e-07, -9.877323579876705e-07, 2.501299795586983e-07];
+
     /// <summary>erfc keeps 1 − series only where the cancellation is mild (erf below 0.71), and takes the fraction deeper.</summary>
-    public const int ErfcDepth32 = 80, ErfcDepth64 = 400;
+    public const int ErfcDepth32 = 80;
     public const float ErfcBound32 = 0.75f;
     public const double ErfcBound64 = 0.75;
 
@@ -419,24 +426,18 @@ public static class Funcs
         return Vector.ConditionalSelect(Vector.LessThan(x, Vector<double>.Zero), -r, r);
     }
 
-    // The continued fraction f = x + (depth/2) / f, …, down to f = x + ½ / f (f starting at x), as a ratio P / Q: each level
-    // P' = x·P + (d/2)·Q, Q' = P — two multiply-adds, no division — the pair rescaled to (1, Q/P) every 16th level (one
-    // division, the magnitudes held far from overflow) and divided once at the end; x taken at most 28 (e^(−x²) is 0 in
-    // f64 past it: the fraction's value no longer counts).
-    private static Vector<double> Fraction(Vector<double> ax, int depth)
+    // erfc |x| for |x| ≥ 0.75 on the f64 lane: e^(−x²) (x² carried with its rounding, x2lo) · S(u) / x (ErfcTail64); x² infinite:
+    // its low part ∞ − ∞ taken 0, e^(−x²) 0.
+    private static Vector<double> ErfcTail(Vector<double> ax)
     {
-        var a = Vector.Min(ax, new Vector<double>(28.0));
-        var p = a;
-        var q = Vector<double>.One;
-        for (int d = depth; d >= 1; d--)
-        {
-            var np = Vector.FusedMultiplyAdd(a, p, new Vector<double>(d * 0.5) * q);
-            q = p;
-            p = np;
-            if (d % 16 == 1 && d > 1) { q /= p; p = Vector<double>.One; }
-        }
-
-        return p / q;
+        var x2 = ax * ax;
+        var x2lo = Vector.FusedMultiplyAdd(ax, ax, -x2);
+        x2lo = Vector.ConditionalSelect(Vector.Equals(x2lo, x2lo), x2lo, Vector<double>.Zero);
+        var t = Vector<double>.One / ax;
+        var u = Vector.FusedMultiplyAdd(t, new Vector<double>(1.5), -Vector<double>.One);
+        var sp = new Vector<double>(ErfcTail64[^1]);
+        for (int k = ErfcTail64.Length - 2; k >= 0; k--) sp = Vector.FusedMultiplyAdd(sp, u, new Vector<double>(ErfcTail64[k]));
+        return Exps.Exp(-x2) * (Vector<double>.One - x2lo) * sp / ax;
     }
 
     public static Vector<double> Erf(Vector<double> x)
@@ -446,10 +447,7 @@ public static class Funcs
         var series = new Vector<double>(ErfSeries[ErfTerms64 - 1]);
         for (int k = ErfTerms64 - 2; k >= 0; k--) series = Vector.FusedMultiplyAdd(series, x2, new Vector<double>(ErfSeries[k]));
         series *= ax;
-        var f = Fraction(ax, ErfDepth64);
-        var x2lo = Vector.FusedMultiplyAdd(ax, ax, -x2);
-        x2lo = Vector.ConditionalSelect(Vector.Equals(x2lo, x2lo), x2lo, Vector<double>.Zero);  // x² infinite: ∞ − ∞, and e^(−x²) 0
-        var tail = Vector<double>.One - Exps.Exp(-x2) * (Vector<double>.One - x2lo) * new Vector<double>(InvSqrtPi) / f;
+        var tail = Vector<double>.One - ErfcTail(ax);
         var y = Vector.ConditionalSelect(Vector.LessThan(ax, new Vector<double>(ErfBound64)), series, tail);
         y = Vector.Min(y, Vector<double>.One);
         y = Vector.ConditionalSelect(Vector.LessThan(x, Vector<double>.Zero), -y, y);
@@ -463,10 +461,7 @@ public static class Funcs
         var series = new Vector<double>(ErfSeries[ErfTerms64 - 1]);
         for (int k = ErfTerms64 - 2; k >= 0; k--) series = Vector.FusedMultiplyAdd(series, x2, new Vector<double>(ErfSeries[k]));
         series *= x;
-        var f = Fraction(ax, ErfcDepth64);
-        var x2lo = Vector.FusedMultiplyAdd(ax, ax, -x2);
-        x2lo = Vector.ConditionalSelect(Vector.Equals(x2lo, x2lo), x2lo, Vector<double>.Zero);  // x² infinite: ∞ − ∞, and e^(−x²) 0
-        var tail = Exps.Exp(-x2) * (Vector<double>.One - x2lo) * new Vector<double>(InvSqrtPi) / f;
+        var tail = ErfcTail(ax);
         var y = Vector.ConditionalSelect(Vector.LessThan(ax, new Vector<double>(ErfcBound64)), Vector<double>.One - series,
             Vector.ConditionalSelect(Vector.LessThan(x, Vector<double>.Zero), new Vector<double>(2.0) - tail, tail));
         return Vector.ConditionalSelect(Vector.Equals(x, x), y, x);
@@ -474,34 +469,38 @@ public static class Funcs
 
     // ---------------------------------------------------------------- f64 erf and erfc four vectors at a time
     // The same arithmetic as Erf and Erfc above, lane for lane and step for step, over four vectors side by side: their
-    // series and continued fractions are chains of dependent multiply-adds hundreds long, so one vector at a time runs at
-    // the multiply-add's latency; four chains in step run at its throughput. Every value is the one Erf or Erfc gives
-    // (Checks.ErfFour proves it bit for bit).
+    // series and tails are chains of dependent multiply-adds, so one vector at a time runs at the multiply-add's latency;
+    // four chains in step run at its throughput. Every value is the one Erf or Erfc gives (Checks.ErfFour proves it bit
+    // for bit).
 
-    // Fraction for four vectors: each its own P, Q, rescaled at the same levels.
-    private static void Fraction4(Vector<double> x0, Vector<double> x1, Vector<double> x2, Vector<double> x3, int depth,
-        out Vector<double> f0, out Vector<double> f1, out Vector<double> f2, out Vector<double> f3)
+    // ErfcTail for four vectors, their polynomials' steps in turn.
+    private static void ErfcTail4(Vector<double> a0, Vector<double> a1, Vector<double> a2, Vector<double> a3,
+        out Vector<double> t0, out Vector<double> t1, out Vector<double> t2, out Vector<double> t3)
     {
-        var top = new Vector<double>(28.0);
-        Vector<double> a0 = Vector.Min(x0, top), a1 = Vector.Min(x1, top), a2 = Vector.Min(x2, top), a3 = Vector.Min(x3, top);
-        Vector<double> p0 = a0, p1 = a1, p2 = a2, p3 = a3;
-        Vector<double> q0 = Vector<double>.One, q1 = q0, q2 = q0, q3 = q0;
-        for (int d = depth; d >= 1; d--)
+        var one = Vector<double>.One;
+        var c15 = new Vector<double>(1.5);
+        Vector<double> u0 = Vector.FusedMultiplyAdd(one / a0, c15, -one), u1 = Vector.FusedMultiplyAdd(one / a1, c15, -one);
+        Vector<double> u2 = Vector.FusedMultiplyAdd(one / a2, c15, -one), u3 = Vector.FusedMultiplyAdd(one / a3, c15, -one);
+        Vector<double> p0 = new(ErfcTail64[^1]), p1 = p0, p2 = p0, p3 = p0;
+        for (int k = ErfcTail64.Length - 2; k >= 0; k--)
         {
-            // Each chain's P' = x·P + (d/2)·Q, Q' = P, one chain after the other (fourteen vectors live: no spill).
-            var h = new Vector<double>(d * 0.5);
-            var t = h * q0; q0 = p0; p0 = Vector.FusedMultiplyAdd(a0, p0, t);
-            t = h * q1; q1 = p1; p1 = Vector.FusedMultiplyAdd(a1, p1, t);
-            t = h * q2; q2 = p2; p2 = Vector.FusedMultiplyAdd(a2, p2, t);
-            t = h * q3; q3 = p3; p3 = Vector.FusedMultiplyAdd(a3, p3, t);
-            if (d % 16 == 1 && d > 1)
-            {
-                q0 /= p0; q1 /= p1; q2 /= p2; q3 /= p3;
-                p0 = p1 = p2 = p3 = Vector<double>.One;
-            }
+            var c = new Vector<double>(ErfcTail64[k]);
+            p0 = Vector.FusedMultiplyAdd(p0, u0, c);
+            p1 = Vector.FusedMultiplyAdd(p1, u1, c);
+            p2 = Vector.FusedMultiplyAdd(p2, u2, c);
+            p3 = Vector.FusedMultiplyAdd(p3, u3, c);
         }
 
-        f0 = p0 / q0; f1 = p1 / q1; f2 = p2 / q2; f3 = p3 / q3;
+        t0 = Scaled(a0, p0); t1 = Scaled(a1, p1); t2 = Scaled(a2, p2); t3 = Scaled(a3, p3);
+    }
+
+    // e^(−x²) · (1 − x2lo) · sp / x: ErfcTail's last steps from its polynomial's value.
+    private static Vector<double> Scaled(Vector<double> ax, Vector<double> sp)
+    {
+        var x2 = ax * ax;
+        var x2lo = Vector.FusedMultiplyAdd(ax, ax, -x2);
+        x2lo = Vector.ConditionalSelect(Vector.Equals(x2lo, x2lo), x2lo, Vector<double>.Zero);
+        return Exps.Exp(-x2) * (Vector<double>.One - x2lo) * sp / ax;
     }
 
     // The f64 series Σ ErfSeries[k]·x2^k (ErfTerms64 terms) for four vectors.
@@ -519,29 +518,22 @@ public static class Funcs
         }
     }
 
-    // Erf's or Erfc's last steps for one vector, from its series sum (not yet times x) and its fraction.
-    private static Vector<double> ErfFrom(Vector<double> x, Vector<double> series, Vector<double> f)
+    // Erf's or Erfc's last steps for one vector, from its series sum (not yet times x) and its tail (ErfcTail's value).
+    private static Vector<double> ErfFrom(Vector<double> x, Vector<double> series, Vector<double> erfcTail)
     {
         var ax = Vector.Abs(x);
-        var x2 = ax * ax;
         series *= ax;
-        var x2lo = Vector.FusedMultiplyAdd(ax, ax, -x2);
-        x2lo = Vector.ConditionalSelect(Vector.Equals(x2lo, x2lo), x2lo, Vector<double>.Zero);
-        var tail = Vector<double>.One - Exps.Exp(-x2) * (Vector<double>.One - x2lo) * new Vector<double>(InvSqrtPi) / f;
+        var tail = Vector<double>.One - erfcTail;
         var y = Vector.ConditionalSelect(Vector.LessThan(ax, new Vector<double>(ErfBound64)), series, tail);
         y = Vector.Min(y, Vector<double>.One);
         y = Vector.ConditionalSelect(Vector.LessThan(x, Vector<double>.Zero), -y, y);
         return Vector.ConditionalSelect(Vector.Equals(x, x), y, x);
     }
 
-    private static Vector<double> ErfcFrom(Vector<double> x, Vector<double> series, Vector<double> f)
+    private static Vector<double> ErfcFrom(Vector<double> x, Vector<double> series, Vector<double> tail)
     {
         var ax = Vector.Abs(x);
-        var x2 = ax * ax;
         series *= x;
-        var x2lo = Vector.FusedMultiplyAdd(ax, ax, -x2);
-        x2lo = Vector.ConditionalSelect(Vector.Equals(x2lo, x2lo), x2lo, Vector<double>.Zero);
-        var tail = Exps.Exp(-x2) * (Vector<double>.One - x2lo) * new Vector<double>(InvSqrtPi) / f;
         var y = Vector.ConditionalSelect(Vector.LessThan(ax, new Vector<double>(ErfcBound64)), Vector<double>.One - series,
             Vector.ConditionalSelect(Vector.LessThan(x, Vector<double>.Zero), new Vector<double>(2.0) - tail, tail));
         return Vector.ConditionalSelect(Vector.Equals(x, x), y, x);
@@ -552,7 +544,7 @@ public static class Funcs
     {
         Vector<double> a0 = Vector.Abs(x0), a1 = Vector.Abs(x1), a2 = Vector.Abs(x2), a3 = Vector.Abs(x3);
         Series4(a0 * a0, a1 * a1, a2 * a2, a3 * a3, out var s0, out var s1, out var s2, out var s3);
-        Fraction4(a0, a1, a2, a3, ErfDepth64, out var f0, out var f1, out var f2, out var f3);
+        ErfcTail4(a0, a1, a2, a3, out var f0, out var f1, out var f2, out var f3);
         x0 = ErfFrom(x0, s0, f0); x1 = ErfFrom(x1, s1, f1); x2 = ErfFrom(x2, s2, f2); x3 = ErfFrom(x3, s3, f3);
     }
 
@@ -561,7 +553,7 @@ public static class Funcs
     {
         Vector<double> a0 = Vector.Abs(x0), a1 = Vector.Abs(x1), a2 = Vector.Abs(x2), a3 = Vector.Abs(x3);
         Series4(a0 * a0, a1 * a1, a2 * a2, a3 * a3, out var s0, out var s1, out var s2, out var s3);
-        Fraction4(a0, a1, a2, a3, ErfcDepth64, out var f0, out var f1, out var f2, out var f3);
+        ErfcTail4(a0, a1, a2, a3, out var f0, out var f1, out var f2, out var f3);
         x0 = ErfcFrom(x0, s0, f0); x1 = ErfcFrom(x1, s1, f1); x2 = ErfcFrom(x2, s2, f2); x3 = ErfcFrom(x3, s3, f3);
     }
 
