@@ -211,10 +211,18 @@ since on the build that changed them: the CUDA box losses (8db7cc0 forward, 2268
 rows (03a6098, erf and erfc in float64 by a fitted tail instead of the continued fraction, at no worse error). Rows
 re-timed on their own build in one exclusive job of 3 rounds: 11 CUDA rows (off their earlier reading or at a lower
 memory clock) and the 226 CPU rows that read more than 10 % off the CPU's previous table. Where a re-time and its
-readout disagree by more than 10 % (77 CPU rows) the cell carries the reading less favourable to Adad, both subjects
-from that process. `docs/wip/baseline.md` is that assembled file: every row, its builds, and notes naming each re-timed
-or re-measured row. Device bandwidth rows follow the driver's memory P-state (a row timed at P3 reads up to about 1.9×
-its P1 time); setting "Prefer maximum performance" for dotnet.exe in the NVIDIA control panel gives stable readings.
+readout disagree by more than 10 % (77 CPU rows), two kinds are told apart. Where the re-time's three processes agree
+with each other within 10 % and no other process reads the readout's level, the reading is the readout's process alone
+(59 rows): the cell takes the re-time's medians, and the notes name the readout's reading. Where the re-time's processes
+disagree with each other, or a 390-row long-process probe read the row as the readout did, the row reads at two levels
+(18 rows): the cell carries the reading less favourable to Adad, both subjects from that process. The CPU rows of the
+operations changed since (the recurrent steps, the composed attention, the max-pool backwards and scatter_add_rows,
+whose temporaries are now kept instead of allocated each call) are re-timed on build d56a2f3, which carries that change,
+both subjects, in one exclusive job of 3 rounds (182 rows); where its three processes disagree by more than 10 % (17
+rows) the cell carries the one less favourable to Adad. `docs/wip/baseline.md` is that assembled file: every row, its
+builds, and notes naming each re-timed or re-measured row. Device bandwidth rows follow the driver's memory P-state (a
+row timed at P3 reads up to about 1.9× its P1 time); setting "Prefer maximum performance" for dotnet.exe in the NVIDIA
+control panel gives stable readings.
 
 The columns shown here are the `INumberBase<T>` version (`number`, — where .NET has no such type) and Adad. Times are
 medians in ms. Every subject's error is against float64 math (products in double-double). On the core rows Adad's error
@@ -289,8 +297,8 @@ subject's error stands beside its time. The narrow floats, the sub-byte integers
 | rows | 18 | 180 | — | 180 | — |
 | layout and indexing | 23 | 422 | — | 422 | — |
 | products on views | 8 | 156 | — | 156 | — |
-| attention | 8 | 80 | 1.25× (ahead on 2 of 3) | 80 | 1.73× (ahead on 3 of 3) |
-| optimizers | 5 | 50 | 1.17× (ahead on 7 of 15) | 50 | 1.33× (ahead on 11 of 15) |
+| attention | 8 | 80 | 1.25× (ahead on 2 of 3) | 80 | 1.98× (ahead on 3 of 3) |
+| optimizers | 5 | 50 | 1.17× (ahead on 7 of 15) | 50 | 1.39× (ahead on 12 of 15) |
 | convolution | 2 | 44 | 2.72× (ahead on 22 of 22) | 44 | 13.29× (ahead on 22 of 22) |
 | recurrent | 8 | 72 | — | 72 | — |
 | routing, losses | 8 | 86 | 1.33× (ahead on 4 of 6) | 86 | 4.19× (ahead on 6 of 6) |
