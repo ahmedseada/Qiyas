@@ -215,14 +215,14 @@ internal static partial class Ptx
         string union = e.Sub(e.Add(e.Mul(wp, hp), e.Mul(wg, hg)), inter), ue = e.Add(union, eps), iou = e.Div(inter, ue);
         string loss = e.Sub(one, iou);
         string cw = e.Sub(e.Max(x2, gx2), e.Min(x1, gx1)), ch = e.Sub(e.Max(y2, gy2), e.Min(y1, gy1));
-        // The loss first; the derivative's terms (their divisions among them) only for the backward: emitted for a loss
-        // alone they cost a float64 row its divisions' time (ptxas keeps a division's slow path).
+        // The loss's own terms only for a loss, the derivative's (their divisions among them) only for the backward: emitted
+        // where unused they cost a float64 row their divisions' time (ptxas keeps a division's slow path).
         string area = "", ae = "", diag = "", dx = "", dy = "", rho = "", diff = "", af = "", alpha = "";
         if (overlap == BoxOverlap.GIoU)
         {
             area = e.Mul(cw, ch);
             ae = e.Add(area, eps);
-            loss = e.Add(loss, e.Div(e.Sub(area, union), ae));
+            if (!backward) loss = e.Add(loss, e.Div(e.Sub(area, union), ae));
         }
         else if (overlap is BoxOverlap.DIoU or BoxOverlap.CIoU)
         {
@@ -230,14 +230,14 @@ internal static partial class Ptx
             dx = e.Mul(e.Add(e.Sub(x1, gx1), e.Sub(x2, gx2)), half);
             dy = e.Mul(e.Add(e.Sub(y1, gy1), e.Sub(y2, gy2)), half);
             rho = e.Add(e.Mul(dx, dx), e.Mul(dy, dy));
-            loss = e.Add(loss, e.Div(rho, diag));
+            if (!backward) loss = e.Add(loss, e.Div(rho, diag));
             if (overlap == BoxOverlap.CIoU)
             {
                 diff = e.Sub(e.Atan(e.Div(wg, hg)), e.Atan(e.Div(wp, hp)));
                 af = e.C(Boxes.AspectFactor);
                 string v = e.Mul(e.Mul(af, diff), diff);
                 alpha = e.Div(v, e.Add(e.Add(e.Sub(one, iou), v), eps));
-                loss = e.Add(loss, e.Mul(alpha, v));
+                if (!backward) loss = e.Add(loss, e.Mul(alpha, v));
             }
         }
 
