@@ -150,6 +150,10 @@ internal sealed partial class Kernels
     private readonly struct LogTopKBody<TN, TLane, TL>(byte[] x, int cols, int k, byte[] values, int[] indices, bool lanes) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
+        // At the final tier from the first call and never inlined into the team's trampoline. Under the runtime's profile its
+        // tier-1 code took the row passes in and read the narrow floats 1.15-1.35x slower than this (bfloat16 12.5 ms
+        // against 9.4, float16 12.6 against 10.9).
+        [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
         public void Run(int first, int last)
         {
             var pool = ArrayPool<TLane>.Shared;
@@ -276,6 +280,10 @@ internal sealed partial class Kernels
     private struct CrossEntropyBody<TN, TLane, TL>(byte[] x, int cols, int[] targets, TLane[] losses) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
+        // At the final tier from the first call and never inlined into the team's trampoline. Under the runtime's profile its
+        // tier-1 code took the row passes in (5253 bytes against 715 without the profile) and read bfloat16 1.35x slower than
+        // this (12.4 ms against 9.2).
+        [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
         public readonly void Run(int first, int last)
         {
             var pool = ArrayPool<TLane>.Shared;
@@ -325,8 +333,10 @@ internal sealed partial class Kernels
     {
         // At the final tier from the first call, its running sum compared as the lane's own numbers: its tier-1 code with
         // the runtime's profile (and Widths.Compare's, a call a column) read float16 and bfloat16 1.6-1.7x slower than
-        // without one (9.1 ms against 5.4 for float16).
-        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        // without one (9.1 ms against 5.4 for float16). Never inlined into the team's trampoline either: the trampoline's
+        // tier-1 code under the profile took this body in (2463 bytes against a 6-byte jump without it) and read 1.15-1.2x
+        // slower than this (bfloat16 5.18 ms against 4.49, q8_0 6.43 against 5.28).
+        [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
         public readonly void Run(int first, int last)
         {
             var pool = ArrayPool<TLane>.Shared;
