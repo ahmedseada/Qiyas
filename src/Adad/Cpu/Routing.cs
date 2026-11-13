@@ -374,13 +374,93 @@ internal sealed partial class Kernels
     /// outside [0, buckets) in no bucket, the order −1 past the sources placed (IRouting.Route).</summary>
     public static void Route(int[] index, int buckets, int[] counts, int[] offsets, int[] order)
     {
-        Array.Clear(counts);
-        foreach (int i in index) if ((uint)i < (uint)buckets) counts[i]++;
-        offsets[0] = 0;
-        for (int b = 0; b < buckets; b++) offsets[b + 1] = offsets[b] + counts[b];
-        var cursor = new int[buckets];
-        Array.Copy(offsets, cursor, buckets);
-        for (int i = 0; i < index.Length; i++) if ((uint)index[i] < (uint)buckets) order[cursor[index[i]]++] = i;
-        order.AsSpan(offsets[buckets], index.Length - offsets[buckets]).Fill(-1);
+        // On the team: each task counts a slice of the sources into its own run of counts, then a pass over the buckets
+        // turns them into each task's cursor in each bucket (a bucket's tasks in slice order; at most half as many counts as
+        // sources, so that pass stays short), then each task places its slice. A bucket holds its sources in source order,
+        // as one pass placing them in turn would: the same counts, offsets and order. On one thread the placement's
+        // scattered writes ran at that one core's caches: 65 536 buckets took 2.2 ms with the thread throttled (efficiency
+        // cores) and 4.0 with it at full speed (measured).
+        int n = index.Length;
+        int tasks = Math.Min(Math.Min(Threads, n / RouteSlice), Math.Min(64, Math.Max(1, n / Math.Max(1, 2 * buckets))));
+        if (tasks <= 1)
+        {
+            Array.Clear(counts);
+            foreach (int i in index) if ((uint)i < (uint)buckets) counts[i]++;
+            offsets[0] = 0;
+            for (int b = 0; b < buckets; b++) offsets[b + 1] = offsets[b] + counts[b];
+            var cursor = new int[buckets];
+            Array.Copy(offsets, cursor, buckets);
+            for (int i = 0; i < n; i++) if ((uint)index[i] < (uint)buckets) order[cursor[index[i]]++] = i;
+            order.AsSpan(offsets[buckets], n - offsets[buckets]).Fill(-1);
+            return;
+        }
+
+        int slice = (n + tasks - 1) / tasks;
+        var cells = ArrayPool<int>.Shared.Rent(buckets * tasks);
+        try
+        {
+            Team.For(tasks, 1, (long)n * 4, new RouteCount(index, buckets, tasks, slice, cells));
+            // cells[t·buckets + b]: task t's count in bucket b, then its first place there.
+            offsets[0] = 0;
+            int at = 0;
+            for (int b = 0; b < buckets; b++)
+            {
+                int start = at;
+                for (int t = 0; t < tasks; t++)
+                {
+                    int c = cells[t * buckets + b];
+                    cells[t * buckets + b] = at;
+                    at += c;
+                }
+
+                counts[b] = at - start;
+                offsets[b + 1] = at;
+            }
+
+            Team.For(tasks, 1, (long)n * 4, new RoutePlace(index, buckets, tasks, slice, cells, order));
+            order.AsSpan(offsets[buckets], n - offsets[buckets]).Fill(-1);
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(cells);
+        }
+    }
+
+    // Route's team: a task at least this many sources.
+    private const int RouteSlice = 1 << 15;
+
+    private readonly struct RouteCount(int[] index, int buckets, int tasks, int slice, int[] cells) : Team.IBody
+    {
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public void Run(int first, int last)
+        {
+            for (int t = first; t < last; t++)
+            {
+                cells.AsSpan(t * buckets, buckets).Clear();
+                int end = Math.Min(index.Length, (t + 1) * slice);
+                for (int i = t * slice; i < end; i++)
+                {
+                    int k = index[i];
+                    if ((uint)k < (uint)buckets) cells[t * buckets + k]++;
+                }
+            }
+        }
+    }
+
+    private readonly struct RoutePlace(int[] index, int buckets, int tasks, int slice, int[] cells, int[] order) : Team.IBody
+    {
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public void Run(int first, int last)
+        {
+            for (int t = first; t < last; t++)
+            {
+                int end = Math.Min(index.Length, (t + 1) * slice);
+                for (int i = t * slice; i < end; i++)
+                {
+                    int k = index[i];
+                    if ((uint)k < (uint)buckets) order[cells[t * buckets + k]++] = i;
+                }
+            }
+        }
     }
 }
