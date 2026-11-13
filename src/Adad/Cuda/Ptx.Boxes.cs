@@ -215,31 +215,48 @@ internal static partial class Ptx
         string union = e.Sub(e.Add(e.Mul(wp, hp), e.Mul(wg, hg)), inter), ue = e.Add(union, eps), iou = e.Div(inter, ue);
         string loss = e.Sub(one, iou);
         string cw = e.Sub(e.Max(x2, gx2), e.Min(x1, gx1)), ch = e.Sub(e.Max(y2, gy2), e.Min(y1, gy1));
+        // The loss first; the derivative's terms (their divisions among them) only for the backward: emitted for a loss
+        // alone they cost a float64 row its divisions' time (ptxas keeps a division's slow path).
+        string area = "", ae = "", diag = "", dx = "", dy = "", rho = "", diff = "", af = "", alpha = "";
+        if (overlap == BoxOverlap.GIoU)
+        {
+            area = e.Mul(cw, ch);
+            ae = e.Add(area, eps);
+            loss = e.Add(loss, e.Div(e.Sub(area, union), ae));
+        }
+        else if (overlap is BoxOverlap.DIoU or BoxOverlap.CIoU)
+        {
+            diag = e.Add(e.Add(e.Mul(cw, cw), e.Mul(ch, ch)), eps);
+            dx = e.Mul(e.Add(e.Sub(x1, gx1), e.Sub(x2, gx2)), half);
+            dy = e.Mul(e.Add(e.Sub(y1, gy1), e.Sub(y2, gy2)), half);
+            rho = e.Add(e.Mul(dx, dx), e.Mul(dy, dy));
+            loss = e.Add(loss, e.Div(rho, diag));
+            if (overlap == BoxOverlap.CIoU)
+            {
+                diff = e.Sub(e.Atan(e.Div(wg, hg)), e.Atan(e.Div(wp, hp)));
+                af = e.C(Boxes.AspectFactor);
+                string v = e.Mul(e.Mul(af, diff), diff);
+                alpha = e.Div(v, e.Add(e.Add(e.Sub(one, iou), v), eps));
+                loss = e.Add(loss, e.Mul(alpha, v));
+            }
+        }
+
+        if (!backward) return (loss, "", "", "", "");
         string dInter = e.Neg(e.Div(one, ue)), dUnion = e.Div(iou, ue);
         string dCw = zero, dCh = zero, dPx = zero, dPy = zero, dW = zero, dH = zero;
         if (overlap == BoxOverlap.GIoU)
         {
-            string area = e.Mul(cw, ch), ae = e.Add(area, eps);
-            loss = e.Add(loss, e.Div(e.Sub(area, union), ae));
             dUnion = e.Sub(dUnion, e.Div(one, ae));
             string dArea = e.Div(ue, e.Mul(ae, ae));
             (dCw, dCh) = (e.Mul(dArea, ch), e.Mul(dArea, cw));
         }
         else if (overlap is BoxOverlap.DIoU or BoxOverlap.CIoU)
         {
-            string diag = e.Add(e.Add(e.Mul(cw, cw), e.Mul(ch, ch)), eps);
-            string dx = e.Mul(e.Add(e.Sub(x1, gx1), e.Sub(x2, gx2)), half), dy = e.Mul(e.Add(e.Sub(y1, gy1), e.Sub(y2, gy2)), half);
-            string rho = e.Add(e.Mul(dx, dx), e.Mul(dy, dy));
-            loss = e.Add(loss, e.Div(rho, diag));
             (dPx, dPy) = (e.Div(e.Mul(two, dx), diag), e.Div(e.Mul(two, dy), diag));
             string dDiag = e.Neg(e.Div(rho, e.Mul(diag, diag)));
             (dCw, dCh) = (e.Mul(e.Mul(two, dDiag), cw), e.Mul(e.Mul(two, dDiag), ch));
             if (overlap == BoxOverlap.CIoU)
             {
-                string diff = e.Sub(e.Atan(e.Div(wg, hg)), e.Atan(e.Div(wp, hp))), af = e.C(Boxes.AspectFactor);
-                string v = e.Mul(e.Mul(af, diff), diff);
-                string alpha = e.Div(v, e.Add(e.Add(e.Sub(one, iou), v), eps));
-                loss = e.Add(loss, e.Mul(alpha, v));
                 string held = e.Sub(one, e.Mul(alpha, alpha));             // ∂(α·v)/∂IoU = α², ∂(α·v)/∂v = α·(2 − α)
                 (dInter, dUnion) = (e.Mul(dInter, held), e.Mul(dUnion, held));
                 string k = e.Div(e.Mul(e.Mul(e.Mul(two, af), e.Mul(alpha, e.Sub(two, alpha))), diff), e.Add(e.Mul(wp, wp), e.Mul(hp, hp)));
@@ -247,7 +264,6 @@ internal static partial class Ptx
             }
         }
 
-        if (!backward) return (loss, "", "", "", "");
         dInter = e.Sub(dInter, dUnion);
         dW = e.Add(dW, e.Mul(dUnion, hp));
         dH = e.Add(dH, e.Mul(dUnion, wp));
