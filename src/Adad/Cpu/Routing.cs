@@ -323,6 +323,10 @@ internal sealed partial class Kernels
     private struct SampleBody<TN, TLane, TL>(byte[] x, int cols, byte[] u, int[] picks) : Team.IBody
         where TN : struct, IAdad<TN, TLane> where TLane : unmanaged where TL : struct, IFloatLane<TL, TLane>
     {
+        // At the final tier from the first call, its running sum compared as the lane's own numbers: its tier-1 code with
+        // the runtime's profile (and Widths.Compare's, a call a column) read float16 and bfloat16 1.6-1.7x slower than
+        // without one (9.1 ms against 5.4 for float16).
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public readonly void Run(int first, int last)
         {
             var pool = ArrayPool<TLane>.Shared;
@@ -352,13 +356,17 @@ internal sealed partial class Kernels
                     double t = LaneValue(total);
                     int pick = -1;
                     if (t > 0 && !double.IsPositiveInfinity(t) && !double.IsNaN(LaneValue(target)))
+                    {
+                        // No NaN here (the total is finite, the weights taken positive), so "past" is the lane's own >.
+                        double goal = LaneValue(target);
                         for (int c = 0; c < cols; c++)
                         {
                             if (!(LaneValue(row[c]) > 0)) continue;
                             pick = c;
                             run = TL.Add(run, row[c]);
-                            if (Widths.Compare(run, target) > 0) break;
+                            if (LaneValue(run) > goal) break;
                         }
+                    }
 
                     picks[r] = pick;
                 }
