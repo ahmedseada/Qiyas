@@ -1091,8 +1091,28 @@ internal static class VulkanLimits
         string across = $"{PeakGroups} workgroups × {Threads} invocations";
         foreach (var (lane, k) in Scalar)
         {
-            if (k == K.F64 && !vk.Float64) continue;
+            if (k == K.F64 && !vk.Float64 || k == K.F16 && !vk.Float16) continue;
             if (Peak(vk, k) is { } p) lanes.Add((lane, p.Rate, $"{p.Form}, {across}"));
+        }
+
+        // The packed 8-bit dot product where the device says it is accelerated, four multiply-adds an instruction.
+        foreach (var (lane, signed, has) in new[] { ("s8dp", true, vk.IntDot8Signed), ("u8dp", false, vk.IntDot8Unsigned) })
+        {
+            if (has && DotPeak(vk, signed) is { } r) lanes.Add((lane, r, $"dot4x8 c*c + b, 8 chains, {across}"));
+        }
+
+        // Each kind of the matrix units the device lists, by Adad's kinds (A's and B's component, the accumulator's); a
+        // kind with several shapes keeps the fastest.
+        foreach (var (lane, ab, c) in new[] { ("f16mma", "f16", "f32"), ("bf16mma", "bf16", "f32"), ("s8mma", "s8", "s32"), ("u8mma", "u8", "u32") })
+        {
+            foreach (var unit in vk.CooperativeMatrices.Where(u => u.A == ab && u.B == ab && u.C == c && u.Result == c))
+            {
+                if (UnitPeak(vk, unit) is not { } r) continue;
+                int at = lanes.FindIndex(l => l.Item1 == lane);
+                string say = $"{unit.M}x{unit.N}x{unit.K}, a subgroup's, {across}";
+                if (at < 0) lanes.Add((lane, r, say));
+                else if (r > lanes[at].Item2) lanes[at] = (lane, r, say);
+            }
         }
 
         var reads = Refined(Limits.Curve(Read, 4L << 30, [], 1), Read);
@@ -1327,7 +1347,7 @@ internal static class VulkanLimits
     // Adad's lanes on the device (Kinds: the lanes its kernels compute in) by the names the rows report them.
     private static readonly (string Lane, K Kind)[] Scalar =
     [
-        ("f64", K.F64), ("f32", K.F32), ("s64", K.S64), ("u64", K.U64), ("s32", K.S32), ("u32", K.U32),
+        ("f64", K.F64), ("f32", K.F32), ("f16", K.F16), ("s64", K.S64), ("u64", K.U64), ("s32", K.S32), ("u32", K.U32),
     ];
 
     // Thirty-two multiply-adds an invocation a trip, in one of two forms. Chains: eight independent chains unrolled four
@@ -1339,15 +1359,20 @@ internal static class VulkanLimits
     private static SpvKernel PeakKernel(Vulkan vk, K k, bool tile)
     {
         var b = new Spv($"limits_{k}{(tile ? "_tile" : "")}", Threads, vk.Controls);
-        V o = b.Arg(0), trips = b.Arg(1, K.U32), fa = b.Arg(2, k), fb = b.Arg(3, k);
+        V o = b.Arg(0), trips = b.Arg(1, K.U32);
+        // An f16 lane's a and b come as f32 (an argument slot holds 32 or 64 bits), rounded to f16 once.
+        V fa = k == K.F16 ? b.Convert(b.Arg(2, K.F32), k) : b.Arg(2, k), fb = k == K.F16 ? b.Convert(b.Arg(3, K.F32), k) : b.Arg(3, k);
         bool f = Kinds.IsFloat(k);
         var id = b.GlobalX;
         var c = new Var[8];
-        for (int j = 0; j < 8; j++) c[j] = b.Local(f ? id.To(k) * 1e-9 + 0.1 * (j + 1) : id.To(k) + (double)(2 * j + 1));
+        // A float's values start near 0.1·(j + 1), offset by the invocation's index where the lane holds it finely (f16 holds
+        // an index past 65504 as infinite: its start is the value alone).
+        V Start(double v) => k == K.F16 ? b.C(k, v) : id.To(k) * 1e-12 + v;
+        for (int j = 0; j < 8; j++) c[j] = b.Local(f ? Start(0.1 * (j + 1)) : id.To(k) + (double)(2 * j + 1));
         var x = new V[4];
         var y = new V[2];
-        for (int i = 0; tile && i < 4; i++) x[i] = id.To(k) * 1e-12 + (0.5 + 0.01 * i);
-        for (int j = 0; tile && j < 2; j++) y[j] = id.To(k) * 1e-12 + (0.25 + 0.01 * j);
+        for (int i = 0; tile && i < 4; i++) x[i] = Start(0.5 + 0.01 * i);
+        for (int j = 0; tile && j < 2; j++) y[j] = Start(0.25 + 0.01 * j);
         b.For(b.U(0), trips, _ =>
         {
             for (int u = 0; u < 4; u++)
@@ -1381,7 +1406,7 @@ internal static class VulkanLimits
         ulong output = Rent(vk, (long)PeakGroups * Threads * 8);
         if (output == 0) return null;
         bool fl = Kinds.IsFloat(k);
-        ulong a = fl ? (k == K.F64 ? Vulkan.D(0.999) : Vulkan.F(0.999f)) : 3, c = fl ? (k == K.F64 ? Vulkan.D(1e-3) : Vulkan.F(1e-3f)) : 7;
+        ulong a = fl ? Lit(k, 0.999) : 3, c = fl ? Lit(k, 1e-3) : 7;
         try
         {
             double Pass(uint trips)
@@ -1405,4 +1430,137 @@ internal static class VulkanLimits
             vk.Release(output);
         }
     }
+
+    // A float lane's argument in its slot (Spv.Arg reads a float's bits from the slot's low bits).
+    private static ulong Lit(K k, double v) => k switch
+    {
+        K.F64 => Vulkan.D(v),
+        _ => Vulkan.F((float)v),
+    };
+
+    // Times launches of `make`'s kernel over PeakGroups workgroups whose trips do `perTrip` multiply-adds an invocation:
+    // trips for about 20 ms from a short launch's time, then the median of five launches' rates; null where the device
+    // refuses the kernel.
+    private static double? Rate(Vulkan vk, string key, Vulkan.Maker make, double perTrip, Func<uint, ulong[]> args)
+    {
+        (ulong, SpvKernel) f;
+        try { f = vk.Cached(key, make); }
+        catch (Exception e) when (e is NotSupportedException or InvalidOperationException) { return null; }
+        double Pass(uint trips)
+        {
+            long start = Stopwatch.GetTimestamp();
+            vk.Launch(f, PeakGroups, 1, args(trips));
+            vk.Synchronize();
+            return Stopwatch.GetElapsedTime(start).TotalSeconds;
+        }
+
+        uint probe = 16;
+        Pass(probe);
+        double secs = Math.Max(Pass(probe), 1e-6);
+        uint trips = (uint)Math.Clamp(probe * 0.02 / secs, probe, 1 << 24);
+        double work = (double)PeakGroups * Threads * trips * perTrip;
+        return Limits.Median(() => work / Pass(trips));
+    }
+
+    // Eight chains an invocation of the packed dot product, unrolled four times a trip: c = dot(c's four bytes, c's) + b
+    // (CUDA's dp4a c, c, c, b: no product to fold). Slots: output, trips, b.
+    private static SpvKernel DotKernel(Vulkan vk, bool signed)
+    {
+        var b = new Spv($"limits_dot_{(signed ? "s" : "u")}8", Threads, vk.Controls);
+        V o = b.Arg(0), trips = b.Arg(1, K.U32);
+        var k = signed ? K.S32 : K.U32;
+        var add = b.Arg(2, k);
+        var id = b.GlobalX;
+        var c = new Var[8];
+        for (int j = 0; j < 8; j++) c[j] = b.Local(b.Bitcast(id * 2654435761.0 + (double)(j * 40503 + 1), k));
+        b.For(b.U(0), trips, _ =>
+        {
+            for (int u = 0; u < 4; u++)
+                for (int j = 0; j < 8; j++) c[j].V = b.Dot4x8(c[j].V, c[j].V, signed, signed) + add;
+        });
+        var sum = c[0].V;
+        for (int j = 1; j < 8; j++) sum += c[j].V;
+        b.Store(b.At(o, id, 4), sum);
+        return b.Build();
+    }
+
+    private static double? DotPeak(Vulkan vk, bool signed)
+    {
+        ulong output = Rent(vk, (long)PeakGroups * Threads * 4);
+        if (output == 0) return null;
+        try { return Rate(vk, $"limits_dot_{signed}", () => DotKernel(vk, signed), 32 * 4, trips => [output, trips, 7]); }
+        finally { vk.Release(output); }
+    }
+
+    private static K UnitKind(string name) => name switch
+    {
+        "f16" => K.F16,
+        "bf16" => K.BF16,
+        "f32" => K.F32,
+        "s8" => K.S8,
+        "u8" => K.U8,
+        "s32" => K.S32,
+        _ => K.U32,
+    };
+
+    // A subgroup's four accumulators of the units' multiply-add, four steps a trip: acc_j = A·B + acc_j, B loaded from
+    // memory once, A each trip from one of two tiles by the trip's parity (with a fixed A·B a compiler may compute an
+    // integer kind's product once outside the loop and add it). The accumulators' sum stored where every subgroup stores
+    // it (the stores cannot be dropped; their values are not read). Slots: A's two tiles, B, output, trips.
+    private static SpvKernel UnitKernel(Vulkan vk, CooperativeMatrix unit)
+    {
+        K ka = UnitKind(unit.A), kc = UnitKind(unit.C);
+        var b = new Spv($"limits_mma_{unit.A}_{unit.C}_{unit.M}x{unit.N}x{unit.K}", Threads, vk.Controls);
+        V pa = b.Arg(0), pb = b.Arg(1), po = b.Arg(2), trips = b.Arg(3, K.U32);
+        var ta = b.Coop(ka, unit.M, unit.K, Use.A);
+        var tb = b.Coop(ka, unit.K, unit.N, Use.B);
+        var tc = b.Coop(kc, unit.M, unit.N, Use.Accumulator);
+        int bytes = ka.Bytes();
+        var mb = b.Load(tb, ka, pb, b.U(unit.N), false, 16);
+        var acc = new MVar[4];
+        for (int j = 0; j < 4; j++) acc[j] = b.Local(b.Fill(tc, 0));
+        b.For(b.U(0), trips, t =>
+        {
+            var ma = b.Load(ta, ka, pa + b.Convert(t & 1UL, K.U64) * (double)(unit.M * unit.K * bytes), b.U(unit.K), false, 16);
+            for (int u = 0; u < 4; u++)
+                for (int j = 0; j < 4; j++) acc[j].M = b.MulAdd(ma, mb, acc[j].M);
+        });
+        var sum = b.Add(b.Add(acc[0].M, acc[1].M), b.Add(acc[2].M, acc[3].M));
+        b.Store(sum, kc, po, b.U(unit.N), false, 16);
+        return b.Build();
+    }
+
+    // The kind's multiply-adds a second: a subgroup's 16 multiply-adds of M·N·K terms a trip, an invocation's share of
+    // them 16·M·N·K / the subgroup's size.
+    private static double? UnitPeak(Vulkan vk, CooperativeMatrix unit)
+    {
+        K ka = UnitKind(unit.A);
+        int bytes = ka.Bytes(), tile = unit.M * unit.K;
+        // A's two tiles 1 and ½ (an 8-bit kind's 1 and 2), B a small value (the sums stay finite).
+        bool integer = ka is K.S8 or K.U8;
+        var a = new double[2 * tile];
+        for (int i = 0; i < a.Length; i++) a[i] = i < tile ? 1 : integer ? 2 : 0.5;
+        var bv = Enumerable.Repeat(integer ? 1.0 : 1.0 / 1024, unit.K * unit.N).ToArray();
+        ulong pa = Rent(vk, a.Length * bytes), pb = Rent(vk, bv.Length * bytes), po = Rent(vk, unit.M * unit.N * 4);
+        try
+        {
+            if (pa == 0 || pb == 0 || po == 0) return null;
+            vk.Upload<byte>(Encode(ka, a), pa);
+            vk.Upload<byte>(Encode(ka, bv), pb);
+            double perTrip = 16.0 * unit.M * unit.N * unit.K / vk.SubgroupSize;
+            return Rate(vk, $"limits_mma_{unit}", () => UnitKernel(vk, unit), perTrip, trips => [pa, pb, po, trips]);
+        }
+        finally
+        {
+            foreach (ulong x in new[] { pa, pb, po }) if (x != 0) vk.Release(x);
+        }
+    }
+
+    // Values as the units' component stores them.
+    private static byte[] Encode(K k, double[] v) => k switch
+    {
+        K.F16 => [.. v.SelectMany(x => BitConverter.GetBytes((Half)x))],
+        K.BF16 => [.. v.SelectMany(x => BitConverter.GetBytes((ushort)(BitConverter.SingleToUInt32Bits((float)x) >> 16)))],
+        _ => [.. v.Select(x => (byte)(sbyte)x)],
+    };
 }
