@@ -14,6 +14,7 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
+using System.Runtime.InteropServices;
 
 namespace Adad.Abstraction;
 
@@ -35,8 +36,25 @@ internal static unsafe class Team
     private static delegate*<void*, int, int, void> s_invoke;
     private static void* s_body;
     private static int s_count, s_size, s_chunks;
-    private static long s_state;                                              // the job's generation (high 32 bits) and next chunk (low)
-    private static int s_done, s_generation;
+    private static int s_generation;
+
+    // The counters every thread writes, each on 128 bytes of its own (a line and the line the processor fetches with it):
+    // the job's state (its generation in the high 32 bits, the next chunk in the low), taken by a compare-exchange a chunk,
+    // and the chunks done, counted by each thread and read by the caller as it waits. As plain statics they fell wherever
+    // the process had placed Team's statics, beside each other and other hot fields: an empty 48-chunk job took 13-15 us
+    // in most processes and 6 in some (with or without a CUDA part before, the team made first or last), and the rows
+    // that dispatch often followed it (quantize_rows float16 2.35-2.55 ms or 1.11). Apart they take 4.1-4.6 us in every
+    // process (quantize_rows float16 0.80-0.91).
+    [StructLayout(LayoutKind.Explicit, Size = 384)]
+    private struct Counters
+    {
+        [FieldOffset(128)] public long State;
+        [FieldOffset(256)] public int Done;
+    }
+
+    private static readonly Counters[] s_counters = new Counters[1];
+    private static ref long s_state => ref s_counters[0].State;
+    private static ref int s_done => ref s_counters[0].Done;
     private static ExceptionDispatchInfo? s_error;
 
     [ThreadStatic]
@@ -152,8 +170,18 @@ internal static unsafe class Team
     private sealed class Worker
     {
         private readonly ManualResetEventSlim _wake = new(false, 0);
-        private int _job;                                                    // the generation this worker is to run
-        private int _sleeping;
+        // The generation this worker is to run and whether it sleeps, on 128 bytes of their own: the caller writes every
+        // worker's in turn while each spins reading its own.
+        [StructLayout(LayoutKind.Explicit, Size = 256)]
+        private struct Flags
+        {
+            [FieldOffset(128)] public int Job;
+            [FieldOffset(132)] public int Sleeping;
+        }
+
+        private Flags _flags;
+        private ref int _job => ref _flags.Job;
+        private ref int _sleeping => ref _flags.Sleeping;
 
         public Worker(int index)
         {
