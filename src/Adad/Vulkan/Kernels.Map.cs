@@ -176,8 +176,10 @@ internal static partial class VkKernels
         }
 
         // erfc |x| past its bound: e^(−x²) (x² carried with its rounding) times, on the f64 lane, S(u)/x (Funcs.ErfcTail64:
-        // u = 1.5/x − 1), on the f32 lane 1/√π over the continued fraction `depth` deep, bottom-up.
-        private static V ErfcTail(Spv b, V ax, V x2, int depth)
+        // u = 1.5/x − 1), on the f32 lane t·S(u) (the CPU's Funcs.ErfcTail32, step for step: t = 1/x, u = t·(2/span) − 1),
+        // a polynomial in place of CUDA's continued fraction of 48 or 80 quotients (the same error, the bench's: erf
+        // float32 1.45e-7 by either).
+        private static V ErfcTail(Spv b, V ax, V x2)
         {
             bool w = ax.Kind == K.F64;
             var corr = b.C(ax.Kind, 1) - b.Fma(ax, ax, -x2);
@@ -190,10 +192,11 @@ internal static partial class VkKernels
                 return (e * sp) / ax;
             }
 
-            var f = ax;
-            for (int d = depth; d >= 1; d--) f = ax + b.C(ax.Kind, d * 0.5) / f;
+            var t = b.C(ax.Kind, 1) / ax;
+            var v = b.Fma(t, b.C(ax.Kind, (float)(2 / Funcs.ErfcTailSpan)), b.C(ax.Kind, -1));
+            var s = Poly(b, v, Funcs.ErfcTail32, Funcs.ErfcTail32.Length, 0);
             var e32 = Exp(b, -x2) * corr;
-            return (e32 * Funcs.InvSqrtPi) / f;
+            return e32 * (t * s);
         }
 
         public static V Erf(Spv b, V x)
@@ -202,7 +205,7 @@ internal static partial class VkKernels
             var ax = b.Abs(x);
             var x2 = ax * ax;
             var series = Poly(b, x2, Funcs.ErfSeries, w ? Funcs.ErfTerms64 : Funcs.ErfTerms32, 0) * ax;
-            var tail = b.C(x.Kind, 1) - ErfcTail(b, ax, x2, Funcs.ErfDepth32);
+            var tail = b.C(x.Kind, 1) - ErfcTail(b, ax, x2);
             var y = b.Select(ax < (w ? Funcs.ErfBound64 : Funcs.ErfBound32), series, tail);
             y = b.Min(y, b.C(x.Kind, 1));
             y = b.Select(x < 0, -y, y);
@@ -215,7 +218,7 @@ internal static partial class VkKernels
             var ax = b.Abs(x);
             var x2 = ax * ax;
             var series = Poly(b, x2, Funcs.ErfSeries, w ? Funcs.ErfTerms64 : Funcs.ErfTerms32, 0) * x;
-            var tail = ErfcTail(b, ax, x2, Funcs.ErfcDepth32);
+            var tail = ErfcTail(b, ax, x2);
             var mid = b.C(x.Kind, 1) - series;
             var two = b.C(x.Kind, 2) - tail;
             var y = b.Select(x < 0, two, tail);

@@ -11,7 +11,7 @@
 //   Tanh     expm1(2x) / (expm1(2x) + 2); Sigmoid 1 / (1 + e^−x)
 //   Erf      the series Σ (−1)^k x^(2k+1) / (k! (2k+1)) · 2/√π for |x| below a bound, else 1 − erfc; erfc's tail (|x| past
 //            its bound) on the f64 lane e^(−x²)·S(t)/x, t = 1/x, S a polynomial fitted to 6.3e-17 (ErfcTail64), on every
-//            device; on the f32 lane the CPU's e^(−x²)·t·S(t) (ErfcTail32), the device's the continued fraction
+//            device; on the f32 lane e^(−x²)·t·S(t) (ErfcTail32) on the CPU and Vulkan, CUDA's the continued fraction
 //            erfc x = e^(−x²)/√π · 1/(x + ½/(x + 1/(x + 3/2/(x + …)))) evaluated bottom-up a fixed depth
 using System.Numerics;
 
