@@ -104,14 +104,14 @@ internal sealed partial class Spv
     /// the next <paramref name="stride"/> elements on: both in the array's elements, whatever the matrix's components).</summary>
     public M Load(CoopType type, Arr array, V index, V stride, bool columnMajor = false)
     {
-        uint pointer = _m.Value(SpirvOp.AccessChain, _m.TypePointer(array.Storage, Type(array.Kind)), array.Variable, index.Id);
+        uint pointer = _m.Value(SpirvOp.AccessChain, _m.TypePointer(array.Space, Type(array.Kind)), array.Variable, index.Id);
         return new M(this, _m.Value(SpirvOp.CooperativeMatrixLoadKHR, type.Id, pointer, Const(K.U32, columnMajor ? 1UL : 0), stride.Id), type);
     }
 
     /// <summary>Stores a matrix into a workgroup array of scalars (rows, or columns, <paramref name="stride"/> elements apart).</summary>
     public void Store(M matrix, Arr array, V index, V stride, bool columnMajor = false)
     {
-        uint pointer = _m.Value(SpirvOp.AccessChain, _m.TypePointer(array.Storage, Type(array.Kind)), array.Variable, index.Id);
+        uint pointer = _m.Value(SpirvOp.AccessChain, _m.TypePointer(array.Space, Type(array.Kind)), array.Variable, index.Id);
         _m.Code(SpirvOp.CooperativeMatrixStoreKHR, pointer, matrix.Id, Const(K.U32, columnMajor ? 1UL : 0), stride.Id);
     }
 

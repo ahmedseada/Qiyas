@@ -145,12 +145,12 @@ internal readonly struct Arr(Spv b, uint variable, K kind, int length, StorageCl
     public readonly int Length = length;
     public readonly K Kind = kind;
     internal readonly uint Variable = variable;
-    internal readonly StorageClass Storage = storage;
+    internal readonly StorageClass Space = storage;
 
     public V this[V index]
     {
-        get => b.ArrayLoad(Variable, Storage, Kind, index);
-        set => b.ArrayStore(Variable, Storage, index, value);
+        get => b.ArrayLoad(Variable, Space, Kind, index);
+        set => b.ArrayStore(Variable, Space, index, value);
     }
 
     public V this[int index]
