@@ -3,7 +3,8 @@
 
 // Resampling with a per-channel scale and shift on Vulkan (Kernels.Resample.cs), CUDA's plan (Cuda/GpuOps.Resample.cs): the
 // horizontal pass into a rented plane of lane values where it runs, then the outputs a word an invocation
-// (a block format's by its encoder), the vertical pass reading the horizontal one's values (or the input) where they are.
+// (a block format's by its encoder, from lane storage where the encoder is staged), the vertical pass reading the
+// horizontal one's values (or the input) where they are.
 // Where both passes run in the f32 lane into a plain format of eight or more values a word: both in one kernel by tiles
 // (VkKernels.ResampleTiled), the middle plane's values kept in workgroup memory and a value an invocation.
 using Adad.Abstraction;
@@ -55,7 +56,28 @@ public sealed partial class VulkanOps
             var src = a.XTaps > 0 ? midFmt : fi;
             ulong s = a.XTaps > 0 ? mid : x;
             bool vertical = a.YTaps > 0, norm = values != 0;
-            if (f.IsBlock)
+            if (f.IsBlock && !VkKernels.EncodesDirect(vk, f))
+            {
+                // A block format whose encoder is staged (Q4_0: an invocation a block): its values by the plain kernel into
+                // lane storage (a word an invocation, each value its taps once), then the encoder from them (BlockFromLanes),
+                // not each block's 32 values' taps one after another in the encoder's source (q4_0 1.645 ms against 0.658;
+                // a direct encoder's teams make a value an invocation already, q8_0 0.531 against 0.636 through lanes). The
+                // same values (ResampleValue in the f32 lane either way): the same blocks.
+                var lf = VkKernels.LaneFormat(Lane.F32);
+                ulong lanes = vk.Rent(a.Count * 4);
+                try
+                {
+                    var k = vk.Cached($"resample_out:{lf.Name}:{src.Name}:{Lane.F32.Name}:{vertical}:{norm}", () => VkKernels.ResampleOut(vk, lf, src, Lane.F32, vertical, norm));
+                    vk.Launch(k, Groups(lf.Words(a.Count), VkKernels.Threads), 1, s, bounds, weights, values, lanes, Vulkan.U(a.Count), Vulkan.U(a.OutHeight), Vulkan.U(a.OutWidth),
+                        Vulkan.U(a.Height), Vulkan.U(a.Across), Vulkan.U(a.YTaps), Vulkan.U(a.RowBounds), Vulkan.U(a.RowWeights), Vulkan.U(a.Channels));
+                    Encode(f, a.Count, vk.Cached($"block_lanes:{Lane.F32.Name}:{f.Name}", () => VkKernels.BlockFromLanes(vk, Lane.F32, f)), y, lanes);
+                }
+                finally
+                {
+                    vk.Return(lanes);
+                }
+            }
+            else if (f.IsBlock)
                 Encode(f, a.Count, vk.Cached($"block_resample_out:{f.Name}:{src.Name}:{vertical}:{norm}", () => VkKernels.BlockResampleOut(vk, f, src, vertical, norm)), y,
                     s, bounds, weights, values, Vulkan.U(a.OutHeight), Vulkan.U(a.OutWidth), Vulkan.U(a.Height), Vulkan.U(a.Across), Vulkan.U(a.YTaps), Vulkan.U(a.RowBounds),
                     Vulkan.U(a.RowWeights), Vulkan.U(a.Channels));
