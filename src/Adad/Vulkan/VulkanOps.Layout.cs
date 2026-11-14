@@ -84,6 +84,24 @@ public sealed partial class VulkanOps
                     vk.Return(lanes);
                 }
             }
+            // A block format whose encoder is staged (Q4_0: an invocation a block) for an operation whose values are dear
+            // (LayoutLanes): the values by the plain kernel into lane storage (a word an invocation, LayoutValue's as the
+            // encoder's source makes them), then the encoder from them (VulkanOps.Resample.cs's plan).
+            else if (k.Count > 0 && f.IsBlock && LayoutLanes(f, kn))
+            {
+                var lf = VkKernels.LaneFormat(lane);
+                ulong lanes = vk.Rent(k.Count * (long)lane.Size);
+                try
+                {
+                    var fn = vk.Cached($"layout:{kn}:{lf.Name}:{lane.Name}:{(inFmt ?? f).Name}", () => VkKernels.Layout(vk, lf, lane, kn, inFmt ?? f));
+                    vk.Launch(fn, Groups(lf.Words(k.Count), VkKernels.Threads), 1, VkKernels.LayoutSlots(x, x2, idx, aux, lanes, k.Count, cols, k.P));
+                    Encode(f, k.Count, vk.Cached($"block_lanes:{lane.Name}:{f.Name}", () => VkKernels.BlockFromLanes(vk, lane, f)), output, lanes);
+                }
+                finally
+                {
+                    vk.Return(lanes);
+                }
+            }
             // A block format's encoder reads its sources alone: the output's slot is left empty, so only an output that is one
             // of the inputs makes the encoding go through a buffer of its own (Encode).
             else if (k.Count > 0 && f.IsBlock)
@@ -116,6 +134,13 @@ public sealed partial class VulkanOps
 
         return lane.Name;
     }
+
+    // Whether a block layout goes through lane storage (the plain kernel, then BlockFromLanes): where the format's encoder
+    // is staged (EncodesDirect false: Q4_0) and a value's source is dear enough that a block's 32 made one after another
+    // wait on it. Measured (q4_0, the encoder's source against lane storage): interpolate_bilinear_bwd 0.733 ms against
+    // 0.429, col2im 0.132 against 0.121; the reads and window scans of the others ran slower through lane storage
+    // (gather_rows 0.225 against 0.397, pad2d 0.223 against 0.374, avgpool_bwd 0.142 against 0.172).
+    private bool LayoutLanes(Fmt f, string kn) => kn is "interpolate_bilinear_bwd" or "col2im" && !VkKernels.EncodesDirect(vk, f);
 
     // A canonical strided view's tiling (VkKernels.StridedTileDim): its rank, the stride-1 dimension (−1: none), the
     // workgroups along x (the tiles of the last and that dimension) and y (the other dimensions' product), where the device
