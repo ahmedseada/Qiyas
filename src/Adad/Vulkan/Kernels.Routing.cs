@@ -418,13 +418,19 @@ internal static partial class VkKernels
         var chunk = (cols + (ReduceThreads - 1)) >> 8;
         var c0 = tid * chunk;
         var c1 = b.Min(c0 + chunk, cols);
-        // This invocation's chunk sum of the positive weights (a weight below 0 adds nothing, a NaN carries into it).
+        // This invocation's chunk sum of the positive weights (a weight below 0 adds nothing, a NaN carries into it); the
+        // chunk's first and last columns of positive weight (cols: none; the last + 1, 0: none) on the way.
         var zero = b.C(k, 0);
         var sum = b.Local(zero);
+        var firstMine = b.Local(cols);
+        var lastMine = b.Local(b.U(0));
         b.For(c0, c1, c =>
         {
             var v = Codec.UnpackAt(b, f, x, start + c, lane);
             sum.V = sum.V + b.Select(v < zero, zero, v);
+            var positive = v > zero;
+            firstMine.V = b.Select(positive & (firstMine.V == cols), c, firstMine.V);
+            lastMine.V = b.Select(positive, c + 1, lastMine.V);
         });
         var sums = b.Shared(k, ReduceThreads);
         var total = b.Shared(k, 1);
@@ -445,17 +451,21 @@ internal static partial class VkKernels
         b.Barrier();
         var threshold = Codec.UnpackAt(b, f, u, row, lane) * total[0];
         // The first crossing in this invocation's chunk at a column of positive weight (cols when none), the least over the
-        // workgroup; the chunk's last column of positive weight (+ 1; 0: none), the greatest over it.
-        var run = b.Local(sums[tid]);
+        // workgroup; the chunk's last column of positive weight (+ 1; 0: none), the greatest over it. A chunk whose running
+        // sum starts past the threshold crosses at its first positive weight (before + w rounds to at least before): that
+        // column without the scan; every other chunk scans as the running sum goes.
+        var before = sums[tid];
         var found = b.Local(cols);
-        var lastMine = b.Local(b.U(0));
-        b.For(c0, c1, c =>
+        b.If(before > threshold, () => found.V = firstMine.V, () =>
         {
-            var w = Codec.UnpackAt(b, f, x, start + c, lane);
-            var positive = w > zero;
-            run.V = run.V + b.Select(positive, w, zero);
-            lastMine.V = b.Select(positive, c + 1, lastMine.V);
-            found.V = b.Select((run.V > threshold) & positive & (found.V == cols), c, found.V);
+            var run = b.Local(before);
+            b.For(c0, c1, c =>
+            {
+                var w = Codec.UnpackAt(b, f, x, start + c, lane);
+                var positive = w > zero;
+                run.V = run.V + b.Select(positive, w, zero);
+                found.V = b.Select((run.V > threshold) & positive & (found.V == cols), c, found.V);
+            });
         });
         var least = GroupReduce(b, b.Shared(K.U32, ReduceThreads), tid, found.V, b.Min, ReduceThreads);
         var lastPos = GroupReduce(b, b.Shared(K.U32, ReduceThreads), tid, lastMine.V, b.Max, ReduceThreads);
