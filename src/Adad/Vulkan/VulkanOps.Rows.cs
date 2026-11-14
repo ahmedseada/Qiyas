@@ -46,6 +46,35 @@ public sealed partial class VulkanOps
             return lane.Name;
         }
 
+        // A K-quant's rows (blocks of 256: each value's decode its sub-block's scales): the one kernel into lane storage
+        // (LaneFormat; the row held decoded where it fits, each block decoded once), then its encoder from those values
+        // (BlockFromLanes), not the statistics' pass then each value replayed in the encoder's source (each input decoded
+        // twice). The same values (the fused kernel's reductions and values are the two kernels'): the same blocks.
+        // Measured: q4_k layer_norm_bwd 1.387 ms against 0.912, q6_k 0.986 against 0.688; Q8_0's and Q4_0's cheap decodes
+        // save less than the lane storage's traffic costs (q8_0 softmax_bwd 0.329 against 0.415, q4_0 0.299 against 0.438).
+        if (f.IsBlock && f.BlockValues >= 256 && VkKernels.RowReduces(op) && cols > 0)
+        {
+            var lf = VkKernels.LaneFormat(lane);
+            var (capacity, holdX, holdX2, keep) = VkKernels.RowHolds(vk, f, lane, op, second, cols);
+            ulong ly = vk.Rent(n * lane.Size), ly2 = out2 ? vk.Rent(n * lane.Size) : 0;
+            try
+            {
+                var fused = vk.Cached($"rowfused:{op.Name}:{f.Name}:{second}:{out2}:{capacity}:{holdX}:{holdX2}:{keep}:{lf.Name}",
+                    () => VkKernels.RowFused(vk, f, lane, op, second, out2, capacity, holdX, holdX2, keep, lf));
+                vk.Launch(fused, (uint)rows, 1, x, x2, g, bt, s, pos, ly, out2 ? ly2 : y2, Vulkan.U(rows), Vulkan.U(cols), Slot(lane, a), Slot(lane, b), 0);
+                var encoder = vk.Cached($"block_lanes:{lane.Name}:{f.Name}", () => VkKernels.BlockFromLanes(vk, lane, f));
+                if (out2) Encode(f, n, new BlockJob(encoder, y, [ly]), new BlockJob(encoder, y2, [ly2]));
+                else Encode(f, n, new BlockJob(encoder, y, [ly]));
+            }
+            finally
+            {
+                vk.Return(ly);
+                if (ly2 != 0) vk.Return(ly2);
+            }
+
+            return lane.Name;
+        }
+
         ulong stats = VkKernels.RowReduces(op) ? vk.Rent((long)rows * 4 * lane.Size) : 0;
         try
         {

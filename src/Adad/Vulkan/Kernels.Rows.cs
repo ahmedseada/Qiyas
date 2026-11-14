@@ -83,7 +83,7 @@ internal static partial class VkKernels
         var (rx, rx2, keeps) = RowReads(vk, op);
         int capacity = RowCapacity(cols);
         bool Fits(int arrays) => RowFusedBytes(lane, capacity, arrays) <= vk.MaxSharedBytes;
-        if (RowStaged(f, lane))
+        if (RowStaged(f, lane) || f.IsBlock)
         {
             bool wantX = rx >= 2, want2 = second && rx2 >= 2;
             if (wantX && want2 && Fits(2)) return (capacity, true, true, false);
@@ -96,11 +96,13 @@ internal static partial class VkKernels
 
     /// <summary>The operation in one kernel, a workgroup a row of whole words (RowFused above), holding what RowHolds says.
     /// Arguments as RowStats's.</summary>
-    public static SpvKernel RowFused(Vulkan vk, Fmt f, Lane lane, RowOp op, bool second, bool out2, int capacity, bool holdX, bool holdX2, bool keepTerms)
+    /// <param name="store">The outputs' format where it is not the inputs' (a block format's rows: lane storage, LaneFormat,
+    /// for its encoder after).</param>
+    public static SpvKernel RowFused(Vulkan vk, Fmt f, Lane lane, RowOp op, bool second, bool out2, int capacity, bool holdX, bool holdX2, bool keepTerms, Fmt? store = null)
     {
         var b = new Spv($"rowfused_{op.Name}_{f.Name}_{lane.Name}_{capacity}{(holdX ? "h" : "")}{(holdX2 ? "h2" : "")}{(keepTerms ? "k" : "")}" +
-            $"{(second ? "" : "_nosecond")}{(out2 ? "_y2" : "")}", RowThreads, vk.Controls);
-        var c = new RowCtx(b, f, lane, RowMode.Fused, op.Second && second, holdX || holdX2 || keepTerms ? capacity : 0, out2, holdX, holdX2, keepTerms);
+            $"{(second ? "" : "_nosecond")}{(out2 ? "_y2" : "")}{(store is null ? "" : "_s" + store.Name)}", RowThreads, vk.Controls);
+        var c = new RowCtx(b, f, lane, RowMode.Fused, op.Second && second, holdX || holdX2 || keepTerms ? capacity : 0, out2, holdX, holdX2, keepTerms, store);
         c.LoadRow();
         EmitRowOp(c, op);
         c.StoreOutputs();
@@ -224,6 +226,7 @@ internal static partial class VkKernels
 
         public int PassesX2 { get; private set; }
         private readonly bool out2;
+        private readonly Fmt storeFmt;                                       // Fused: the outputs' format (f, or lane storage)
         private readonly List<(Func<V> Value, bool Second)> stores = [];     // Fused: the outputs, made after the operation
         private int k;
 
@@ -242,10 +245,11 @@ internal static partial class VkKernels
         public V? Captured, Captured2;
 
         public RowCtx(Spv b, Fmt f, Lane lane, RowMode mode, bool second, int capacity = 0, bool out2 = false, bool holdX = true, bool holdX2 = false,
-            bool keepTerms = false)
+            bool keepTerms = false, Fmt? store = null)
         {
             this.b = b;
             this.f = f;
+            storeFmt = store ?? f;
             this.lane = lane;
             this.mode = mode;
             this.second = second;
@@ -305,18 +309,19 @@ internal static partial class VkKernels
         public void StoreOutputs()
         {
             if (mode != RowMode.Fused) return;
-            var wk = Codec.WordKind(f);
-            int bytes = f.WordBits / 8;
-            var words = Cols / (double)f.Per;
+            var sf = storeFmt;
+            var wk = Codec.WordKind(sf);
+            int bytes = sf.WordBits / 8;
+            var words = Cols / (double)sf.Per;
             var first = Row * words;
             b.For(Tid, words, b.U(RowThreads), w =>
             {
                 var packed = new Dictionary<bool, V>();
-                for (int i = 0; i < f.Per; i++)
+                for (int i = 0; i < sf.Per; i++)
                 {
-                    BeginColumn(w * (double)f.Per + i);
+                    BeginColumn(w * (double)sf.Per + i);
                     foreach (var (value, toSecond) in stores)
-                        packed[toSecond] = Codec.Pack(b, f, value(), lane, i, packed.TryGetValue(toSecond, out var word) ? word : b.CBits(wk, 0));
+                        packed[toSecond] = Codec.Pack(b, sf, value(), lane, i, packed.TryGetValue(toSecond, out var word) ? word : b.CBits(wk, 0));
                 }
 
                 foreach (var (toSecond, word) in packed) b.Store(b.At(toSecond ? Dst2 : Dst, first + w, bytes), word);
