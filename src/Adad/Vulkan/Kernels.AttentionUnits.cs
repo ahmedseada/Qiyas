@@ -10,10 +10,11 @@
 //   softmax online  the scores stored to the subgroup's staging; each row's invocations (subgroup / M of them) take its
 //                   columns in parts: the row's max and sum joined from the parts in order, the running max, sum and
 //                   the context rescaled as the f32 fused rows do (Fn.Exp, the same masks)
-//   O += P·V        P as two slices of the kind (hi = P rounded, lo = P − hi rounded: P to 22 bits in f16, 16 in bf16, so
-//                   the context keeps the f32 lane's rounding), [hi | lo] against [V; V] on the units into a tile's
-//                   context; the tile's context stored to the staging and joined into each row's context, held by the
-//                   row's invocations in registers (a cooperative matrix's rows cannot be scaled one by one).
+//   O = O·α + P·V   P as two slices of the kind (hi = P rounded, lo = P − hi rounded: P to 22 bits in f16, 16 in bf16, so
+//                   the context keeps the f32 lane's rounding), [hi | lo] against [V; V] on the units into the context's
+//                   accumulators, held across the tiles; each row's rescale α as an f32 matrix (α_i in every column of
+//                   row i) by unit products of α's two f16 slices against ones (22 bits of α), the context times it
+//                   element by element before the tile's products add in.
 //
 // Loads: a format that is the kind itself (float16 for f16, bfloat16 for bf16) at an even d copies its stored words, two
 // values each, into workgroup memory; the others decode value by value (Codec.UnpackAt) into the kind's bits, two values
@@ -41,12 +42,15 @@ internal static partial class VkKernels
     /// <summary>Workgroup bytes of the units attention rows: the K/V tile, each subgroup's staging (its rows' Q, scores,
     /// P's two slices or a tile's context), the row parts' joins.</summary>
     public static int AttentionUnitsShared(CooperativeMatrix unit, int dCap, int subgroup) =>
-        4 * (UnitsAttnKeys * UnitsKvStride(dCap) + UnitsAttnWarps * unit.M * Math.Max(2 * UnitsAttnKeys, dCap) + UnitsAttnWarps * subgroup);
+        4 * (UnitsAttnKeys * UnitsKvStride(dCap) + UnitsAttnWarps * UnitsAttnRegion(unit, dCap) + UnitsAttnWarps * subgroup + 128);
+
+    // A subgroup's staging words: its rows' scores and P's slices, or Q's halves, or the context; then α's two f16 tiles.
+    private static int UnitsAttnRegion(CooperativeMatrix unit, int dCap) => unit.M * Math.Max(2 * UnitsAttnKeys, dCap) + 256;
 
     /// <summary>Whether the units attention runs with this unit, head capacity and subgroup size (whole fragments, a row's
     /// invocations a whole share of the subgroup).</summary>
     public static bool AttentionUnitsFit(CooperativeMatrix unit, int dCap, int subgroup) =>
-        unit.M <= subgroup && subgroup % unit.M == 0 && dCap % unit.K == 0 && dCap % unit.N == 0 && UnitsAttnKeys % unit.N == 0 && UnitsAttnKeys % unit.K == 0
+        unit.M == 16 && unit.N == 16 && unit.M <= subgroup && subgroup % unit.M == 0 && dCap % unit.K == 0 && dCap % unit.N == 0 && UnitsAttnKeys % unit.N == 0 && UnitsAttnKeys % unit.K == 0
         && UnitsAttnKeys % (subgroup / unit.M) == 0 && dCap % (subgroup / unit.M) == 0 && (UnitsAttnKeys / (subgroup / unit.M)) % 2 == 0;
 
     /// <summary>Whether a format's stored words are the units kind's values two a word (the loads copy them at an even d).</summary>
@@ -59,7 +63,8 @@ internal static partial class VkKernels
     {
         int sg = vk.SubgroupSize, threads = UnitsAttnWarps * sg, rm = unit.M, br = UnitsAttnWarps * rm, bc = UnitsAttnKeys;
         if (!AttentionUnitsFit(unit, dCap, sg)) throw new NotSupportedException($"vulkan: attention on the units {unit} at d {dCap} with subgroups of {sg}");
-        int tpr = sg / rm, cpt = bc / tpr, opt = dCap / tpr, kvStride = UnitsKvStride(dCap), region = rm * Math.Max(2 * bc, dCap);
+        int tpr = sg / rm, cpt = bc / tpr, opt = dCap / tpr, kvStride = UnitsKvStride(dCap), region = UnitsAttnRegion(unit, dCap);
+        int aRegion = region - 256;                                              // α's hi tile, then its lo tile (16 × 16 f16 each)
         K ek = UnitKind(unit.A);
         var b = new Spv($"attention_rows_units_{f.Name}_{unit.A}_{unit.M}x{unit.N}x{unit.K}_d{dCap}{(direct ? "_direct" : "")}", threads, vk.Controls);
         V q = b.Arg(0), kp = b.Arg(1), vp = b.Arg(2), o = b.Arg(3), lim = b.Arg(4), starts = b.Arg(5), ranges = b.Arg(6);
@@ -72,6 +77,7 @@ internal static partial class VkKernels
         var kv = b.Shared(K.U32, bc * kvStride);
         var stage = b.Shared(K.U32, UnitsAttnWarps * region);
         var joins = b.Shared(K.F32, threads);
+        var ones = b.Shared(K.U32, 128);                                         // 16 × 16 f16, column-major: row 0 all ones
         var mine = warp * (uint)region;                                          // this subgroup's staging
         var zero = b.F(0);
         var negInf = b.F(double.NegativeInfinity);
@@ -140,6 +146,9 @@ internal static partial class VkKernels
             });
         }
 
+        // The α tiles' words all 0 (each row's first word is rewritten every tile), the ones' tile.
+        for (int it = 0; it < 256 / sg; it++) stage[mine + (uint)(aRegion + it * sg) + lane] = b.U(0);
+        b.For(tid, b.U(128), b.U(threads), w => ones[w] = b.Select((w & 7UL) == 0, b.U(0x3C00), b.U(0)));
         b.SubgroupBarrier();
         var qf = new M[dCap / unit.K];
         for (int dc = 0; dc < qf.Length; dc++) qf[dc] = b.Load(ta, stage, mine + (uint)(dc * unit.K / 2), b.U(dCap / 2));
@@ -147,8 +156,12 @@ internal static partial class VkKernels
 
         var m = b.Local(negInf);
         var l = b.Local(zero);
-        var ov = new Var[opt];
-        for (int j = 0; j < opt; j++) ov[j] = b.Local(zero);
+        var th = b.Coop(K.F16, 16, 16, Use.A);
+        var tones = b.Coop(K.F16, 16, 16, Use.B);
+        var ctx = new MVar[dCap / unit.N];
+        for (int dc = 0; dc < ctx.Length; dc++) ctx[dc] = b.Local(b.Fill(tc, 0));
+        b.Barrier();                                                             // the ones' tile written
+        var onesB = b.Load(tones, ones, b.U(0), b.U(8), columnMajor: true);
         var lo = b.Load(K.U32, b.At(ranges, qb * 2, 4));
         var hi = b.Load(K.U32, b.At(ranges, qb * 2 + 1, 4));
         var tile0 = lo / (double)bc * bc;
@@ -223,16 +236,24 @@ internal static partial class VkKernels
                 stage[mine + (uint)pRegion + r * (uint)bc + (uint)(bc / 2) + col / 2] = l0 | l1 << 16;
             }
 
+            // α's slices (f16) into column 0 of row r of the α tiles, by the row's first invocation.
+            b.If(part == 0, () =>
+            {
+                var (ah, al) = HiLo(b, K.F16, alpha);
+                stage[mine + (uint)aRegion + r * 8] = ah;
+                stage[mine + (uint)(aRegion + 128) + r * 8] = al;
+            });
             b.SubgroupBarrier();
+            var scaleRows = b.MulAdd(b.Load(th, stage, mine + (uint)aRegion, b.U(8)), onesB, b.Fill(tc, 0));
+            scaleRows = b.MulAdd(b.Load(th, stage, mine + (uint)(aRegion + 128), b.U(8)), onesB, scaleRows);
             b.Barrier();
             LoadTile(vp, t0, lk);
             b.Barrier();
 
-            // The tile's context [hi | lo]·[V; V] by the units, each dimension block into its accumulator.
-            var tcs = new M[dCap / unit.N];
-            for (int dc = 0; dc < tcs.Length; dc++)
+            // The context's blocks times α row by row, then [hi | lo]·[V; V] added by the units.
+            for (int dc = 0; dc < ctx.Length; dc++)
             {
-                var acc = b.Fill(tc, 0);
+                var acc = b.Mul(ctx[dc].M, scaleRows);
                 for (int kc = 0; kc < 2 * bc / unit.K; kc++)
                 {
                     var pf = b.Load(ta, stage, mine + (uint)(pRegion + kc * unit.K / 2), b.U(bc));
@@ -240,26 +261,20 @@ internal static partial class VkKernels
                     acc = b.MulAdd(pf, vf, acc);
                 }
 
-                tcs[dc] = acc;
-            }
-
-            b.SubgroupBarrier();
-            for (int dc = 0; dc < tcs.Length; dc++) b.Store(tcs[dc], stage, mine + (uint)(dc * unit.N), b.U(dCap));
-            b.SubgroupBarrier();
-            for (int j = 0; j < opt; j++)
-            {
-                var col = part * (uint)opt + (uint)j;
-                ov[j].V = b.Fma(ov[j].V, alpha, b.Bitcast(stage[mine + r * (uint)dCap + col], K.F32));
+                ctx[dc].M = acc;
             }
 
             b.SubgroupBarrier();
         });
 
+        // The context into the staging, each row's values over its sum.
+        for (int dc = 0; dc < ctx.Length; dc++) b.Store(ctx[dc].M, stage, mine + (uint)(dc * unit.N), b.U(dCap));
+        b.SubgroupBarrier();
         var inv = b.Select(l.V > 0, b.F(1) / l.V, zero);
         for (int j = 0; j < opt; j++)
         {
             var dim = part * (uint)opt + (uint)j;
-            var value = ov[j].V * inv;
+            var value = b.Bitcast(stage[mine + r * (uint)dCap + dim], K.F32) * inv;
             b.If(valid & (dim < d), () => b.Store(b.At(o, qHead + i * d + dim, 4), value));
         }
 
