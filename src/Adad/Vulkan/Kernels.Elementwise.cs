@@ -192,10 +192,11 @@ internal static partial class VkKernels
 
     /// <summary>x (ff) into the block format ft, each value read as float32 (rounded to nearest where wider: the format
     /// encodes from float32). Slots: x.</summary>
-    public static SpvKernel BlockConvert(Vulkan vk, Fmt ff, Fmt ft) =>
-        BlockEncoder(vk, ft, $"convert_{ff.Name}", b =>
+    /// <param name="staged">Into staging slots (BlockEncoder's direct: false) for a caller's own compaction.</param>
+    public static SpvKernel BlockConvert(Vulkan vk, Fmt ff, Fmt ft, bool staged = false) =>
+        BlockEncoder(vk, ft, $"convert_{ff.Name}{(staged ? "_staged" : "")}", b =>
         {
             var px = b.Arg(0);
             return (at, _) => Codec.UnpackAt(b, ff, px, at, Lane.F32);
-        });
+        }, staged ? false : null);
 }

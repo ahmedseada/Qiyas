@@ -57,7 +57,7 @@ internal static partial class VkKernels
                 var (written, index) = WrittenAt(b, at, cap, steps, unit, w);
                 return b.Select(written, Codec.UnpackAt(b, fx, px, index, Lane.F32), Codec.UnpackAt(b, fb, ps, at, Lane.F32));
             };
-        });
+        }, direct: false);
 
     /// <summary>The encoder's staging slots into the destination's words (BlockCompact), the blocks that hold a written value
     /// only: a block the write does not touch keeps its bytes. Slots: staging, destination, blocks, pos, n, cap, steps, unit.</summary>

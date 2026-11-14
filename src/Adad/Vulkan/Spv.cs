@@ -566,6 +566,34 @@ internal sealed partial class Spv
 
     public V Bitcast(V a, K to) => a.Kind == to ? a : new V(this, _m.Value(SpirvOp.Bitcast, Type(to), a.Id), to);
 
+    /// <summary>The value of the invocation of this subgroup whose lane is this one's lane xor <paramref name="mask"/>
+    /// (OpGroupNonUniformShuffleXor; where the device has it: Vulkan.SubgroupShuffles). Every invocation of the subgroup
+    /// reaches it together.</summary>
+    public V ShuffleXor(V value, int mask)
+    {
+        _m.Capability(Cap.GroupNonUniform);
+        _m.Capability(Cap.GroupNonUniformShuffle);
+        return new V(this, _m.Value(SpirvOp.GroupNonUniformShuffleXor, Type(value.Kind), Const(K.U32, 3), value.Id, Const(K.U32, (ulong)mask)), value.Kind);
+    }
+
+    private V? _subgroupLane;
+
+    /// <summary>The invocation's lane in its subgroup (SubgroupLocalInvocationId).</summary>
+    public V SubgroupLane
+    {
+        get
+        {
+            if (_subgroupLane is V known) return known;
+            _m.Capability(Cap.GroupNonUniform);
+            uint u32 = Type(K.U32);
+            uint variable = _m.GlobalVariable(_m.TypePointer(StorageClass.Input, u32), StorageClass.Input);
+            _m.Decorate(variable, Decoration.BuiltIn, (uint)BuiltIn.SubgroupLocalInvocationId);
+            var v = new V(this, _m.PrologueValue(SpirvOp.Load, u32, variable), K.U32);
+            _subgroupLane = v;
+            return v;
+        }
+    }
+
     /// <summary>A value as kind <paramref name="to"/>: integers widened by their own sign and narrowed to their low bits,
     /// integers to floats rounded to nearest, floats widened exactly and narrowed rounded to nearest, floats to integers
     /// truncated (in range only: Pack holds a value to its range first).</summary>

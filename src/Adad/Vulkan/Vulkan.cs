@@ -88,6 +88,8 @@ public sealed unsafe class Vulkan : IDisposable
         var properties2 = new VkPhysicalDeviceProperties2 { SType = VkApi.StructurePhysicalDeviceProperties2, PNext = &controls };
         VkApi.vkGetPhysicalDeviceProperties2(_physical, &properties2);
         SubgroupSize = (int)subgroup.SubgroupSize;
+        // Shuffles in compute kernels (VK_SUBGROUP_FEATURE_SHUFFLE_BIT 0x10 in a stage set holding VK_SHADER_STAGE_COMPUTE_BIT 0x20).
+        SubgroupShuffles = (subgroup.SupportedStages & 0x20) != 0 && (subgroup.SupportedOperations & 0x10) != 0;
 
         var features12 = new VkPhysicalDeviceVulkan12Features { SType = VkApi.StructurePhysicalDeviceVulkan12Features };
         var features11 = new VkPhysicalDeviceVulkan11Features { SType = VkApi.StructurePhysicalDeviceVulkan11Features, PNext = &features12 };
@@ -240,6 +242,10 @@ public sealed unsafe class Vulkan : IDisposable
 
     /// <summary>8-bit and 16-bit loads and stores of device memory (storageBuffer8BitAccess, storageBuffer16BitAccess).</summary>
     public bool Storage8 { get; }
+
+    /// <summary>A compute kernel's invocations exchange values across their subgroup (the shuffle operations, as the device
+    /// reports them).</summary>
+    public bool SubgroupShuffles { get; }
 
     public bool Storage16 { get; }
 
@@ -581,6 +587,26 @@ public sealed unsafe class Vulkan : IDisposable
 
         if (found < 0) throw new NotSupportedException($"{Name}: no memory type with flags {want:X}");
         return found;
+    }
+
+    /// <summary>Whether two values are addresses into one buffer (a value no buffer holds is no address).</summary>
+    public bool SameBuffer(ulong a, ulong b) => Holder(a) is { } x && Holder(b) is { } y && x == y;
+
+    // The address of the allocation holding a value as an address, or null.
+    private ulong? Holder(ulong address)
+    {
+        var keys = _allocations.Keys;
+        int lo = 0, hi = keys.Count - 1;
+        while (lo <= hi)
+        {
+            int mid = (lo + hi) / 2;
+            if (keys[mid] <= address) lo = mid + 1;
+            else hi = mid - 1;
+        }
+
+        if (hi < 0) return null;
+        var a = _allocations.Values[hi];
+        return address < a.Address + (ulong)a.Size ? a.Address : null;
     }
 
     // The allocation holding a device address, and the offset of the address in it.

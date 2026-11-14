@@ -42,9 +42,13 @@ public sealed partial class VulkanOps
 
             if (f.IsBlock)
             {
-                // Each output by the encoder from its values' replays (y and y2 encoded before either is written).
-                var y1 = new BlockJob(vk.Cached($"block_rowreplay:{op.Name}:{f.Name}:{second}:y", () => VkKernels.BlockRowReplay(vk, f, lane, op, second, false)), y, args);
-                if (out2) Encode(f, n, y1, new BlockJob(vk.Cached($"block_rowreplay:{op.Name}:{f.Name}:{second}:y2", () => VkKernels.BlockRowReplay(vk, f, lane, op, second, true)), y2, args));
+                // Each output by the encoder from its values' replays (y and y2 encoded before either is written). The replays
+                // read the inputs and the statistics alone: the outputs' slots are left empty (Encode then encodes in place
+                // unless an output is one of the inputs).
+                ulong[] sources = [.. args];
+                sources[6] = sources[7] = 0;
+                var y1 = new BlockJob(vk.Cached($"block_rowreplay:{op.Name}:{f.Name}:{second}:y", () => VkKernels.BlockRowReplay(vk, f, lane, op, second, false)), y, sources);
+                if (out2) Encode(f, n, y1, new BlockJob(vk.Cached($"block_rowreplay:{op.Name}:{f.Name}:{second}:y2", () => VkKernels.BlockRowReplay(vk, f, lane, op, second, true)), y2, sources));
                 else Encode(f, n, y1);
             }
             else

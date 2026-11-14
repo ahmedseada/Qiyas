@@ -23,13 +23,43 @@ internal static partial class VkKernels
     /// <summary>An encoder of f whose values come from source(at, inside) (at below n; inside false for a value past n,
     /// whose result is dropped: a source with side effects predicates them on it), the source built over the kernel's own
     /// arguments (slots 0 .. 13).</summary>
-    public static SpvKernel BlockEncoder(Vulkan vk, Fmt f, string name, Func<Spv, Func<V, V, V>> source)
+    /// <param name="direct">Whether the encoder writes the blocks where they lie (EncodesDirect, the default) or into
+    /// staging slots for a compaction of the caller's own (the caches' writes, which compact only the words they touch).</param>
+    public static SpvKernel BlockEncoder(Vulkan vk, Fmt f, string name, Func<Spv, Func<V, V, V>> source, bool? direct = null)
     {
-        var b = new Spv($"encode_{name}_{f.Name}", Threads, vk.Controls);
+        direct ??= EncodesDirect(vk, f);
+        var b = new Spv($"encode_{(direct.Value ? "direct_" : "")}{name}_{f.Name}", Threads, vk.Controls);
         var value = source(b);
-        EncodeBlocks(b, f, b.Arg(StagingSlot), b.Arg(CountSlot, K.U32), value);
+        if (direct.Value) EncodeDirect(b, f, b.Arg(StagingSlot), b.Arg(CountSlot, K.U32), value, TeamShuffles(vk));
+        else EncodeBlocks(b, f, b.Arg(StagingSlot), b.Arg(CountSlot, K.U32), value);
         return b.Build();
     }
+
+    /// <summary>Where an encoder's values come from: each block's from its own place in the source (maps, rows, most
+    /// layouts, optimizers), from a strided view's places, or from a transpose's (each value of a block from another).</summary>
+    public enum EncodeSource { Own, View, Transpose }
+
+    /// <summary>Whether an encoder of f writes the blocks where they are stored (EncodeDirect: a workgroup's teams of
+    /// invocations a block, its bytes stored as 8-bit words: storageBuffer8BitAccess), else into staging slots compacted
+    /// after (EncodeBlocks, BlockCompact: an invocation a block); measured on this device. Own: every format but Q4_0,
+    /// whose 32 values one invocation scans faster than a team finds its first value of the largest magnitude, with
+    /// shuffles or without (map:add q4_0 0.198 ms staged, 0.243 direct by shuffles, 0.454 by a tree of three arrays). A
+    /// view: every format (layout:strided q4_0 0.530 against 0.790, q4_k 0.768 against 1.210). A transpose: the formats of
+    /// 32 values (q8_0 0.532 against 1.100, q4_0 0.499 against 0.658), not those of 256 (q4_k 0.948 against 0.688: 256
+    /// invocations decoding from 256 blocks at once).</summary>
+    public static bool EncodesDirect(Vulkan vk, Fmt f, EncodeSource source = EncodeSource.Own) =>
+        vk.Storage8 && source switch { EncodeSource.Own => !f.Is("q4_0"), EncodeSource.View => true, _ => f.BlockValues <= 32 };
+
+    /// <summary>The subgroup width the direct encoders' teams join over by shuffles (0: through workgroup memory): where the
+    /// device shuffles in compute kernels and its subgroups are whole teams of 32 (a width of 32 or more dividing the
+    /// workgroup). The teams then are lanes of one subgroup and join without a barrier.</summary>
+    public static int TeamShuffles(Vulkan vk) => vk.SubgroupShuffles && vk.SubgroupSize >= 32 && Threads % vk.SubgroupSize == 0 ? vk.SubgroupSize : 0;
+
+    /// <summary>Whether an encoder kernel (BlockEncoder's) writes its blocks where they lie.</summary>
+    public static bool IsDirect(SpvKernel encoder) => encoder.Name.StartsWith("encode_direct_", StringComparison.Ordinal);
+
+    /// <summary>The blocks a workgroup of the direct encoder encodes: a value an invocation.</summary>
+    public static int DirectBlocks(Fmt f) => Threads / f.BlockValues;
 
     /// <summary>The staging slots into the output's words, a thread per stored word (the bytes past the last block kept).
     /// Arguments: staging, output, blocks.</summary>
@@ -111,6 +141,287 @@ internal static partial class VkKernels
             else if (f.Is("q6_k")) EncodeQ6K(b, e, vals);
             else throw new NotSupportedException($"{f.Name}: no block encoder");
         });
+    }
+
+    // ---------------------------------------------------------------- the blocks encoded where they are stored
+
+    // The workgroup's blocks (DirectBlocks of them), a value an invocation: each block's team of BlockValues invocations
+    // takes its values from the source (0 past n), joins what the block's scales need by trees over the team in workgroup
+    // memory (the largest magnitude, the extremes: each the same whatever the order it is joined in, with the same start
+    // as EncodeBlocks's loops), then each invocation makes the codes EncodeBlocks makes and the bytes are stored as 8-bit
+    // words where the block lies in the output (every byte of a block below the count written, no other). The same
+    // operations on each value as EncodeBlocks: the same bytes. An invocation reads its own value before any block is
+    // written, so an output may be its source where each value reads only its own position (Encode copies through a
+    // buffer of its own otherwise).
+    private static void EncodeDirect(Spv b, Fmt f, V output, V n, Func<V, V, V> source, int shuffles)
+    {
+        int bv = f.BlockValues, per = Threads / bv;
+        // With shuffles, an invocation's place is its subgroup's lanes in order (SubgroupId · width + lane): a team of 32
+        // (or a Q6_K sub-block of 16) is then lanes of one subgroup.
+        var tid = shuffles > 0 ? b.SubgroupId * (double)shuffles + b.SubgroupLane : b.LocalIdX;
+        var t = new Team(b, shuffles > 0);
+        var team = per == 1 ? b.U(0) : tid / (double)bv;
+        var i = per == 1 ? tid : tid - team * (double)bv;
+        var start = tid - i;                                               // the team's first invocation
+        var blk = b.GroupX * (double)per + team;
+        var blocks = (n + b.U(bv - 1)) / b.U(bv);
+        var live = blk < blocks;
+        var at = blk * (double)bv + i;
+        var inside = at < n;
+        var x = source(b.Min(at, n - 1), inside);
+        if (x.Kind != K.F32) x = b.Convert(x, K.F32);                     // an f64 lane value rounded once
+        var v = b.Select(inside, x, b.C(K.F32, 0));
+        var vals = b.Shared(K.F32, Threads);
+        var sh = b.Shared(K.F32, Threads);
+        vals[tid] = v;
+        var block = b.At(output, b.Select(live, blk, b.U(0)), f.BlockBytes);
+        var o = new DirectOut(b, block, live);
+        if (f.Is("q8_0")) DirectQ8_0(b, t, o, vals, sh, tid, i, start, v);
+        else if (f.Is("q4_0")) DirectQ4_0(b, t, o, vals, sh, tid, i, start, v);
+        else if (f.Is("q4_k")) DirectQ4K(b, t, o, sh, tid, v);
+        else if (f.Is("q6_k")) DirectQ6K(b, t, o, sh, tid, v);
+        else throw new NotSupportedException($"{f.Name}: no block encoder");
+    }
+
+    // A block's bytes stored where it lies, only for a block below the count.
+    private readonly struct DirectOut(Spv b, V block, V live)
+    {
+        public void Byte(V offset, V value, V when)
+        {
+            // The address and the byte made before the condition (a struct's members cannot be captured by the lambda).
+            Spv sb = b;
+            V address = block + b.Convert(offset, K.U64), code = b.Convert(value & 0xFFUL, K.U8);
+            sb.If(live & when, () => sb.Store(address, code));
+        }
+
+        public void Byte(int offset, V value, V when) => Byte(b.U(offset), value, when);
+
+        public void Half(int offset, V code, V when)
+        {
+            Byte(offset, code & 0xFFUL, when);
+            Byte(offset + 1, (code >> 8) & 0xFFUL, when);
+        }
+    }
+
+    // How a team joins its values: by subgroup shuffles (Shuffles: the team lanes of one subgroup, every lane holding the
+    // result, no barrier) or by TeamReduce's tree in workgroup memory.
+    private readonly struct Team(Spv b, bool shuffles)
+    {
+        public bool Shuffles => shuffles;
+
+        // The team's `size` values (this invocation's v) joined by an order-free join (max, min): every invocation's result.
+        public V Join(Arr sh, V tid, V i, V start, int size, V v, Func<V, V, V> join)
+        {
+            if (!shuffles)
+            {
+                sh[tid] = v;
+                return TeamReduce(b, sh, tid, i, start, size, join);
+            }
+
+            for (int s = size / 2; s >= 1; s /= 2) v = join(v, b.ShuffleXor(v, s));
+            return v;
+        }
+
+        // The largest of `count` values in sh[0 .. count) and 0 (NMax: a NaN never taken), read by every invocation after
+        // their writes (a barrier before; a tree over them where the team does not shuffle).
+        public V LargestOf(Arr sh, V tid, int count)
+        {
+            Spv sb = b;
+            if (!shuffles)
+            {
+                sb.Barrier();
+                sb.If(tid < (double)count, () => sh[tid] = sb.Max(sb.C(K.F32, 0), sh[tid]));
+                return TeamReduce(sb, sh, tid, tid, sb.U(0), count, (p, q) => sb.Max(p, q));
+            }
+
+            sb.Barrier();
+            var acc = sb.C(K.F32, 0);
+            for (int k = 0; k < count; k++) acc = sb.Max(acc, sh[sb.U(k)]);
+            return acc;
+        }
+    }
+
+    // A tree over each team's `size` values in sh (the team's first at start, this invocation's i-th), by join(lower,
+    // upper): the team's value left at sh[start], read back by every invocation (a barrier before and after).
+    private static V TeamReduce(Spv b, Arr sh, V tid, V i, V start, int size, Func<V, V, V> join)
+    {
+        b.Barrier();
+        for (int s = size / 2; s >= 1; s /= 2)
+        {
+            int step = s;
+            b.If(i < step, () => sh[tid] = join(sh[tid], sh[tid + step]));
+            b.Barrier();
+        }
+
+        var result = sh[start];
+        b.Barrier();
+        return result;
+    }
+
+    // Q8_0 (EncodeQ8_0's steps): d = max|x| / 127 (from 0, NMax: a NaN never taken), q = clamp(round(x / d), −127, 127).
+    private static void DirectQ8_0(Spv b, Team t, DirectOut o, Arr vals, Arr sh, V tid, V i, V start, V v)
+    {
+        var amax = t.Join(sh, tid, i, start, 32, b.Max(b.C(K.F32, 0), b.Abs(v)), (p, q) => b.Max(p, q));
+        var (code, d) = Half(b, amax / 127.0);
+        var id = Inverse(b, d);
+        var q8 = b.Min(b.Max(b.RoundEven(v * id), b.C(K.F32, -127)), b.C(K.F32, 127));
+        o.Half(0, code, i == 0);
+        o.Byte(i + 2.0, Low8(b, b.Convert(q8, K.S32)), b.Bool(true));
+    }
+
+    // Q4_0 (EncodeQ4_0's steps): the value of the largest magnitude, the first of them (from 0: a magnitude above the one
+    // held is taken, so a NaN never and a tie never), d = it / −8, q = clamp((int)(x / d + 8.5), 0, 15); byte i holds
+    // values i and i + 16.
+    private static void DirectQ4_0(Spv b, Team t, DirectOut o, Arr vals, Arr sh, V tid, V i, V start, V v)
+    {
+        var a = b.Abs(v);
+        var taken = a > 0.0;
+        if (t.Shuffles)
+        {
+            // The join (the larger magnitude; of equal ones the lower place) is order-free: every lane ends with the
+            // block's first value of the largest magnitude.
+            V m = b.Select(taken, a, b.C(K.F32, 0)), x = b.Select(taken, v, b.C(K.F32, 0)), place = i;
+            for (int s = 16; s >= 1; s /= 2)
+            {
+                V um = b.ShuffleXor(m, s), ux = b.ShuffleXor(x, s), up = b.ShuffleXor(place, s);
+                var take = (um > m) | ((um == m) & (up < place));
+                m = b.Select(take, um, m);
+                x = b.Select(take, ux, x);
+                place = b.Select(take, up, place);
+            }
+
+            var upper = b.ShuffleXor(v, 16);                                     // value i + 16 for i below 16
+            var (code1, d1) = Half(b, x / -8.0);
+            var id1 = Inverse(b, d1);
+            o.Half(0, code1, i == 0);
+            var low1 = i < 16.0;
+            var lo1 = ClampInt(b, v * id1 + 8.5, 0, 15);
+            var hi1 = ClampInt(b, upper * id1 + 8.5, 0, 15);
+            o.Byte(i + 2.0, Low8(b, lo1 | (hi1 << 4)), low1);
+            return;
+        }
+
+        sh[tid] = b.Select(taken, a, b.C(K.F32, 0));
+        var xs = b.Shared(K.F32, Threads);
+        xs[tid] = b.Select(taken, v, b.C(K.F32, 0));
+        var places = b.Shared(K.U32, Threads);
+        places[tid] = i;
+        b.Barrier();
+        // The tree's partials hold interleaved places (lane j the places j, j + 16, … joined): of equal magnitudes the one of
+        // the lower place is kept, as the scan keeps the first.
+        for (int s = 16; s >= 1; s /= 2)
+        {
+            int step = s;
+            b.If(i < step, () =>
+            {
+                var upper = sh[tid + step];
+                var mine = sh[tid];
+                var take = (upper > mine) | ((upper == mine) & (places[tid + step] < places[tid]));
+                sh[tid] = b.Select(take, upper, mine);
+                xs[tid] = b.Select(take, xs[tid + step], xs[tid]);
+                places[tid] = b.Select(take, places[tid + step], places[tid]);
+            });
+            b.Barrier();
+        }
+
+        var max = xs[start];
+        var (code, d) = Half(b, max / -8.0);
+        var id = Inverse(b, d);
+        o.Half(0, code, i == 0);
+        var low = i < 16.0;
+        var lo = ClampInt(b, v * id + 8.5, 0, 15);
+        var hi = ClampInt(b, vals[b.Select(low, tid + 16.0, tid)] * id + 8.5, 0, 15);
+        o.Byte(i + 2.0, Low8(b, lo | (hi << 4)), low);
+    }
+
+    // Q4_K (EncodeQ4K's steps), a workgroup a super-block: each sub-block of 32's extremes (from float's largest and
+    // smallest, NMin and NMax: a NaN never taken) and min(lo, 0), its scale (hi − min) / 15; the largest scale and −min
+    // over the eight (from 0); d, dmin; each sub-block's 6-bit codes; each value's 4-bit code, pairs of sub-blocks sharing
+    // 32 bytes.
+    private static void DirectQ4K(Spv b, Team t, DirectOut o, Arr sh, V tid, V v)
+    {
+        var j = tid >> 5;
+        var i = tid & 31UL;
+        var start = tid - i;
+        var lo = b.Shared(K.F32, Threads);
+        var low = t.Join(lo, tid, i, start, 32, b.Min(b.C(K.F32, float.MaxValue), v), (p, q) => b.Min(p, q));
+        var high = t.Join(sh, tid, i, start, 32, b.Max(b.C(K.F32, float.MinValue), v), (p, q) => b.Max(p, q));
+        var l0 = b.Min(low, b.C(K.F32, 0));
+        var s = (high - l0) / 15.0;
+        var m = -l0;
+        // The eight sub-blocks' scales and mins in sh[0 .. 8) and lo[0 .. 8), joined from 0 by NMax.
+        b.If(i == 0, () => { sh[j] = s; lo[j] = m; });
+        var z = b.U(0);
+        var maxScale = t.LargestOf(sh, tid, 8);
+        var maxMin = t.Shuffles ? LargestRead(b, lo, 8) : t.LargestOf(lo, tid, 8);
+        var (codeD, d) = Half(b, maxScale / 63.0);
+        var (codeM, dmin) = Half(b, maxMin / 63.0);
+        var first = tid == 0;
+        o.Half(0, codeD, first);
+        o.Half(2, codeM, first);
+        var ls = b.Select(d == 0, b.S(0), ClampInt(b, b.RoundEven(s / d), 0, 63));
+        var lm = b.Select(dmin == 0, b.S(0), ClampInt(b, b.RoundEven(m / dmin), 0, 63));
+        var codes = b.Shared(K.S32, Threads);
+        var subs = b.Shared(K.S32, 16);
+        b.If(i == 0, () => { subs[j] = ls; subs[j + 8.0] = lm; });
+        var dj = d * b.Convert(ls, K.F32);
+        var mj = dmin * b.Convert(lm, K.F32);
+        codes[tid] = b.Select(dj == 0, b.S(0), ClampInt(b, b.RoundEven((v + mj) / dj), 0, 15));
+        b.Barrier();
+        // The 12 bytes of 6-bit codes: sub-blocks 0..3 whole in bytes 0..7, 4..7 split (invocations 0..3, three bytes each).
+        var four = tid < 4.0;
+        var jj = b.Select(four, tid, z);
+        V s0 = subs[jj], m0 = subs[jj + 8.0], s1 = subs[jj + 4.0], m1 = subs[jj + 12.0];
+        o.Byte(jj + 4.0, Low8(b, s0 | ((s1 >> 4) << 6)), four);
+        o.Byte(jj + 8.0, Low8(b, m0 | ((m1 >> 4) << 6)), four);
+        o.Byte(jj + 12.0, Low8(b, (s1 & 0xFUL) | ((m1 & 0xFUL) << 4)), four);
+        // The codes: invocation p·32 + c (p < 4) the byte of sub-blocks 2p (low nibble) and 2p + 1 (high) at value c.
+        var half = tid < 128.0;
+        var pair = b.Select(half, tid >> 5, z);
+        var c = tid & 31UL;
+        var q0 = codes[pair * 64.0 + c];
+        var q1 = codes[pair * 64.0 + 32 + c];
+        o.Byte(pair * 32.0 + c + 16, Low8(b, q0 | (q1 << 4)), half);
+    }
+
+    // Q6_K (EncodeQ6K's steps), a workgroup a super-block: each sub-block of 16's scale max|x| / 31 (from 0), the largest
+    // (from 0); d; each sub-block's int8 scale; each value's code q + 32 split into 4 low bits (ql) and 2 high (qh).
+    private static void DirectQ6K(Spv b, Team t, DirectOut o, Arr sh, V tid, V v)
+    {
+        var j = tid >> 4;
+        var i = tid & 15UL;
+        var start = tid - i;
+        var amax = t.Join(sh, tid, i, start, 16, b.Max(b.C(K.F32, 0), b.Abs(v)), (p, q) => b.Max(p, q));
+        var s = amax / 31.0;
+        var z = b.U(0);
+        b.If(i == 0, () => sh[j] = s);
+        var maxScale = t.LargestOf(sh, tid, 16);
+        var (code, d) = Half(b, maxScale / 127.0);
+        o.Half(208, code, tid == 0);
+        var l = b.Select(d == 0, b.S(0), ClampInt(b, b.RoundEven(s / d), -127, 127));
+        o.Byte(j + 192.0, Low8(b, l), i == 0);
+        var dj = d * b.Convert(l, K.F32);
+        var codes = b.Shared(K.U32, Threads);
+        codes[tid] = b.Bitcast(b.Select(dj == 0, b.S(0), ClampInt(b, b.RoundEven(v / dj), -32, 31)) + b.S(32), K.U32);
+        b.Barrier();
+        // Invocation h·32 + l (h < 2): values l, l + 32, l + 64, l + 96 of the half h's 128.
+        var two = tid < 64.0;
+        var hh = b.Select(two, tid >> 5, z);
+        var ll = tid & 31UL;
+        var vBase = hh * 128.0 + ll;
+        V q1 = codes[vBase], q2 = codes[vBase + 32], q3 = codes[vBase + 64], q4 = codes[vBase + 96];
+        var lBase = hh * 64.0 + ll;
+        o.Byte(lBase, (q1 & 0xFUL) | ((q3 & 0xFUL) << 4), two);
+        o.Byte(lBase + 32, (q2 & 0xFUL) | ((q4 & 0xFUL) << 4), two);
+        o.Byte(hh * 32.0 + 128 + ll, ((q1 >> 4) & 3UL) | (((q2 >> 4) & 3UL) << 2) | (((q3 >> 4) & 3UL) << 4) | (((q4 >> 4) & 3UL) << 6), two);
+    }
+
+    // The largest of sh[0 .. count) and 0 (NMax: a NaN never taken), read after a barrier already passed.
+    private static V LargestRead(Spv b, Arr sh, int count)
+    {
+        var acc = b.C(K.F32, 0);
+        for (int k = 0; k < count; k++) acc = b.Max(acc, sh[b.U(k)]);
+        return acc;
     }
 
     // Math.Clamp((int)x, lo, hi) of an integral f32 (or a truncation toward zero), as s32.
@@ -349,7 +660,7 @@ internal static partial class VkKernels
         {
             V src = b.Arg(0), rows = b.Arg(1, K.U32), cols = b.Arg(2, K.U32);
             return (at, _) => Codec.UnpackAt(b, f, src, (at % rows) * cols + at / rows, Lane.F32);
-        });
+        }, EncodesDirect(vk, f, EncodeSource.Transpose));
 
     /// <summary>out[r·k + j] = x[r][index[r·k + j]]. Slots: x, index, cols, k.</summary>
     public static SpvKernel BlockGather(Vulkan vk, Fmt f) =>
@@ -377,7 +688,7 @@ internal static partial class VkKernels
                 var value = LayoutValue(b, inFmt ?? f, lane, name, a, r, c, at);
                 return value.Kind == K.F32 ? value : b.Convert(value, K.F32);
             };
-        });
+        }, EncodesDirect(vk, f, name == "strided" ? EncodeSource.View : EncodeSource.Own));
 
     /// <summary>A row operation's output (y, or y2 when second) replayed with its row's statistics. The rows' slots (0 .. 12).</summary>
     public static SpvKernel BlockRowReplay(Vulkan vk, Fmt f, Lane lane, RowOp op, bool secondInput, bool secondOutput) =>

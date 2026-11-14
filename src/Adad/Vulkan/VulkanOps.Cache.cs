@@ -3,7 +3,8 @@
 
 // Key and value caches on Vulkan (Abstraction/Cache.cs, ICache; their kernels Kernels.Cache.cs and the decode kernel's
 // cache options, Kernels.Attention.cs): the position stays on the device, read by each kernel. A write: an invocation a
-// stored word of the cache; a block format's cache by its encoder into staging and the compaction of the touched words.
+// stored word of the cache; a block format's cache by its encoder into staging (the staged encoders, not the direct
+// ones) and the compaction of the touched words.
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
@@ -49,7 +50,7 @@ public sealed partial class VulkanOps
                 slots[0] = source;
                 slots[VkKernels.StagingSlot] = staging;
                 slots[VkKernels.CountSlot] = (ulong)((long)rows * c.D);
-                vk.Launch(vk.Cached($"block_convert:{fx.Name}:{fc.Name}", () => VkKernels.BlockConvert(vk, fx, fc)), Groups(blocks, VkKernels.Threads), 1, slots);
+                vk.Launch(vk.Cached($"block_convert_staged:{fx.Name}:{fc.Name}", () => VkKernels.BlockConvert(vk, fx, fc, staged: true)), Groups(blocks, VkKernels.Threads), 1, slots);
                 long wph = ((long)steps * rowBytes + 3) / 4 + 1;
                 vk.Launch(vk.Cached($"cache_rows_compact:{fc.Name}", () => VkKernels.CacheRowsCompact(vk, fc)), Groups(c.Heads * wph, VkKernels.Threads), 1,
                     staging, cache, position, Vulkan.U(c.Heads), Vulkan.U(steps), Vulkan.U(c.Capacity), Vulkan.U(rowBytes), Vulkan.U(wph));
