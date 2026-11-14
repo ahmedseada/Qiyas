@@ -331,13 +331,42 @@ public sealed partial class GpuOps(Gpu gpu)
     public string Gemv<TN>(ulong a, ulong x, ulong y, int rows, int cols, bool transposed) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (Routes.Route(f) && !transposed && cols % 32 == 0)
-        {
-            ulong yBlocks = gpu.Rent(rows * 4L);
-            try { string blockLane = GemvBlocks<TN>(a, x, yBlocks, rows, cols); Back(f, Lane.F32, yBlocks, y, rows); return blockLane; }
-            finally { gpu.Return(yBlocks); }
-        }
+        // The block-scaled product where the type's layout fits it and (measured mode) it measures faster at this shape.
+        if (Routes.Route(f) && !transposed && cols % 32 == 0 && (!Routes.Measured || GemvBlocksFaster<TN>(a, x, rows, cols)))
+            return GemvViaBlocks<TN>(a, x, y, rows, cols);
+        return GemvGeneric<TN>(a, x, y, rows, cols, transposed);
+    }
 
+    private string GemvViaBlocks<TN>(ulong a, ulong x, ulong y, int rows, int cols) where TN : struct, IAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        ulong yBlocks = gpu.Rent(rows * 4L);
+        try { string blockLane = GemvBlocks<TN>(a, x, yBlocks, rows, cols); Back(f, Lane.F32, yBlocks, y, rows); return blockLane; }
+        finally { gpu.Return(yBlocks); }
+    }
+
+    private readonly Dictionary<string, bool> _gemvBlocksFaster = [];
+
+    // Measured mode: the block gemv or the generic one, whichever this device measures faster at the shape (once).
+    private bool GemvBlocksFaster<TN>(ulong a, ulong x, int rows, int cols) where TN : struct, IAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        string key = $"{f.Name}:{rows}x{cols}";
+        if (_gemvBlocksFaster.TryGetValue(key, out bool known)) return known;
+        ulong scratch = gpu.Rent(f.Words(rows) * 4 + 64);
+        try
+        {
+            var (tb, tg) = Measure.Faster(() => GemvViaBlocks<TN>(a, x, scratch, rows, cols), () => GemvGeneric<TN>(a, x, scratch, rows, cols, false), Gpu.Synchronize);
+            bool blocks = _gemvBlocksFaster[key] = tb <= tg;
+            Note($"gemv {key}: block-scaled {tb:0.000} ms, generic {tg:0.000} ms: {(blocks ? "block-scaled" : "generic")}");
+            return blocks;
+        }
+        finally { gpu.Return(scratch); }
+    }
+
+    private string GemvGeneric<TN>(ulong a, ulong x, ulong y, int rows, int cols, bool transposed) where TN : struct, IAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
         // Every type, block formats too: A and x read in place (decoded a value at a time), y's sums in the sum lane, then
         // stored as the type (a block format's blocks encoded from them). The lane is the one the type's range gives, not
         // the measured values': A is read once, so a pass measuring it would cost as much as the product. Any lane the
@@ -453,7 +482,7 @@ public sealed partial class GpuOps(Gpu gpu)
             if (f.Bits == 64) return "f64";
             if (f.Bits == 32 || f.IsBlock) return "f32";                     // a block's values (an f16 scale times an integer) are exact in f32, not in f16
             var kind = Routes.IsBf16(f) ? Ptx.Kind.BF16 : Ptx.Kind.F16;
-            return !Routes.Generic && MmaSupported(kind) ? kind.Name + "mma" : "f32";
+            return !Routes.Generic && !_noUnits && MmaSupported(kind) ? kind.Name + "mma" : "f32";
         }
 
         double bound = bounds.Bound;

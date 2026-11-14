@@ -1059,15 +1059,42 @@ internal sealed partial class Kernels
     /// <summary>y = A·x (A rows × cols, x cols, y rows) or, transposed, y = Aᵀ·x (x rows, y cols), in the sum lane; y stored as the type.</summary>
     public static string Gemv<TN>(byte[] a, byte[] x, byte[] y, int rows, int cols, bool transposed) where TN : struct, IAdad<TN>
     {
-        if (Routes.Route<TN>() && !transposed && cols % 32 == 0)
-        {
-            // The block-scaled integer product: the format's own fast path (y encoded by blocks from float32 lanes).
-            var yl = new float[rows];
-            string blockLane = GemvBlocks(Routes.Layout<TN>(), a, x, yl, rows, cols);
-            CopyLanes<TN>(MemoryMarshal.AsBytes(yl.AsSpan()).ToArray(), y, rows);
-            return blockLane;
-        }
+        // The block-scaled integer product where the type's layout fits it, the CPU has the s8 dot lane, and (measured
+        // mode) it measures faster than the generic route at this shape.
+        if (Routes.Route<TN>() && !transposed && cols % 32 == 0 && (!Routes.Measured || (S8Dot.IsSupported && GemvBlocksFaster<TN>(a, x, rows, cols))))
+            return GemvViaBlocks<TN>(a, x, y, rows, cols);
+        return GemvGeneric<TN>(a, x, y, rows, cols, transposed);
+    }
 
+    // The block-scaled integer product (y encoded by blocks from float32 lanes).
+    private static string GemvViaBlocks<TN>(byte[] a, byte[] x, byte[] y, int rows, int cols) where TN : struct, IAdad<TN>
+    {
+        var yl = new float[rows];
+        string blockLane = GemvBlocks(Routes.Layout<TN>(), a, x, yl, rows, cols);
+        CopyLanes<TN>(MemoryMarshal.AsBytes(yl.AsSpan()).ToArray(), y, rows);
+        return blockLane;
+    }
+
+    private static readonly Dictionary<string, bool> s_gemvBlocksFaster = [];
+
+    // Measured mode: the block gemv or the generic one, whichever this processor measures faster at the shape (once).
+    private static bool GemvBlocksFaster<TN>(byte[] a, byte[] x, int rows, int cols) where TN : struct, IAdad<TN>
+    {
+        string key = $"{TN.Name}:{rows}x{cols}";
+        lock (s_gemvBlocksFaster)
+        {
+            if (s_gemvBlocksFaster.TryGetValue(key, out bool known)) return known;
+            var scratch = new byte[TN.Bytes(rows)];
+            var (tb, tg) = Measure.Faster(() => GemvViaBlocks<TN>(a, x, scratch, rows, cols), () => GemvGeneric<TN>(a, x, scratch, rows, cols, false));
+            bool blocks = s_gemvBlocksFaster[key] = tb <= tg;
+            Note($"gemv {key}: block-scaled {tb:0.000} ms, generic {tg:0.000} ms: {(blocks ? "block-scaled" : "generic")}");
+            return blocks;
+        }
+    }
+
+    // Every type: the sum lane the bounds give.
+    private static string GemvGeneric<TN>(byte[] a, byte[] x, byte[] y, int rows, int cols, bool transposed) where TN : struct, IAdad<TN>
+    {
         var (aLo, aHi) = TN.IsFloat ? (0, 0) : TN.Range(a, rows * cols);                 // a float type's lane does not depend on them
         var (xLo, xHi) = TN.IsFloat ? (0, 0) : TN.Range(x, transposed ? rows : cols);
         var bounds = new Bounds(aLo, aHi, xLo, xHi, transposed ? rows : cols);

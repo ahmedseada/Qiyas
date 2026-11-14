@@ -40,6 +40,7 @@ internal sealed partial class Kernels
     public static void UnpackBlock(ScaledBlock format, ReadOnlySpan<byte> block, out float scale, Span<sbyte> q)
     {
         scale = (float)BitConverter.ToHalf(block[..2]);
+        if (format.CodeBits == 8 && format.CodeBias == 0) { MemoryMarshal.Cast<byte, sbyte>(block.Slice(2, 32)).CopyTo(q); return; }
         if (format.CodeBits == 8) { for (int i = 0; i < 32; i++) q[i] = (sbyte)((sbyte)block[2 + i] + format.CodeBias); return; }
         for (int i = 0; i < 16; i++) { q[i] = (sbyte)((block[2 + i] & 0xF) + format.CodeBias); q[i + 16] = (sbyte)((block[2 + i] >> 4) + format.CodeBias); }
     }

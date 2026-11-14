@@ -76,7 +76,11 @@ public static class Routes
 
     public static bool Generic => Mode == "generic";
 
-    public static bool Props => Mode == "props";
+    /// <summary>The type's description decides (props and measured).</summary>
+    public static bool Props => Mode is "props" or "measured";
+
+    /// <summary>"measured": a fast path only where the device has it, the description fits it, and it measures faster at the shape.</summary>
+    public static bool Measured => Mode == "measured";
 
     /// <summary>Whether the format is one the block routes can take (name or layout, as the mode says).</summary>
     public static bool Takes(Fmt f) => Props ? f.Scaled.Is32 : f.Name is "q8_0" or "q4_0";

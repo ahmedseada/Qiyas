@@ -18,7 +18,46 @@ public sealed partial class GpuOps
     {
         if (v.K == 0) return MatMulNoTerms<TN>(v, c);
         if (BlockView<TN>(v) && UseBlocks<TN>(v, a, b, c)) return MatMulViewBlocks<TN>(v, a, b, c);
+        if (Routes.Measured && UnitsCandidate<TN>() && !UseUnits<TN>(v, a, b, c)) return WithoutUnits(() => MatMulViewRoute<TN>(v, a, b, c));
         return MatMulViewRoute<TN>(v, a, b, c);
+    }
+
+    // Measured mode: while set, a 16-bit float's product takes the f32 lane, not the matrix units.
+    private bool _noUnits;
+
+    private string WithoutUnits(Func<string> run)
+    {
+        _noUnits = true;
+        try { return run(); }
+        finally { _noUnits = false; }
+    }
+
+    // A 16-bit float the matrix units could take: the device has the unit (it accepts the instruction), and the type's
+    // description is the unit's operand format (f16: 5-bit exponent, 10-bit mantissa; bf16: 8 and 7).
+    private bool UnitsCandidate<TN>() where TN : struct, IAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        if (!f.IsFloat || f.IsBlock || f.Bits != 16) return false;
+        bool f16 = !Routes.IsBf16(f);
+        return MmaSupported(f16 ? Ptx.Kind.F16 : Ptx.Kind.BF16) && Routes.IsUnitFloat(f, f16);
+    }
+
+    private readonly Dictionary<string, bool> _unitsFaster = [];
+
+    // Measured mode: the matrix units or the f32 lane, whichever this device measures faster at the shape (once).
+    private bool UseUnits<TN>(ProductView v, ulong a, ulong b, ulong c) where TN : struct, IAdad<TN>
+    {
+        string key = $"{Fmt.Of<TN>().Name}:{v.M}x{v.N}x{v.K}:{v.TransA}{v.TransB}:{v.Batch}";
+        if (_unitsFaster.TryGetValue(key, out bool known)) return known;
+        ulong scratch = gpu.Rent(Fmt.Of<TN>().Words(v.ValuesC) * 4 + 64);
+        try
+        {
+            var (tu, tf) = Measure.Faster(() => MatMulViewRoute<TN>(v, a, b, scratch), () => WithoutUnits(() => MatMulViewRoute<TN>(v, a, b, scratch)), Gpu.Synchronize);
+            bool units = _unitsFaster[key] = tu <= tf;
+            Note($"product {key}: matrix units {tu:0.000} ms, f32 lane {tf:0.000} ms: {(units ? "matrix units" : "f32 lane")}");
+            return units;
+        }
+        finally { gpu.Return(scratch); }
     }
 
     /// <summary>C of a product of no terms (k = 0): the empty sum, 0 in every value of every batch's C. Taken as the
