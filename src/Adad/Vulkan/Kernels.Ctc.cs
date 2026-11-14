@@ -19,8 +19,9 @@ internal static partial class VkKernels
 {
     public const int CtcThreads = 256, CtcRowThreads = 64;
 
-    /// <summary>Workgroup bytes of the ctc kernel for states up to cap: two state buffers with pads, the per-state terms, log P.</summary>
-    public static int CtcShared(Lane lane, int cap) => (3 * cap + 5) * lane.Size;
+    /// <summary>Workgroup bytes of the ctc kernel for states up to cap: two state buffers with pads, the per-state terms, log P,
+    /// and the sequence's states' classes and flags (read once from memory, then every frame from the workgroup's).</summary>
+    public static int CtcShared(Lane lane, int cap) => (3 * cap + 5) * lane.Size + 2 * (cap + 2) * 4;
 
     /// <summary>Arguments: x, lse, ilen, grad (0 for the loss alone), T, B, C; a workgroup per row (T·B of them).</summary>
     public static SpvKernel CtcRows(Vulkan vk, Fmt f, Lane lane, bool backward)
@@ -100,15 +101,35 @@ internal static partial class VkKernels
         V LseAt(V t) => b.Load(k, b.At(lseG, t * B + seq, lane.Size));
         V Base(V t) => (t & 1UL) * stride;
         // log y_t(l'_s) = x[t][seq][cls(s)] − lse_t.
-        V Emit(V row, V lseT, V s) => Codec.UnpackAt(b, f, x, row + U(clsG, flagRow + s), lane) - lseT;
+        // The sequence's states' classes and flags (cap + 2 of each: a state's s + 2 among them), once into workgroup memory.
+        var clsSh = b.Shared(K.U32, cap + 2);
+        var flagSh = b.Shared(K.U32, cap + 2);
+        b.For(tid, b.Min(S + 2, smax + 2), b.U(CtcThreads), s =>
+        {
+            clsSh[s] = U(clsG, flagRow + s);
+            flagSh[s] = U(flagsG, flagRow + s);
+        });
+        b.Barrier();
+        V Emit(V row, V lseT, V s) => Codec.UnpackAt(b, f, x, row + clsSh[s], lane) - lseT;
 
+        // log(e^p + e^q + e^r), the terms e^(· − max) added in that order: the largest's term is e^0 = 1 exactly, so only
+        // the other two are exponentiated (the same sums as all three).
         V Lse3(V p, V q, V r)
         {
             var m = b.Max(b.Max(p, q), r);
             var none = m == double.NegativeInfinity;
             var ms = b.Select(none, zero, m);
-            var sum = Fn.Exp(b, p - ms) + Fn.Exp(b, q - ms);
-            sum = sum + Fn.Exp(b, r - ms);
+            var pm = p == m;
+            var qm = !pm & (q == m);
+            var top = pm | qm;
+            var one = b.C(k, 1);
+            var e1 = Fn.Exp(b, b.Select(pm, q, p) - ms);
+            var e2 = Fn.Exp(b, b.Select(top, r, q) - ms);
+            var ep = b.Select(pm, one, e1);
+            var eq = b.Select(pm, e1, b.Select(qm, one, e2));
+            var er = b.Select(top, e2, one);
+            var sum = ep + eq;
+            sum = sum + er;
             return b.Select(none, negInf, ms + Fn.Log(b, sum));
         }
 
@@ -133,7 +154,7 @@ internal static partial class VkKernels
                 var e = Emit(row, lseT, s);
                 var p = buf[prev + s + 2];
                 var q = buf[prev + s + 1];
-                var r = b.Select((U(flagsG, flagRow + s) & 1UL) == 0, negInf, buf[prev + s]);
+                var r = b.Select((flagSh[s] & 1UL) == 0, negInf, buf[prev + s]);
                 var v = Lse3(p, q, r) + e;
                 // The first frame: state 0 and 1 take their emissions, the rest −∞.
                 v = b.Select(first, b.Select(s < 2, e, negInf), v);
@@ -180,7 +201,7 @@ internal static partial class VkKernels
                     var e = Emit(row, lseT, s);
                     var p = buf[prev + s];
                     var q = buf[prev + s + 1];
-                    var r = b.Select((U(flagsG, flagRow + s + 2) & 1UL) == 0, negInf, buf[prev + s + 2]);
+                    var r = b.Select((flagSh[s + 2] & 1UL) == 0, negInf, buf[prev + s + 2]);
                     var v = Lse3(p, q, r) + e;
                     v = b.Select(isLast, b.Select(s + 2 >= S, e, negInf), v);
                     buf[cur + s] = v;
@@ -191,11 +212,11 @@ internal static partial class VkKernels
                 // Each class's first state: y − Σ of its class's terms, in state order.
                 b.For(tid, S, b.U(CtcThreads), s =>
                 {
-                    b.If((U(flagsG, flagRow + s) & 2UL) != 0, () =>
+                    b.If((flagSh[s] & 2UL) != 0, () =>
                     {
-                        var myc = U(clsG, flagRow + s);
+                        var myc = clsSh[s];
                         var sum = b.Local(zero);
-                        b.For(s, S, b.U(2), q => sum.V = b.Select(U(clsG, flagRow + q) == myc, sum.V + gsh[q], sum.V));
+                        b.For(s, S, b.U(2), q => sum.V = b.Select(clsSh[q] == myc, sum.V + gsh[q], sum.V));
                         var ci = row + myc;
                         var y = Fn.Exp(b, Codec.UnpackAt(b, f, x, ci, lane) - lseT) - sum.V;
                         b.Store(b.At(grad, ci, lane.Size), y);

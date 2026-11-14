@@ -7,7 +7,8 @@
 // packed rows), transposed, batched and the backward pair, within the product's rounding. On the plain kernel, each
 // tiling (VulkanOps.TilingForced: 8 or 4 values a side an invocation, k whole or split in slices added in order) at a
 // long k and at sizes off every tile, every type; the experts' grouped products at each value a side, and the experts'
-// products an expert a units product (VulkanOps.ExpertsOnUnits forced).
+// products an expert a units product (VulkanOps.ExpertsOnUnits forced); a block format's box losses by each route
+// (VulkanOps.BoxLanes forced).
 using Adad.Vulkan;
 
 namespace Qiyas;
@@ -51,6 +52,17 @@ internal static partial class Checks
         }
         finally { ops.UnitsShape = null; }
         if (ok) Console.WriteLine($"check {"products on the matrix units",-36} vulkan every type under each of the kernel's {shapes.Length} shapes ({string.Join(", ", shapes)}): in place at 256 x 256 x 128, packed at 37 x 29 x 53, one side packed at 37 x 256 x 128 and 256 x 37 x 128, within the product's rounding");
+
+        // A block format's box losses by each route (the encoder computing its values, the f32 lanes then the encoder).
+        foreach (bool lanes in new[] { false, true })
+        {
+            try
+            {
+                ops.BoxLanes = lanes;
+                ok &= BoxLosses(ops, "vulkan");
+            }
+            finally { ops.BoxLanes = null; }
+        }
 
         // The experts' products an expert a units product wherever the type and lane allow (the measurement's other choice).
         try
