@@ -427,39 +427,77 @@ internal static partial class VkKernels
     private static V WordCount(Spv b, Fmt f, V n) =>
         f.WordBits == 64 ? n : b.Convert((b.Convert(n, K.U64) * (double)f.Bits + 31.0) >> 5, K.U32);
 
-    /// <summary>c = a + b over n values: a thread per word, each value in the type's own lane.</summary>
-    public static SpvKernel Add(Vulkan vk, Fmt f)
+    /// <summary>The stored words a vectorized element-wise kernel's invocation takes (Words: 16 bytes of them).</summary>
+    public static int VectorWords(Fmt f) => 16 / (f.WordBits / 8);
+
+    /// <summary>Whether an element-wise kernel takes 16 bytes of words an invocation (Words' vector) where the buffers allow:
+    /// for a type of several values a word, whose word an invocation leaves little in flight (float16 map:copy 0.116 ms
+    /// against 0.123, int8 add 0.059 against 0.075); not where a value is a word (float32 map:copy 0.228 against 0.215:
+    /// a quarter of the invocations).</summary>
+    public static bool Vectorizes(Fmt f) => f.Per > 1;
+
+    // A thread's words of an element-wise kernel: one word (gid); or, vectorized, VectorWords consecutive words read and
+    // written 16 bytes at a time where all of them are below the count (the last thread's words a word at a time). Each word
+    // made by `word` from its inputs' words: the same words either way.
+    private static void Words(Spv b, Fmt f, V n, bool vector, V[] inputs, V output, Func<V[], V> word) =>
+        Words(b, f, n, vector, inputs, output, (w, _) => word(w));
+
+    // As above, `word` also given the word's index.
+    private static void Words(Spv b, Fmt f, V n, bool vector, V[] inputs, V output, Func<V[], V, V> word)
+    {
+        var gid = b.GlobalX;
+        var wk = Codec.WordKind(f);
+        int bytes = f.WordBits / 8;
+        var count = WordCount(b, f, n);
+        void One(V w) => b.Store(b.At(output, w, bytes), word([.. inputs.Select(p => b.Load(wk, b.At(p, w, bytes)))], w));
+        if (!vector)
+        {
+            b.If(gid < count, () => One(gid));
+            return;
+        }
+
+        int per = VectorWords(f);
+        var first = gid * (double)per;
+        b.If(first + (per - 1.0) < count, () =>
+        {
+            var loaded = inputs.Select(p => b.LoadN(wk, per, b.At(p, gid, 16))).ToArray();
+            var made = new V[per];
+            for (int q = 0; q < per; q++) made[q] = word([.. loaded.Select(l => l[q])], first + q);
+            b.StoreN(b.At(output, gid, 16), made);
+        }, () => b.For(first, b.Min(first + (double)per, count), One));
+    }
+
+    /// <summary>c = a + b over n values: a thread per word (or, vector, per 16 bytes of words: VectorWords), each value in the
+    /// type's own lane.</summary>
+    public static SpvKernel Add(Vulkan vk, Fmt f, bool vector = false)
     {
         var lane = f.Natural;
-        var b = new Spv("add_" + f.Name, Threads, vk.Controls);
+        var b = new Spv("add_" + f.Name + (vector ? "_v" : ""), Threads, vk.Controls);
         var pa = b.Arg(0);
         var pb = b.Arg(1);
         var pc = b.Arg(2);
         var n = b.Arg(3, K.U32);
-        var gid = b.GlobalX;
         var wk = Codec.WordKind(f);
-        b.If(gid < WordCount(b, f, n), () =>
+        Words(b, f, n, vector, [pa, pb], pc, w =>
         {
-            int bytes = f.WordBits / 8;
-            var wa = b.Load(wk, b.At(pa, gid, bytes));
-            var wb = b.Load(wk, b.At(pb, gid, bytes));
             var wc = b.CBits(wk, 0);
             for (int i = 0; i < f.Per; i++)
             {
-                var z = Codec.Unpack(b, f, wa, i, lane) + Codec.Unpack(b, f, wb, i, lane);
+                var z = Codec.Unpack(b, f, w[0], i, lane) + Codec.Unpack(b, f, w[1], i, lane);
                 wc = Codec.Pack(b, f, z, lane, i, wc);
             }
 
-            b.Store(b.At(pc, gid, bytes), wc);
+            return wc;
         });
         return b.Build();
     }
 
-    /// <summary>output = op(x, y, z; a, b) over n values of f in lane `lane`: a thread per word (absent inputs never read).</summary>
-    public static SpvKernel Map(Vulkan vk, Fmt f, Lane lane, MapOp op)
+    /// <summary>output = op(x, y, z; a, b) over n values of f in lane `lane`: a thread per word (or, vector, per 16 bytes of
+    /// words: VectorWords; absent inputs never read).</summary>
+    public static SpvKernel Map(Vulkan vk, Fmt f, Lane lane, MapOp op, bool vector = false)
     {
         var k = Kinds.Of(lane);
-        var b = new Spv($"map_{op.Name}_{f.Name}_{lane.Name}", Threads, vk.Controls);
+        var b = new Spv($"map_{op.Name}_{f.Name}_{lane.Name}{(vector ? "_v" : "")}", Threads, vk.Controls);
         var px = b.Arg(0);
         var py = b.Arg(1);
         var pz = b.Arg(2);
@@ -467,14 +505,13 @@ internal static partial class VkKernels
         var n = b.Arg(4, K.U32);
         var a = b.Arg(5, k);
         var pb = b.Arg(6, k);
-        var gid = b.GlobalX;
         var wk = Codec.WordKind(f);
-        b.If(gid < WordCount(b, f, n), () =>
+        V[] inputs = [.. new[] { px, py, pz }.Take(op.Inputs)];
+        Words(b, f, n, vector, inputs, po, w =>
         {
-            int bytes = f.WordBits / 8;
-            var wx = op.Inputs >= 1 ? b.Load(wk, b.At(px, gid, bytes)) : b.CBits(wk, 0);
-            var wy = op.Inputs >= 2 ? b.Load(wk, b.At(py, gid, bytes)) : wx;
-            var wz = op.Inputs >= 3 ? b.Load(wk, b.At(pz, gid, bytes)) : wx;
+            var wx = op.Inputs >= 1 ? w[0] : b.CBits(wk, 0);
+            var wy = op.Inputs >= 2 ? w[1] : wx;
+            var wz = op.Inputs >= 3 ? w[2] : wx;
             var wo = b.CBits(wk, 0);
             for (int i = 0; i < f.Per; i++)
             {
@@ -484,39 +521,36 @@ internal static partial class VkKernels
                 wo = Codec.Pack(b, f, Formula(b, k, op.Name, x, y, z, a, pb), lane, i, wo, wrap: !f.IsFloat);
             }
 
-            b.Store(b.At(po, gid, bytes), wo);
+            return wo;
         });
         return b.Build();
     }
 
-    /// <summary>output[r, c] = op(x[r, c], v[c]) over rows × cols values of f (not a block format): a thread per output word,
-    /// each of its values' row vector entry read where it is stored.</summary>
-    public static SpvKernel MapRow(Vulkan vk, Fmt f, Lane lane, MapOp op)
+    /// <summary>output[r, c] = op(x[r, c], v[c]) over rows × cols values of f (not a block format): a thread per output word
+    /// (or, vector, per 16 bytes of words: VectorWords), each of its values' row vector entry read where it is stored.</summary>
+    public static SpvKernel MapRow(Vulkan vk, Fmt f, Lane lane, MapOp op, bool vector = false)
     {
         var k = Kinds.Of(lane);
-        var b = new Spv($"maprow_{op.Name}_{f.Name}_{lane.Name}", Threads, vk.Controls);
+        var b = new Spv($"maprow_{op.Name}_{f.Name}_{lane.Name}{(vector ? "_v" : "")}", Threads, vk.Controls);
         var px = b.Arg(0);
         var pv = b.Arg(1);
         var po = b.Arg(2);
         var n = b.Arg(3, K.U32);
         var cols = b.Arg(4, K.U32);
-        var gid = b.GlobalX;
         var wk = Codec.WordKind(f);
-        b.If(gid < WordCount(b, f, n), () =>
+        var zero = b.C(k, 0);
+        Words(b, f, n, vector, [px], po, (w, word) =>
         {
-            int bytes = f.WordBits / 8;
-            var wx = b.Load(wk, b.At(px, gid, bytes));
             var wo = b.CBits(wk, 0);
-            var zero = b.C(k, 0);
             for (int i = 0; i < f.Per; i++)
             {
-                var at = gid * (double)f.Per + i;
-                var x = Codec.Unpack(b, f, wx, i, lane);
+                var at = word * (double)f.Per + i;
+                var x = Codec.Unpack(b, f, w[0], i, lane);
                 var v = Codec.UnpackAt(b, f, pv, at % cols, lane);
                 wo = Codec.Pack(b, f, Formula(b, k, op.Name, x, v, x, zero, zero), lane, i, wo, wrap: !f.IsFloat);
             }
 
-            b.Store(b.At(po, gid, bytes), wo);
+            return wo;
         });
         return b.Build();
     }

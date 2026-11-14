@@ -119,8 +119,11 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
             return;
         }
 
-        var k = vk.Cached($"add:{f.Name}", () => VkKernels.Add(vk, f));
-        vk.Launch(k, Groups(f.Words(n), VkKernels.Threads), 1, a, b, c, Vulkan.U(n));
+        // 16 bytes of words an invocation where every buffer's address is a 16-byte one (VkKernels.VectorWords), for a type of
+        // several values a word (VkKernels.Vectorizes).
+        bool vector = VkKernels.Vectorizes(f) && ((a | b | c) & 15) == 0;
+        var k = vk.Cached($"add:{f.Name}:{vector}", () => VkKernels.Add(vk, f, vector));
+        vk.Launch(k, Groups(vector ? (f.Words(n) + VkKernels.VectorWords(f) - 1) / VkKernels.VectorWords(f) : f.Words(n), VkKernels.Threads), 1, a, b, c, Vulkan.U(n));
     }
 
     public string Map<TN>(MapOp op, ulong x, ulong y, ulong z, ulong output, int n, double a, double b) where TN : struct, IAdad<TN>
@@ -135,8 +138,10 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
             return lane.Name;
         }
 
-        var k = vk.Cached($"map:{op.Name}:{f.Name}:{lane.Name}", () => VkKernels.Map(vk, f, lane, op));
-        vk.Launch(k, Groups(f.Words(n), VkKernels.Threads), 1, x, y, z, output, Vulkan.U(n), Slot(lane, a), Slot(lane, b));
+        // 16 bytes of words an invocation where the inputs' and the output's addresses are 16-byte ones (VkKernels.VectorWords).
+        bool vector = VkKernels.Vectorizes(f) && ((output | (op.Inputs >= 1 ? x : 0) | (op.Inputs >= 2 ? y : 0) | (op.Inputs >= 3 ? z : 0)) & 15) == 0;
+        var k = vk.Cached($"map:{op.Name}:{f.Name}:{lane.Name}:{vector}", () => VkKernels.Map(vk, f, lane, op, vector));
+        vk.Launch(k, Groups(vector ? (f.Words(n) + VkKernels.VectorWords(f) - 1) / VkKernels.VectorWords(f) : f.Words(n), VkKernels.Threads), 1, x, y, z, output, Vulkan.U(n), Slot(lane, a), Slot(lane, b));
         return lane.Name;
     }
 
@@ -154,8 +159,9 @@ public sealed partial class VulkanOps(Vulkan vk) : IDevice<ulong, ulong>
             return lane.Name;
         }
 
-        var k = vk.Cached($"maprow:{op.Name}:{f.Name}", () => VkKernels.MapRow(vk, f, lane, op));
-        vk.Launch(k, Groups(f.Words(n), VkKernels.Threads), 1, x, v, output, Vulkan.U(n), Vulkan.U(cols));
+        bool vector = VkKernels.Vectorizes(f) && ((x | output) & 15) == 0;
+        var k = vk.Cached($"maprow:{op.Name}:{f.Name}:{vector}", () => VkKernels.MapRow(vk, f, lane, op, vector));
+        vk.Launch(k, Groups(vector ? (f.Words(n) + VkKernels.VectorWords(f) - 1) / VkKernels.VectorWords(f) : f.Words(n), VkKernels.Threads), 1, x, v, output, Vulkan.U(n), Vulkan.U(cols));
         return lane.Name;
     }
 
