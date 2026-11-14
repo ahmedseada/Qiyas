@@ -173,6 +173,17 @@ internal static partial class VkKernels
         return (start, end - start);
     }
 
+    // The outputs [first, end) along an axis whose adaptive windows (AdaptiveSpan) can hold input position i: window o
+    // starts at or before i when o·n < (i + 1)·outs, and ends after it when (o + 1)·n > i·outs, so o runs from ⌊i·outs/n⌋
+    // to ⌊((i + 1)·outs − 1)/n⌋ (held to the outputs).
+    private static (V First, V End) AdaptiveRange(V i, V n, V outs)
+    {
+        var b = i.B;
+        var first = b.Min(i * outs / n, outs);
+        var end = b.Min(((i + 1) * outs - 1) / n + 1, outs);
+        return (first, end);
+    }
+
     // The input positions window o covers along an axis of n (LayoutArgs.Window): min(o·s − before + k, n) − max(o·s − before,
     // 0), signed (a window may start in the leading pad).
     private static V WindowSpan(Spv b, V o, V s, V before, V k, V n)
@@ -195,6 +206,190 @@ internal static partial class VkKernels
         var i1 = b.Min(i0 + 1, last);
         var f = b.Convert(b.Select(past, b.U(0), rem), k) / b.Convert(delta, k);
         return (i0, i1, f, b.C(k, 1) - f);
+    }
+
+    /// <summary>The bilinear interpolations' axes (BilinearAxis of every output row oh &lt; OH, then of every output column),
+    /// once a call, so the kernels read each position's two rows and weight instead of making them for every value with a
+    /// division of integers and one of the lane: at aux, i0 (u32) for the OH + OW positions, then i1 (u32), then f (lane). The
+    /// same operations on the same integers: the same weights. The layout's slots (p: C H W OH OW αh βh δh αw βw δw).</summary>
+    public static SpvKernel BilinearTables(Vulkan vk, Lane lane)
+    {
+        var k = Kinds.Of(lane);
+        var b = new Spv($"bilinear_tables_{lane.Name}", Threads, vk.Controls);
+        var a = new LayoutIn(b);
+        var p = a.P;
+        var o = b.GlobalX;
+        V H = p[1], W = p[2], OH = p[3], OW = p[4];
+        var n = OH + OW;
+        b.If(o < n, () =>
+        {
+            var rows = o < OH;
+            var at = b.Select(rows, o, o - OH);
+            var (i0, i1, f, _) = BilinearAxis(b, k, at, b.Select(rows, H, W), b.Select(rows, p[5], p[8]), b.Select(rows, p[6], p[9]), b.Select(rows, p[7], p[10]));
+            b.Store(b.At(a.Aux, o, 4), i0);
+            b.Store(b.At(a.Aux, n + o, 4), i1);
+            b.Store(b.At(a.Aux + b.Convert(n, K.U64) * 8.0, o, lane.Size), f);
+        });
+        return b.Build();
+    }
+
+    /// <summary>The dimension a canonical strided view (P: d0 … d(n−1) | s0 … s(n−1) | base) reads with stride 1, other than its
+    /// last, where its last's stride is not 1: the view is then a transposition of that dimension with the last (batched
+    /// over the others), which StridedTiled copies by tiles; −1 where none (the last reads in order, or no dimension does).
+    /// A packed type's tiles store whole words: its last dimension's values whole words.</summary>
+    public static int StridedTileDim(Fmt f, int[] p)
+    {
+        int n = p.Length / 2;
+        if (n < 2 || p[2 * n - 1] == 1) return -1;
+        if (f.Per > 1 && (long)p[n - 1] * f.Bits % 32 != 0) return -1;
+        for (int j = n - 2; j >= 0; j--) if (p[n + j] == 1 && p[j] > 1) return j;
+        return -1;
+    }
+
+    /// <summary>A canonical strided view of rank n whose dimension j reads with stride 1 (StridedTileDim), copied by tiles of 32
+    /// of dimension j × 32 of the last through workgroup memory (in the lane): a workgroup of 32 × 8 invocations reads its
+    /// tile along j (consecutive invocations consecutive input values) and writes it along the last (consecutive output
+    /// values; a packed type a word an invocation). Workgroups (⌈d_last / 32⌉ · ⌈d_j / 32⌉, the product of the other
+    /// dimensions). The layout's slots (P as Layout's strided).</summary>
+    public static SpvKernel StridedTiled(Vulkan vk, Fmt f, Lane lane, int n, int j)
+    {
+        const int T = TransposeTile, Y = 8, P = T + 1;
+        var k = Kinds.Of(lane);
+        var b = new Spv($"strided_tiled{n}_{j}_{f.Name}", T, vk.Controls, Y);
+        var a = new LayoutIn(b);
+        var p = a.P;
+        V tx = b.LocalIdX, ty = b.LocalIdY;
+        V dl = p[n - 1], dj = p[j], sl = p[2 * n - 1];
+        var tilesL = (dl + (T - 1.0)) / (double)T;
+        var tl = b.GroupX % tilesL;
+        var tj = b.GroupX / tilesL;
+        // The other dimensions' indices from the workgroup's y (innermost first), their input offset and output row.
+        var t = b.GroupY;
+        var inBase = p[2 * n];
+        var rowBase = b.U(0);
+        var rowStride = b.U(1);                                                    // the output rows a step of dimension d is
+        var strideJ = b.U(1);
+        for (int d = n - 2; d >= 0; d--)
+        {
+            if (d == j)
+            {
+                strideJ = rowStride;
+            }
+            else
+            {
+                var i = t % p[d];
+                t = t / p[d];
+                inBase = inBase + i * p[n + d];
+                rowBase = rowBase + i * rowStride;
+            }
+
+            rowStride = rowStride * p[d];
+        }
+
+        var tile = b.Shared(k, T * P);
+        var j0 = tj * (double)T;
+        var l0 = tl * (double)T;
+        for (int y = 0; y < T; y += Y)
+        {
+            var aj = j0 + tx;
+            var al = l0 + ty + y;
+            var at = (ty + y) * (double)P + tx;
+            b.If((aj < dj) & (al < dl), () => tile[at] = Codec.UnpackAt(b, f, a.X, inBase + aj + al * sl, lane));
+        }
+
+        b.Barrier();
+        var wk = Codec.WordKind(f);
+        int bytes = f.WordBits / 8;
+        if (f.Per == 1)
+        {
+            for (int y = 0; y < T; y += Y)
+            {
+                var aj = j0 + ty + y;
+                var al = l0 + tx;
+                var value = tile[tx * (double)P + ty + y];
+                b.If((aj < dj) & (al < dl), () => b.Store(b.At(a.Out, (rowBase + aj * strideJ) * dl + al, bytes), Codec.Pack(b, f, value, lane, 0, b.CBits(wk, 0))));
+            }
+
+            return b.Build();
+        }
+
+        int words = T / f.Per;
+        var tid = ty * (double)T + tx;
+        b.For(tid, b.U(T * words), b.U(T * Y), w =>
+        {
+            var row = w / (double)words;
+            var word = w - row * (double)words;
+            var aj = j0 + row;
+            var first = l0 + word * (double)f.Per;
+            b.If((aj < dj) & (first < dl), () =>
+            {
+                var packed = b.CBits(wk, 0);
+                for (int i = 0; i < f.Per; i++) packed = Codec.Pack(b, f, tile[(word * (double)f.Per + i) * P + row], lane, i, packed);
+                b.Store(b.At(a.Out, ((rowBase + aj * strideJ) * dl + first) / (double)f.Per, bytes), packed);
+            });
+        });
+        return b.Build();
+    }
+
+    /// <summary>The adaptive pools (forward) a workgroup an output word: each of the word's outputs' window read by the
+    /// workgroup's invocations in strides (the window's pixels in row-major order j = tid, tid + 256, …), joined by the tree
+    /// in workgroup memory: max pooling by First (Adad's order: the largest, a NaN where the window holds one), average
+    /// pooling's sum (its terms' order the tree's), then divided by the window's size. The word packed and stored by the
+    /// first invocation. Workgroups: the output's words (along x, then rows of them). The layout's slots.</summary>
+    public static SpvKernel AdaptivePool(Vulkan vk, Fmt f, Lane lane, bool max)
+    {
+        var k = Kinds.Of(lane);
+        var b = new Spv($"adaptive_pool_{(max ? "max" : "avg")}_{f.Name}_{lane.Name}", ReduceThreads, vk.Controls);
+        var a = new LayoutIn(b);
+        var p = a.P;
+        V H = p[1], W = p[2], OH = p[3], OW = p[4];
+        var tid = b.LocalIdX;
+        var word = b.GroupY * b.GroupsX + b.GroupX;
+        var natural = f.Natural;
+        var nk = Kinds.Of(natural);
+        var wk = Codec.WordKind(f);
+        var sv = b.Shared(k, ReduceThreads);
+        var packed = b.CBits(wk, 0);
+        var last = a.Count - 1;
+        for (int i = 0; i < f.Per; i++)
+        {
+            var at = word * (double)f.Per + i;
+            var o = b.Min(at, last);
+            var ow = o % OW;
+            var r = o / OW;
+            var oh = r % OH;
+            var ch = r / OH;
+            var (h0, hl) = AdaptiveSpan(oh, H, OH);
+            var (w0, wl) = AdaptiveSpan(ow, W, OW);
+            var acc = b.Local(max ? Identity(b, k, "max") : b.C(k, 0));
+            b.For(tid, hl * wl, b.U(ReduceThreads), j =>
+            {
+                var dy = j / wl;
+                var xv = Codec.UnpackAt(b, f, a.X, (ch * H + h0 + dy) * W + w0 + (j - dy * wl), lane);
+                acc.V = max ? First(b, acc.V, xv) : acc.V + xv;
+            });
+            V value = max
+                ? GroupReduce(b, sv, tid, acc.V, (x, y) => First(b, x, y), ReduceThreads)
+                : GroupReduce(b, sv, tid, acc.V, (x, y) => x + y, ReduceThreads) / b.Convert(hl * wl, k);
+            var stored = lane.Name == natural.Name ? value : Codec.Convert(b, lane, value, natural);
+            packed = Codec.Pack(b, f, b.Select(at < a.Count, stored, b.C(nk, 0)), natural, i, packed);
+        }
+
+        var finalWord = packed;
+        b.If((tid == 0) & (word < WordCount(b, f, a.Count)), () => b.Store(b.At(a.Out, word, f.WordBits / 8), finalWord));
+        return b.Build();
+    }
+
+    /// <summary>The bytes BilinearTables takes for an output of OH × OW positions.</summary>
+    public static long BilinearTableBytes(int oh, int ow, Lane lane) => (long)(oh + ow) * (8 + lane.Size);
+
+    // An axis's position o (rows: o an output row, else an output column) from BilinearTables at aux: i0, i1, f, g = 1 − f.
+    private static (V I0, V I1, V F, V G) TableAxis(Spv b, K k, int size, V aux, V oh, V ow, bool rows, V o)
+    {
+        var n = oh + ow;
+        var at = rows ? o : oh + o;
+        var f = b.Load(k, b.At(aux + b.Convert(n, K.U64) * 8.0, at, size));
+        return (b.Load(K.U32, b.At(aux, at, 4)), b.Load(K.U32, b.At(aux, n + at, 4)), f, b.C(k, 1) - f);
     }
 
     // A nearest axis (LayoutArgs.NearestAt): min(max(2(o·α + β) + δ, 0) / 2δ, in − 1), signed (β may be negative).
@@ -350,12 +545,21 @@ internal static partial class VkKernels
                 var (h0, h1) = SourceRange(b, bilinear, ih, H, OH, p[5], p[6], p[7]);
                 var (w0, w1) = SourceRange(b, bilinear, c, W, OW, p[8], p[9], p[10]);
                 var acc = b.Local(Zero());
+                // Bilinear: each position's rows and weight from the tables at aux (BilinearTables), AxisWeight's rule.
+                (V, V) Weight(bool rows, V o, V i)
+                {
+                    if (!bilinear) return rows ? AxisWeight(b, k, false, o, i, H, p[5], p[6], p[7]) : AxisWeight(b, k, false, o, i, W, p[8], p[9], p[10]);
+                    var (i0, i1, f, g) = TableAxis(b, k, lane.Size, a.Aux, OH, OW, rows, o);
+                    var first = i0 == i;
+                    return (first | (i1 == i), b.Select(first, g, f));
+                }
+
                 b.For(h0, h1, oh =>
                 {
-                    var (hasY, wy) = AxisWeight(b, k, bilinear, oh, ih, H, p[5], p[6], p[7]);
+                    var (hasY, wy) = Weight(true, oh, ih);
                     b.If(hasY, () => b.For(w0, w1, ow =>
                     {
-                        var (hasX, wx) = AxisWeight(b, k, bilinear, ow, c, W, p[8], p[9], p[10]);
+                        var (hasX, wx) = Weight(false, ow, c);
                         b.If(hasX, () => acc.V = b.Fma(Load((ch * OH + oh) * OW + ow), wy * wx, acc.V));
                     }));
                 });
@@ -364,12 +568,13 @@ internal static partial class VkKernels
 
             case "interpolate_bilinear":
             {
-                // p: C H W OH OW αh βh δh αw βw δw: each axis's two rows and weight exactly (BilinearAxis).
-                V H = p[1], W = p[2], OH = p[3];
+                // p: C H W OH OW αh βh δh αw βw δw: each axis's two rows and weight exactly (BilinearAxis), from the tables at
+                // aux (BilinearTables).
+                V H = p[1], W = p[2], OH = p[3], OW = p[4];
                 var oh = r % OH;
                 var ch = r / OH;
-                var (y0, y1, fy, gy) = BilinearAxis(b, k, oh, H, p[5], p[6], p[7]);
-                var (x0, x1, fx, gx) = BilinearAxis(b, k, c, W, p[8], p[9], p[10]);
+                var (y0, y1, fy, gy) = TableAxis(b, k, lane.Size, a.Aux, OH, OW, true, oh);
+                var (x0, x1, fx, gx) = TableAxis(b, k, lane.Size, a.Aux, OH, OW, false, c);
                 V Pixel(V yy, V xx) => Load((ch * H + yy) * W + xx);
                 var top = b.Fma(Pixel(y0, x1), fx, Pixel(y0, x0) * gx);
                 var bottom = b.Fma(Pixel(y1, x1), fx, Pixel(y1, x0) * gx);
@@ -470,17 +675,21 @@ internal static partial class VkKernels
             case "adaptive_maxpool_bwd":
             case "adaptive_avgpool_bwd":
             {
-                // Output (ch, ih, iw = c), r = ch·H + ih: over the output rows and columns whose window holds the pixel.
+                // Output (ch, ih, iw = c), r = ch·H + ih: over the output rows and columns whose window holds the pixel, in
+                // ascending order. Only the outputs from AdaptiveRange's first to its last can hold it (the windows' starts and
+                // ends rise with the output), so the scan starts and ends there: the same windows in the same order.
                 bool max = name == "adaptive_maxpool_bwd";
                 V H = p[1], W = p[2], OH = p[3], OW = p[4];
                 var ih = r % H;
                 var ch = r / H;
                 var me = (ch * H + ih) * W + c;
                 var acc = b.Local(Zero());
-                b.For(b.U(0), OH, oh =>
+                var (oh0, oh1) = AdaptiveRange(ih, H, OH);
+                var (ow0, ow1) = AdaptiveRange(c, W, OW);
+                b.For(oh0, oh1, oh =>
                 {
                     var (h0, hl) = AdaptiveSpan(oh, H, OH);
-                    b.If((ih >= h0) & (ih < h0 + hl), () => b.For(b.U(0), OW, ow =>
+                    b.If((ih >= h0) & (ih < h0 + hl), () => b.For(ow0, ow1, ow =>
                     {
                         var (w0, wl) = AdaptiveSpan(ow, W, OW);
                         b.If((c >= w0) & (c < w0 + wl), () =>

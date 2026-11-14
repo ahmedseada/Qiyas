@@ -104,6 +104,8 @@ public static class LayoutCases
                 // Transpositions along the middle and the third dimension (stride 1 there, not last): the tiled copy, partial tiles.
                 yield return Make(name, type, 360, null, [3, 4, 5, 6, 120, 1, 24, 4, 0], 360, 66);
                 yield return Make(name, type, 360, null, [3, 4, 5, 6, 120, 30, 1, 5, 0], 360, 67);
+                // A 64 × 40 array read as 40 × 64: rows of 64 values, whole words of every type, so the packed types' tiles too.
+                yield return Make(name, type, 64 * 40, null, [40, 64, 1, 40, 0], 64 * 40, 65);
                 // Six dimensions: a pixel shuffle's (n, c, r, r, h, w) read as (n, c, h, r, w, r) (n and c merge: five left), a full
                 // permutation of six, and one that merges to a single contiguous run.
                 yield return Make(name, type, 480, null, [2, 3, 5, 2, 4, 2, 240, 80, 4, 40, 1, 20, 0], 480, 68);

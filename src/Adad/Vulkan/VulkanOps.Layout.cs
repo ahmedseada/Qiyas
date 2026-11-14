@@ -47,6 +47,15 @@ public sealed partial class VulkanOps
                 Order(idx, n, targets, counts, aux, aux + (ulong)((targets + 1) * 4L));
             }
 
+            if (k.Name is "interpolate_bilinear" or "interpolate_bilinear_bwd" && k.Count > 0)
+            {
+                // Each output row's and column's source rows and weight, once (VkKernels.BilinearTables), into aux.
+                int oh = k.P[3], ow = k.P[4];
+                aux = vk.Rent(VkKernels.BilinearTableBytes(oh, ow, lane));
+                var tables = vk.Cached($"bilinear_tables:{lane.Name}", () => VkKernels.BilinearTables(vk, lane));
+                vk.Launch(tables, Groups(oh + ow, VkKernels.Threads), 1, VkKernels.LayoutSlots(0, 0, 0, aux, 0, oh + ow, 0, k.P));
+            }
+
             if (k.Name is "maxpool_bwd" or "adaptive_maxpool_bwd")
             {
                 // Each window's first-ranked of the forward input in Adad's order, once, into aux.
@@ -57,8 +66,24 @@ public sealed partial class VulkanOps
                 if (windows > 0) vk.Launch(argmax, Groups(windows, VkKernels.Threads), 1, VkKernels.LayoutSlots(0, x2, 0, 0, aux, windows, 0, k.P));
             }
 
+            // A block format's encoder reads its sources alone: the output's slot is left empty, so only an output that is one
+            // of the inputs makes the encoding go through a buffer of its own (Encode).
             if (k.Count > 0 && f.IsBlock)
-                Encode(f, k.Count, vk.Cached($"block_layout:{kn}:{f.Name}:{lane.Name}:{inFmt?.Name}", () => VkKernels.BlockLayout(vk, f, lane, kn, inFmt)), output, VkKernels.LayoutSlots(x, x2, idx, aux, output, k.Count, cols, k.P));
+                Encode(f, k.Count, vk.Cached($"block_layout:{kn}:{f.Name}:{lane.Name}:{inFmt?.Name}", () => VkKernels.BlockLayout(vk, f, lane, kn, inFmt)), output, VkKernels.LayoutSlots(x, x2, idx, aux, 0, k.Count, cols, k.P));
+            else if (k.Count > 0 && k.Name is "adaptive_maxpool" or "adaptive_avgpool" && inFmt is null && f.Words(k.Count) <= (long)vk.MaxGroupsX * vk.MaxGroupsY)
+            {
+                // A workgroup an output word, its windows read by every invocation (VkKernels.AdaptivePool).
+                var pool = vk.Cached($"adaptive_pool:{k.Name}:{f.Name}:{lane.Name}", () => VkKernels.AdaptivePool(vk, f, lane, k.Name == "adaptive_maxpool"));
+                long words = f.Words(k.Count);
+                uint px = (uint)Math.Min(words, vk.MaxGroupsX), py = (uint)((words + px - 1) / px);
+                vk.Launch(pool, px, py, VkKernels.LayoutSlots(x, x2, idx, aux, output, k.Count, cols, k.P));
+            }
+            else if (k.Count > 0 && k.Name == "strided" && inFmt is null && StridedTiles(f, k.P) is var (n, j, gx, gy) && j >= 0)
+            {
+                // A view that transposes a stride-1 dimension with its last: by tiles (VkKernels.StridedTiled).
+                var tiled = vk.Cached($"strided_tiled:{n}:{j}:{f.Name}:{lane.Name}", () => VkKernels.StridedTiled(vk, f, lane, n, j));
+                vk.Launch(tiled, gx, gy, VkKernels.LayoutSlots(x, x2, idx, aux, output, k.Count, cols, k.P));
+            }
             else if (k.Count > 0)
             {
                 var fn = vk.Cached($"layout:{kn}:{f.Name}:{lane.Name}:{inFmt?.Name}", () => VkKernels.Layout(vk, f, lane, kn, inFmt));
@@ -72,5 +97,17 @@ public sealed partial class VulkanOps
         }
 
         return lane.Name;
+    }
+
+    // A canonical strided view's tiling (VkKernels.StridedTileDim): its rank, the stride-1 dimension (−1: none), the
+    // workgroups along x (the tiles of the last and that dimension) and y (the other dimensions' product), where the device
+    // takes them.
+    private (int N, int J, uint X, uint Y) StridedTiles(Fmt f, int[] p)
+    {
+        int n = p.Length / 2, j = VkKernels.StridedTileDim(f, p);
+        if (j < 0) return (n, -1, 0, 0);
+        long x = (long)Groups(p[n - 1], VkKernels.TransposeTile) * Groups(p[j], VkKernels.TransposeTile), y = 1;
+        for (int d = 0; d < n - 1; d++) if (d != j) y *= p[d];
+        return x <= vk.MaxGroupsX && y <= vk.MaxGroupsY && y > 0 ? (n, j, (uint)x, (uint)y) : (n, -1, 0, 0);
     }
 }
