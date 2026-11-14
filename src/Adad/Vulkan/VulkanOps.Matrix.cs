@@ -158,8 +158,9 @@ public sealed partial class VulkanOps
     }
 
     /// <summary>The units' sums (the kind's lane at c, C's batches strideC apart) of op(A)·op(B) over the view's batches,
-    /// A stored as fa from value aOff, B as fb from bOff: read in place where both are the kind's own type, the shape whole
-    /// tiles and the operands 16-byte aligned, else their rows packed into the kind (PackUnits).</summary>
+    /// A stored as fa from value aOff, B as fb from bOff: each operand read in place where it is the kind's own type, its
+    /// side whole tiles, k whole slices and its rows 16-byte aligned, else its rows packed into the kind (PackUnits: whole
+    /// tiles of rows, whole slices of k, zeros past them).</summary>
     private void UnitsProduct(ProductView v, string kind, ulong a, Fmt fa, long aOff, ulong b, Fmt fb, long bOff, ulong lanes)
     {
         var unit = Unit(kind)!.Value;
@@ -167,14 +168,15 @@ public sealed partial class VulkanOps
         int eb = VkKernels.UnitKind(kind).Bytes(), bk = cfg.KBytes / eb;
         static bool OwnKind(Fmt f, string kind) => (f.Is("float16") && kind == "f16") || (f.Is("bfloat16") && kind == "bf16") || (f.Is("int8") && kind == "s8") || (f.Is("uint8") && kind == "u8");
         ulong at = a + (ulong)(aOff * eb), bt = b + (ulong)(bOff * eb);
-        bool whole = v.M % cfg.BM == 0 && v.N % cfg.BN == 0 && v.K > 0 && v.K % bk == 0 && at % 16 == 0 && bt % 16 == 0
-            && (v.Batch == 1 || (v.StrideAOrDefault * eb % 16 == 0 && v.StrideBOrDefault * eb % 16 == 0));
+        bool kWhole = v.K > 0 && v.K % bk == 0;
+        bool inA = OwnKind(fa, kind) && kWhole && v.M % cfg.BM == 0 && at % 16 == 0 && (v.Batch == 1 || v.StrideAOrDefault * eb % 16 == 0);
+        bool inB = OwnKind(fb, kind) && kWhole && v.N % cfg.BN == 0 && bt % 16 == 0 && (v.Batch == 1 || v.StrideBOrDefault * eb % 16 == 0);
         var rented = new List<ulong>();
         try
         {
             int tilesM = (v.M + cfg.BM - 1) / cfg.BM;
             uint groupsX = Groups(v.N, cfg.BN), groupsY = (uint)((long)tilesM * v.Batch);
-            if (OwnKind(fa, kind) && OwnKind(fb, kind) && whole)
+            if (inA && inB)
             {
                 var fn = vk.Cached($"units_matmul:{kind}:{cfg}:{!v.TransA}:{!v.TransB}", () => VkKernels.UnitsMatMul(vk, unit, cfg, !v.TransA, !v.TransB));
                 vk.Launch(fn, groupsX, groupsY, at, bt, lanes, Vulkan.U(v.TransA ? v.M : v.K), Vulkan.U(v.TransB ? v.K : v.N), Vulkan.U(v.M), Vulkan.U(v.N), Vulkan.U(v.K),
@@ -183,31 +185,40 @@ public sealed partial class VulkanOps
                 return;
             }
 
-            // A's rows and Bᵀ's rows packed into the kind: whole tiles of rows, whole slices of k, zeros past them.
+            // The operands not in place: A's rows and Bᵀ's rows packed into the kind (one in place: k whole, so kp = k).
             if (aOff + (v.Batch - 1) * v.StrideAOrDefault > uint.MaxValue || bOff + (v.Batch - 1) * v.StrideBOrDefault > uint.MaxValue)
                 throw new NotSupportedException("vulkan: a product's operand past 2^32 values");
             int mp = tilesM * cfg.BM, np = (int)groupsX * cfg.BN, kp = Math.Max(bk, (v.K + bk - 1) / bk * bk);
             long rowBytes = (long)kp * eb, aBytes = mp * rowBytes, bBytes = np * rowBytes;
-            ulong pa = vk.Rent(v.Batch * aBytes), pb = vk.Rent(v.Batch * bBytes);
-            rented.Add(pa);
-            rented.Add(pb);
-            var packA = vk.Cached($"pack_units:{fa.Name}:{kind}", () => VkKernels.PackUnits(vk, fa, kind));
-            var packB = vk.Cached($"pack_units:{fb.Name}:{kind}", () => VkKernels.PackUnits(vk, fb, kind));
+            ulong pa = inA ? 0 : vk.Rent(v.Batch * aBytes), pb = inB ? 0 : vk.Rent(v.Batch * bBytes);
+            if (!inA) rented.Add(pa);
+            if (!inB) rented.Add(pb);
             int wordsPerRow = (int)(rowBytes / 4);
             for (int z = 0; z < v.Batch; z++)
             {
                 // A (m × k) by rows: stored by rows of k (row stride k), or as Aᵀ (k × m: row stride 1, k's stride m).
-                vk.Launch(packA, Groups((long)mp * wordsPerRow, VkKernels.Threads), 1, a, pa + (ulong)(z * aBytes), Vulkan.U(v.M), Vulkan.U(v.K),
-                    Vulkan.U(v.TransA ? 1 : v.K), Vulkan.U(v.TransA ? v.M : 1), Vulkan.U(wordsPerRow), Vulkan.U(mp * wordsPerRow), Vulkan.U(aOff + z * v.StrideAOrDefault));
+                if (!inA)
+                {
+                    var packA = vk.Cached($"pack_units:{fa.Name}:{kind}", () => VkKernels.PackUnits(vk, fa, kind));
+                    vk.Launch(packA, Groups((long)mp * wordsPerRow, VkKernels.Threads), 1, a, pa + (ulong)(z * aBytes), Vulkan.U(v.M), Vulkan.U(v.K),
+                        Vulkan.U(v.TransA ? 1 : v.K), Vulkan.U(v.TransA ? v.M : 1), Vulkan.U(wordsPerRow), Vulkan.U(mp * wordsPerRow), Vulkan.U(aOff + z * v.StrideAOrDefault));
+                }
+
                 // Bᵀ (n × k) by rows: B stored k × n (column j: row stride 1, k's stride n), or as Bᵀ (row stride k).
-                vk.Launch(packB, Groups((long)np * wordsPerRow, VkKernels.Threads), 1, b, pb + (ulong)(z * bBytes), Vulkan.U(v.N), Vulkan.U(v.K),
-                    Vulkan.U(v.TransB ? v.K : 1), Vulkan.U(v.TransB ? 1 : v.N), Vulkan.U(wordsPerRow), Vulkan.U(np * wordsPerRow), Vulkan.U(bOff + z * v.StrideBOrDefault));
+                if (!inB)
+                {
+                    var packB = vk.Cached($"pack_units:{fb.Name}:{kind}", () => VkKernels.PackUnits(vk, fb, kind));
+                    vk.Launch(packB, Groups((long)np * wordsPerRow, VkKernels.Threads), 1, b, pb + (ulong)(z * bBytes), Vulkan.U(v.N), Vulkan.U(v.K),
+                        Vulkan.U(v.TransB ? v.K : 1), Vulkan.U(v.TransB ? 1 : v.N), Vulkan.U(wordsPerRow), Vulkan.U(np * wordsPerRow), Vulkan.U(bOff + z * v.StrideBOrDefault));
+                }
             }
 
-            var fp = vk.Cached($"units_matmul:{kind}:{cfg}:True:False", () => VkKernels.UnitsMatMul(vk, unit, cfg, true, false));
-            vk.Launch(fp, groupsX, groupsY, pa, pb, lanes, Vulkan.U(kp), Vulkan.U(kp), Vulkan.U(v.M), Vulkan.U(v.N), Vulkan.U(kp),
-                Vulkan.U(aBytes / eb), Vulkan.U(bBytes / eb), Vulkan.U(v.StrideCOrDefault), Vulkan.U(tilesM));
-            UnitsRoute = "packed";
+            bool aRows = !inA || !v.TransA, bRows = inB && !v.TransB;
+            var fp = vk.Cached($"units_matmul:{kind}:{cfg}:{aRows}:{bRows}", () => VkKernels.UnitsMatMul(vk, unit, cfg, aRows, bRows));
+            vk.Launch(fp, groupsX, groupsY, inA ? at : pa, inB ? bt : pb, lanes, Vulkan.U(inA ? (v.TransA ? v.M : v.K) : kp), Vulkan.U(inB ? (v.TransB ? v.K : v.N) : kp),
+                Vulkan.U(v.M), Vulkan.U(v.N), Vulkan.U(kp), Vulkan.U(inA ? v.StrideAOrDefault : aBytes / eb), Vulkan.U(inB ? v.StrideBOrDefault : bBytes / eb),
+                Vulkan.U(v.StrideCOrDefault), Vulkan.U(tilesM));
+            UnitsRoute = inA ? "B packed" : inB ? "A packed" : "packed";
         }
         finally
         {

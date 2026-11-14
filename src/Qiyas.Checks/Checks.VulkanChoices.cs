@@ -45,10 +45,12 @@ internal static partial class Checks
                 ops.UnitsShape = shape;
                 ok &= ProductsWith(ops, "vulkan", 256, 256, 128, $" [units {shape}, in place]");
                 ok &= ProductsWith(ops, "vulkan", 37, 29, 53, $" [units {shape}]");
+                ok &= ProductsWith(ops, "vulkan", 37, 256, 128, $" [units {shape}, A packed]");
+                ok &= ProductsWith(ops, "vulkan", 256, 37, 128, $" [units {shape}, B packed]");
             }
         }
         finally { ops.UnitsShape = null; }
-        if (ok) Console.WriteLine($"check {"products on the matrix units",-36} vulkan every type under each of the kernel's {shapes.Length} shapes ({string.Join(", ", shapes)}): in place at 256 x 256 x 128 and packed at 37 x 29 x 53, within the product's rounding");
+        if (ok) Console.WriteLine($"check {"products on the matrix units",-36} vulkan every type under each of the kernel's {shapes.Length} shapes ({string.Join(", ", shapes)}): in place at 256 x 256 x 128, packed at 37 x 29 x 53, one side packed at 37 x 256 x 128 and 256 x 37 x 128, within the product's rounding");
 
         // The experts' products an expert a units product wherever the type and lane allow (the measurement's other choice).
         try
