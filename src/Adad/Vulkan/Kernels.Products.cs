@@ -59,9 +59,30 @@ internal static partial class VkKernels
         ProductTiles(b, lane, transA, transB, M, N, kBegin, kEnd, row0, pc, batch * strideC,
             (gr, gk, inside) => Codec.UnpackAt(b, fa, pa, baseA + b.Select(inside, transA ? gk * M + gr : gr * Kd + gk, b.U(0)), lane),
             (gk, gc, inside) => Codec.UnpackAt(b, fb, pb, baseB + b.Select(inside, transB ? gc * Kd + gk : gk * N + gc, b.U(0)), lane), micro,
-            runsA ? (gr, gk, inside) => Codec.UnpackRun(b, fa, pa, baseA + b.Select(inside, transA ? gk * M + gr : gr * Kd + gk, b.U(0)), run, lane) : null,
-            runsB ? (gk, gc, inside) => Codec.UnpackRun(b, fb, pb, baseB + b.Select(inside, transB ? gc * Kd + gk : gk * N + gc, b.U(0)), run, lane) : null);
+            runsA ? (gr, gk, inside) => Run(b, fa, pa, baseA + b.Select(inside, transA ? gk * M + gr : gr * Kd + gk, b.U(0)), run, lane) : null,
+            runsB ? (gk, gc, inside) => Run(b, fb, pb, baseB + b.Select(inside, transB ? gc * Kd + gk : gk * N + gc, b.U(0)), run, lane) : null);
         return b.Build();
+    }
+
+    /// <summary>Whether a format's values are read as runs by RunsWords: a type of one value a 32- or 64-bit word.</summary>
+    public static bool RunsWords(Fmt f) => !f.IsBlock && f.Per == 1 && (f.WordBits == 32 || f.WordBits == 64);
+
+    // `count` consecutive values from index (a multiple of count, the array's runs aligned to their bytes) as lane values: a
+    // block format's by Codec.UnpackRun; a type of one value a word by loads of 4 words (16 or 32 bytes) at a time.
+    private static V[] Run(Spv b, Fmt f, V basePtr, V index, int count, Lane lane)
+    {
+        if (f.IsBlock) return Codec.UnpackRun(b, f, basePtr, index, count, lane);
+        int wb = f.WordBits / 8;
+        var kind = f.WordBits == 64 ? K.U64 : K.U32;
+        var values = new V[count];
+        for (int at = 0; at < count; at += 4)
+        {
+            int n = Math.Min(4, count - at);
+            var words = n == 1 ? [b.Load(kind, b.At(basePtr, index + (double)at, wb))] : b.LoadN(kind, n, b.At(basePtr, index + (double)at, wb));
+            for (int i = 0; i < n; i++) values[at + i] = Codec.Unpack(b, f, words[i], 0, lane);
+        }
+
+        return values;
     }
 
     /// <summary>The slices' partial products added in order into C: c[i] = Σ_z parts[z·count + i] in the lane. Arguments:

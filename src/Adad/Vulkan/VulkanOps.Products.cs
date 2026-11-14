@@ -113,8 +113,10 @@ public sealed partial class VulkanOps
         int tile = VkKernels.Tile(t.Micro), tilesM = (v.M + tile - 1) / tile;
         bool split = t.Slices > 1 && v.K > 0;
         // A block format's operand read as runs of values where its stored rows, offset and batch stride are whole runs of 8.
-        bool runsA = fa.IsBlock && (v.TransA ? v.M : v.K) % 8 == 0 && aOff % 8 == 0 && v.StrideAOrDefault % 8 == 0;
-        bool runsB = fb.IsBlock && (v.TransB ? v.K : v.N) % 8 == 0 && bOff % 8 == 0 && v.StrideBOrDefault % 8 == 0;
+        // A block format's operand, or a type of one value a word, read as runs of values where its stored rows, offset and
+        // batch stride are whole runs of 8 (a word type's runs by 16- or 32-byte loads).
+        bool runsA = (fa.IsBlock || VkKernels.RunsWords(fa)) && (v.TransA ? v.M : v.K) % 8 == 0 && aOff % 8 == 0 && v.StrideAOrDefault % 8 == 0;
+        bool runsB = (fb.IsBlock || VkKernels.RunsWords(fb)) && (v.TransB ? v.K : v.N) % 8 == 0 && bOff % 8 == 0 && v.StrideBOrDefault % 8 == 0;
         var fn = vk.Cached($"matmul:{fa.Name}:{fb.Name}:{lane.Name}:{v.TransA}:{v.TransB}:{t.Micro}:{split}:{runsA}:{runsB}",
             () => VkKernels.MatMul(vk, fa, fb, lane, v.TransA, v.TransB, t.Micro, split, runsA, runsB));
         if (!split)
