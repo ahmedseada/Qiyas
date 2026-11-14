@@ -526,16 +526,22 @@ internal static partial class Ptx
         }
 
         /// <summary>x·σ(t + lo) as x / (1 + e^(−t)·(1 − lo)), the denominator's sum split exactly and its low part
-        /// folded into the quotient: one rounding fewer than x times the rounded σ(t).</summary>
+        /// folded into the quotient: one rounding fewer than x times the rounded σ(t). Where e^(−t) is infinite (t below the
+        /// lane's exp range: gelu past x ≈ −10, silu past −88.7) the quotient x / ∞ = ±0 stands: the low part (∞·lo + ∞)
+        /// and the split sum (∞ − ∞) would make a NaN of it.</summary>
         public string XSigmoid(string x, string t, string? lo = null)
         {
             if (lane.Wide) return Mul(x, Sigmoid(t));
             string e = Exp(Neg(t));
-            if (lo != null) e = Fma(e, Neg(Select(Nan(lo), C(0), lo)), e);    // lo a NaN only where t is infinite (∞ − ∞): no low part
+            string huge = b.P();
+            b.L($"testp.infinite.{_op} {huge}, {e};");
+            if (lo != null) e = Select(huge, e, Fma(e, Neg(Select(Nan(lo), C(0), lo)), e));   // lo a NaN only where t is infinite (∞ − ∞): no low part
             string one = C(1), d = Add(e, one), bv = Sub(d, e);
             string dlo = Add(Sub(e, Sub(d, bv)), Sub(one, bv));
             string q = Div(x, d), c = Bin($"div.approx.{_op}", dlo, d);
-            return Select(Equal(c, C(0)), q, Fma(Neg(q), c, q));             // no correction: q as it is (q infinite, c 0: not ∞·0)
+            string none = b.P();
+            b.L($"or.pred {none}, {Equal(c, C(0))}, {huge};");
+            return Select(none, q, Fma(Neg(q), c, q));                         // no correction: q as it is (q infinite, c 0: not ∞·0)
         }
 
         public string GeluGrad(string x)

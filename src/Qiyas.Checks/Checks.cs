@@ -2613,7 +2613,7 @@ internal static partial class Checks
     /// <summary>Each formula over 1001 values of each of its types, on the CPU (ops null) or the device, against the float64
     /// reference rounded as the type rounds: integer types exact; float types within one step of the type plus a few ulps of
     /// the lane (the transcendental functions' own error). With <paramref name="special"/>, each float type over NaN, ±∞,
-    /// ±0, values of each input's range and a negative one, in every combination of the inputs (SpecialInputs): a NaN or an
+    /// ±0, values of each input's range and a negative one, ±1e4, in every combination of the inputs (SpecialInputs): a NaN or an
     /// infinity exactly where the reference has one. Each formula at its catalogue parameters and its Variants.</summary>
     public static bool Maps(IDevice<ulong, ulong>? ops, string device = "device", bool special = false)
     {
@@ -2772,8 +2772,12 @@ internal static partial class Checks
     // values), stored as the type stores them.
     private static (byte[]? X, byte[]? Y, byte[]? Z, int N) SpecialInputs(string type, MapOp op)
     {
+        // Past the range, ±1e4: finite values a formula's terms overflow at (gelu's and silu's e^(−t) in f32, which a
+        // product's epilogue reaches), where float64's own terms overflow or vanish too (the reference and the lane agree on
+        // ∞, 0 and NaN there; at ±100 they do not: e^100 is finite in float64, not in float32).
         static double[] Values((double Low, double High) r) => [double.NaN, double.PositiveInfinity, double.NegativeInfinity, 0.0, -0.0,
-            r.Low + 0.2 * (r.High - r.Low), r.Low + 0.5 * (r.High - r.Low), r.Low + 0.9 * (r.High - r.Low), -(r.Low + 0.9 * (r.High - r.Low))];
+            r.Low + 0.2 * (r.High - r.Low), r.Low + 0.5 * (r.High - r.Low), r.Low + 0.9 * (r.High - r.Low), -(r.Low + 0.9 * (r.High - r.Low)),
+            -1e4, 1e4];
         double[] vx = Values(op.XRange), vy = Values(op.YRange);
         int k = vx.Length, n = (int)Math.Pow(k, Math.Max(op.Inputs, 1));
         double[] xs = new double[n], ys = new double[n], zs = new double[n];

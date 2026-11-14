@@ -270,19 +270,22 @@ internal static partial class VkKernels
         }
 
         /// <summary>x·σ(t + lo) as x / (1 + e^(−t)·(1 − lo)), the denominator's sum split exactly and its low part folded
-        /// into the quotient (CUDA's XSigmoid; the small correction's quotient the device's own, as CUDA's div.approx).</summary>
+        /// into the quotient (CUDA's XSigmoid; the small correction's quotient the device's own, as CUDA's div.approx). Where
+        /// e^(−t) is infinite (t below the lane's exp range: gelu past x ≈ −10, silu past −88.7) the quotient x / ∞ = ±0
+        /// stands: the low part (∞·lo + ∞) and the split sum (∞ − ∞) would make a NaN of it.</summary>
         public V XSigmoid(V x, V t, V? lo = null)
         {
             if (k == K.F64) return x * Sigmoid(t);
             var e = Exp(-t);
-            if (lo is { } l) e = b.Fma(e, -b.Select(b.IsNan(l), C(0), l), e);  // lo a NaN only where t is infinite (∞ − ∞): no low part
+            var huge = b.IsInf(e);
+            if (lo is { } l) e = b.Select(huge, e, b.Fma(e, -b.Select(b.IsNan(l), C(0), l), e));  // lo a NaN only where t is infinite (∞ − ∞): no low part
             var one = C(1);
             var d = e + one;
             var bv = d - e;
             var dlo = (e - (d - bv)) + (one - bv);
             var q = x / d;
             var c = b.Op2(dlo, d, SpirvOp.FDiv);
-            return b.Select(c == 0, q, b.Fma(-q, c, q));                         // no correction: q as it is (q infinite, c 0: not ∞·0)
+            return b.Select((c == 0) | huge, q, b.Fma(-q, c, q));               // no correction: q as it is (q infinite, c 0: not ∞·0)
         }
 
         public V GeluGrad(V x)
