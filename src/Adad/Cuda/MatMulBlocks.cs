@@ -30,7 +30,7 @@ internal static partial class Ptx
     public static string MatMulBlocks(Gpu gpu, Fmt f, out string entry)
     {
         entry = $"matmul_blocks_{f.Name}";
-        bool q8 = f.Is("q8_0");
+        bool q8 = Routes.Bytewise(f);
         int bb = f.BlockBytes, halves = bb / 2, tile = BlocksTile, rowB = BlocksRow, ks = BlocksStage, T = BlocksThreads;
         int rowHalves = ks * halves, slab = tile * rowB;                       // a row's halves per stage; one k-block's tile
         int aOff = 0, bOff = ks * slab, saOff = 2 * ks * slab, sbOff = saOff + ks * tile * 4, shared = sbOff + ks * tile * 4;
@@ -247,7 +247,7 @@ public sealed partial class GpuOps
     public string MatMulBlocks<TN>(ulong a, ulong b, ulong cLanes, int m, int n, int k) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (f.Name is not ("q8_0" or "q4_0") || k % 32 != 0) throw new NotSupportedException($"{f.Name}: the block product takes Q8_0 or Q4_0 with k in whole blocks");
+        if (!Routes.Takes(f) || k % 32 != 0) throw new NotSupportedException($"{f.Name}: the block product takes Q8_0 or Q4_0 with k in whole blocks");
         if (!BlockProductAvailable) throw new NotSupportedException("the block product needs the s8 tensor instruction at k = 32");
         var fn = gpu.Cached($"matmul_blocks:{f.Name}", (out string e) => Ptx.MatMulBlocks(gpu, f, out e));
         Gpu.Launch(fn, Grid(n, Ptx.BlocksTile), Grid(m, Ptx.BlocksTile), Ptx.BlocksThreads, 1, 0, a, b, cLanes, Gpu.U(m), Gpu.U(n), Gpu.U(k / 32));
@@ -260,7 +260,7 @@ public sealed partial class GpuOps
     private readonly Dictionary<string, bool> _blocksFaster = [];
 
     private bool BlockView<TN>(ProductView v) where TN : struct, IAdad<TN> =>
-        Fmt.Of<TN>().Name is "q8_0" or "q4_0" && v.Batch == 1 && !v.TransA && v.TransB && v.K % 32 == 0 && BlockProductAvailable;
+        Routes.Route(Fmt.Of<TN>()) && v.Batch == 1 && !v.TransA && v.TransB && v.K % 32 == 0 && BlockProductAvailable;
 
     /// <summary>The block product for the view (A·Bᵀ), C encoded to the type by blocks.</summary>
     public string MatMulViewBlocks<TN>(ProductView v, ulong a, ulong b, ulong c) where TN : struct, IAdad<TN>

@@ -30,7 +30,14 @@ internal sealed partial class Kernels
     /// <summary>C (float32 lanes in cLanes, m × n) = A·Bᵀ for A (m × k), B (n × k) both Q8_0 or both Q4_0, k a multiple of 32.</summary>
     public static string MatMulBlocks(string format, byte[] a, byte[] b, byte[] cLanes, int m, int n, int k)
     {
-        if (format is not ("q8_0" or "q4_0") || k % 32 != 0) throw new NotSupportedException($"{format}: the block product takes Q8_0 or Q4_0 with k in whole blocks");
+        if (format is not ("q8_0" or "q4_0")) throw new NotSupportedException($"{format}: the block product takes Q8_0 or Q4_0 with k in whole blocks");
+        return MatMulBlocks(Routes.Layout(format), a, b, cLanes, m, n, k);
+    }
+
+    /// <summary>The block product by the layout: C (float32 lanes) = A·Bᵀ for scaled-int blocks, k a multiple of 32.</summary>
+    public static string MatMulBlocks(ScaledBlock format, byte[] a, byte[] b, byte[] cLanes, int m, int n, int k)
+    {
+        if (!format.Is32 || k % 32 != 0) throw new NotSupportedException($"{format}: the block product takes 32-value scaled-int blocks with k in whole blocks");
         if (!S8Dot.IsSupported) throw new NotSupportedException("the block product needs the s8 dot lane");
         if (k == 0)
         {
@@ -63,13 +70,13 @@ internal sealed partial class Kernels
     private static readonly Dictionary<string, bool> s_blocksFaster = [];
 
     private static bool BlockView<TN>(ProductView v) where TN : struct, IAdad<TN> =>
-        TN.Name is "q8_0" or "q4_0" && v.Batch == 1 && !v.TransA && v.TransB && v.K > 0 && v.K % 32 == 0 && BlockProductAvailable;
+        Routes.Route<TN>() && v.Batch == 1 && !v.TransA && v.TransB && v.K > 0 && v.K % 32 == 0 && BlockProductAvailable;
 
     /// <summary>The block product for the view (A·Bᵀ), C encoded to the type by blocks.</summary>
     public static string MatMulViewBlocks<TN>(ProductView v, byte[] a, byte[] b, byte[] c) where TN : struct, IAdad<TN>
     {
         var lanes = new byte[(long)v.M * v.N * 4];
-        string lane = MatMulBlocks(TN.Name, a, b, lanes, v.M, v.N, v.K);
+        string lane = MatMulBlocks(Routes.Layout<TN>(), a, b, lanes, v.M, v.N, v.K);
         var store = new BlocksStore(lanes, c, (long)v.M * v.N);
         TN.Elementwise(ref store);
         return lane;
@@ -102,7 +109,7 @@ internal sealed partial class Kernels
     // Both bodies compiled at the final tier from the first call: the runtime's first tier ran the product 20× slower,
     // for the first rounds of a run, until the counted calls promoted it.
     // Rows of blocks (from row `from` of x) as int8 values and per-4-byte scales, row r at r·k.
-    private readonly struct UnpackRowsBody(string format, byte[] x, sbyte[] q, float[] s, int k, int from) : Team.IBody
+    private readonly struct UnpackRowsBody(ScaledBlock format, byte[] x, sbyte[] q, float[] s, int k, int from) : Team.IBody
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public void Run(int first, int last)
@@ -111,9 +118,9 @@ internal sealed partial class Kernels
         }
     }
 
-    private static void UnpackRow(string format, byte[] x, int row, int k, Span<sbyte> q, Span<float> s)
+    private static void UnpackRow(ScaledBlock format, byte[] x, int row, int k, Span<sbyte> q, Span<float> s)
     {
-        int blocks = k / 32, bb = format == "q8_0" ? 34 : 18;
+        int blocks = k / 32, bb = format.Bytes;
         for (int bl = 0; bl < blocks; bl++)
         {
             long at = (long)row * blocks + bl;
@@ -123,7 +130,7 @@ internal sealed partial class Kernels
     }
 
     // A task: 4 rows of A, unpacked once, against the panel's B rows (C's columns j0 ..).
-    private readonly struct MatMulBlocksBody(string format, byte[] a, sbyte[] qb, float[] sb, byte[] cLanes, int m, int n, int k, int j0, int cols) : Team.IBody
+    private readonly struct MatMulBlocksBody(ScaledBlock format, byte[] a, sbyte[] qb, float[] sb, byte[] cLanes, int m, int n, int k, int j0, int cols) : Team.IBody
     {
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public void Run(int first, int last)

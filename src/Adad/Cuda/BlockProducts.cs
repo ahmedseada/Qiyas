@@ -56,7 +56,7 @@ internal static partial class Ptx
             b.L($"mov.b32 {w}, {{{lo}, {hi}}};");
         }
 
-        if (f.Is("q8_0"))
+        if (Routes.Bytewise(f))
         {
             // 32 int8 at +2: eight 4-byte groups.
             for (int g = 0; g < 8; g++)
@@ -120,8 +120,8 @@ public sealed partial class GpuOps
     public string GemvBlocks<TN>(ulong a, ulong x, ulong y, int rows, int cols) where TN : struct, IAdad<TN>
     {
         var f = Fmt.Of<TN>();
-        if (!f.IsBlock || f.Name is not ("q8_0" or "q4_0") || cols % 32 != 0) throw new NotSupportedException($"{f.Name}: the block product takes Q8_0 or Q4_0 with columns in whole blocks");
-        bool dp = f.Is("q8_0") && Dp4aSupported(true);
+        if (!f.IsBlock || !Routes.Takes(f) || cols % 32 != 0) throw new NotSupportedException($"{f.Name}: the block product takes Q8_0 or Q4_0 with columns in whole blocks");
+        bool dp = Routes.Bytewise(f) && Dp4aSupported(true);
         var fn = gpu.Cached($"gemv_blocks:{f.Name}:{dp}", (out string e) => Ptx.GemvBlocks(gpu, f, dp, out e));
         Gpu.Launch(fn, Grid(rows, 256), 1, 256, 1, 0, a, x, y, Gpu.U(rows), Gpu.U(cols / 32));
         return dp ? "s8dp blocks" : "s32 blocks";

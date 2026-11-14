@@ -19,7 +19,10 @@ public sealed record Fmt(string Name, int Bits, bool IsFloat, bool Signed)
     public int BlockBytes => Name switch { "q8_0" => 34, "q4_0" => 18, "q4_k" => 144, "q6_k" => 210, _ => 0 };
     public bool IsBlock => BlockValues > 0;
 
-    public static Fmt Of<TN>() where TN : struct, IAdad<TN> => new(TN.Name, TN.Bits, TN.IsFloat, TN.Min < 0);
+    public static Fmt Of<TN>() where TN : struct, IAdad<TN> => new(TN.Name, TN.Bits, TN.IsFloat, TN.Min < 0) { Scaled = TN.Scaled };
+
+    /// <summary>The type's scaled-int block layout, as it describes it (default: not one).</summary>
+    public ScaledBlock Scaled { get; init; }
 
     public bool Is(string name) => Name == name;
 
@@ -47,6 +50,48 @@ public sealed record Fmt(string Name, int Bits, bool IsFloat, bool Signed)
         var lane = from.IsBlock ? Lane.F32 : from.Natural;
         return (lane, to.IsFloat && to.Bits < 32 && lane != Lane.F32);
     }
+}
+
+/// <summary>
+/// A block of integer codes under one float16 scale at the block's start: Values a block taking Bytes; CodeBits 8 (a byte a
+/// value) or 4 (byte j's low nibble value j, its high nibble value j + Values/2); CodeBias added to each code. Default: not one.
+/// </summary>
+public readonly record struct ScaledBlock(int Values, int Bytes, int CodeBits, int CodeBias)
+{
+    /// <summary>The shape the block product and the block gemv take: 32 values, 8- or 4-bit codes.</summary>
+    public bool Is32 => Values == 32 && CodeBits is 8 or 4;
+}
+
+/// <summary>
+/// How a block format reaches its fast routes (the block product, the block gemv), for the design comparison: "name" (as
+/// the code has it: the route tests the type's name), "props" (the route tests the layout the type describes), "generic"
+/// (no fast route: the path every type takes). ADAD_ROUTES chooses; default "name".
+/// </summary>
+public static class Routes
+{
+    public static readonly string Mode = (Environment.GetEnvironmentVariable("ADAD_ROUTES") ?? "name").Trim().ToLowerInvariant();
+
+    public static bool Generic => Mode == "generic";
+
+    public static bool Props => Mode == "props";
+
+    /// <summary>Whether the format is one the block routes can take (name or layout, as the mode says).</summary>
+    public static bool Takes(Fmt f) => Props ? f.Scaled.Is32 : f.Name is "q8_0" or "q4_0";
+
+    public static bool Takes<TN>() where TN : struct, IAdad<TN> => Props ? TN.Scaled.Is32 : TN.Name is "q8_0" or "q4_0";
+
+    /// <summary>Whether the route is taken: the format qualifies and the mode isn't generic.</summary>
+    public static bool Route(Fmt f) => !Generic && Takes(f);
+
+    public static bool Route<TN>() where TN : struct, IAdad<TN> => !Generic && Takes<TN>();
+
+    /// <summary>A byte a value (Q8_0's codes): by name or by the layout.</summary>
+    public static bool Bytewise(Fmt f) => Props ? f.Scaled.CodeBits == 8 : f.Is("q8_0");
+
+    /// <summary>The layout the routes read: from the name (as the code has it) or as the type describes it.</summary>
+    public static ScaledBlock Layout(string name) => name switch { "q8_0" => new(32, 34, 8, 0), "q4_0" => new(32, 18, 4, -8), _ => default };
+
+    public static ScaledBlock Layout<TN>() where TN : struct, IAdad<TN> => Props ? TN.Scaled : Layout(TN.Name);
 }
 
 /// <summary>A register type kernels compute in: f32, f64, and the 32- and 64-bit integers, signed (s) or not (u).</summary>

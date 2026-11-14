@@ -51,6 +51,9 @@ public interface IAdad<TSelf> where TSelf : struct, IAdad<TSelf>
     /// or not starting on one, rewrites the unit; two threads must not write one unit.</summary>
     static virtual int Granularity => TSelf.Bits >= 8 ? 1 : 8 / TSelf.Bits;
 
+    /// <summary>The scaled-int block layout the type describes (default: not a scaled-int block format).</summary>
+    static virtual ScaledBlock Scaled => default;
+
     /// <summary>Runs <paramref name="visitor"/> with the lane element-wise operations take.</summary>
     static abstract void Elementwise<TV>(ref TV visitor) where TV : struct, ILaneVisitor;
 

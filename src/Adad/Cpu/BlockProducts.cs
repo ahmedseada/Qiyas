@@ -16,10 +16,14 @@ namespace Adad.Cpu;
 internal sealed partial class Kernels
 {
     /// <summary>y = A·x for A (rows × cols) and x (cols) both Q8_0 or both Q4_0 (cols a multiple of 32); y as float32 lanes. Returns the lane's name.</summary>
-    public static string GemvBlocks(string format, byte[] a, byte[] x, float[] y, int rows, int cols)
+    public static string GemvBlocks(string format, byte[] a, byte[] x, float[] y, int rows, int cols) =>
+        GemvBlocks(Routes.Layout(format), a, x, y, rows, cols);
+
+    /// <summary>y = A·x for scaled-int blocks of the layout <paramref name="format"/> (cols a multiple of 32); y as float32 lanes.</summary>
+    public static string GemvBlocks(ScaledBlock format, byte[] a, byte[] x, float[] y, int rows, int cols)
     {
         if (cols % 32 != 0) throw new ArgumentException("the block product takes columns in whole blocks of 32");
-        int blocks = cols / 32, blockBytes = format == "q8_0" ? 34 : 18;
+        int blocks = cols / 32, blockBytes = format.Bytes;
         // x's blocks decoded once into scales and integer values (int8 for both formats: Q4_0's q − 8).
         var xs = new float[blocks];
         var xq = new sbyte[cols];
@@ -29,14 +33,18 @@ internal sealed partial class Kernels
     }
 
     /// <summary>A block's scale and its 32 integer values (Q4_0: q − 8) as int8.</summary>
-    public static void UnpackBlock(string format, ReadOnlySpan<byte> block, out float scale, Span<sbyte> q)
+    public static void UnpackBlock(string format, ReadOnlySpan<byte> block, out float scale, Span<sbyte> q) =>
+        UnpackBlock(Routes.Layout(format), block, out scale, q);
+
+    /// <summary>A block's scale and its 32 integer values (code + the layout's bias) as int8, by the layout.</summary>
+    public static void UnpackBlock(ScaledBlock format, ReadOnlySpan<byte> block, out float scale, Span<sbyte> q)
     {
         scale = (float)BitConverter.ToHalf(block[..2]);
-        if (format == "q8_0") { for (int i = 0; i < 32; i++) q[i] = (sbyte)block[2 + i]; return; }
-        for (int i = 0; i < 16; i++) { q[i] = (sbyte)((block[2 + i] & 0xF) - 8); q[i + 16] = (sbyte)((block[2 + i] >> 4) - 8); }
+        if (format.CodeBits == 8) { for (int i = 0; i < 32; i++) q[i] = (sbyte)((sbyte)block[2 + i] + format.CodeBias); return; }
+        for (int i = 0; i < 16; i++) { q[i] = (sbyte)((block[2 + i] & 0xF) + format.CodeBias); q[i + 16] = (sbyte)((block[2 + i] >> 4) + format.CodeBias); }
     }
 
-    private struct GemvBlockBody(string format, byte[] a, float[] xs, sbyte[] xq, float[] y, int cols, int blockBytes) : Team.IBody
+    private struct GemvBlockBody(ScaledBlock format, byte[] a, float[] xs, sbyte[] xq, float[] y, int cols, int blockBytes) : Team.IBody
     {
         public readonly void Run(int first, int last)
         {

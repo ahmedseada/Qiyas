@@ -1059,11 +1059,11 @@ internal sealed partial class Kernels
     /// <summary>y = A·x (A rows × cols, x cols, y rows) or, transposed, y = Aᵀ·x (x rows, y cols), in the sum lane; y stored as the type.</summary>
     public static string Gemv<TN>(byte[] a, byte[] x, byte[] y, int rows, int cols, bool transposed) where TN : struct, IAdad<TN>
     {
-        if (TN.Name is "q8_0" or "q4_0" && !transposed && cols % 32 == 0)
+        if (Routes.Route<TN>() && !transposed && cols % 32 == 0)
         {
             // The block-scaled integer product: the format's own fast path (y encoded by blocks from float32 lanes).
             var yl = new float[rows];
-            string blockLane = GemvBlocks(TN.Name, a, x, yl, rows, cols);
+            string blockLane = GemvBlocks(Routes.Layout<TN>(), a, x, yl, rows, cols);
             CopyLanes<TN>(MemoryMarshal.AsBytes(yl.AsSpan()).ToArray(), y, rows);
             return blockLane;
         }

@@ -410,6 +410,7 @@ public readonly struct Q8_0 : IFloatAdad<Q8_0>, IAdad<Q8_0, float>
 {
     public const int BlockValues = 32, BlockBytes = 34;
     public static string Name => "q8_0";
+    public static ScaledBlock Scaled => new(BlockValues, BlockBytes, 8, 0);
     public static int Bits => 8;
     public static bool IsFloat => true;
     public static double Min => -65504;
@@ -429,6 +430,7 @@ public readonly struct Q4_0 : IFloatAdad<Q4_0>, IAdad<Q4_0, float>
 {
     public const int BlockValues = 32, BlockBytes = 18;
     public static string Name => "q4_0";
+    public static ScaledBlock Scaled => new(BlockValues, BlockBytes, 4, -8);
     public static int Bits => 4;
     public static bool IsFloat => true;
     public static double Min => -65504;
