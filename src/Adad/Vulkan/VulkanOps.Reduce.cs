@@ -44,13 +44,36 @@ public sealed partial class VulkanOps
             {
                 if (axis == Axis.Cols)
                 {
-                    var kc = vk.Cached($"argmax_cols:{f.Name}", () => VkKernels.ArgmaxCols(vk, f, own));
-                    vk.Launch(kc, Groups(cols, VkKernels.ReduceThreads), 1, x, output, Vulkan.U(rows), Vulkan.U(cols));
+                    // A thread per column over a split of the rows (as the column sums), the splits joined in order.
+                    bool byWords = VkKernels.ColsByWords(f, cols);
+                    var kc = vk.Cached($"argmax_cols:{f.Name}:{byWords}", () => VkKernels.ArgmaxCols(vk, f, own, byWords));
+                    uint across = Groups(byWords ? cols / f.Per : cols, VkKernels.ReduceThreads);
+                    int splits = Splits(rows, cols), per = (rows + splits - 1) / splits;
+                    if (splits == 1)
+                    {
+                        vk.Launch(kc, across, 1, x, output, Vulkan.U(rows), Vulkan.U(cols), Vulkan.U(per), 0);
+                        return "s32 index";
+                    }
+
+                    ulong at = vk.Rent((long)splits * cols * 4), vals = vk.Rent((long)splits * cols * own.Size);
+                    try
+                    {
+                        vk.Launch(kc, across, (uint)splits, x, at, Vulkan.U(rows), Vulkan.U(cols), Vulkan.U(per), vals);
+                        var join = vk.Cached($"argmax_cols_join:{own.Name}", () => VkKernels.ArgmaxColsJoin(vk, own));
+                        vk.Launch(join, Groups(cols, VkKernels.ReduceThreads), 1, at, vals, output, Vulkan.U(splits), Vulkan.U(cols));
+                    }
+                    finally
+                    {
+                        vk.Return(at);
+                        vk.Return(vals);
+                    }
+
                     return "s32 index";
                 }
 
-                var kr = vk.Cached($"argmax:{f.Name}", () => VkKernels.ArgmaxRows(vk, f, own));
                 int r = axis == Axis.Whole ? 1 : rows, c = axis == Axis.Whole ? total : cols;
+                bool byGroups = VkKernels.ByGroups(f, c, x);
+                var kr = vk.Cached($"argmax:{f.Name}:{byGroups}", () => VkKernels.ArgmaxRows(vk, f, own, byGroups));
                 vk.Launch(kr, (uint)r, 1, x, output, Vulkan.U(c));
                 return "s32 index";
             }
@@ -68,7 +91,8 @@ public sealed partial class VulkanOps
             // A narrow float type's whole sum: each invocation's running sum in f32 compensated, the invocations' and the
             // chunks' sums joined in float64, the result rounded once to the f32 lane.
             int n = total, blocks = WholeBlocks(n), chunk = WholeChunk(n);
-            var kahan = vk.Cached($"reduce_rows:sum:{op == "sumsq"}:{f.Name}:f32:kahan", () => VkKernels.ReduceRows(vk, f, Lane.F32, "sum", op == "sumsq", compensated: true));
+            bool wholeGroups = VkKernels.ByGroups(f, chunk, x) && n % VkKernels.GroupValues(f) == 0;
+            var kahan = vk.Cached($"reduce_rows:sum:{op == "sumsq"}:{f.Name}:f32:kahan:{wholeGroups}", () => VkKernels.ReduceRows(vk, f, Lane.F32, "sum", op == "sumsq", compensated: true, groups: wholeGroups));
             var lf = VkKernels.LaneFormat(Lane.F64);
             var join = vk.Cached($"reduce_rows:sum:False:{lf.Name}:f64", () => VkKernels.ReduceRows(vk, lf, Lane.F64, "sum", false));
             ulong partials = vk.Rent((long)blocks * 8), wide = vk.Rent(8);
@@ -99,7 +123,8 @@ public sealed partial class VulkanOps
         if (axis == Axis.Rows && f.IsFloat && !lane.Wide)
         {
             // A narrow float type's row sums: the compensated pass, a workgroup a row, joined as exact f32 pairs, rounded once.
-            var kr = vk.Cached($"reduce_rows:sum:{op == "sumsq"}:{f.Name}:f32:kahan:f32", () => VkKernels.ReduceRows(vk, f, Lane.F32, "sum", op == "sumsq", compensated: true, storeF32: true));
+            bool rowGroups = VkKernels.ByGroups(f, cols, x);
+            var kr = vk.Cached($"reduce_rows:sum:{op == "sumsq"}:{f.Name}:f32:kahan:f32:{rowGroups}", () => VkKernels.ReduceRows(vk, f, Lane.F32, "sum", op == "sumsq", compensated: true, storeF32: true, groups: rowGroups));
             vk.Launch(kr, (uint)rows, 1, x, output, Vulkan.U(cols), Vulkan.U(0));
             return lane.Name;
         }
@@ -112,18 +137,21 @@ public sealed partial class VulkanOps
     {
         if (axis == Axis.Cols)
         {
-            var kc = vk.Cached($"reduce_cols:{op}:{squares}:{f.Name}:{lane.Name}", () => VkKernels.ReduceCols(vk, f, lane, op, squares));
+            // A thread a stored word of the columns where a word holds several and the rows are whole words.
+            bool byWords = VkKernels.ColsByWords(f, cols);
+            var kc = vk.Cached($"reduce_cols:{op}:{squares}:{f.Name}:{lane.Name}:{byWords}", () => VkKernels.ReduceCols(vk, f, lane, op, squares, byWords));
+            uint across = Groups(byWords ? cols / f.Per : cols, VkKernels.ReduceThreads);
             int splits = Splits(rows, cols), per = (rows + splits - 1) / splits;
             if (splits == 1)
             {
-                vk.Launch(kc, Groups(cols, VkKernels.ReduceThreads), 1, x, output, Vulkan.U(rows), Vulkan.U(cols), Vulkan.U(per));
+                vk.Launch(kc, across, 1, x, output, Vulkan.U(rows), Vulkan.U(cols), Vulkan.U(per));
                 return;
             }
 
             ulong parts = vk.Rent((long)splits * cols * lane.Size);
             try
             {
-                vk.Launch(kc, Groups(cols, VkKernels.ReduceThreads), (uint)splits, x, parts, Vulkan.U(rows), Vulkan.U(cols), Vulkan.U(per));
+                vk.Launch(kc, across, (uint)splits, x, parts, Vulkan.U(rows), Vulkan.U(cols), Vulkan.U(per));
                 var lf = VkKernels.LaneFormat(lane);
                 var k2 = vk.Cached($"reduce_cols:{op}:False:{lf.Name}:{lane.Name}", () => VkKernels.ReduceCols(vk, lf, lane, op, false));
                 vk.Launch(k2, Groups(cols, VkKernels.ReduceThreads), 1, parts, output, Vulkan.U(splits), Vulkan.U(cols), Vulkan.U(splits));
@@ -136,20 +164,23 @@ public sealed partial class VulkanOps
             return;
         }
 
-        var kr = vk.Cached($"reduce_rows:{op}:{squares}:{f.Name}:{lane.Name}", () => VkKernels.ReduceRows(vk, f, lane, op, squares));
         if (axis == Axis.Rows)
         {
+            // A 16-byte group of words a step where a word holds several values and the rows are whole groups.
+            bool rowGroups = VkKernels.ByGroups(f, cols, x);
+            var kr = vk.Cached($"reduce_rows:{op}:{squares}:{f.Name}:{lane.Name}:{rowGroups}", () => VkKernels.ReduceRows(vk, f, lane, op, squares, groups: rowGroups));
             vk.Launch(kr, (uint)rows, 1, x, output, Vulkan.U(cols), Vulkan.U(0));
             return;
         }
 
         int n = rows * cols, blocks = WholeBlocks(n), chunk = WholeChunk(n);
         var first = chunkLane ?? lane;
-        if (first.Name != lane.Name) kr = vk.Cached($"reduce_rows:{op}:{squares}:{f.Name}:{first.Name}", () => VkKernels.ReduceRows(vk, f, first, op, squares));
+        bool chunkGroups = VkKernels.ByGroups(f, chunk, x) && n % VkKernels.GroupValues(f) == 0;
+        var kc2 = vk.Cached($"reduce_rows:{op}:{squares}:{f.Name}:{first.Name}:{chunkGroups}", () => VkKernels.ReduceRows(vk, f, first, op, squares, groups: chunkGroups));
         ulong partials = vk.Rent((long)blocks * first.Size);
         try
         {
-            vk.Launch(kr, (uint)blocks, 1, x, partials, Vulkan.U(n), Vulkan.U(chunk));
+            vk.Launch(kc2, (uint)blocks, 1, x, partials, Vulkan.U(n), Vulkan.U(chunk));
             var lf = VkKernels.LaneFormat(first);
             var k2 = vk.Cached($"reduce_rows:{op}:False:{lf.Name}:{lane.Name}", () => VkKernels.ReduceRows(vk, lf, lane, op, false));
             vk.Launch(k2, 1, 1, partials, output, Vulkan.U(blocks), Vulkan.U(0));
@@ -218,6 +249,16 @@ public sealed partial class VulkanOps
             return lane.Name;
         }
 
+        // By tiles through workgroup memory where a tile's output rows are whole words (VkKernels.TransposeTiles); else a
+        // thread an output word, its values gathered where they are.
+        uint tilesX = Groups(cols, VkKernels.TransposeTile), tilesY = Groups(rows, VkKernels.TransposeTile);
+        if (VkKernels.TransposeTiles(f, rows) && tilesX <= vk.MaxGroupsX && tilesY <= vk.MaxGroupsY)
+        {
+            var tiled = vk.Cached($"transpose_tiled:{f.Name}", () => VkKernels.TransposeTiled(vk, f, lane));
+            vk.Launch(tiled, tilesX, tilesY, x, output, Vulkan.U(rows), Vulkan.U(cols));
+            return lane.Name;
+        }
+
         var k = vk.Cached($"transpose:{f.Name}", () => VkKernels.Transpose(vk, f, lane));
         vk.Launch(k, Groups(f.Words((long)rows * cols), VkKernels.Threads), 1, x, output, Vulkan.U(rows), Vulkan.U(cols));
         return lane.Name;
@@ -237,15 +278,17 @@ public sealed partial class VulkanOps
         {
             if (transposed)
             {
-                var kc = vk.Cached($"gemv_cols:{f.Name}:{lane.Name}", () => VkKernels.GemvCols(vk, f, lane));
+                bool byWords = VkKernels.ColsByWords(f, cols);
+                var kc = vk.Cached($"gemv_cols:{f.Name}:{lane.Name}:{byWords}", () => VkKernels.GemvCols(vk, f, lane, byWords));
+                uint across = Groups(byWords ? cols / f.Per : cols, VkKernels.Threads);
                 int splits = Splits(rows, cols), per = (rows + splits - 1) / splits;
-                if (splits == 1) vk.Launch(kc, Groups(cols, VkKernels.Threads), 1, a, x, yl, Vulkan.U(rows), Vulkan.U(cols), Vulkan.U(per));
+                if (splits == 1) vk.Launch(kc, across, 1, a, x, yl, Vulkan.U(rows), Vulkan.U(cols), Vulkan.U(per));
                 else
                 {
                     ulong partials = vk.Rent((long)splits * cols * lane.Size);
                     try
                     {
-                        vk.Launch(kc, Groups(cols, VkKernels.Threads), (uint)splits, a, x, partials, Vulkan.U(rows), Vulkan.U(cols), Vulkan.U(per));
+                        vk.Launch(kc, across, (uint)splits, a, x, partials, Vulkan.U(rows), Vulkan.U(cols), Vulkan.U(per));
                         var lf = VkKernels.LaneFormat(lane);
                         var k2 = vk.Cached($"reduce_cols:sum:False:{lf.Name}:{lane.Name}", () => VkKernels.ReduceCols(vk, lf, lane, "sum", false));
                         vk.Launch(k2, Groups(cols, VkKernels.ReduceThreads), 1, partials, yl, Vulkan.U(splits), Vulkan.U(cols), Vulkan.U(splits));
@@ -258,7 +301,8 @@ public sealed partial class VulkanOps
             }
             else
             {
-                var kr = vk.Cached($"gemv_rows:{f.Name}:{lane.Name}", () => VkKernels.GemvRows(vk, f, lane));
+                bool byGroups = VkKernels.ByGroups(f, cols, a) && x % 16 == 0;
+                var kr = vk.Cached($"gemv_rows:{f.Name}:{lane.Name}:{byGroups}", () => VkKernels.GemvRows(vk, f, lane, byGroups));
                 vk.Launch(kr, (uint)rows, 1, a, x, yl, Vulkan.U(rows), Vulkan.U(cols));
             }
 

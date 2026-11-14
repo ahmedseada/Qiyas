@@ -2226,9 +2226,14 @@ internal static partial class Checks
             const int LR = 97, LC = 4099;
             var longData = Bench.Registry.Make(type, LR * LC, 44, -1, 1);
             var longValues = Bench.Registry.Values(type, longData, LR * LC);
+            // Rows of whole 16-byte groups of words of every type (256 values: a device may read a row's words a thread each,
+            // or a group of four a step), the whole in chunks of whole groups, the columns in splits of the rows.
+            const int WR = 256, WC = 256;
+            var wordData = Bench.Registry.Make(type, WR * WC, 45, -1, 1);
+            var wordValues = Bench.Registry.Values(type, wordData, WR * WC);
             foreach (string op in new[] { "sum", "sumsq", "max", "min", "argmax" })
             {
-                foreach (var (axis, r, c, d, vals) in new[] { (Axis.Whole, R, C, data, values), (Axis.Rows, R, C, data, values), (Axis.Cols, R, C, data, values), (Axis.Whole, LR, LC, longData, longValues), (Axis.Cols, LR, LC, longData, longValues), (Axis.Cols, LC, LR, longData, longValues) })
+                foreach (var (axis, r, c, d, vals) in new[] { (Axis.Whole, R, C, data, values), (Axis.Rows, R, C, data, values), (Axis.Cols, R, C, data, values), (Axis.Whole, LR, LC, longData, longValues), (Axis.Cols, LR, LC, longData, longValues), (Axis.Cols, LC, LR, longData, longValues), (Axis.Whole, WR, WC, wordData, wordValues), (Axis.Rows, WR, WC, wordData, wordValues), (Axis.Cols, WR, WC, wordData, wordValues) })
                 {
 
                     int count = axis == Axis.Whole ? 1 : axis == Axis.Rows ? r : c;
@@ -2289,6 +2294,16 @@ internal static partial class Checks
                 var y = Bench.Registry.Poisoned(type, t ? C : R);
                 Bench.Registry.With(type, new GemvRun(ops, data, x, y, R, C, t));
                 ok &= Close(type, t ? "gemv_t" : "gemv", where, y, want, t ? C : R, terms: t ? R : C);
+            }
+
+            // Both ways over the rows of whole groups too (a device's reads of a row's words or groups at a time).
+            foreach (bool t in new[] { false, true })
+            {
+                var x = Bench.Registry.Make(type, t ? WR : WC, 46, -1, 1);
+                var want = References.Gemv(wordValues, Bench.Registry.Values(type, x, t ? WR : WC), WR, WC, t);
+                var y = Bench.Registry.Poisoned(type, t ? WC : WR);
+                Bench.Registry.With(type, new GemvRun(ops, wordData, x, y, WR, WC, t));
+                ok &= Close(type, t ? "gemv_t 256x256" : "gemv 256x256", where, y, want, t ? WC : WR, terms: t ? WR : WC);
             }
         }
 
