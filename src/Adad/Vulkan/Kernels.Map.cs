@@ -30,6 +30,7 @@ internal static partial class VkKernels
         {
             bool w = x.Kind == K.F64;
             double lo = w ? -745.1332 : -103.9721, hi = w ? 709.78 : 88.72283;
+            if (w) return Exp64(b, x, lo, hi);
             var c = b.Min(b.Max(x, b.C(x.Kind, lo)), b.C(x.Kind, hi));
             var n = b.RoundEven(c * (w ? 1.4426950408889634 : 1.44269504));
             var r = b.Fma(n, b.C(x.Kind, w ? -6.93147180369123816490e-01 : -0.693359375), c);
@@ -54,6 +55,46 @@ internal static partial class VkKernels
             var y = p * s1 * s2;
             y = b.Select(x < lo, b.C(x.Kind, 0), y);
             y = b.Select(x > hi, b.C(x.Kind, double.PositiveInfinity), y);
+            return b.Select(b.IsNan(x), x, y);
+        }
+
+        // e^x in f64, Exps.Exp's steps (the definition): n by 32/ln 2, r in two parts, u = r·P(r), 2^(j/32) as hi + lo by a
+        // tree of selects on j's bits, (hi + fma(hi, u, lo))·2^q, the scale in two halves.
+        private static V Exp64(Spv b, V x, double lo, double hi)
+        {
+            var c = b.Min(b.Max(x, b.D(lo)), b.D(hi));
+            var n = b.RoundEven(c * Exps.ExpInv32);
+            var r = b.Fma(n, b.D(-Exps.Ln2Hi32), c);
+            r = b.Fma(n, b.D(-Exps.Ln2Lo32), r);
+            var p = b.D(Exps.ExpP64[0]);
+            for (int k = 1; k < Exps.ExpP64.Length; k++) p = b.Fma(p, r, b.D(Exps.ExpP64[k]));
+            var u = p * r;
+            var nn = b.Convert(n, K.S64);
+            var j = b.Convert(nn, K.U32) & 31UL;
+            V Table(double[] t)
+            {
+                var level = t.Select(v => b.D(v)).ToArray();
+                for (int bit = 0; level.Length > 1; bit++)
+                {
+                    var set = (j & (ulong)(1 << bit)) != 0;
+                    var next = new V[level.Length / 2];
+                    for (int m = 0; m < next.Length; m++) next[m] = b.Select(set, level[2 * m + 1], level[2 * m]);
+                    level = next;
+                }
+
+                return level[0];
+            }
+
+            var th = Table(Exps.Exp2Hi);
+            var tl = Table(Exps.Exp2Lo);
+            var wv = th + b.Fma(th, u, tl);
+            var ni = nn >> 5;
+            var half = ni >> 1;
+            var s1 = b.Bitcast((half + 1023) << 52, K.F64);
+            var s2 = b.Bitcast(((ni - half) + 1023) << 52, K.F64);
+            var y = wv * s1 * s2;
+            y = b.Select(x < lo, b.D(0), y);
+            y = b.Select(x > hi, b.D(double.PositiveInfinity), y);
             return b.Select(b.IsNan(x), x, y);
         }
 

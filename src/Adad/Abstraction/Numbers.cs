@@ -18,6 +18,7 @@
 // boxes or calls through a delegate.
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.X86;
@@ -574,35 +575,81 @@ internal static class Exps
         return Vector.ConditionalSelect(Vector.Equals(x, x), y, x);
     }
 
+    /// <summary>The f64 exp's table: 2^(j/32) for j in 0 .. 31 as hi + lo (hi the double nearest, lo the double nearest the
+    /// rest; from 50-digit values, local/exp/score.py).</summary>
+    internal static readonly double[] Exp2Hi = [1.0, 1.0218971486541166, 1.0442737824274138, 1.0671404006768237, 1.0905077326652577, 1.1143867425958924, 1.1387886347566916, 1.1637248587775775, 1.189207115002721, 1.215247359980469, 1.241857812073484, 1.2690509571917332, 1.2968395546510096, 1.3252366431597413, 1.3542555469368927, 1.383909881963832, 1.4142135623730951, 1.4451808069770467, 1.4768261459394993, 1.5091644275934228, 1.5422108254079407, 1.5759808451078865, 1.6104903319492543, 1.645755478153965, 1.681792830507429, 1.718619298122478, 1.7562521603732995, 1.7947090750031072, 1.8340080864093424, 1.8741676341103, 1.9152065613971474, 1.9571441241754002];
+
+    internal static readonly double[] Exp2Lo = [0.0, 5.109225028973444e-17, 8.551889705537965e-17, -7.899853966841582e-17, -3.046782079812471e-17, 1.0410278456845571e-16, 8.912812676025408e-17, 3.8292048369240935e-17, 3.982015231465646e-17, -7.712630692681488e-17, 4.658027591836937e-17, 2.667932131342186e-18, 2.5382502794888315e-17, -2.8587312100388614e-17, 7.70094837980299e-17, -6.770511658794786e-17, -9.667293313452913e-17, -3.0237581349939873e-17, -3.483994556892796e-17, -1.016455327754295e-16, 7.949834809697621e-17, -1.0136916471278304e-17, 2.4707192569797888e-17, -1.0125679913674773e-16, 8.199010020581497e-17, -1.851380418263111e-17, 2.960140695448873e-17, 1.8227458427912087e-17, 3.283107224245627e-17, -6.122763413004143e-17, -1.0619946056195963e-16, 8.960767791036668e-17];
+
+    /// <summary>32 / ln 2, and ln 2 / 32 in two parts (fdlibm's ln2_hi and ln2_lo over 32: n·hi exact for every n the range
+    /// gives).</summary>
+    internal const double ExpInv32 = 46.16624130844683, Ln2Hi32 = 0.02166084938653512, Ln2Lo32 = 5.9631716539705866e-12;
+
+    /// <summary>The f64 exp's polynomial: e^r − 1 = r·P(r), P Taylor's to r^5/720 (|r| ≤ ln 2/64: its rest below 4e-18).</summary>
+    internal static readonly double[] ExpP64 = [1.0 / 720, 1.0 / 120, 1.0 / 24, 1.0 / 6, 0.5, 1.0];
+
+    /// <summary>e^x in f64 (the definition): n = round(x·32/ln 2), r = x − n·ln 2/32 (two parts), u = r·P(r) = e^r − 1,
+    /// j = n mod 32, q = n div 32, e^x = (hi_j + fma(hi_j, u, lo_j))·2^q, the scale in two halves (a result into the
+    /// subnormals scaled once each way). Fourteen f64 steps where the degree-13 Taylor took nineteen; the worst error 0.68
+    /// ulp against 40 digits where it was 0.78 (local/exp/score.py).</summary>
     public static Vector<double> Exp(Vector<double> x)
     {
         var c = Vector.Min(Vector.Max(x, new Vector<double>(-745.1332)), new Vector<double>(709.78));
-        var n = Vector.Round(c * new Vector<double>(1.4426950408889634));
-        var r = Vector.FusedMultiplyAdd(n, new Vector<double>(-6.93147180369123816490e-01), c);
-        r = Vector.FusedMultiplyAdd(n, new Vector<double>(-1.90821492927058770002e-10), r);
-        var p = new Vector<double>(1.0 / 6227020800);
-        p = Vector.FusedMultiplyAdd(p, r, new Vector<double>(1.0 / 479001600));
-        p = Vector.FusedMultiplyAdd(p, r, new Vector<double>(1.0 / 39916800));
-        p = Vector.FusedMultiplyAdd(p, r, new Vector<double>(1.0 / 3628800));
-        p = Vector.FusedMultiplyAdd(p, r, new Vector<double>(1.0 / 362880));
-        p = Vector.FusedMultiplyAdd(p, r, new Vector<double>(1.0 / 40320));
-        p = Vector.FusedMultiplyAdd(p, r, new Vector<double>(1.0 / 5040));
-        p = Vector.FusedMultiplyAdd(p, r, new Vector<double>(1.0 / 720));
-        p = Vector.FusedMultiplyAdd(p, r, new Vector<double>(1.0 / 120));
+        var n = Vector.Round(c * new Vector<double>(ExpInv32));
+        var r = Vector.FusedMultiplyAdd(n, new Vector<double>(-Ln2Hi32), c);
+        r = Vector.FusedMultiplyAdd(n, new Vector<double>(-Ln2Lo32), r);
+        // ExpP64's steps written out (the same order).
+        var p = Vector.FusedMultiplyAdd(new Vector<double>(1.0 / 720), r, new Vector<double>(1.0 / 120));
         p = Vector.FusedMultiplyAdd(p, r, new Vector<double>(1.0 / 24));
         p = Vector.FusedMultiplyAdd(p, r, new Vector<double>(1.0 / 6));
         p = Vector.FusedMultiplyAdd(p, r, new Vector<double>(0.5));
         p = Vector.FusedMultiplyAdd(p, r, Vector<double>.One);
-        p = Vector.FusedMultiplyAdd(p, r, Vector<double>.One);
-        // n as an integer through the 1.5·2^52 shift (no 64-bit float-to-integer instruction needed).
+        var u = p * r;
+        // n + 2^20 as an integer through the 1.5·2^52 shift (no 64-bit float-to-integer instruction needed; the bias, a
+        // multiple of 64, keeps it positive, so its j, q = ⌊n/32⌋ and ⌊q/2⌋ come by logical shifts).
         var magic = new Vector<double>(6755399441055744.0);
-        var ni = Vector.AsVectorInt64(n + magic) - Vector.AsVectorInt64(magic);
-        var half = ni >> 1;
-        var s1 = Vector.AsVectorDouble((half + new Vector<long>(1023)) << 52);
-        var s2 = Vector.AsVectorDouble((ni - half + new Vector<long>(1023)) << 52);
-        var y = p * s1 * s2;
+        var nb = Vector.AsVectorInt64(n + magic) - new Vector<long>(0x4338000000000000L - (1L << 20));
+        var (hi, lo) = Exp2Table(nb & new Vector<long>(31));
+        var p2 = hi + Vector.FusedMultiplyAdd(hi, u, lo);
+        var qb = Vector.ShiftRightLogical(nb, 5);
+        var hb = Vector.ShiftRightLogical(nb, 6);
+        var s1 = Vector.AsVectorDouble((hb + new Vector<long>(1023 - (1L << 14))) << 52);
+        var s2 = Vector.AsVectorDouble((qb - hb + new Vector<long>(1023 - (1L << 14))) << 52);
+        var y = p2 * s1 * s2;
         y = Vector.ConditionalSelect(Vector.LessThan(x, new Vector<double>(-745.1332)), Vector<double>.Zero, y);
         y = Vector.ConditionalSelect(Vector.GreaterThan(x, new Vector<double>(709.78)), new Vector<double>(double.PositiveInfinity), y);
         return Vector.ConditionalSelect(Vector.Equals(x, x), y, x);
+    }
+
+    // Exp2Hi and Exp2Lo side by side: entry j's pair one 16-byte load.
+    private static readonly double[] Exp2Pairs = Pairs();
+
+    private static double[] Pairs()
+    {
+        var t = new double[64];
+        for (int i = 0; i < 32; i++) (t[2 * i], t[2 * i + 1]) = (Exp2Hi[i], Exp2Lo[i]);
+        return t;
+    }
+
+    // The table's hi and lo at each lane's j (0 .. 31): where the vector is AVX's four lanes, each lane's pair by one load and
+    // two unpacks (no gather: a gather's cost differs between cores), else a lane at a time (the same values either way).
+    private static (Vector<double> Hi, Vector<double> Lo) Exp2Table(Vector<long> j)
+    {
+        if (Avx.IsSupported && Vector<double>.Count == 4)
+        {
+            var index = j.AsVector256();
+            ref double t = ref MemoryMarshal.GetArrayDataReference(Exp2Pairs);
+            var a0 = Vector128.LoadUnsafe(ref t, (nuint)index.GetElement(0) * 2);
+            var a1 = Vector128.LoadUnsafe(ref t, (nuint)index.GetElement(1) * 2);
+            var a2 = Vector128.LoadUnsafe(ref t, (nuint)index.GetElement(2) * 2);
+            var a3 = Vector128.LoadUnsafe(ref t, (nuint)index.GetElement(3) * 2);
+            var even = Vector256.Create(a0, a2);
+            var odd = Vector256.Create(a1, a3);
+            return (Avx.UnpackLow(even, odd).AsVector(), Avx.UnpackHigh(even, odd).AsVector());
+        }
+
+        Span<double> hs = stackalloc double[Vector<double>.Count], ls = stackalloc double[Vector<double>.Count];
+        for (int i = 0; i < hs.Length; i++) { hs[i] = Exp2Hi[(int)j[i]]; ls[i] = Exp2Lo[(int)j[i]]; }
+        return (new Vector<double>(hs), new Vector<double>(ls));
     }
 }

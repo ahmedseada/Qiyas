@@ -87,9 +87,20 @@ public sealed class PtxBuilder
 
     public void Label(string name) => _body.Append(name).Append(":\n");
 
+    /// <summary>The kernel reads the f64 exp's table (Codec.Exp): the module declares it.</summary>
+    public bool UsesExpTable { get; set; }
+
     public string Finish(string header, string entry, string parameters, int sharedBytes = 0)
     {
         var sb = new StringBuilder(header);
+        if (UsesExpTable)
+        {
+            // Exps.Exp2Hi and Exp2Lo, the f64 exp's 2^(j/32) as hi + lo, read by its lanes at their j (cached loads).
+            string Values(double[] t) => string.Join(", ", t.Select(v => "0d" + BitConverter.DoubleToUInt64Bits(v).ToString("X16")));
+            sb.Append($".global .align 8 .f64 adad_exp2hi[32] = {{{Values(Exps.Exp2Hi)}}};\n");
+            sb.Append($".global .align 8 .f64 adad_exp2lo[32] = {{{Values(Exps.Exp2Lo)}}};\n");
+        }
+
         if (sharedBytes > 48 * 1024) sb.Append(".extern .shared .align 16 .b8 smem[];\n");
         sb.Append(".visible .entry ").Append(entry).Append('(').Append(parameters).Append(")\n{\n");
         sb.Append($"    .reg .pred %p<{Math.Max(1, _p)}>;\n    .reg .b32 %r<{Math.Max(1, _r)}>;\n    .reg .b64 %rd<{Math.Max(1, _rd)}>;\n");
@@ -531,6 +542,54 @@ internal static class Codec
 
     // ---------------------------------------------------------------- exp (the CPU's polynomial)
 
+    // The module's table (Finish's adad_exp2hi or adad_exp2lo) at j (0 .. 31, a u32 register): a cached load.
+    private static string TableLoad(PtxBuilder b, string table, string j)
+    {
+        b.UsesExpTable = true;
+        string at = b.RD(), off = b.RD(), v = b.FD();
+        b.L($"mov.u64 {at}, {table};");
+        b.L($"mul.wide.u32 {off}, {j}, 8;");
+        b.L($"add.u64 {at}, {at}, {off};");
+        b.L($"ld.global.nc.f64 {v}, [{at}];");
+        return v;
+    }
+
+    /// <summary>e^v·2^off in the f32 lane (off an s32 register: 128, 0 or −128): Exp's steps with the scale's exponent offset
+    /// split between its halves and v held to [−192.6, 177.3] (Exps.ExpOff).</summary>
+    public static string ExpOff32(PtxBuilder b, string v, string off)
+    {
+        string c = b.F(), n = b.F(), r = b.F(), p = b.F(), ni = b.R(), half = b.R(), o2 = b.R(), s1 = b.R(), s2 = b.R(), fs1 = b.F(), fs2 = b.F(), y = b.F(), pl = b.P(), ph = b.P(), pn = b.P();
+        b.L($"max.f32 {c}, {v}, {Hex(-192.6f)};");
+        b.L($"min.f32 {c}, {c}, {Hex(177.3f)};");
+        b.L($"mul.rn.f32 {n}, {c}, {Hex(1.44269504f)};");
+        b.L($"cvt.rni.f32.f32 {n}, {n};");
+        b.L($"fma.rn.f32 {r}, {n}, {Hex(-0.693359375f)}, {c};");
+        b.L($"fma.rn.f32 {r}, {n}, {Hex(2.12194440e-4f)}, {r};");
+        b.L($"mov.f32 {p}, {Hex(1f / 5040)};");
+        foreach (float k in new[] { 1f / 720, 1f / 120, 1f / 24, 1f / 6, 0.5f, 1f, 1f }) b.L($"fma.rn.f32 {p}, {p}, {r}, {Hex(k)};");
+        b.L($"cvt.rni.s32.f32 {ni}, {n};");
+        b.L($"shr.s32 {half}, {ni}, 1;");
+        b.L($"shr.s32 {o2}, {off}, 1;");
+        b.L($"add.s32 {s1}, {half}, {o2};");
+        b.L($"add.s32 {s1}, {s1}, 127;");
+        b.L($"shl.b32 {s1}, {s1}, 23;");
+        b.L($"sub.s32 {s2}, {ni}, {half};");
+        b.L($"add.s32 {s2}, {s2}, {o2};");
+        b.L($"add.s32 {s2}, {s2}, 127;");
+        b.L($"shl.b32 {s2}, {s2}, 23;");
+        b.L($"mov.b32 {fs1}, {s1};");
+        b.L($"mov.b32 {fs2}, {s2};");
+        b.L($"mul.rn.f32 {y}, {p}, {fs1};");
+        b.L($"mul.rn.f32 {y}, {y}, {fs2};");
+        b.L($"setp.lt.f32 {pl}, {v}, {Hex(-192.6f)};");
+        b.L($"selp.f32 {y}, 0f00000000, {y}, {pl};");
+        b.L($"setp.gt.f32 {ph}, {v}, {Hex(177.3f)};");
+        b.L($"selp.f32 {y}, 0f7F800000, {y}, {ph};");
+        b.L($"testp.notanumber.f32 {pn}, {v};");
+        b.L($"selp.f32 {y}, {v}, {y}, {pn};");
+        return y;
+    }
+
     public static string Exp(PtxBuilder b, Lane lane, string x)
     {
         if (!lane.Wide)
@@ -569,14 +628,24 @@ internal static class Codec
             string D(double v) => Lane.F64.Literal(v);
             b.L($"max.f64 {c}, {x}, {D(-745.1332)};");
             b.L($"min.f64 {c}, {c}, {D(709.78)};");
-            b.L($"mul.rn.f64 {n}, {c}, {D(1.4426950408889634)};");
+            // Exps.Exp's steps (the definition): n by 32/ln 2, r in two parts, u = r·P(r), 2^(j/32) as hi + lo by a tree of
+            // selects on j's bits, (hi + fma(hi, u, lo))·2^q.
+            b.L($"mul.rn.f64 {n}, {c}, {D(Exps.ExpInv32)};");
             b.L($"cvt.rni.f64.f64 {n}, {n};");
-            b.L($"fma.rn.f64 {r}, {n}, {D(-6.93147180369123816490e-01)}, {c};");
-            b.L($"fma.rn.f64 {r}, {n}, {D(-1.90821492927058770002e-10)}, {r};");
-            b.L($"mov.f64 {p}, {D(1.0 / 6227020800)};");
-            foreach (double k in new[] { 1.0 / 479001600, 1.0 / 39916800, 1.0 / 3628800, 1.0 / 362880, 1.0 / 40320, 1.0 / 5040, 1.0 / 720, 1.0 / 120, 1.0 / 24, 1.0 / 6, 0.5, 1.0, 1.0 })
-                b.L($"fma.rn.f64 {p}, {p}, {r}, {D(k)};");
-            b.L($"cvt.rni.s64.f64 {ni}, {n};");
+            b.L($"fma.rn.f64 {r}, {n}, {D(-Exps.Ln2Hi32)}, {c};");
+            b.L($"fma.rn.f64 {r}, {n}, {D(-Exps.Ln2Lo32)}, {r};");
+            b.L($"mov.f64 {p}, {D(Exps.ExpP64[0])};");
+            for (int k = 1; k < Exps.ExpP64.Length; k++) b.L($"fma.rn.f64 {p}, {p}, {r}, {D(Exps.ExpP64[k])};");
+            string u = b.FD(), nn = b.RD(), j = b.R(), hi, lo, v = b.FD(), w = b.FD();
+            b.L($"mul.rn.f64 {u}, {p}, {r};");
+            b.L($"cvt.rni.s64.f64 {nn}, {n};");
+            b.L($"cvt.u32.u64 {j}, {nn};");
+            b.L($"and.b32 {j}, {j}, 31;");
+            hi = TableLoad(b, "adad_exp2hi", j);
+            lo = TableLoad(b, "adad_exp2lo", j);
+            b.L($"fma.rn.f64 {v}, {hi}, {u}, {lo};");
+            b.L($"add.rn.f64 {w}, {hi}, {v};");
+            b.L($"shr.s64 {ni}, {nn}, 5;");
             b.L($"shr.s64 {half}, {ni}, 1;");
             b.L($"add.s64 {s1}, {half}, 1023;");
             b.L($"shl.b64 {s1}, {s1}, 52;");
@@ -585,7 +654,7 @@ internal static class Codec
             b.L($"shl.b64 {s2}, {s2}, 52;");
             b.L($"mov.b64 {fs1}, {s1};");
             b.L($"mov.b64 {fs2}, {s2};");
-            b.L($"mul.rn.f64 {y}, {p}, {fs1};");
+            b.L($"mul.rn.f64 {y}, {w}, {fs1};");
             b.L($"mul.rn.f64 {y}, {y}, {fs2};");
             b.L($"setp.lt.f64 {pl}, {x}, {D(-745.1332)};");
             b.L($"selp.f64 {y}, 0d0000000000000000, {y}, {pl};");
