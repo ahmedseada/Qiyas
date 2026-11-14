@@ -8,8 +8,10 @@
 //                  weights exp((x − m) / t) in lane storage (NaN throughout a row whose m is not finite).
 //   SampleDraw     each rule's prefix of the row's order, by the scores' order keys (Routing.Order's integer form: a
 //                  stored value as an unsigned integer that orders as Adad's order does, made where it is read): top-k's
-//                  k-th column by narrowing the keys' range sixteen ways a pass (an invocation its columns tid, tid +
-//                  256, …; the workgroup's trees of the counts), its key's columns cut by column order (an invocation a
+//                  k-th key by the digits of its offset from the row's least, eight bits a pass, for a float or block
+//                  format (an invocation its columns tid, tid + 256, …; a 256-bin count by workgroup atomics, scanned
+//                  from the top), by narrowing the keys' range sixteen ways a pass for an integer format (the
+//                  workgroup's trees of the counts), its key's columns cut by column order (an invocation a
 //                  chunk of consecutive columns, the chunks' counts' prefix); the nucleus over top-k's columns gathered
 //                  into workgroup memory where k fits a workgroup's invocations (each ranks itself among them, the first
 //                  sums them in order), else by narrowing the keys' range sixteen ways with the weights' sums and its
@@ -57,6 +59,12 @@ internal static partial class VkKernels
     /// fifty instructions at the device's full rate and the stored weights a write and two or more reads of a row of lane
     /// values (four bytes a column for a type of one); not in the f64 lane, whose exp and quotient run at its f64 rate.</summary>
     public static bool SampleWeighsInPlace(Lane lane) => !lane.Wide;
+
+    /// <summary>Whether SampleDraw finds top-k's k-th key by 8-bit digits (workgroup atomics) rather than by narrowing its range
+    /// sixteen ways a pass: for a float or block format, whose scores spread over many keys (measured: sample_filtered f32
+    /// 7.74 ms against 5.65, q4_0 9.56 against 5.78); not for an integer format, whose few values' adds wait on one
+    /// another's bins (int4 2.68 against 3.59, uint8 4.53 against 4.74).</summary>
+    public static bool RadixTopK(Fmt f) => f.IsFloat || f.IsBlock;
 
     /// <summary>The rules a call's SampleDraw holds code for (SampleRules): top-k (k below cols), the nucleus (p below 1 in
     /// the lane), the nucleus over top-k's columns gathered (both, k at most SampleGathered). A kernel without a rule's
@@ -242,8 +250,57 @@ internal static partial class VkKernels
             kmax.V = GroupReduce(b, keyTree, tid, hi.V, b.Max, ReduceThreads);
         });
 
-        // Top-k: the largest key at least k columns reach (sixteen ways a pass), then its columns cut by column order.
-        if (rules.TopK) b.If(hasTopK, () =>
+        // Top-k: the largest key at least k columns reach (the k-th largest), then its columns cut by column order. A float or
+        // block format's keys (RadixTopK): by the digits of key − kmin from the top, eight bits a pass, the keys that hold
+        // the digits so far counted a bin a digit (workgroup atomics), from the top by a scan, the digit whose count reaches
+        // what is left of k taken; the digits above the span's highest bit are 0 without a pass. An integer format's: by
+        // narrowing the keys' range sixteen ways a pass (its values few: their atomics would wait on one another's bins).
+        if (rules.TopK && RadixTopK(f)) b.If(hasTopK, () =>
+        {
+            int bits = kk == K.U64 ? 64 : 32;
+            V Wide(V u32) => kk == K.U32 ? u32 : b.Convert(u32, kk);
+            V Narrow32(V key) => kk == K.U32 ? key : b.Convert(key, K.U32);
+            var picked = b.Shared(K.U32, 2);
+            var prefix = b.Local(b.CBits(kk, 0));
+            var need = b.Local(topK);
+            var span = kmax.V - kmin.V;
+            var last = b.U(ReduceThreads - 1);
+            for (int s = bits - 8; s >= 0; s -= 8)
+            {
+                int shift = s;
+                ulong above = shift + 8 >= bits ? 0UL : (ones << (shift + 8)) & ones;    // the digits taken before this one
+                b.If((span >> shift) != 0.0, () =>
+                {
+                    counts[tid] = b.U(0);
+                    b.Barrier();
+                    b.For(tid, cols, strided, c =>
+                    {
+                        var off = KeyOf(c) - kmin.V;
+                        b.If((off & above) == prefix.V, () => counts.AtomicAdd(Narrow32((off >> shift) & 255UL), b.U(1)));
+                    });
+                    b.Barrier();
+                    // counts[d] = the keys of digit d or above (a scan from the top, eight steps).
+                    for (int o = 1; o < ReduceThreads; o *= 2)
+                    {
+                        var v = counts[tid] + b.Select(tid + (double)o <= (double)(ReduceThreads - 1), counts[b.Min(tid + (double)o, last)], b.U(0));
+                        b.Barrier();
+                        counts[tid] = v;
+                        b.Barrier();
+                    }
+
+                    var mine = counts[tid];
+                    var next = b.Select(tid < (double)(ReduceThreads - 1), counts[b.Min(tid + 1.0, last)], b.U(0));
+                    b.If((mine >= need.V) & (next < need.V), () => { picked[0] = tid; picked[1] = next; });
+                    b.Barrier();
+                    need.V = need.V - picked[1];
+                    prefix.V = prefix.V | (Wide(picked[0]) << shift);
+                    b.Barrier();
+                });
+            }
+
+            CutByColumn(kmin.V + prefix.V, null, topK);
+        });
+        else if (rules.TopK) b.If(hasTopK, () =>
         {
             var lo = b.Local(kmin.V);
             var hi = b.Local(kmax.V);

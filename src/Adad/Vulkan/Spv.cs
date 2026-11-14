@@ -158,6 +158,10 @@ internal readonly struct Arr(Spv b, uint variable, K kind, int length, StorageCl
         get => this[b.U(index)];
         set => this[b.U(index)] = value;
     }
+
+    /// <summary>Atomically adds value (u32 or s32) to element index of a workgroup array (the workgroup's scope; a barrier
+    /// orders it with the reads after); returns the old value.</summary>
+    public V AtomicAdd(V index, V value) => b.ArrayAtomicAdd(Variable, Space, index, value);
 }
 
 /// <summary>What the device grants a kernel's float arithmetic (the float controls it reports) and the widths it may declare
@@ -648,6 +652,12 @@ internal sealed partial class Spv
     {
         uint pointer = _m.Value(SpirvOp.AccessChain, _m.TypePointer(storage, Type(kind)), variable, index.Id);
         return new V(this, _m.Value(SpirvOp.Load, Type(kind), pointer), kind);
+    }
+
+    internal V ArrayAtomicAdd(uint variable, StorageClass storage, V index, V value)
+    {
+        uint pointer = _m.Value(SpirvOp.AccessChain, _m.TypePointer(storage, Type(value.Kind)), variable, index.Id);
+        return new V(this, _m.Value(SpirvOp.AtomicIAdd, Type(value.Kind), pointer, Const(K.U32, 2), Const(K.U32, 0), value.Id), value.Kind);
     }
 
     internal void ArrayStore(uint variable, StorageClass storage, V index, V value)
