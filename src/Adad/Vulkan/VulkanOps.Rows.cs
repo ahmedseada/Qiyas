@@ -2,7 +2,10 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // The row operations, softmax and rms_norm among them, and the normalization parameters' backward on Vulkan
-// (Kernels.Rows.cs): the rows' statistics by a workgroup a row, then the outputs a thread per stored word. Float types
+// (Kernels.Rows.cs): a workgroup a row in one kernel where the rows are whole words (float32's and float64's held in
+// its memory as far as they fit); else the rows' statistics by a workgroup a row, then the outputs a thread per stored
+// word.
+// Float types
 // in the f32 lane (float64 in f64), as on CUDA; a block format's outputs replayed into its encoder (each block from its
 // values' replays).
 using Adad.Abstraction;
@@ -30,6 +33,19 @@ public sealed partial class VulkanOps
         long n = (long)rows * cols;
         if (n == 0) return lane.Name;
         bool second = op.Second && x2 != 0, out2 = op.SecondOut && y2 != 0;
+
+        // One kernel where the rows are whole words, holding what fits the workgroup's memory (VkKernels.RowFused, RowHolds);
+        // in the f64 lane not for an operation that reads its row in one pass (log_softmax_bwd: the one kernel saves only its
+        // second input's re-read, and its outputs' f64 exps ran slower in it, 1.774 ms against 1.632 by the two kernels).
+        if (!f.IsBlock && VkKernels.RowReduces(op) && (f.Per == 1 || (long)cols * f.Bits % 32 == 0) && !(lane.Wide && VkKernels.RowReads(vk, op).X < 2))
+        {
+            var (capacity, holdX, holdX2, keep) = VkKernels.RowHolds(vk, f, lane, op, second, cols);
+            var fused = vk.Cached($"rowfused:{op.Name}:{f.Name}:{second}:{out2}:{capacity}:{holdX}:{holdX2}:{keep}",
+                () => VkKernels.RowFused(vk, f, lane, op, second, out2, capacity, holdX, holdX2, keep));
+            vk.Launch(fused, (uint)rows, 1, x, x2, g, bt, s, pos, y, y2, Vulkan.U(rows), Vulkan.U(cols), Slot(lane, a), Slot(lane, b), 0);
+            return lane.Name;
+        }
+
         ulong stats = VkKernels.RowReduces(op) ? vk.Rent((long)rows * 4 * lane.Size) : 0;
         try
         {

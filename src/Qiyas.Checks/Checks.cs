@@ -2094,8 +2094,9 @@ internal static partial class Checks
 
     // ---------------------------------------------------------------- the row operations on odd shapes
 
-    /// <summary>Every float type, three shapes (37 × 1001; 5 × 64, a short row; 3 × 17, rows not ending on a word for the
-    /// narrow floats): every row operation against float64 within the type's step plus the operation's ulps of its error
+    /// <summary>Every float type, the shapes (37 × 1001; 5 × 64, a short row; 3 × 17, rows not ending on a word for the
+    /// narrow floats; wide rows; 2 × 3001 and 2 × 6007, where a device holds a float64 or a float32 row in its workgroup
+    /// memory but not the row's second input with it): every row operation against float64 within the type's step plus the operation's ulps of its error
     /// scale; the parameter backward (both statistics) against float64 within its scale.</summary>
     public static bool Rows(IDevice<ulong, ulong>? ops, string device = "device")
     {
@@ -2104,7 +2105,7 @@ internal static partial class Checks
         foreach (var type in Bench.Registry.Names)
         {
             if (!Bench.Registry.IsFloat(type) || Bench.Registry.IsBlock(type)) continue;
-            foreach (var (rows, cols) in new[] { (37, 1001), (5, 64), (3, 17), (3, 20011), (2, 16384), (2, 32768) })
+            foreach (var (rows, cols) in new[] { (37, 1001), (5, 64), (3, 17), (3, 20011), (2, 16384), (2, 32768), (2, 3001), (2, 6007) })
             {
                 foreach (var op in RowOps.All)
                     {
