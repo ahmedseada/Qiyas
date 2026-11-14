@@ -4,6 +4,8 @@
 // Resampling with a per-channel scale and shift on Vulkan (Kernels.Resample.cs), CUDA's plan (Cuda/GpuOps.Resample.cs): the
 // horizontal pass into a rented plane of lane values where it runs, then the outputs a word an invocation
 // (a block format's by its encoder), the vertical pass reading the horizontal one's values (or the input) where they are.
+// Where both passes run in the f32 lane into a plain format of eight or more values a word: both in one kernel by tiles
+// (VkKernels.ResampleTiled), the middle plane's values kept in workgroup memory and a value an invocation.
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
@@ -17,6 +19,27 @@ public sealed partial class VulkanOps
         var lane = f.FloatLane;
         string name = lane.Name;
         if (a.Count == 0) return name;
+        // The tiles where both passes run, the output is a plain format of eight or more values a word whose rows are whole
+        // words, the lane is f32, and the tile's rows fit workgroup memory. Measured: the two kernels' output a word an
+        // invocation, its 8 to 32 values one after another, is what the tiles' value an invocation saves (int4 0.717 ms
+        // against 0.850, uint2 0.677 against 0.855); where a word holds 4 or fewer, the tiles lose more than the middle
+        // plane's traffic saves (float16 0.742 against 0.525, int8 0.724 against 0.674: a tile's rows made again by the
+        // next tile's first rows, a workgroup's memory held). The f64 lane's arithmetic is its cost.
+        if (a.XTaps > 0 && a.YTaps > 0 && !f.IsBlock && !lane.Wide && f.Per >= 8 && a.OutWidth % f.Per == 0)
+        {
+            int rows = VkKernels.ResampleTileRows(a);
+            uint tilesX = Groups(a.OutWidth, VkKernels.ResampleTileX), tilesY = Groups(a.OutHeight, VkKernels.ResampleTileY);
+            if (VkKernels.ResampleTiledBytes(f, lane, rows) <= vk.MaxSharedBytes && (long)a.Planes * tilesY <= vk.MaxGroupsY)
+            {
+                bool normed = values != 0;
+                var tiled = vk.Cached($"resample_tiled:{f.Name}:{fi.Name}:{lane.Name}:{rows}:{normed}", () => VkKernels.ResampleTiled(vk, f, fi, lane, normed, rows));
+                vk.Launch(tiled, tilesX, (uint)(a.Planes * tilesY), x, bounds, weights, values, y, Vulkan.U(a.OutHeight), Vulkan.U(a.OutWidth),
+                    Vulkan.U(a.Height), Vulkan.U(a.Width), Vulkan.U(a.XTaps), Vulkan.U(a.YTaps), Vulkan.U(a.RowBounds), Vulkan.U(a.RowWeights),
+                    Vulkan.U(a.Channels), Vulkan.U((int)tilesY));
+                return name;
+            }
+        }
+
         var midFmt = lane.Wide ? new Fmt("float64", 64, true, true) : new Fmt("float32", 32, true, true);
         ulong mid = 0;
         try

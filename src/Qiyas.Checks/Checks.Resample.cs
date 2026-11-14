@@ -20,6 +20,9 @@ internal static partial class Checks
         ("12x10 to 5x7 hamming", 2, 2, 12, 10, 5, 7, ResampleFilter.Hamming),
         ("37x3 to 11x1 lanczos", 1, 1, 37, 3, 11, 1, ResampleFilter.Lanczos),
         ("4x4 kept", 3, 3, 4, 4, 4, 4, ResampleFilter.Cubic),
+        // Past a tile of the device's (Vulkan's 32 rows × 64 columns), the output rows whole words of every type (96 values).
+        ("70x150 to 40x96 cubic", 2, 2, 70, 150, 40, 96, ResampleFilter.Cubic),
+        ("20x40 to 75x64 triangle", 1, 1, 20, 40, 75, 64, ResampleFilter.Triangle),
     ];
 
     public static bool Resamples(IDevice<ulong, ulong>? ops, string device = "device")
