@@ -38,7 +38,10 @@ public sealed partial class VulkanOps
             for (int i = 0; i < a.B; i++) host[cls.Length + flags.Length + a.B + i] = 2 * a.LabelLengths[i] + 1;
             ulong dc = Rent(host.Length * 4L), df = dc + (ulong)(cls.Length * 4L), di = df + (ulong)(flags.Length * 4L), ds = di + (ulong)(a.B * 4L);
             vk.Upload<int>(host, dc);
-            var rows = vk.Cached($"ctc_rows:{f.Name}:{backward}", () => VkKernels.CtcRows(vk, f, lane, backward));
+            // The loss alone: a row of at most 2048 classes held by its invocations, read once (measured faster; the
+            // gradient's rows, which hold the values for a third pass too, measured slower held and stream).
+            int held = !backward && a.C <= 32 * VkKernels.CtcRowThreads ? (a.C + VkKernels.CtcRowThreads - 1) / VkKernels.CtcRowThreads : 0;
+            var rows = vk.Cached($"ctc_rows:{f.Name}:{backward}:{held}", () => VkKernels.CtcRows(vk, f, lane, backward, held));
             vk.Launch(rows, (uint)((long)a.T * a.B), 1, x, lse, di, lgrad, Vulkan.U(a.T), Vulkan.U(a.B), Vulkan.U(a.C));
             var fn = vk.Cached($"ctc:{f.Name}:{backward}:{cap}", () => VkKernels.Ctc(vk, f, lane, cap, backward));
             vk.Launch(fn, (uint)a.B, 1, x, lse, alpha, dc, df, di, ds, lloss, lgrad, Vulkan.U(a.T), Vulkan.U(a.B), Vulkan.U(a.C), Vulkan.U(smax));

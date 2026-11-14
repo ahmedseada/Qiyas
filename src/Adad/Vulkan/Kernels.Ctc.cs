@@ -23,11 +23,12 @@ internal static partial class VkKernels
     /// and the sequence's states' classes and flags (read once from memory, then every frame from the workgroup's).</summary>
     public static int CtcShared(Lane lane, int cap) => (3 * cap + 5) * lane.Size + 2 * (cap + 2) * 4;
 
-    /// <summary>Arguments: x, lse, ilen, grad (0 for the loss alone), T, B, C; a workgroup per row (T·B of them).</summary>
-    public static SpvKernel CtcRows(Vulkan vk, Fmt f, Lane lane, bool backward)
+    /// <summary>Arguments: x, lse, ilen, grad (0 for the loss alone), T, B, C; a workgroup per row (T·B of them). held
+    /// (0: none): the row's values an invocation holds (C ≤ held · 64), read once for the max, the sum and the gradient.</summary>
+    public static SpvKernel CtcRows(Vulkan vk, Fmt f, Lane lane, bool backward, int held = 0)
     {
         var k = Kinds.Of(lane);
-        var b = new Spv($"ctc_rows_{f.Name}_{lane.Name}_{(backward ? "bwd" : "fwd")}", CtcRowThreads, vk.Controls);
+        var b = new Spv($"ctc_rows_{f.Name}_{lane.Name}_{(backward ? "bwd" : "fwd")}{(held > 0 ? $"_h{held}" : "")}", CtcRowThreads, vk.Controls);
         var x = b.Arg(0);
         var lse = b.Arg(1);
         var ilen = b.Arg(2);
@@ -48,6 +49,40 @@ internal static partial class VkKernels
         }
 
         var sh = b.Shared(k, CtcRowThreads);
+        if (held > 0)
+        {
+            // The invocation's values (columns tid + 64·u) read once; the max, the sum (in u's order, as the loop's) and
+            // the gradient from them.
+            b.If(!past, () =>
+            {
+                var xv = new V[held];
+                var inside = new V[held];
+                for (int u = 0; u < held; u++)
+                {
+                    var c = tid + (double)(u * CtcRowThreads);
+                    inside[u] = c < C;
+                    xv[u] = Codec.UnpackAt(b, f, x, row + b.Select(inside[u], c, b.U(0)), lane);
+                }
+
+                var mh = b.C(k, double.NegativeInfinity);
+                for (int u = 0; u < held; u++) mh = b.Select(inside[u], b.Max(mh, xv[u]), mh);
+                var maxH = GroupReduce(b, sh, tid, mh, b.Max, CtcRowThreads);
+                var sumH = b.C(k, 0);
+                for (int u = 0; u < held; u++) sumH = b.Select(inside[u], sumH + Fn.Exp(b, xv[u] - maxH), sumH);
+                var totalH = GroupReduce(b, sh, tid, sumH, static (p, q) => p + q, CtcRowThreads);
+                var resH = maxH + Fn.Log(b, totalH);
+                b.If(tid == 0, () => b.Store(b.At(lse, r, lane.Size), resH));
+                if (backward)
+                    for (int u = 0; u < held; u++)
+                    {
+                        var c = tid + (double)(u * CtcRowThreads);
+                        var y = Fn.Exp(b, xv[u] - resH);
+                        b.If(inside[u], () => b.Store(b.At(grad, row + c, lane.Size), y));
+                    }
+            });
+            return b.Build();
+        }
+
         b.If(!past, () =>
         {
             var m = b.Local(b.C(k, double.NegativeInfinity));
