@@ -132,22 +132,30 @@ public sealed partial class VulkanOps
     // counted, offsets[buckets] the sources with one, the order −1 past them (IRouting.Route).
     private void Order(ulong index, int n, int buckets, ulong counts, ulong offsets, ulong order)
     {
-        vk.Clear(counts, Math.Max(1, buckets) * 4L);
-        if (n > 0)
-        {
-            var count = vk.Cached("scatter_count", () => VkKernels.ScatterCount(vk));
-            vk.Launch(count, Groups(n, VkKernels.Threads), 1, index, counts, Vulkan.U(n), Vulkan.U(buckets));
-        }
-
-        var scan = vk.Cached("offsets_scan", () => VkKernels.OffsetsScan(vk));
-        vk.Launch(scan, 1, 1, counts, offsets, Vulkan.U(buckets));
-        if (n == 0) return;
-        ulong kept = offsets + (ulong)(buckets * 4L);
         int bits = buckets <= 1 ? 0 : 32 - BitOperations.LeadingZeroCount((uint)(buckets - 1));
         int passes = Math.Max(1, (bits + 7) / 8), tiles = (n + VkKernels.RadixTile - 1) / VkKernels.RadixTile;
+        // One pass (buckets ≤ 256: a key its own digit): the counts and offsets are the pass's digit totals and bases,
+        // written by its bases' scan; more passes count the buckets first.
+        bool onePass = passes == 1 && n > 0;
+        if (!onePass)
+        {
+            vk.Clear(counts, Math.Max(1, buckets) * 4L);
+            if (n > 0)
+            {
+                var count = vk.Cached("scatter_count", () => VkKernels.ScatterCount(vk));
+                vk.Launch(count, Groups(n, VkKernels.Threads), 1, index, counts, Vulkan.U(n), Vulkan.U(buckets));
+            }
+
+            var scan = vk.Cached("offsets_scan", () => VkKernels.OffsetsScan(vk));
+            vk.Launch(scan, 1, 1, counts, offsets, Vulkan.U(buckets));
+        }
+
+        if (n == 0) return;
+        ulong kept = offsets + (ulong)(buckets * 4L);
         var histogram = vk.Cached("radix_histogram", () => VkKernels.RadixHistogram(vk));
         var prefix = vk.Cached("radix_scan_tiles", () => VkKernels.RadixScanTiles(vk));
         var digitBases = vk.Cached("radix_scan_bases", () => VkKernels.RadixScanBases(vk));
+        var bucketBases = vk.Cached("radix_scan_bases_buckets", () => VkKernels.RadixScanBases(vk, buckets: true));
         var scatter = vk.Cached("radix_scatter", () => VkKernels.RadixScatter(vk));
         ulong hist = vk.Rent((long)VkKernels.RadixDigits * tiles * 4), bases = vk.Rent(VkKernels.RadixDigits * 4L), totals = vk.Rent(VkKernels.RadixDigits * 4L);
         ulong keysA = vk.Rent(n * 4L), keysB = vk.Rent(n * 4L), valuesA = vk.Rent(n * 4L), valuesB = vk.Rent(n * 4L);
@@ -161,7 +169,8 @@ public sealed partial class VulkanOps
                 ulong valid = p == 0 ? 0 : kept, tail = p == passes - 1 ? kept : 0;
                 vk.Launch(histogram, (uint)tiles, 1, keys, Vulkan.U(n), Vulkan.U(8 * p), hist, Vulkan.U(tiles), Vulkan.U(buckets), valid);
                 vk.Launch(prefix, VkKernels.RadixDigits, 1, hist, Vulkan.U(tiles), totals);
-                vk.Launch(digitBases, 1, 1, totals, bases);
+                if (onePass) vk.Launch(bucketBases, 1, 1, totals, bases, counts, offsets, Vulkan.U(buckets));
+                else vk.Launch(digitBases, 1, 1, totals, bases);
                 vk.Launch(scatter, (uint)tiles, 1, keys, values, Vulkan.U(n), Vulkan.U(8 * p), hist, Vulkan.U(tiles), bases, keysOut, valuesOut, Vulkan.U(buckets), valid, tail);
                 keys = keysOut;
                 values = valuesOut;

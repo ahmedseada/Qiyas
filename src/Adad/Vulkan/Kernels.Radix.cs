@@ -101,15 +101,29 @@ internal static partial class VkKernels
         return b.Build();
     }
 
-    /// <summary>bases[d] = Σ_{d' &lt; d} totals[d']: one workgroup, an invocation a digit. Arguments: totals, bases.</summary>
-    public static SpvKernel RadixScanBases(Vulkan vk)
+    /// <summary>bases[d] = Σ_{d' &lt; d} totals[d']: one workgroup, an invocation a digit. Arguments: totals, bases; with
+    /// buckets (route's one pass: every key a digit, below buckets ≤ 256): counts, offsets, buckets too, counts[d] =
+    /// totals[d] and offsets[d] = bases[d] for d &lt; buckets, offsets[buckets] the keys kept.</summary>
+    public static SpvKernel RadixScanBases(Vulkan vk, bool buckets = false)
     {
-        var b = new Spv("radix_scan_bases", RadixDigits, vk.Controls);
+        var b = new Spv($"radix_scan_bases{(buckets ? "_buckets" : "")}", RadixDigits, vk.Controls);
         var totals = b.Arg(0);
         var bases = b.Arg(1);
         var d = b.LocalIdX;
-        var (before, _) = GroupPrefix(b, b.Shared(K.U32, RadixDigits), d, b.Load(K.U32, b.At(totals, d, 4)), RadixDigits);
+        var count = b.Load(K.U32, b.At(totals, d, 4));
+        var (before, total) = GroupPrefix(b, b.Shared(K.U32, RadixDigits), d, count, RadixDigits);
         b.Store(b.At(bases, d, 4), before);
+        if (buckets)
+        {
+            V counts = b.Arg(2), offsets = b.Arg(3), targets = b.Arg(4, K.U32);
+            b.If(d < targets, () =>
+            {
+                b.Store(b.At(counts, d, 4), count);
+                b.Store(b.At(offsets, d, 4), before);
+            });
+            b.If(d == 0, () => b.Store(b.At(offsets, targets, 4), total));
+        }
+
         return b.Build();
     }
 
