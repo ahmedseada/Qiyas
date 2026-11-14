@@ -5,11 +5,12 @@
 // digit radix sort of (bucket, source) pairs, 8 bits a pass, each pass over tiles of 256 sources:
 //   RadixHistogram  a workgroup per tile: each digit's count in the tile (counted from the tile's digits in workgroup
 //                   memory, no atomics), stored digit-major (hist[d · tiles + t]);
-//   RadixScan       one workgroup: each digit's counts prefixed over the tiles (an invocation a digit), the digits' totals
-//                   prefixed (the digits' bases);
+//   RadixScanTiles  a workgroup per digit: the digit's counts prefixed over the tiles (each invocation a run of tiles
+//                   summed, the runs prefixed by the workgroup's scan), its total kept;
+//   RadixScanBases  one workgroup: the digits' totals prefixed (the digits' bases);
 //   RadixScatter    a workgroup per tile: each source to base[d] + hist[d][t] + its rank among the tile's earlier sources
 //                   of its digit — stable, so the passes compose to the order by bucket, sources in order within one.
-// The counts by integer atomics and the offsets by a scan (ScatterCount, ScatterScan). A source whose bucket is outside
+// The counts by integer atomics and the offsets by a workgroup's scan (ScatterCount, OffsetsScan). A source whose bucket is outside
 // [0, buckets) (the limit; unsigned, so a negative one too) is in no place: the first pass drops it, the later passes take
 // the sources with a bucket (valid: their count on the device) as their n, and the last pass writes −1 ("no source") past
 // them (tail), so every value of the order is written.
@@ -51,34 +52,89 @@ internal static partial class VkKernels
         return b.Build();
     }
 
-    /// <summary>hist[d][t] ← Σ_{t' &lt; t} hist[d][t'] in place, bases[d] = Σ_{d' &lt; d} the digits' totals. Arguments: hist, tiles, bases.</summary>
-    public static SpvKernel RadixScan(Vulkan vk)
+    // The workgroup's exclusive prefix of each invocation's value v (u32) and the total, by a scan in workgroup memory
+    // (Hillis–Steele over `threads` values).
+    private static (V Before, V Total) GroupPrefix(Spv b, Arr sh, V tid, V v, int threads)
     {
-        var b = new Spv("radix_scan", RadixDigits, vk.Controls);
+        sh[tid] = v;
+        b.Barrier();
+        for (int s = 1; s < threads; s *= 2)
+        {
+            int step = s;
+            var add = b.Select(tid >= step, sh[b.Select(tid >= step, tid - step, tid)], b.U(0));
+            b.Barrier();
+            sh[tid] = sh[tid] + add;
+            b.Barrier();
+        }
+
+        var inclusive = sh[tid];
+        var total = sh[b.U(threads - 1)];
+        b.Barrier();
+        return (inclusive - v, total);
+    }
+
+    /// <summary>hist[d][t] ← Σ_{t' &lt; t} hist[d][t'] in place and totals[d] = Σ_t hist[d][t]: a workgroup per digit d, each
+    /// invocation a run of ⌈tiles / 256⌉ tiles. Arguments: hist, tiles, totals.</summary>
+    public static SpvKernel RadixScanTiles(Vulkan vk)
+    {
+        var b = new Spv("radix_scan_tiles", RadixTile, vk.Controls);
         var hist = b.Arg(0);
         var tiles = b.Arg(1, K.U32);
-        var bases = b.Arg(2);
-        var d = b.LocalIdX;
-        var acc = b.Local(b.U(0));
-        b.For(b.U(0), tiles, t =>
+        var totals = b.Arg(2);
+        var tid = b.LocalIdX;
+        var d = b.GroupX;
+        var run = (tiles + (RadixTile - 1)) / (double)RadixTile;
+        var first = b.Min(tid * run, tiles);
+        var last = b.Min(first + run, tiles);
+        var sum = b.Local(b.U(0));
+        b.For(first, last, t => sum.V = sum.V + b.Load(K.U32, b.At(hist, d * tiles + t, 4)));
+        var (before, total) = GroupPrefix(b, b.Shared(K.U32, RadixTile), tid, sum.V, RadixTile);
+        var acc = b.Local(before);
+        b.For(first, last, t =>
         {
             var at = b.At(hist, d * tiles + t, 4);
             var c = b.Load(K.U32, at);
             b.Store(at, acc.V);
             acc.V = acc.V + c;
         });
-        var totals = b.Shared(K.U32, RadixDigits);
-        totals[d] = acc.V;
-        b.Barrier();
-        b.If(d == 0, () =>
+        b.If(tid == 0, () => b.Store(b.At(totals, d, 4), total));
+        return b.Build();
+    }
+
+    /// <summary>bases[d] = Σ_{d' &lt; d} totals[d']: one workgroup, an invocation a digit. Arguments: totals, bases.</summary>
+    public static SpvKernel RadixScanBases(Vulkan vk)
+    {
+        var b = new Spv("radix_scan_bases", RadixDigits, vk.Controls);
+        var totals = b.Arg(0);
+        var bases = b.Arg(1);
+        var d = b.LocalIdX;
+        var (before, _) = GroupPrefix(b, b.Shared(K.U32, RadixDigits), d, b.Load(K.U32, b.At(totals, d, 4)), RadixDigits);
+        b.Store(b.At(bases, d, 4), before);
+        return b.Build();
+    }
+
+    /// <summary>offsets[0] = 0, offsets[r + 1] = offsets[r] + counts[r] for r &lt; targets, offsets past targets + 1 untouched:
+    /// one workgroup, each invocation a run of ⌈targets / 256⌉ counts summed, the runs prefixed by the workgroup's scan, each
+    /// run's offsets written. Arguments: counts, offsets, targets.</summary>
+    public static SpvKernel OffsetsScan(Vulkan vk)
+    {
+        var b = new Spv("offsets_scan", RadixTile, vk.Controls);
+        var counts = b.Arg(0);
+        var offsets = b.Arg(1);
+        var targets = b.Arg(2, K.U32);
+        var tid = b.LocalIdX;
+        var run = (targets + (RadixTile - 1)) / (double)RadixTile;
+        var first = b.Min(tid * run, targets);
+        var last = b.Min(first + run, targets);
+        var sum = b.Local(b.U(0));
+        b.For(first, last, r => sum.V = sum.V + b.Load(K.U32, b.At(counts, r, 4)));
+        var (before, _) = GroupPrefix(b, b.Shared(K.U32, RadixTile), tid, sum.V, RadixTile);
+        b.If(tid == 0, () => b.Store(b.At(offsets, b.U(0), 4), b.U(0)));
+        var acc = b.Local(before);
+        b.For(first, last, r =>
         {
-            var run = b.Local(b.U(0));
-            b.For(b.U(0), b.U(RadixDigits), q =>
-            {
-                var c = totals[q];
-                b.Store(b.At(bases, q, 4), run.V);
-                run.V = run.V + c;
-            });
+            acc.V = acc.V + b.Load(K.U32, b.At(counts, r, 4));
+            b.Store(b.At(offsets, r + 1, 4), acc.V);
         });
         return b.Build();
     }

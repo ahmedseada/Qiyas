@@ -2,7 +2,9 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the repository root.
 
 // Routing, sampling and the cross-entropy loss on Vulkan (Routing.cs; CUDA's Ptx.Routing.cs): a workgroup per row for
-// top-k (k passes of the workgroup's first largest over the columns not yet taken) and for sampling (each invocation's
+// top-k (k up to TopKLocalMax: one read of the row, each invocation keeping its own first k in order, then k rounds of
+// the workgroup's first among the invocations' heads; a larger k: k passes of the workgroup's first largest over the
+// columns not yet taken) and for sampling (each invocation's
 // chunk summed, the chunks' prefix by the first, the first crossing found per chunk and the least taken) and for the
 // loss (a running max and sum of exponentials per invocation, joined by the tree). Values are stored a thread per word
 // by gathers (top-k's values, pick) and the losses kept as lane values and stored once, so no two invocations store into
@@ -14,6 +16,121 @@ namespace Adad.Vulkan;
 internal static partial class VkKernels
 {
     public const int MaxTopK = 256;
+
+    /// <summary>The largest k the one-read top-k takes (each invocation's first k held in registers, in caps of 8, 16, 32).</summary>
+    public const int TopKLocalMax = 32;
+
+    /// <summary>The one-read top-k's list length an invocation holds for k (8, 16 or 32).</summary>
+    public static int TopKCap(int k) => k <= 8 ? 8 : k <= 16 ? 16 : 32;
+
+    /// <summary>indices[r][i] for i &lt; k ≤ cap (s32): the row's k first in Adad's order (Routing.Precedes: larger first, a
+    /// NaN above every number, ties by the lower index), the row read once. Each invocation keeps its columns' first cap in
+    /// order (a column ranks below an equal value of a lower column), then k rounds take the workgroup's first of the
+    /// invocations' heads by the tree (the lowest index among equals) and the invocation holding it moves its list up. The
+    /// same columns as TopKRows. A 32- or 64-bit float lane's values are ranked by integer keys (OrderKey: the same order,
+    /// the comparisons at the integer rate). Arguments: x, indices, cols, k.</summary>
+    public static SpvKernel TopKRowsLocal(Vulkan vk, Fmt f, Lane lane, int cap)
+    {
+        var lk = Kinds.Of(lane);
+        bool keyed = lk is K.F32 or K.F64;
+        var held = keyed ? (lk == K.F64 ? K.U64 : K.U32) : lk;
+        var b = new Spv($"topk_local_{f.Name}_{lane.Name}_{cap}", ReduceThreads, vk.Controls);
+        var x = b.Arg(0);
+        var indices = b.Arg(1);
+        var cols = b.Arg(2, K.U32);
+        var k = b.Arg(3, K.U32);
+        var tid = b.LocalIdX;
+        var row = b.GroupX;
+        var start = row * cols;
+        var none = b.U(0xFFFFFFFF);
+        var empty = keyed ? b.CBits(held, 0) : Identity(b, lk, "max");
+        var vals = new Var[cap];
+        var idx = new Var[cap];
+        for (int j = 0; j < cap; j++) { vals[j] = b.Local(empty); idx[j] = b.Local(none); }
+
+        // Whether (v, i) comes before (w, j) in the list's order (an empty slot last).
+        V Before(V v, V i, V w, V j)
+        {
+            var (above, same) = keyed ? (v > w, v == w) : Rank(b, lane, v, w);
+            return (i != none) & ((j == none) | above | (same & (i < j)));
+        }
+
+        // (value, column) into the list: down it by compare-and-swap (column `none`: nothing enters).
+        void Insert(V value, V ci)
+        {
+            var cv = keyed ? OrderKey(b, value) : value;
+            for (int j = 0; j < cap; j++)
+            {
+                var sv0 = vals[j].V;
+                var si0 = idx[j].V;
+                var take = Before(cv, ci, sv0, si0);
+                vals[j].V = b.Select(take, cv, sv0);
+                idx[j].V = b.Select(take, ci, si0);
+                cv = b.Select(take, sv0, cv);
+                ci = b.Select(take, si0, ci);
+            }
+        }
+
+        if (f.IsBlock)
+        {
+            // A block format: runs of 8 values (one read of their block's scales; a run never crosses a block), the row's
+            // first and last runs taking only the row's values.
+            const int Run = 8;
+            var g0 = start / (double)Run;
+            var runs = (start + cols + (Run - 1)) / (double)Run - g0;
+            b.For(tid, runs, b.U(ReduceThreads), gi =>
+            {
+                var at0 = (g0 + gi) * Run;
+                var values = Codec.UnpackRun(b, f, x, at0, Run, lane);
+                for (int q = 0; q < Run; q++)
+                {
+                    var at = at0 + q;
+                    var inside = (at >= start) & (at - start < cols);
+                    Insert(values[q], b.Select(inside, at - start, none));
+                }
+            });
+        }
+        else b.For(tid, cols, b.U(ReduceThreads), c => Insert(Codec.UnpackAt(b, f, x, start + c, lane), c));
+
+        var sv = b.Shared(held, ReduceThreads);
+        var si = b.Shared(K.U32, ReduceThreads);
+        b.For(b.U(0), k, i =>
+        {
+            sv[tid] = vals[0].V;
+            si[tid] = idx[0].V;
+            b.Barrier();
+            for (int s = ReduceThreads / 2; s >= 1; s /= 2)
+            {
+                int step = s;
+                b.If(tid < step, () =>
+                {
+                    var mv = sv[tid];
+                    var mi = si[tid];
+                    var ov = sv[tid + step];
+                    var oi = si[tid + step];
+                    var take = Before(ov, oi, mv, mi);
+                    sv[tid] = b.Select(take, ov, mv);
+                    si[tid] = b.Select(take, oi, mi);
+                });
+                b.Barrier();
+            }
+
+            var chosen = si[0];
+            b.If(tid == 0, () => b.Store(b.At(indices, row * k + i, 4), chosen));
+            // The invocation holding it moves its list up (columns are each one invocation's: one holds it).
+            var won = idx[0].V == chosen;
+            for (int j = 0; j < cap - 1; j++)
+            {
+                vals[j].V = b.Select(won, vals[j + 1].V, vals[j].V);
+                idx[j].V = b.Select(won, idx[j + 1].V, idx[j].V);
+            }
+
+            vals[cap - 1].V = b.Select(won, empty, vals[cap - 1].V);
+            idx[cap - 1].V = b.Select(won, none, idx[cap - 1].V);
+            b.Barrier();
+        });
+        return b.Build();
+    }
 
     /// <summary>indices[r][i] for i &lt; k (s32): the row's k first in Adad's order (Routing.Precedes: larger first, a NaN
     /// above every number, ties by the lower index). Arguments: x, indices, cols, k.</summary>
@@ -172,8 +289,8 @@ internal static partial class VkKernels
 
     /// <summary>The top-k's values as log-probabilities (IRouting.LogSoftmaxTopK), a workgroup a row: targets holds `count`
     /// columns a row (TopK's: the first the row's first-ranked, every one in the row). m = x at the first column; Σ exp(x − m)
-    /// over the row, each invocation four sums over its columns (a fixed order) joined by the workgroup's tree; then an
-    /// invocation a chosen column: (x[t] − m) − log Σ as a lane value at losses[row·count + j].
+    /// over the row, each invocation four sums over its columns (a fixed order; a block format's read in runs of 8) joined by
+    /// the workgroup's tree; then an invocation a chosen column: (x[t] − m) − log Σ as a lane value at losses[row·count + j].
     /// Arguments: x, targets, losses, cols, count.</summary>
     public static SpvKernel LogProbRows(Vulkan vk, Fmt f, Lane lane)
     {
@@ -190,7 +307,26 @@ internal static partial class VkKernels
         var m = Codec.UnpackAt(b, f, x, start + first, lane);
         var sums = new Var[Sums];
         for (int u = 0; u < Sums; u++) sums[u] = b.Local(b.C(k, 0));
-        b.For(tid, cols, b.U(Sums * ReduceThreads), i =>
+        if (f.IsBlock)
+        {
+            // A block format: runs of 8 values (one read of their block's scales), value q of a run into sum q % 4, the row's
+            // first and last runs taking only the row's values.
+            const int Run = 8;
+            var g0 = start / (double)Run;
+            var runs = (start + cols + (Run - 1)) / (double)Run - g0;
+            b.For(tid, runs, b.U(ReduceThreads), gi =>
+            {
+                var at0 = (g0 + gi) * Run;
+                var values = Codec.UnpackRun(b, f, x, at0, Run, lane);
+                for (int q = 0; q < Run; q++)
+                {
+                    var at = at0 + q;
+                    var inside = (at >= start) & (at - start < cols);
+                    sums[q % Sums].V = sums[q % Sums].V + b.Select(inside, Fn.Exp(b, values[q] - m), b.C(k, 0));
+                }
+            });
+        }
+        else b.For(tid, cols, b.U(Sums * ReduceThreads), i =>
         {
             for (int u = 0; u < Sums; u++)
             {

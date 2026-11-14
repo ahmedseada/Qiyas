@@ -18,10 +18,25 @@ public sealed partial class VulkanOps
         var lane = f.Natural;
         if (k > VkKernels.MaxTopK) throw new NotSupportedException($"vulkan: top-k with k = {k} exceeds the kernel's passes ({VkKernels.MaxTopK}); a partial sort is the step");
         if (rows == 0 || k == 0) return lane.Name;
-        var fn = vk.Cached($"topk:{f.Name}", () => VkKernels.TopKRows(vk, f, lane));
-        vk.Launch(fn, (uint)rows, 1, x, indices, Vulkan.U(cols), Vulkan.U(k));
+        TopKIndices(f, x, rows, cols, k, indices);
         Gather(f, x, indices, values, rows, cols, k);
         return lane.Name;
+    }
+
+    // The top-k columns of each row (s32), in the type's own lane: the row read once for k up to TopKLocalMax, else k passes.
+    private void TopKIndices(Fmt f, ulong x, int rows, int cols, int k, ulong indices)
+    {
+        var lane = f.Natural;
+        if (k <= VkKernels.TopKLocalMax)
+        {
+            int cap = VkKernels.TopKCap(k);
+            var local = vk.Cached($"topk_local:{f.Name}:{cap}", () => VkKernels.TopKRowsLocal(vk, f, lane, cap));
+            vk.Launch(local, (uint)rows, 1, x, indices, Vulkan.U(cols), Vulkan.U(k));
+            return;
+        }
+
+        var fn = vk.Cached($"topk:{f.Name}", () => VkKernels.TopKRows(vk, f, lane));
+        vk.Launch(fn, (uint)rows, 1, x, indices, Vulkan.U(cols), Vulkan.U(k));
     }
 
     /// <summary>The top-k of each row as log-probabilities (IRouting.LogSoftmaxTopK): TopK's indices, then
@@ -34,7 +49,7 @@ public sealed partial class VulkanOps
         var lane = RowLane(f);
         if (k > VkKernels.MaxTopK) throw new NotSupportedException($"vulkan: top-k with k = {k} exceeds the kernel's passes ({VkKernels.MaxTopK}); a partial sort is the step");
         if (rows == 0 || k == 0) return lane.Name;
-        vk.Launch(vk.Cached($"topk:{f.Name}", () => VkKernels.TopKRows(vk, f, f.Natural)), (uint)rows, 1, x, indices, Vulkan.U(cols), Vulkan.U(k));
+        TopKIndices(f, x, rows, cols, k, indices);
         bool own = f.Is("float32") || f.Is("float64");
         ulong lanes = own ? values : vk.Rent(Math.Max(16, (long)rows * k * lane.Size));
         try
@@ -124,16 +139,17 @@ public sealed partial class VulkanOps
             vk.Launch(count, Groups(n, VkKernels.Threads), 1, index, counts, Vulkan.U(n), Vulkan.U(buckets));
         }
 
-        var scan = vk.Cached("scatter_scan", () => VkKernels.ScatterScan(vk));
+        var scan = vk.Cached("offsets_scan", () => VkKernels.OffsetsScan(vk));
         vk.Launch(scan, 1, 1, counts, offsets, Vulkan.U(buckets));
         if (n == 0) return;
         ulong kept = offsets + (ulong)(buckets * 4L);
         int bits = buckets <= 1 ? 0 : 32 - BitOperations.LeadingZeroCount((uint)(buckets - 1));
         int passes = Math.Max(1, (bits + 7) / 8), tiles = (n + VkKernels.RadixTile - 1) / VkKernels.RadixTile;
         var histogram = vk.Cached("radix_histogram", () => VkKernels.RadixHistogram(vk));
-        var prefix = vk.Cached("radix_scan", () => VkKernels.RadixScan(vk));
+        var prefix = vk.Cached("radix_scan_tiles", () => VkKernels.RadixScanTiles(vk));
+        var digitBases = vk.Cached("radix_scan_bases", () => VkKernels.RadixScanBases(vk));
         var scatter = vk.Cached("radix_scatter", () => VkKernels.RadixScatter(vk));
-        ulong hist = vk.Rent((long)VkKernels.RadixDigits * tiles * 4), bases = vk.Rent(VkKernels.RadixDigits * 4L);
+        ulong hist = vk.Rent((long)VkKernels.RadixDigits * tiles * 4), bases = vk.Rent(VkKernels.RadixDigits * 4L), totals = vk.Rent(VkKernels.RadixDigits * 4L);
         ulong keysA = vk.Rent(n * 4L), keysB = vk.Rent(n * 4L), valuesA = vk.Rent(n * 4L), valuesB = vk.Rent(n * 4L);
         try
         {
@@ -144,7 +160,8 @@ public sealed partial class VulkanOps
                 // The first pass drops the indices outside [0, buckets); the later ones take the kept (offsets[buckets]).
                 ulong valid = p == 0 ? 0 : kept, tail = p == passes - 1 ? kept : 0;
                 vk.Launch(histogram, (uint)tiles, 1, keys, Vulkan.U(n), Vulkan.U(8 * p), hist, Vulkan.U(tiles), Vulkan.U(buckets), valid);
-                vk.Launch(prefix, 1, 1, hist, Vulkan.U(tiles), bases);
+                vk.Launch(prefix, VkKernels.RadixDigits, 1, hist, Vulkan.U(tiles), totals);
+                vk.Launch(digitBases, 1, 1, totals, bases);
                 vk.Launch(scatter, (uint)tiles, 1, keys, values, Vulkan.U(n), Vulkan.U(8 * p), hist, Vulkan.U(tiles), bases, keysOut, valuesOut, Vulkan.U(buckets), valid, tail);
                 keys = keysOut;
                 values = valuesOut;
@@ -152,7 +169,7 @@ public sealed partial class VulkanOps
         }
         finally
         {
-            vk.Return(hist); vk.Return(bases);
+            vk.Return(hist); vk.Return(bases); vk.Return(totals);
             vk.Return(keysA); vk.Return(keysB); vk.Return(valuesA); vk.Return(valuesB);
         }
     }

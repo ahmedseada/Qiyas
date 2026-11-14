@@ -538,22 +538,4 @@ internal static partial class VkKernels
         return b.Build();
     }
 
-    /// <summary>offsets[0] = 0, offsets[r + 1] = offsets[r] + counts[r], and offsets[targets + 1 ..] untouched: one invocation,
-    /// a serial scan. Arguments: counts, offsets, targets.</summary>
-    public static SpvKernel ScatterScan(Vulkan vk)
-    {
-        var b = new Spv("scatter_scan", 1, vk.Controls);
-        var counts = b.Arg(0);
-        var offsets = b.Arg(1);
-        var targets = b.Arg(2, K.U32);
-        var acc = b.Local(b.U(0));
-        b.Store(b.At(offsets, b.U(0), 4), b.U(0));
-        b.For(b.U(0), targets, r =>
-        {
-            acc.V = acc.V + b.Load(K.U32, b.At(counts, r, 4));
-            b.Store(b.At(offsets, r + 1, 4), acc.V);
-        });
-        return b.Build();
-    }
-
 }
