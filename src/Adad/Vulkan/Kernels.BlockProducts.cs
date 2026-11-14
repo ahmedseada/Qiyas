@@ -139,28 +139,29 @@ internal static partial class VkKernels
         var zeroI = b.Fill(ti, 0);
         var zeroF = b.Fill(tf, 0);
 
-        // The jobs' fetched values carried from one block to the next: block kb + 1's read while kb's products run.
-        var held = new Var[2, perSide, 5];
-        for (int side = 0; side < 2; side++)
-        {
-            for (int it = 0; it < perSide; it++)
-            {
-                var got = Fetch(side == 0, it, b.U(0));
-                for (int w = 0; w < 5; w++) held[side, it, w] = b.Local(got[w]);
-            }
-        }
+        // The jobs' fetched values carried two blocks ahead: block kb + 2's read while kb's products run (and kb + 1's, read
+        // the block before, wait in registers), the loads' latency behind two blocks' products.
+        const int Ahead = 2;
+        var held = new Var[Ahead, 2, perSide, 5];
+        for (int d = 0; d < Ahead; d++)
+            for (int side = 0; side < 2; side++)
+                for (int it = 0; it < perSide; it++)
+                {
+                    var got = Fetch(side == 0, it, b.U((uint)d));
+                    for (int w = 0; w < 5; w++) held[d, side, it, w] = b.Local(got[w]);
+                }
 
         b.For(b.U(0), blocks, kb =>
         {
             b.Barrier();
             for (int side = 0; side < 2; side++)
                 for (int it = 0; it < perSide; it++)
-                    Put(side == 0, it, [.. Enumerable.Range(0, 5).Select(w => held[side, it, w].V)]);
+                    Put(side == 0, it, [.. Enumerable.Range(0, 5).Select(w => held[0, side, it, w].V)]);
             b.Barrier();
             var next = new V[2, perSide][];
             for (int side = 0; side < 2; side++)
                 for (int it = 0; it < perSide; it++)
-                    next[side, it] = Fetch(side == 0, it, kb + 1);
+                    next[side, it] = Fetch(side == 0, it, kb + Ahead);
             for (int i = 0; i < 2; i++)
             {
                 var rowTile = wr * 2 + (uint)i;                                  // A's 16-row block among the four
@@ -178,7 +179,11 @@ internal static partial class VkKernels
 
             for (int side = 0; side < 2; side++)
                 for (int it = 0; it < perSide; it++)
-                    for (int w = 0; w < 5; w++) held[side, it, w].V = next[side, it][w];
+                    for (int w = 0; w < 5; w++)
+                    {
+                        for (int dd = 0; dd + 1 < Ahead; dd++) held[dd, side, it, w].V = held[dd + 1, side, it, w].V;
+                        held[Ahead - 1, side, it, w].V = next[side, it][w];
+                    }
         });
 
         // C: a whole 16 × 16 by the units; one past m or n through the subgroup's scratch, each value inside alone.
