@@ -53,6 +53,17 @@ internal static partial class Checks
         finally { ops.UnitsShape = null; }
         if (ok) Console.WriteLine($"check {"products on the matrix units",-36} vulkan every type under each of the kernel's {shapes.Length} shapes ({string.Join(", ", shapes)}): in place at 256 x 256 x 128, packed at 37 x 29 x 53, one side packed at 37 x 256 x 128 and 256 x 37 x 128, within the product's rounding");
 
+        // Q8_0's and Q4_0's A·B on the f16 units by the block rows' product (forced where its view allows it): every type's
+        // products at k and n whole blocks and not.
+        try
+        {
+            ops.BlockRowsForced = true;
+            ok &= ProductsWith(ops, "vulkan", 37, 64, 96, " [block rows]");
+            ok &= ProductsWith(ops, "vulkan", 70, 96, 64, " [block rows]");
+        }
+        finally { ops.BlockRowsForced = null; }
+        if (ok) Console.WriteLine($"check {"block rows' product",-36} vulkan every type at 37 x 64 x 96 and 70 x 96 x 64 with Q8_0's and Q4_0's A·B on the f16 units forced, within the product's rounding");
+
         // A block format's box losses by each route (the encoder computing its values, the f32 lanes then the encoder).
         foreach (bool lanes in new[] { false, true })
         {

@@ -26,6 +26,7 @@ public sealed partial class VulkanOps
         if (v.M == 0 || v.N == 0 || v.Batch == 0) return lane.Name;
         if (UnitsKind(f, bounds) is string kind) return MatMulUnits<TN>(v, kind, a, b, c);
         if (UseBlocks(f, v, () => MatMulViewBlocks<TN>(v, a, b, c), () => MatMulPlain(f, lane, v, a, b, c))) return MatMulViewBlocks<TN>(v, a, b, c);
+        if (UseBlockRows(f, v, bounds, () => MatMulBlockRows<TN>(v, a, b, c), () => MatMulPlain(f, lane, v, a, b, c))) return MatMulBlockRows<TN>(v, a, b, c);
         if (f.Is("float64") && lane == Lane.F64 && Sliced(v, a, 0, b, 0, c, () => MatMulPlain(f, lane, v, a, b, c))) return "f64x";
         return MatMulPlain(f, lane, v, a, b, c);
     }
@@ -362,6 +363,52 @@ public sealed partial class VulkanOps
     }
 
     public bool BlockProductAvailable => VkKernels.BlocksRun(vk);
+
+    /// <summary>The gate's override of the block rows' product (A·B of Q8_0 / Q4_0 on the f16 units, Kernels.BlockRows.cs):
+    /// true wherever the view and B's range allow it, false never, null as measured.</summary>
+    internal bool? BlockRowsForced;
+
+    private readonly Dictionary<string, bool> _blockRowsFaster = [];
+
+    // C = A·B by the block rows' product over the view's batches (k and n whole blocks, the batches' strides whole blocks),
+    // C encoded to the type by blocks; returns the lane's name.
+    private string MatMulBlockRows<TN>(ProductView v, ulong a, ulong b, ulong c) where TN : struct, IAdad<TN>
+    {
+        var f = Fmt.Of<TN>();
+        var fn = vk.Cached($"matmul_block_rows:{f.Name}", () => VkKernels.MatMulBlockRows(vk, f));
+        long mn = (long)v.M * v.N;
+        ulong lanes = vk.Rent(v.ValuesC * 4);
+        try
+        {
+            for (int z = 0; z < v.Batch; z++)
+            {
+                ulong az = a + (ulong)(z * v.StrideAOrDefault / 32 * f.BlockBytes), bz = b + (ulong)(z * v.StrideBOrDefault / 32 * f.BlockBytes);
+                vk.Launch(fn, Groups(v.N, VkKernels.BlocksTile), Groups(v.M, VkKernels.BlocksTile), az, bz, lanes + (ulong)(z * v.StrideCOrDefault * 4),
+                    Vulkan.U(v.M), Vulkan.U(v.N), Vulkan.U(v.K / 32));
+            }
+
+            long period = v.Batch > 1 ? Math.Max(mn, v.StrideCOrDefault) : mn;
+            BackKeep(f, Lane.F32, lanes, c, v.ValuesC, period, mn);
+        }
+        finally { vk.Return(lanes); }
+
+        return "f16mma block rows";
+    }
+
+    // The block rows' product or the plain route for a view A·B of Q8_0 / Q4_0 (k and n whole blocks, |B| within f16's
+    // range so its slices are exact), whichever this device measures faster at the shape and format (once).
+    private bool UseBlockRows(Fmt f, ProductView v, Bounds bounds, Func<string> rows, Func<string> plain)
+    {
+        if (f.Name is not ("q8_0" or "q4_0") || v.TransA || v.TransB || v.K == 0 || v.K % 32 != 0 || v.N % 32 != 0 || Units == false
+            || !VkKernels.BlockRowsRun(vk) || Math.Max(Math.Abs(bounds.BMin), Math.Abs(bounds.BMax)) > 65504
+            || (v.Batch > 1 && (v.StrideAOrDefault % 32 != 0 || v.StrideBOrDefault % 32 != 0))) return false;
+        if (BlockRowsForced is bool forced) return forced;
+        string key = $"{f.Name}:{v.M}x{v.N}x{v.K}:{v.Batch}";
+        if (_blockRowsFaster.TryGetValue(key, out bool known)) return known;
+        var (tr, tp) = Measure.Faster(() => rows(), () => plain(), vk.Synchronize);
+        _unitsTimes.Add($"product {key} A·B: block rows {tr:0.000} ms, plain {tp:0.000} ms");
+        return _blockRowsFaster[key] = tr < tp;
+    }
 
     /// <summary>The gate's override: true takes the block product wherever the view allows it, false never, null as measured.</summary>
     internal bool? BlockProducts;
