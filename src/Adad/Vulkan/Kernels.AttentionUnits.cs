@@ -15,8 +15,9 @@
 //                   context; the tile's context stored to the staging and joined into each row's context, held by the
 //                   row's invocations in registers (a cooperative matrix's rows cannot be scaled one by one).
 //
-// Loads decode value by value (Codec.UnpackAt) into the kind's bits, two values a 32-bit word of workgroup memory. O is
-// lane values (f32) stored value by value, as AttentionRows'.
+// Loads: a format that is the kind itself (float16 for f16, bfloat16 for bf16) at an even d copies its stored words, two
+// values each, into workgroup memory; the others decode value by value (Codec.UnpackAt) into the kind's bits, two values
+// a 32-bit word. O is lane values (f32) stored value by value, as AttentionRows'.
 using Adad.Abstraction;
 
 namespace Adad.Vulkan;
@@ -48,15 +49,19 @@ internal static partial class VkKernels
         unit.M <= subgroup && subgroup % unit.M == 0 && dCap % unit.K == 0 && dCap % unit.N == 0 && UnitsAttnKeys % unit.N == 0 && UnitsAttnKeys % unit.K == 0
         && UnitsAttnKeys % (subgroup / unit.M) == 0 && dCap % (subgroup / unit.M) == 0 && (UnitsAttnKeys / (subgroup / unit.M)) % 2 == 0;
 
+    /// <summary>Whether a format's stored words are the units kind's values two a word (the loads copy them at an even d).</summary>
+    public static bool AttentionUnitsDirect(Fmt f, CooperativeMatrix unit) => (f.Is("float16") && unit.A == "f16") || (f.Is("bfloat16") && unit.A == "bf16");
+
     /// <summary>The fused rows on the units. Arguments: q, k, v, o (lane values, f32), limits, starts, ranges (each row
-    /// block's keys [lo, hi)), lq, lk, d, scale (f32); workgroups (⌈lq / (4·M)⌉, heads).</summary>
-    public static SpvKernel AttentionRowsUnits(Vulkan vk, Fmt f, CooperativeMatrix unit, int dCap)
+    /// block's keys [lo, hi)), lq, lk, d, scale (f32); workgroups (⌈lq / (4·M)⌉, heads). direct: the format is the kind
+    /// and d is even (AttentionUnitsDirect): the loads copy words.</summary>
+    public static SpvKernel AttentionRowsUnits(Vulkan vk, Fmt f, CooperativeMatrix unit, int dCap, bool direct = false)
     {
         int sg = vk.SubgroupSize, threads = UnitsAttnWarps * sg, rm = unit.M, br = UnitsAttnWarps * rm, bc = UnitsAttnKeys;
         if (!AttentionUnitsFit(unit, dCap, sg)) throw new NotSupportedException($"vulkan: attention on the units {unit} at d {dCap} with subgroups of {sg}");
         int tpr = sg / rm, cpt = bc / tpr, opt = dCap / tpr, kvStride = UnitsKvStride(dCap), region = rm * Math.Max(2 * bc, dCap);
         K ek = UnitKind(unit.A);
-        var b = new Spv($"attention_rows_units_{f.Name}_{unit.A}_{unit.M}x{unit.N}x{unit.K}_d{dCap}", threads, vk.Controls);
+        var b = new Spv($"attention_rows_units_{f.Name}_{unit.A}_{unit.M}x{unit.N}x{unit.K}_d{dCap}{(direct ? "_direct" : "")}", threads, vk.Controls);
         V q = b.Arg(0), kp = b.Arg(1), vp = b.Arg(2), o = b.Arg(3), lim = b.Arg(4), starts = b.Arg(5), ranges = b.Arg(6);
         V lq = b.Arg(7, K.U32), lk = b.Arg(8, K.U32), d = b.Arg(9, K.U32), scale = b.Arg(10, K.F32);
         var tid = b.LocalIdX;
@@ -91,6 +96,16 @@ internal static partial class VkKernels
             return b.Select(inside, bits, b.U(0));
         }
 
+        // Values (row, dim) and (row, dim + 1) as one word of the kind's bits: the stored word (direct: dim even, d even),
+        // else two values decoded; 0 past the rows or d.
+        V Pair(V src, V rowBase, V row, V rows, V dim)
+        {
+            if (!direct) return Bits(src, rowBase, row, rows, dim) | Bits(src, rowBase, row, rows, dim + 1) << 16;
+            var inside = (row < rows) & (dim < d);
+            var at = src + b.Convert(rowBase + b.Select(inside, row * d + dim, b.U(0)), K.U64) * 2;
+            return b.Select(inside, b.Load(K.U32, at), b.U(0));
+        }
+
         // Rows [first, first + count) of K or V (of `rows`) into the tile, two values a word, by the workgroup.
         void LoadTile(V src, V first, V rows)
         {
@@ -103,7 +118,7 @@ internal static partial class VkKernels
                     var row = w / (uint)(dCap / 2);
                     var col = (w - row * (uint)(dCap / 2)) * 2;
                     var g = first + row;
-                    kv[row * (uint)kvStride + col / 2] = Bits(src, kHead, g, rows, col) | Bits(src, kHead, g, rows, col + 1) << 16;
+                    kv[row * (uint)kvStride + col / 2] = Pair(src, kHead, g, rows, col);
                 });
             }
         }
@@ -121,7 +136,7 @@ internal static partial class VkKernels
                 var row = w / (uint)(dCap / 2);
                 var col = (w - row * (uint)(dCap / 2)) * 2;
                 var g = qb * (uint)br + warp * (uint)rm + row;
-                stage[mine + w] = Bits(q, qHead, g, lq, col) | Bits(q, qHead, g, lq, col + 1) << 16;
+                stage[mine + w] = Pair(q, qHead, g, lq, col);
             });
         }
 

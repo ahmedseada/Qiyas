@@ -134,7 +134,8 @@ public sealed partial class VulkanOps
                 // A 16-bit kind's types on the matrix units (Kernels.AttentionUnits.cs): 4·M rows a workgroup.
                 int bu = VkKernels.UnitsAttnWarps * unit.M;
                 ulong unitRanges = KeyRanges(a, bu, rented);
-                var fu = vk.Cached($"attention_rows_units:{f.Name}:{unit}:{dCap}", () => VkKernels.AttentionRowsUnits(vk, f, unit, dCap));
+                bool direct = VkKernels.AttentionUnitsDirect(f, unit) && a.D % 2 == 0;
+                var fu = vk.Cached($"attention_rows_units:{f.Name}:{unit}:{dCap}:{direct}", () => VkKernels.AttentionRowsUnits(vk, f, unit, dCap, direct));
                 vk.Launch(fu, (uint)((a.Lq + bu - 1) / bu), (uint)a.Heads, q, k, v, lo, limits, starts, unitRanges, Vulkan.U(a.Lq), Vulkan.U(a.Lk), Vulkan.U(a.D), Slot(lane, a.Scale));
                 if (!Own(f)) Back(f, lane, lo, o, a.QValues);
                 return unit.A + "mma";
