@@ -153,6 +153,41 @@ internal static partial class VkKernels
         return b.Build();
     }
 
+    /// <summary>The offsets of many buckets in parallel, first part: a workgroup a block of 256 buckets, offsets[r + 1] =
+    /// the block's counts through r (its own prefix) and sums[block] its total. Arguments: counts, offsets, targets, sums;
+    /// workgroups ⌈targets / 256⌉.</summary>
+    public static SpvKernel OffsetsBlocks(Vulkan vk)
+    {
+        var b = new Spv("offsets_blocks", RadixTile, vk.Controls);
+        V counts = b.Arg(0), offsets = b.Arg(1), targets = b.Arg(2, K.U32), sums = b.Arg(3);
+        var tid = b.LocalIdX;
+        var r = b.GroupX * RadixTile + tid;
+        var inside = r < targets;
+        var count = b.Select(inside, b.Load(K.U32, b.At(counts, b.Select(inside, r, b.U(0)), 4)), b.U(0));
+        var (before, total) = GroupPrefix(b, b.Shared(K.U32, RadixTile), tid, count, RadixTile);
+        b.If(inside, () => b.Store(b.At(offsets, r + 1, 4), before + count));
+        b.If(tid == 0, () => b.Store(b.At(sums, b.GroupX, 4), total));
+        return b.Build();
+    }
+
+    /// <summary>The second part: offsets[r + 1] += bases[block] (the blocks' exclusive prefix: OffsetsScan's offsets of the
+    /// sums), offsets[0] = 0. Arguments: offsets, targets, bases; workgroups ⌈targets / 256⌉.</summary>
+    public static SpvKernel OffsetsAdd(Vulkan vk)
+    {
+        var b = new Spv("offsets_add", RadixTile, vk.Controls);
+        V offsets = b.Arg(0), targets = b.Arg(1, K.U32), bases = b.Arg(2);
+        var tid = b.LocalIdX;
+        var r = b.GroupX * RadixTile + tid;
+        var add = b.Load(K.U32, b.At(bases, b.GroupX, 4));
+        b.If(r < targets, () =>
+        {
+            var at = b.At(offsets, r + 1, 4);
+            b.Store(at, b.Load(K.U32, at) + add);
+        });
+        b.If(r == 0, () => b.Store(b.At(offsets, b.U(0), 4), b.U(0)));
+        return b.Build();
+    }
+
     /// <summary>Each source of the tile to base[d] + hist[d][t] + its rank among the tile's earlier sources of digit d.
     /// Arguments: keys, values (0: the sources' own indices, the first pass), n, shift, hist, tiles, bases, keysOut, valuesOut,
     /// limit, valid (as RadixHistogram's), tail (the last pass: the kept count's address; valuesOut[i] = −1 from it to n).</summary>

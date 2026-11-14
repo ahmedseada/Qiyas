@@ -147,7 +147,21 @@ public sealed partial class VulkanOps
             }
 
             var scan = vk.Cached("offsets_scan", () => VkKernels.OffsetsScan(vk));
-            vk.Launch(scan, 1, 1, counts, offsets, Vulkan.U(buckets));
+            if (buckets <= 16 * VkKernels.RadixTile) vk.Launch(scan, 1, 1, counts, offsets, Vulkan.U(buckets));
+            else
+            {
+                // Many buckets: each block of 256 its own prefix, the blocks' totals scanned (one workgroup, few of them),
+                // each block's prefix moved by its base: the same integers as one workgroup's walk, in parallel.
+                int blocks = (buckets + VkKernels.RadixTile - 1) / VkKernels.RadixTile;
+                ulong sums = vk.Rent(blocks * 4L), blockOffsets = vk.Rent((blocks + 1) * 4L);
+                try
+                {
+                    vk.Launch(vk.Cached("offsets_blocks", () => VkKernels.OffsetsBlocks(vk)), (uint)blocks, 1, counts, offsets, Vulkan.U(buckets), sums);
+                    vk.Launch(scan, 1, 1, sums, blockOffsets, Vulkan.U(blocks));
+                    vk.Launch(vk.Cached("offsets_add", () => VkKernels.OffsetsAdd(vk)), (uint)blocks, 1, offsets, Vulkan.U(buckets), blockOffsets);
+                }
+                finally { vk.Return(sums); vk.Return(blockOffsets); }
+            }
         }
 
         if (n == 0) return;
