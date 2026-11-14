@@ -176,6 +176,7 @@ internal static unsafe partial class VkApi
         uint memoryBarrierCount, VkMemoryBarrier* memoryBarriers, uint bufferBarrierCount, void* bufferBarriers, uint imageBarrierCount, void* imageBarriers);
     [LibraryImport(Library)] public static partial void vkCmdCopyBuffer(IntPtr commandBuffer, ulong source, ulong destination, uint regionCount, VkBufferCopy* regions);
     [LibraryImport(Library)] public static partial void vkCmdFillBuffer(IntPtr commandBuffer, ulong buffer, ulong offset, ulong size, uint data);
+    [LibraryImport(Library)] public static partial void vkCmdUpdateBuffer(IntPtr commandBuffer, ulong buffer, ulong offset, ulong size, void* data);
 
     // ---------------------------------------------------------------- synchronization
 

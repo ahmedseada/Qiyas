@@ -51,8 +51,8 @@ public sealed partial class VulkanOps
     /// once in float64 and rounded once to the lane — one sum across the tensors — the factor from it by the map's
     /// clip_factor in the lane, then each tensor's step reading the factor where it is. The passes and the steps of all
     /// the tensors are a dispatch each: the kernels read their tensor from a table on the device (VkKernels.TableRow),
-    /// uploaded a call (a block format's steps: a tensor at a time, its encoder's blocks being one buffer's). Returns the
-    /// lane's name.</summary>
+    /// written a call in order with the dispatches (Vulkan.Update: no wait; a block format's steps: a tensor at a time, its
+    /// encoder's blocks being one buffer's). Returns the lane's name.</summary>
     public string OptimizerMany<TN>(OptimizerArgs a, ReadOnlySpan<OptimizerTensor<ulong>> tensors, ulong sumSquares) where TN : struct, IFloatAdad<TN>
     {
         a.Validate();
@@ -68,7 +68,7 @@ public sealed partial class VulkanOps
                 long blocks = 0;
                 foreach (var t in tensors) if (t.N > 0) blocks += WholeBlocks(t.N);
                 ulong sum = sumSquares != 0 ? sumSquares : Rent(lane.Size);
-                if (blocks == 0) vk.Upload<byte>(new byte[lane.Size], sum);
+                if (blocks == 0) vk.Clear(sum, lane.Size);
                 else
                 {
                     var lf = VkKernels.LaneFormat(Lane.F64);
@@ -88,7 +88,7 @@ public sealed partial class VulkanOps
                     }
 
                     ulong sums = Rent(rows.Count * 8L);
-                    vk.Upload<ulong>(rows.ToArray(), sums);
+                    vk.Update<ulong>(rows.ToArray(), sums);
                     vk.Launch(pass, (uint)blocks, 1, sums, partials, Vulkan.U(rows.Count / VkKernels.SumRow), Vulkan.U(1));
                     vk.Launch(join, 1, 1, partials, wide, Vulkan.U((int)blocks), Vulkan.U(0));
                     if (!lane.Wide) Back(VkKernels.LaneFormat(Lane.F32), Lane.F64, wide, sum, 1);
@@ -123,7 +123,7 @@ public sealed partial class VulkanOps
             else if (words > 0)
             {
                 ulong table = Rent(steps.Count * 8L);
-                vk.Upload<ulong>(steps.ToArray(), table);
+                vk.Update<ulong>(steps.ToArray(), table);
                 Step(f, a, table, 0, 0, 0, steps.Count / VkKernels.StepRow, factor, words);
             }
         }

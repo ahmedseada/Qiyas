@@ -634,6 +634,25 @@ public sealed unsafe class Vulkan : IDisposable
         Synchronize();
     }
 
+    /// <summary>The host's bytes into device memory at <paramref name="destination"/>, recorded in order with the dispatches
+    /// by the device's update command (the bytes kept in the command buffer: no wait, as a launch's arguments) where they
+    /// are whole 32-bit words, at most 64 KB, at an address of a whole word; otherwise by Upload (which waits).</summary>
+    public void Update<T>(ReadOnlySpan<T> source, ulong destination) where T : unmanaged
+    {
+        var bytes = MemoryMarshal.AsBytes(source);
+        if (bytes.Length == 0) return;
+        if (bytes.Length > 65536 || bytes.Length % 4 != 0 || destination % 4 != 0)
+        {
+            Upload(source, destination);
+            return;
+        }
+
+        var (a, offset) = Find(destination);
+        var cb = Recording();
+        fixed (byte* data = bytes) VkApi.vkCmdUpdateBuffer(cb, a.Buffer, offset, (ulong)bytes.Length, data);
+        Barrier(cb);
+    }
+
     /// <summary>Device memory at <paramref name="source"/> into the host's bytes (after the work recorded before it).</summary>
     public void Download<T>(ulong source, Span<T> destination) where T : unmanaged
     {
