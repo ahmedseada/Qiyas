@@ -102,6 +102,7 @@ public readonly struct Float32 : IFloatAdad<Float32>, IAdad<Float32, float>, IAd
 public readonly struct Float16 : IFloatAdad<Float16>, IAdad<Float16, float>
 {
     public static string Name => "float16";
+    public static (int Exponent, int Mantissa) FloatBits => (5, 10);
     public static int Bits => 16;
     public static bool IsFloat => true;
     public static double Min => -65504;
@@ -117,6 +118,7 @@ public readonly struct Float16 : IFloatAdad<Float16>, IAdad<Float16, float>
 public readonly struct BFloat16 : IFloatAdad<BFloat16>, IAdad<BFloat16, float>
 {
     public static string Name => "bfloat16";
+    public static (int Exponent, int Mantissa) FloatBits => (8, 7);
     public static int Bits => 16;
     public static bool IsFloat => true;
     public static double Min => -3.3895313892515355e38;

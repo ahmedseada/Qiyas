@@ -54,6 +54,9 @@ public interface IAdad<TSelf> where TSelf : struct, IAdad<TSelf>
     /// <summary>The scaled-int block layout the type describes (default: not a scaled-int block format).</summary>
     static virtual ScaledBlock Scaled => default;
 
+    /// <summary>A float type's exponent and mantissa widths (default: not described).</summary>
+    static virtual (int Exponent, int Mantissa) FloatBits => default;
+
     /// <summary>Runs <paramref name="visitor"/> with the lane element-wise operations take.</summary>
     static abstract void Elementwise<TV>(ref TV visitor) where TV : struct, ILaneVisitor;
 

@@ -19,10 +19,13 @@ public sealed record Fmt(string Name, int Bits, bool IsFloat, bool Signed)
     public int BlockBytes => Name switch { "q8_0" => 34, "q4_0" => 18, "q4_k" => 144, "q6_k" => 210, _ => 0 };
     public bool IsBlock => BlockValues > 0;
 
-    public static Fmt Of<TN>() where TN : struct, IAdad<TN> => new(TN.Name, TN.Bits, TN.IsFloat, TN.Min < 0) { Scaled = TN.Scaled };
+    public static Fmt Of<TN>() where TN : struct, IAdad<TN> => new(TN.Name, TN.Bits, TN.IsFloat, TN.Min < 0) { Scaled = TN.Scaled, FloatBits = TN.FloatBits };
 
     /// <summary>The type's scaled-int block layout, as it describes it (default: not one).</summary>
     public ScaledBlock Scaled { get; init; }
+
+    /// <summary>A float type's exponent and mantissa widths, as it describes them.</summary>
+    public (int Exponent, int Mantissa) FloatBits { get; init; }
 
     public bool Is(string name) => Name == name;
 
@@ -92,6 +95,12 @@ public static class Routes
     public static ScaledBlock Layout(string name) => name switch { "q8_0" => new(32, 34, 8, 0), "q4_0" => new(32, 18, 4, -8), _ => default };
 
     public static ScaledBlock Layout<TN>() where TN : struct, IAdad<TN> => Props ? TN.Scaled : Layout(TN.Name);
+
+    /// <summary>Whether the format is the bfloat16 layout (8-bit exponent, 7-bit mantissa): by name or by description.</summary>
+    public static bool IsBf16(Fmt f) => Props ? f.FloatBits == (8, 7) : f.Is("bfloat16");
+
+    /// <summary>Whether the format is the matrix unit's own 16-bit float (f16: 5/10, bf16: 8/7): by name or by description.</summary>
+    public static bool IsUnitFloat(Fmt f, bool f16) => Props ? f.FloatBits == (f16 ? (5, 10) : (8, 7)) : f.Is(f16 ? "float16" : "bfloat16");
 }
 
 /// <summary>A register type kernels compute in: f32, f64, and the 32- and 64-bit integers, signed (s) or not (u).</summary>

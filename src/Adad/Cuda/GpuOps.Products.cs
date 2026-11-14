@@ -148,7 +148,7 @@ public sealed partial class GpuOps
             // As MatMul's in-place 16-bit route: whole tiles, the type the kind's own, no padding of k.
             if (v.M % 128 != 0 || v.N % 256 != 0 || v.K % 128 != 0 || InPlace16 == false || Epilogue == false) return false;
             var kind = KindOf(name, v.K);
-            if (kind.Bits != 16 || KPadded(kind, v.K) != v.K || !f.Is(kind == Ptx.Kind.F16 ? "float16" : "bfloat16")) return false;
+            if (kind.Bits != 16 || KPadded(kind, v.K) != v.K || !Routes.IsUnitFloat(f, kind == Ptx.Kind.F16)) return false;
             var mfn = MmaFunction(kind, out uint shared, out int bn, f, v.TransA, !v.TransB, batched: true);
             Gpu.LaunchZ(mfn, Grid(v.N, bn), Grid(v.M, 128), (uint)v.Batch, Ptx.GemmThreads, 1, shared, a, b, c, Gpu.U(v.M), Gpu.U(v.N), Gpu.U(v.K), Gpu.U(v.K),
                 (ulong)bytesA, (ulong)bytesB, (ulong)bytesC);

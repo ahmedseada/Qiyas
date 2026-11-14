@@ -452,8 +452,8 @@ public sealed partial class GpuOps(Gpu gpu)
         {
             if (f.Bits == 64) return "f64";
             if (f.Bits == 32 || f.IsBlock) return "f32";                     // a block's values (an f16 scale times an integer) are exact in f32, not in f16
-            var kind = f.Is("bfloat16") ? Ptx.Kind.BF16 : Ptx.Kind.F16;
-            return MmaSupported(kind) ? kind.Name + "mma" : "f32";
+            var kind = Routes.IsBf16(f) ? Ptx.Kind.BF16 : Ptx.Kind.F16;
+            return !Routes.Generic && MmaSupported(kind) ? kind.Name + "mma" : "f32";
         }
 
         double bound = bounds.Bound;
@@ -694,7 +694,7 @@ public sealed partial class GpuOps(Gpu gpu)
                 var kind = KindOf(laneName, k);
                 int kp = KPadded(kind, k);
                 // A's rows as stored already have the kind's layout when the type is the kind and k is whole blocks.
-                bool aAsIs = f.Bits == kind.Bits && kp == k && (f.IsFloat == kind.IsFloat) && (!f.IsFloat || f.Is(kind == Ptx.Kind.F16 ? "float16" : "bfloat16"));
+                bool aAsIs = f.Bits == kind.Bits && kp == k && (f.IsFloat == kind.IsFloat) && (!f.IsFloat || Routes.IsUnitFloat(f, kind == Ptx.Kind.F16));
                 long t0 = Phases is null ? 0 : Stopwatch.GetTimestamp();
                 // A 16-bit float type in its own kind at whole k-blocks: the tensor kernel reads both operands as stored (Aᵀ and
                 // B k-major by ldmatrix.trans, Bᵀ as its packed rows), no packing pass.
@@ -1072,7 +1072,7 @@ public sealed partial class GpuOps(Gpu gpu)
     {
         ulong packed = gpu.Rent((long)rows * kp * kind.Bits / 8);
         rented.Add(packed);
-        if (transposed && f.Bits == 16 && kind.Bits == 16 && f.Is(kind == Ptx.Kind.F16 ? "float16" : "bfloat16") && rows % 2 == 0)
+        if (transposed && f.Bits == 16 && kind.Bits == 16 && Routes.IsUnitFloat(f, kind == Ptx.Kind.F16) && rows % 2 == 0)
         {
             // A 16-bit type in its own kind: the word-wide transposing tile.
             var f16 = gpu.Cached($"packt16:{f.Name}:{kind.Name}", (out string e) => Ptx.PackTransposed16(gpu, f, kind, out e));
