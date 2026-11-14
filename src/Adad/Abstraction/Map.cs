@@ -40,7 +40,17 @@ public static class Ops
     private const double GeluK = 0.7978845608028654, GeluC = 0.044715;    // √(2/π), the tanh form's cubic coefficient
 
     // The references in forms free of cancellation: 0.5·(1 + tanh u) = σ(2u); 1 − tanh² = sech²; 1 − σ(x) = σ(−x); 1 + erf = erfc(−·).
-    private static double Sigmoid(double x) => 1 / (1 + Math.Exp(-x));
+    // σ by e^(−|x|), the numerator 1 or it by the sign (the definition's stable form: no e^(+large)).
+    private static double Sigmoid(double x)
+    {
+        double t = Math.Exp(-Math.Abs(x));
+        return (x >= 0 ? 1 : t) / (1 + t);
+    }
+
+    // f·y for a factor f whose true value is nonzero (`nonzero`: its inputs finite, …) and of the sign of `sign`: where y is
+    // 0 or ±∞ the product is sign·y (±0, ±∞), not f·y (f may have underflowed to 0 or overflowed: no 0·∞).
+    private static double Times(double f, double y, bool nonzero, double sign = 1) =>
+        nonzero && (y == 0 || double.IsInfinity(y)) ? sign * y : f * y;
 
     // The focal loss's parts free of cancellation: BCE = max(x, 0) − x·t + log1p(e^−|x|); 1 − p_t = t·σ(−x) + (1 − t)·σ(x);
     // σ(x) − t = (1 − t)·σ(x) − t·σ(−x); log1p(u) = log(w)·u / (w − 1) with w = 1 + u (Goldberg), u where w is 1.
@@ -49,7 +59,18 @@ public static class Ops
     private static double FocalCe(double x, double t) => Math.Max(x, 0) - x * t + Log1p(Math.Exp(-Math.Abs(x)));
     private static double FocalQ(double x, double t) => t * Sigmoid(-x) + (1 - t) * Sigmoid(x);
     private static double FocalAlpha(double t, double a) => a * t + (1 - a) * (1 - t);
-    private static double Focal(double x, double t, double a, double g) => FocalAlpha(t, a) * Math.Pow(FocalQ(x, t), g) * FocalCe(x, t);
+    // A hard target the score is far past (x below −87 with t 0, above 87 with t 1): 1 − p_t, BCE and σ·σ' all e^(−|x|) to
+    // the lane's precision, so the loss is α_t·e^(−(γ+1)|x|) and its gradient ±α_t·(1 + γ)·e^(−(γ+1)|x|) (the forms that
+    // keep their value where e^(−|x|) is below the lane's normal numbers; FocalFar).
+    private static bool FocalFar(double x, double t) => (x < -87 && t == 0) || (x > 87 && t == 1);
+    private static double Focal(double x, double t, double a, double g) =>
+        FocalFar(x, t) ? FocalAlpha(t, a) * Math.Exp(-(g + 1) * Math.Abs(x)) : FocalAlpha(t, a) * Math.Pow(FocalQ(x, t), g) * FocalCe(x, t);
+    private static double FocalGradTimes(double x, double t, double a, double g, double z)
+    {
+        if (!FocalFar(x, t)) return FocalGrad(x, t, a, g) * z;
+        double factor = t == 0 ? (1 - a) * (1 + g) : -(a * (1 + g));
+        return Times(factor * Math.Exp(-(g + 1) * Math.Abs(x)), z, factor != 0, factor);
+    }
 
     private static double FocalGradTerms(double x, double t, double a, double g)
     {
@@ -145,36 +166,36 @@ public static class Ops
         new("leaky_relu", 1, true, (x, y, z, a, b) => x > 0 ? x : a * x, Any, Any, 0.1, 0),
         new("pow", 1, true, (x, y, z, a, b) => Pow(x, a), Positive, Any, 2.5, 0, "x^a for x > 0; x < 0 with an odd integer a keeps the sign (exp(a·log|x|): a·log|x| ulps)", Ulps: 16),
         new("mask_scale", 2, true, (x, y, z, a, b) => y != 0 ? x * a : 0, Any, (0, 1), 1.25, 0, "x·a where the mask y is nonzero, 0 where it is 0: a mask kept from a draw (Dropout draws its own), applied forward or backward"),
-        new("gated_silu", 2, true, (x, y, z, a, b) => Silu(x) * y, Any, Any, 0, 0),
+        new("gated_silu", 2, true, (x, y, z, a, b) => Times(Silu(x), y, double.IsFinite(x) && x != 0, x), Any, Any, 0, 0),
         new("gated_gelu", 2, true, (x, y, z, a, b) => Gelu(x) * y, Any, Any, 0, 0, Cond, Ulps: 64),
         new("sqrt_bwd", 2, true, (x, y, z, a, b) => y / (2 * Math.Sqrt(x)), Positive, Any, 0, 0),
         new("inv_sqrt_bwd", 2, true, (x, y, z, a, b) => -0.5 * y / ((x + a) * Math.Sqrt(x + a)), Positive, Any, 1e-6, 0, "d/dx of 1/√(x + a) given dy: −½·dy/((x + a)·√(x + a)), a NaN where x + a < 0 as the forward's"),
-        new("exp_bwd", 2, true, (x, y, z, a, b) => Math.Exp(x) * y, Any, Any, 0, 0),
+        new("exp_bwd", 2, true, (x, y, z, a, b) => Times(Math.Exp(x), y, double.IsFinite(x)), Any, Any, 0, 0),
         new("log_bwd", 2, true, (x, y, z, a, b) => y / x, Positive, Any, 0, 0),
         new("sin_bwd", 2, true, (x, y, z, a, b) => Math.Cos(x) * y, Wide, Any, 0, 0),
         new("cos_bwd", 2, true, (x, y, z, a, b) => -Math.Sin(x) * y, Wide, Any, 0, 0),
-        new("tanh_bwd", 2, true, (x, y, z, a, b) => Funcs.SechSquaredReference(x) * y, Any, Any, 0, 0),
-        new("sigmoid_bwd", 2, true, (x, y, z, a, b) => Sigmoid(x) * Sigmoid(-x) * y, Any, Any, 0, 0),
+        new("tanh_bwd", 2, true, (x, y, z, a, b) => Times(Funcs.SechSquaredReference(x), y, double.IsFinite(x)), Any, Any, 0, 0),
+        new("sigmoid_bwd", 2, true, (x, y, z, a, b) => Times(Sigmoid(x) * Sigmoid(-x), y, double.IsFinite(x)), Any, Any, 0, 0),
         new("silu_bwd", 2, true, (x, y, z, a, b) => SiluGrad(x) * y, Any, Any, 0, 0, Cond, Ulps: 256),
         new("gelu_bwd", 2, true, (x, y, z, a, b) => GeluGrad(x) * y, Any, Any, 0, 0, Cond, Ulps: 256),
         new("gelu_erf_bwd", 2, true, (x, y, z, a, b) => GeluErfGrad(x) * y, Any, Any, 0, 0, Cond, Ulps: 256),
         new("leaky_relu_bwd", 2, true, (x, y, z, a, b) => (x > 0 ? 1 : a) * y, Any, Any, 0.1, 0),
         new("pow_bwd", 2, true, (x, y, z, a, b) => a * Pow(x, a - 1) * y, Positive, Any, 2.5, 0, "", Ulps: 16),
         new("gated_silu_bwd_x", 3, true, (x, y, z, a, b) => SiluGrad(x) * y * z, Any, Any, 0, 0, "d/dx of silu(x)·y given dz" + Cond, Ulps: 256),
-        new("gated_silu_bwd_y", 3, true, (x, y, z, a, b) => Silu(x) * z, Any, Any, 0, 0),
+        new("gated_silu_bwd_y", 3, true, (x, y, z, a, b) => Times(Silu(x), z, double.IsFinite(x) && x != 0, x), Any, Any, 0, 0),
         new("gated_gelu_bwd_x", 3, true, (x, y, z, a, b) => GeluGrad(x) * y * z, Any, Any, 0, 0, Cond, Ulps: 256),
         new("gated_gelu_bwd_y", 3, true, (x, y, z, a, b) => Gelu(x) * z, Any, Any, 0, 0, Cond, Ulps: 64),
         new("gated_tanh_sigmoid", 2, true, (x, y, z, a, b) => Math.Tanh(x) * Sigmoid(y), Any, Any, 0, 0, "tanh(x)·σ(y): a gate whose other side has its own function"),
-        new("gated_tanh_sigmoid_bwd_x", 3, true, (x, y, z, a, b) => Funcs.SechSquaredReference(x) * Sigmoid(y) * z, Any, Any, 0, 0, "d/dx given dz (sech² by σ(2x)·σ(−2x), as tanh_bwd)", Ulps: 16),
-        new("gated_tanh_sigmoid_bwd_y", 3, true, (x, y, z, a, b) => Math.Tanh(x) * Sigmoid(y) * Sigmoid(-y) * z, Any, Any, 0, 0, "d/dy given dz"),
+        new("gated_tanh_sigmoid_bwd_x", 3, true, (x, y, z, a, b) => Times(Funcs.SechSquaredReference(x) * Sigmoid(y), z, double.IsFinite(x) && y > double.NegativeInfinity), Any, Any, 0, 0, "d/dx given dz (sech² by σ(2x)·σ(−2x), as tanh_bwd)", Ulps: 16),
+        new("gated_tanh_sigmoid_bwd_y", 3, true, (x, y, z, a, b) => Times(Math.Tanh(x) * Sigmoid(y) * Sigmoid(-y), z, (x > 0 || x < 0) && double.IsFinite(y), Math.Tanh(x)), Any, Any, 0, 0, "d/dy given dz"),
         new("add_gelu", 2, true, (x, y, z, a, b) => Gelu(x + y), Any, Any, 0, 0, "gelu(x + y): a bias and its gelu in one pass (a row of biases by MapRowFloat); the sum rounded in the lane first, then gelu's conditioning" + Cond, Ulps: 256),
         new("sigmoid_focal", 2, true, (x, y, z, a, b) => Focal(x, y, a, b), Any, (0, 1), 0.25, 2,
             "the sigmoid focal loss: α_t·(1 − p_t)^γ·BCE(x, y), p = σ(x), y the target in [0, 1], α_t = α·y + (1 − α)·(1 − y) with a = α (½ weighs both classes alike, at half the unweighted loss), b = γ ((1 − p_t)^0 = 1, 0^0 among them)" + FocalCond, Ulps: 256),
-        new("sigmoid_focal_bwd", 3, true, (x, y, z, a, b) => FocalGrad(x, y, a, b) * z, Any, (0, 1), 0.25, 2,
+        new("sigmoid_focal_bwd", 3, true, (x, y, z, a, b) => FocalGradTimes(x, y, a, b, z), Any, (0, 1), 0.25, 2,
             "d/dx given dz (the target a constant): α_t·((σ(x) − t)·q^γ − γ·BCE·q^(γ−1)·(2t − 1)·σ(x)σ(−x)), q = 1 − p_t; the two terms share their sign for a target of 0 or 1 and cancel near a soft target's minimum (measured against their magnitude)" + FocalCond,
             Ulps: 256, Scale: (x, y, z, a, b) => FocalGradTerms(x, y, a, b) * Math.Abs(z)),
         new("softcap", 1, true, (x, y, z, a, b) => a * Math.Tanh(b * x / a), Any, Any, 2, 1.5, "a·tanh(b·x/a): a score scaled by b and capped at ±a (attention's cap)", Ulps: 8),
-        new("softcap_bwd", 2, true, (x, y, z, a, b) => b * Funcs.SechSquaredReference(b * x / a) * y, Any, Any, 2, 1.5, "d/dx of softcap given dy: b·sech²(b·x/a)·y (sech² by σ(2u)·σ(−2u), as tanh_bwd)", Ulps: 32),
+        new("softcap_bwd", 2, true, (x, y, z, a, b) => Times(b * Funcs.SechSquaredReference(b * x / a), y, double.IsFinite(b * x / a), b), Any, Any, 2, 1.5, "d/dx of softcap given dy: b·sech²(b·x/a)·y (sech² by σ(2u)·σ(−2u), as tanh_bwd)", Ulps: 32),
         new("clip_factor", 1, true, (x, y, z, a, b) => x > 0 ? Math.Min(1, a / Math.Sqrt(x)) : 1, (0, 4), Any, 1, 0, "min(1, a/√x), 1 where x is 0: the clipping factor of a sum of squares x to the norm a"),
     ];
 

@@ -75,6 +75,149 @@ internal static class MapOps
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector<T> C<T, TL>(double v) where T : unmanaged where TL : struct, ILane<TL, T> => new(TL.From(v));
 
+    // The f32 lane's forms whose factor may fall below the lane's normal numbers (the definition; the devices' Scaled32 the
+    // same steps): σ, its bell σ(v)·σ(−v) and e^x kept 2^128 from it (Funcs.SigmoidS, BellS, Exps.ExpOff), the product
+    // made, then brought back by K·K; a product with 0 or ±∞ by Times (no 0·∞).
+    private static class F32
+    {
+        private static Vector<float> Down(Vector<float> r, Vector<float> k) => r * k * k;
+
+        private static Vector<float> Finite(Vector<float> x) => Vector.AsVectorSingle(Vector.LessThan(Vector.Abs(x), new Vector<float>(float.PositiveInfinity)));
+
+        private static Vector<float> NonZero(Vector<float> x) => Vector.AsVectorSingle(Vector.GreaterThan(x, Vector<float>.Zero) | Vector.LessThan(x, Vector<float>.Zero));
+
+        private static Vector<float> Times(Vector<float> f, Vector<float> y, Vector<float> nonzero, Vector<float> sign)
+        {
+            var edge = Vector.AsVectorSingle(Vector.Equals(y, Vector<float>.Zero) | Vector.Equals(Vector.Abs(y), new Vector<float>(float.PositiveInfinity)));
+            return Vector.ConditionalSelect(nonzero & edge, sign * y, f * y);
+        }
+
+        // Some value past ±87: only there does a scaled form's value differ from the same form at scale 1 (Sigmoid, Bell, Exp),
+        // so a vector with none takes that (the same values, a test per vector).
+        private static bool Far(Vector<float> v) => Vector.GreaterThanAny(Vector.Abs(v), new Vector<float>(87f));
+
+        // Some lane of the product r a NaN: only there can Times' value differ from it (MapOps.HasNaN).
+        private static bool NaN(Vector<float> r) => !Vector.EqualsAll(r, r);
+
+        private static readonly Vector<float> Two = new(2f), Four = new(4f);
+
+        public static Vector<float> Silu(Vector<float> x, Vector<float> y, Vector<float> z, Vector<float> a, Vector<float> b)
+        {
+            if (Far(x)) { var (s, k) = Funcs.SigmoidS(x); return Down(x * s, k); }
+            return x * Funcs.Sigmoid(x);
+        }
+        public static Vector<float> GatedSilu(Vector<float> x, Vector<float> y, Vector<float> z, Vector<float> a, Vector<float> b)
+        {
+            var r = x * Funcs.Sigmoid(x) * y;
+            if (Far(x) || NaN(r)) { var (s, k) = Funcs.SigmoidS(x); return Down(Times(x * s, y, Finite(x) & NonZero(x), x), k); }
+            return r;
+        }
+        public static Vector<float> GatedSiluBwdY(Vector<float> x, Vector<float> y, Vector<float> z, Vector<float> a, Vector<float> b)
+        {
+            var r = x * Funcs.Sigmoid(x) * z;
+            if (Far(x) || NaN(r)) { var (s, k) = Funcs.SigmoidS(x); return Down(Times(x * s, z, Finite(x) & NonZero(x), x), k); }
+            return r;
+        }
+        public static Vector<float> SiluBwd(Vector<float> x, Vector<float> y, Vector<float> z, Vector<float> a, Vector<float> b)
+        {
+            if (Far(x)) { var (s, k) = Funcs.SigmoidS(x); return Down(s * Vector.FusedMultiplyAdd(x, Funcs.Sigmoid(-x), Vector<float>.One) * y, k); }
+            var (s0, sn0) = Funcs.SigmoidPair(x);
+            return s0 * Vector.FusedMultiplyAdd(x, sn0, Vector<float>.One) * y;
+        }
+        public static Vector<float> GatedSiluBwdX(Vector<float> x, Vector<float> y, Vector<float> z, Vector<float> a, Vector<float> b)
+        {
+            if (Far(x)) { var (s, k) = Funcs.SigmoidS(x); return Down(s * Vector.FusedMultiplyAdd(x, Funcs.Sigmoid(-x), Vector<float>.One) * y * z, k); }
+            var (s0, sn0) = Funcs.SigmoidPair(x);
+            return s0 * Vector.FusedMultiplyAdd(x, sn0, Vector<float>.One) * y * z;
+        }
+        public static Vector<float> ExpBwd(Vector<float> x, Vector<float> y, Vector<float> z, Vector<float> a, Vector<float> b)
+        {
+            var r = Exps.Exp(x) * y;
+            if (!Far(x) && !NaN(r)) return r;
+            var low = Vector.LessThan(x, new Vector<float>(-87f));
+            var high = Vector.GreaterThan(x, new Vector<float>(87f));
+            var off = Vector.ConditionalSelect(low, new Vector<int>(128), Vector.ConditionalSelect(high, new Vector<int>(-128), Vector<int>.Zero));
+            var k = Vector.ConditionalSelect(low, new Vector<float>(Funcs.Down64), Vector.ConditionalSelect(high, new Vector<float>(1.8446744073709552E+19f), Vector<float>.One));
+            return Down(Times(Exps.ExpOff(x, off), y, Finite(x), Vector<float>.One), k);
+        }
+        public static Vector<float> SigmoidBwd(Vector<float> x, Vector<float> y, Vector<float> z, Vector<float> a, Vector<float> b)
+        {
+            var r = Funcs.Bell(x) * y;
+            if (Far(x) || NaN(r)) { var (f, k) = Funcs.BellS(x); return Down(Times(f, y, Finite(x), Vector<float>.One), k); }
+            return r;
+        }
+        public static Vector<float> TanhBwd(Vector<float> x, Vector<float> y, Vector<float> z, Vector<float> a, Vector<float> b)
+        {
+            var v = Two * x;
+            var r = Four * Funcs.Bell(v) * y;
+            if (Far(v) || NaN(r)) { var (f, k) = Funcs.BellS(v); return Down(Times(Four * f, y, Finite(x), Vector<float>.One), k); }
+            return r;
+        }
+        public static Vector<float> SoftcapBwd(Vector<float> x, Vector<float> y, Vector<float> z, Vector<float> a, Vector<float> b)
+        {
+            var u = b * x / a;
+            var v = Two * u;
+            var r = Four * Funcs.Bell(v) * b * y;
+            if (Far(v) || NaN(r)) { var (f, k) = Funcs.BellS(v); return Down(Times(Four * f * b, y, Finite(u), b), k); }
+            return r;
+        }
+        public static Vector<float> GatedTanhSigmoid(Vector<float> x, Vector<float> y, Vector<float> z, Vector<float> a, Vector<float> b) => Funcs.Tanh(x) * Funcs.Sigmoid(y);
+        public static Vector<float> GatedTanhSigmoidBwdX(Vector<float> x, Vector<float> y, Vector<float> z, Vector<float> a, Vector<float> b)
+        {
+            var v = Two * x;
+            var r = Four * Funcs.Bell(v) * Funcs.Sigmoid(y) * z;
+            if (!Far(v) && !Far(y) && !NaN(r)) return r;
+            var (f, ka) = Funcs.BellS(v);
+            var (s, kb) = Funcs.SigmoidS(y);
+            var gate = Finite(x) & Vector.AsVectorSingle(Vector.GreaterThan(y, new Vector<float>(float.NegativeInfinity)));
+            return Down(Down(Times(Four * f * s, z, gate, Vector<float>.One), ka), kb);
+        }
+        public static Vector<float> GatedTanhSigmoidBwdY(Vector<float> x, Vector<float> y, Vector<float> z, Vector<float> a, Vector<float> b)
+        {
+            var t = Funcs.Tanh(x);
+            var r = t * Funcs.Bell(y) * z;
+            if (Far(y) || NaN(r)) { var (f, k) = Funcs.BellS(y); return Down(Times(t * f, z, NonZero(x) & Finite(y), t), k); }
+            return r;
+        }
+    }
+
+
+    // f·y for a factor f whose true value is nonzero where `nonzero` (its inputs finite, …), of the sign of `sign`: where y is 0
+    // or ±∞ the product is sign·y (±0, ±∞), not f·y (f may have underflowed to 0 or overflowed: no 0·∞; Map.cs's Times).
+    private static Vector<T> Times<T, TL>(Vector<T> f, Vector<T> y, Vector<T> nonzero, Vector<T> sign) where T : unmanaged where TL : struct, ILane<TL, T>
+    {
+        var edge = Vector.Equals(y, Vector<T>.Zero) | Vector.Equals(Vector.Abs(y), C<T, TL>(double.PositiveInfinity));
+        return Vector.ConditionalSelect(nonzero & edge, TL.Mul(sign, y), TL.Mul(f, y));
+    }
+
+    // σ(x) and σ(−x) from one e^(−|x|) (Funcs.SigmoidPair: TL.Sigmoid's steps for each, the same values).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static (Vector<T> S, Vector<T> Sn) SigmoidPairF<T, TL>(Vector<T> x) where T : unmanaged where TL : struct, IFloatLane<TL, T>
+    {
+        if (typeof(T) == typeof(float)) { var (s, sn) = Funcs.SigmoidPair(Vector.As<T, float>(x)); return (Vector.As<float, T>(s), Vector.As<float, T>(sn)); }
+        var (sd, snd) = Funcs.SigmoidPair(Vector.As<T, double>(x));
+        return (Vector.As<double, T>(sd), Vector.As<double, T>(snd));
+    }
+
+    // Some lane of r a NaN: only there can Times' value differ from the product r = f·y (f·0 and f·±∞ are Times' ±0 and
+    // ±∞ wherever they are not a NaN: f's sign is Times' sign's), so the guard is made only then.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool HasNaN<T>(Vector<T> r) where T : unmanaged => !Vector.EqualsAll(r, r);
+
+    // σ(v)·σ(−v) = t/(1 + t)², t = e^(−|v|): one exp and one division (Funcs.Bell's steps in the lane).
+    private static Vector<T> BellF<T, TL>(Vector<T> v) where T : unmanaged where TL : struct, IFloatLane<TL, T>
+    {
+        var t = TL.Exp(TL.Neg(TL.Abs(v)));
+        var d = TL.Add(t, C<T, TL>(1));
+        return TL.Div(t, TL.Mul(d, d));
+    }
+
+    // |x| finite (false for a NaN).
+    private static Vector<T> Finite<T, TL>(Vector<T> x) where T : unmanaged where TL : struct, ILane<TL, T> => Vector.LessThan(Vector.Abs(x), C<T, TL>(double.PositiveInfinity));
+
+    // x nonzero and not a NaN.
+    private static Vector<T> NonZero<T, TL>(Vector<T> x) where T : unmanaged where TL : struct, ILane<TL, T> => Vector.GreaterThan(x, Vector<T>.Zero) | Vector.LessThan(x, Vector<T>.Zero);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     // Whether p ranks above q in Adad's order (Routing.Order), lane by lane: larger, or a NaN against a number (an integer
     // lane's p > q: no lane equals itself falsely there).
@@ -155,8 +298,7 @@ internal static class MapOps
     {
         var x2 = TL.Mul(x, x);
         var u2 = TL.Mul(C<T, TL>(2 * GeluK), TL.Fma(TL.Mul(C<T, TL>(GeluC), x2), x, x));
-        var s = TL.Sigmoid(u2);
-        var sn = TL.Sigmoid(TL.Neg(u2));
+        var (s, sn) = SigmoidPairF<T, TL>(u2);
         var du = TL.Mul(C<T, TL>(GeluK), TL.Fma(C<T, TL>(3 * GeluC), x2, C<T, TL>(1)));
         return TL.Fma(TL.Mul(TL.Mul(C<T, TL>(2), x), TL.Mul(s, sn)), du, s);
     }
@@ -164,8 +306,8 @@ internal static class MapOps
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector<T> SiluGradF<T, TL>(Vector<T> x) where T : unmanaged where TL : struct, IFloatLane<TL, T>
     {
-        var s = TL.Sigmoid(x);
-        return TL.Mul(s, TL.Fma(x, TL.Sigmoid(TL.Neg(x)), C<T, TL>(1)));
+        var (s, sn) = SigmoidPairF<T, TL>(x);
+        return TL.Mul(s, TL.Fma(x, sn, C<T, TL>(1)));
     }
 
     // Φ(x) = ½·erfc(−x/√2), the normal distribution, without cancellation for x < 0.
@@ -225,23 +367,44 @@ internal static class MapOps
             Cpu.Four.Store(o, x0 * p0, x1 * p1, x2 * p2, x3 * p3);
         }
     }
-    public struct Silu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(x, TL.Sigmoid(x)); }
+    public struct Silu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) =>
+        typeof(T) == typeof(float) ? Vector.As<float, T>(F32.Silu(Vector.As<T, float>(x), Vector.As<T, float>(y), Vector.As<T, float>(z), Vector.As<T, float>(a), Vector.As<T, float>(b))) : Any(x, y, z, a, b);
+
+        private static Vector<T> Any(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(x, TL.Sigmoid(x)); }
     public struct LeakyRelu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(x, Vector<T>.Zero), x, TL.Mul(a, x)); }
     public struct Pow<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => PowF<T, TL>(x, a); }
     public struct MaskScale<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Equal(y, Vector<T>.Zero), Vector<T>.Zero, TL.Mul(x, a)); }
-    public struct GatedSilu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Mul(x, TL.Sigmoid(x)), y); }
+    public struct GatedSilu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) =>
+        typeof(T) == typeof(float) ? Vector.As<float, T>(F32.GatedSilu(Vector.As<T, float>(x), Vector.As<T, float>(y), Vector.As<T, float>(z), Vector.As<T, float>(a), Vector.As<T, float>(b))) : Any(x, y, z, a, b);
+
+        private static Vector<T> Any(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) { var f = TL.Mul(x, TL.Sigmoid(x)); var r = TL.Mul(f, y); return HasNaN(r) ? Times<T, TL>(f, y, Finite<T, TL>(x) & NonZero<T, TL>(x), x) : r; } }
     public struct GatedGelu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(GeluF<T, TL>(x), y); }
     public struct SqrtBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Div(y, TL.Mul(C<T, TL>(2), TL.Sqrt(x))); }
     public struct InvSqrtBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) { var s = TL.Add(x, a); var r = TL.Div(C<T, TL>(1), TL.Sqrt(s)); return TL.Mul(TL.Mul(C<T, TL>(-0.5), TL.Div(r, s)), y); } }
-    public struct ExpBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Exp(x), y); }
+    public struct ExpBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) =>
+        typeof(T) == typeof(float) ? Vector.As<float, T>(F32.ExpBwd(Vector.As<T, float>(x), Vector.As<T, float>(y), Vector.As<T, float>(z), Vector.As<T, float>(a), Vector.As<T, float>(b))) : Any(x, y, z, a, b);
+
+        private static Vector<T> Any(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) { var f = TL.Exp(x); var r = TL.Mul(f, y); return HasNaN(r) ? Times<T, TL>(f, y, Finite<T, TL>(x), Vector<T>.One) : r; } }
     public struct LogBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Div(y, x); }
     public struct SinBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Cos(x), y); }
     public struct CosBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Neg(TL.Mul(TL.Sin(x), y)); }
-    public struct TanhBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) { var s = TL.Sigmoid(TL.Mul(C<T, TL>(2), x)); return TL.Mul(TL.Mul(C<T, TL>(4), TL.Mul(s, TL.Sigmoid(TL.Mul(C<T, TL>(-2), x)))), y); } }
+    public struct TanhBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) =>
+        typeof(T) == typeof(float) ? Vector.As<float, T>(F32.TanhBwd(Vector.As<T, float>(x), Vector.As<T, float>(y), Vector.As<T, float>(z), Vector.As<T, float>(a), Vector.As<T, float>(b))) : Any(x, y, z, a, b);
+
+        private static Vector<T> Any(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) { var f = TL.Mul(C<T, TL>(4), BellF<T, TL>(TL.Mul(C<T, TL>(2), x))); var r = TL.Mul(f, y); return HasNaN(r) ? Times<T, TL>(f, y, Finite<T, TL>(x), Vector<T>.One) : r; } }
     public struct Softcap<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(a, TL.Tanh(TL.Div(TL.Mul(b, x), a))); }
-    public struct SoftcapBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) { var u = TL.Div(TL.Mul(b, x), a); var s = TL.Sigmoid(TL.Mul(C<T, TL>(2), u)); return TL.Mul(TL.Mul(TL.Mul(C<T, TL>(4), TL.Mul(s, TL.Sigmoid(TL.Mul(C<T, TL>(-2), u)))), b), y); } }
-    public struct SigmoidBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Mul(TL.Sigmoid(x), TL.Sigmoid(TL.Neg(x))), y); }
-    public struct SiluBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(SiluGradF<T, TL>(x), y); }
+    public struct SoftcapBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) =>
+        typeof(T) == typeof(float) ? Vector.As<float, T>(F32.SoftcapBwd(Vector.As<T, float>(x), Vector.As<T, float>(y), Vector.As<T, float>(z), Vector.As<T, float>(a), Vector.As<T, float>(b))) : Any(x, y, z, a, b);
+
+        private static Vector<T> Any(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) { var u = TL.Div(TL.Mul(b, x), a); var f = TL.Mul(TL.Mul(C<T, TL>(4), BellF<T, TL>(TL.Mul(C<T, TL>(2), u))), b); var r = TL.Mul(f, y); return HasNaN(r) ? Times<T, TL>(f, y, Finite<T, TL>(u), b) : r; } }
+    public struct SigmoidBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) =>
+        typeof(T) == typeof(float) ? Vector.As<float, T>(F32.SigmoidBwd(Vector.As<T, float>(x), Vector.As<T, float>(y), Vector.As<T, float>(z), Vector.As<T, float>(a), Vector.As<T, float>(b))) : Any(x, y, z, a, b);
+
+        private static Vector<T> Any(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) { var f = BellF<T, TL>(x); var r = TL.Mul(f, y); return HasNaN(r) ? Times<T, TL>(f, y, Finite<T, TL>(x), Vector<T>.One) : r; } }
+    public struct SiluBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) =>
+        typeof(T) == typeof(float) ? Vector.As<float, T>(F32.SiluBwd(Vector.As<T, float>(x), Vector.As<T, float>(y), Vector.As<T, float>(z), Vector.As<T, float>(a), Vector.As<T, float>(b))) : Any(x, y, z, a, b);
+
+        private static Vector<T> Any(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(SiluGradF<T, TL>(x), y); }
     public struct GeluBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(GeluGradF<T, TL>(x), y); }
     public struct GeluErfBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T>
     {
@@ -272,13 +435,28 @@ internal static class MapOps
     }
     public struct LeakyReluBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Select(TL.Greater(x, Vector<T>.Zero), y, TL.Mul(a, y)); }
     public struct PowBwd<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Mul(a, PowF<T, TL>(x, TL.Sub(a, C<T, TL>(1)))), y); }
-    public struct GatedSiluBwdX<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Mul(SiluGradF<T, TL>(x), y), z); }
-    public struct GatedSiluBwdY<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Mul(x, TL.Sigmoid(x)), z); }
+    public struct GatedSiluBwdX<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) =>
+        typeof(T) == typeof(float) ? Vector.As<float, T>(F32.GatedSiluBwdX(Vector.As<T, float>(x), Vector.As<T, float>(y), Vector.As<T, float>(z), Vector.As<T, float>(a), Vector.As<T, float>(b))) : Any(x, y, z, a, b);
+
+        private static Vector<T> Any(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Mul(SiluGradF<T, TL>(x), y), z); }
+    public struct GatedSiluBwdY<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) =>
+        typeof(T) == typeof(float) ? Vector.As<float, T>(F32.GatedSiluBwdY(Vector.As<T, float>(x), Vector.As<T, float>(y), Vector.As<T, float>(z), Vector.As<T, float>(a), Vector.As<T, float>(b))) : Any(x, y, z, a, b);
+
+        private static Vector<T> Any(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) { var f = TL.Mul(x, TL.Sigmoid(x)); var r = TL.Mul(f, z); return HasNaN(r) ? Times<T, TL>(f, z, Finite<T, TL>(x) & NonZero<T, TL>(x), x) : r; } }
     public struct GatedGeluBwdX<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Mul(GeluGradF<T, TL>(x), y), z); }
     public struct GatedGeluBwdY<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(GeluF<T, TL>(x), z); }
-    public struct GatedTanhSigmoid<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Tanh(x), TL.Sigmoid(y)); }
-    public struct GatedTanhSigmoidBwdX<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) { var s = TL.Sigmoid(TL.Mul(C<T, TL>(2), x)); var sech2 = TL.Mul(C<T, TL>(4), TL.Mul(s, TL.Sigmoid(TL.Mul(C<T, TL>(-2), x)))); return TL.Mul(TL.Mul(sech2, TL.Sigmoid(y)), z); } }
-    public struct GatedTanhSigmoidBwdY<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Mul(TL.Tanh(x), TL.Mul(TL.Sigmoid(y), TL.Sigmoid(TL.Neg(y)))), z); }
+    public struct GatedTanhSigmoid<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) =>
+        typeof(T) == typeof(float) ? Vector.As<float, T>(F32.GatedTanhSigmoid(Vector.As<T, float>(x), Vector.As<T, float>(y), Vector.As<T, float>(z), Vector.As<T, float>(a), Vector.As<T, float>(b))) : Any(x, y, z, a, b);
+
+        private static Vector<T> Any(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => TL.Mul(TL.Tanh(x), TL.Sigmoid(y)); }
+    public struct GatedTanhSigmoidBwdX<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) =>
+        typeof(T) == typeof(float) ? Vector.As<float, T>(F32.GatedTanhSigmoidBwdX(Vector.As<T, float>(x), Vector.As<T, float>(y), Vector.As<T, float>(z), Vector.As<T, float>(a), Vector.As<T, float>(b))) : Any(x, y, z, a, b);
+
+        private static Vector<T> Any(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) { var sech2 = TL.Mul(C<T, TL>(4), BellF<T, TL>(TL.Mul(C<T, TL>(2), x))); var f = TL.Mul(sech2, TL.Sigmoid(y)); var r = TL.Mul(f, z); return HasNaN(r) ? Times<T, TL>(f, z, Finite<T, TL>(x) & Vector.GreaterThan(y, C<T, TL>(double.NegativeInfinity)), Vector<T>.One) : r; } }
+    public struct GatedTanhSigmoidBwdY<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) =>
+        typeof(T) == typeof(float) ? Vector.As<float, T>(F32.GatedTanhSigmoidBwdY(Vector.As<T, float>(x), Vector.As<T, float>(y), Vector.As<T, float>(z), Vector.As<T, float>(a), Vector.As<T, float>(b))) : Any(x, y, z, a, b);
+
+        private static Vector<T> Any(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) { var t = TL.Tanh(x); var f = TL.Mul(t, BellF<T, TL>(y)); var r = TL.Mul(f, z); return HasNaN(r) ? Times<T, TL>(f, z, NonZero<T, TL>(x) & Finite<T, TL>(y), t) : r; } }
     public struct AddGelu<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T> { public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b) => GeluF<T, TL>(TL.Add(x, y)); }
     // log1p(u) = log(w)·u / (w − 1), w = 1 + u (Goldberg's), u where w is 1.
     private static Vector<T> Log1pF<T, TL>(Vector<T> u) where T : unmanaged where TL : struct, IFloatLane<TL, T>
@@ -295,9 +473,12 @@ internal static class MapOps
         where T : unmanaged where TL : struct, IFloatLane<TL, T>
     {
         var one = C<T, TL>(1);
-        var ce = TL.Add(TL.Fma(TL.Neg(x), t, TL.Max(x, Vector<T>.Zero)), Log1pF<T, TL>(TL.Exp(TL.Neg(TL.Abs(x)))));
-        var s = TL.Sigmoid(x);
-        var sn = TL.Sigmoid(TL.Neg(x));
+        var e = TL.Exp(TL.Neg(TL.Abs(x)));
+        var ce = TL.Add(TL.Fma(TL.Neg(x), t, TL.Max(x, Vector<T>.Zero)), Log1pF<T, TL>(e));
+        // σ(x) and σ(−x) from the same e^(−|x|): TL.Sigmoid's steps, one exp for the three.
+        var w = TL.Add(e, one);
+        var s = TL.Div(Vector.ConditionalSelect(Vector.GreaterThanOrEqual(x, Vector<T>.Zero), one, e), w);
+        var sn = TL.Div(Vector.ConditionalSelect(Vector.LessThanOrEqual(x, Vector<T>.Zero), one, e), w);
         var u = TL.Sub(one, t);
         var q = TL.Add(TL.Mul(t, sn), TL.Mul(u, s));
         var qg = TL.Select(TL.Equal(g, Vector<T>.Zero), one, PowF<T, TL>(q, g));
@@ -305,12 +486,44 @@ internal static class MapOps
         return (ce, s, sn, q, qg, at);
     }
 
+    // A hard target the score is far past (x below −20 in the f32 lane, −708 in f64, with t 0; above it with t 1), and
+    // e^(−(γ+1)|x|): the loss α_t·e^(−(γ+1)|x|), its gradient ±α_t·(1 + γ)·e^(−(γ+1)|x|) (Map.cs's FocalFar).
+    // In the f32 lane e^(−(γ+1)|x|) is kept 2^128 above where it is below e^−87 (Exps.ExpOff), K = 2^−64 brought down last
+    // twice; in f64 K is 1.
+    // Some |x| past the lane's nearest edge: only there can a value be far (a test per vector; the far forms made only then).
+    private static bool FocalAny<T, TL>(Vector<T> x) where T : unmanaged where TL : struct, IFloatLane<TL, T> =>
+        Vector.GreaterThanAny(Vector.Abs(x), C<T, TL>(typeof(T) == typeof(float) ? 20 : 708));
+
+    private static (Vector<T> Far, Vector<T> Low, Vector<T> P, Vector<T> K) FocalFar<T, TL>(Vector<T> x, Vector<T> t, Vector<T> g) where T : unmanaged where TL : struct, IFloatLane<TL, T>
+    {
+        var ax = Vector.Abs(x);
+        var v = TL.Mul(Vector<T>.Zero - TL.Add(g, C<T, TL>(1)), ax);
+        // f32: |x| past 20 (e^(−|x|) far below the lane's precision: the closed forms are the value, where the general form's
+        // terms leave the lane's range: q^γ, q^(γ−1) under- or overflowed); f64: past 708.
+        var beyond = Vector.GreaterThan(ax, C<T, TL>(typeof(T) == typeof(float) ? 20 : 708));
+        var low = beyond & Vector.LessThan(x, Vector<T>.Zero) & Vector.Equals(t, Vector<T>.Zero);
+        var high = beyond & Vector.GreaterThan(x, Vector<T>.Zero) & Vector.Equals(t, C<T, TL>(1));
+        if (typeof(T) == typeof(float))
+        {
+            var vf = Vector.As<T, float>(v);
+            var big = Vector.LessThan(vf, new Vector<float>(-87f));
+            var ps = Exps.ExpOff(vf, Vector.ConditionalSelect(big, new Vector<int>(128), Vector<int>.Zero));
+            var k = Vector.ConditionalSelect(big, new Vector<float>(Funcs.Down64), Vector<float>.One);
+            return (low | high, low, Vector.As<float, T>(ps), Vector.As<float, T>(k));
+        }
+
+        return (low | high, low, TL.Exp(v), Vector<T>.One);
+    }
+
     public struct SigmoidFocal<T, TL> : IMapOp<T, TL> where T : unmanaged where TL : struct, IFloatLane<TL, T>
     {
         public static Vector<T> Apply(Vector<T> x, Vector<T> y, Vector<T> z, Vector<T> a, Vector<T> b)
         {
             var f = FocalParts<T, TL>(x, y, a, b);
-            return TL.Mul(TL.Mul(f.At, f.Qg), f.Ce);
+            var loss = TL.Mul(TL.Mul(f.At, f.Qg), f.Ce);
+            if (!FocalAny<T, TL>(x)) return loss;
+            var (far, low, p, k) = FocalFar<T, TL>(x, y, b);
+            return TL.Select(far, TL.Mul(TL.Mul(TL.Mul(TL.Select(low, TL.Sub(C<T, TL>(1), a), a), p), k), k), loss);
         }
     }
 
@@ -325,7 +538,13 @@ internal static class MapOps
             var dead = TL.Equal(f.Q, Vector<T>.Zero) | TL.Equal(b, Vector<T>.Zero);
             var second = TL.Mul(TL.Mul(TL.Mul(TL.Mul(b, f.Ce), TL.Div(f.Qg, f.Q)), TL.Sub(TL.Add(y, y), one)), TL.Mul(f.S, f.Sn));
             second = TL.Select(dead, Vector<T>.Zero, second);
-            return TL.Mul(TL.Mul(f.At, TL.Sub(TL.Mul(d, f.Qg), second)), z);
+            var grad = TL.Mul(TL.Mul(f.At, TL.Sub(TL.Mul(d, f.Qg), second)), z);
+            if (!FocalAny<T, TL>(x)) return grad;
+            var (far, low, p, k) = FocalFar<T, TL>(x, y, b);
+            var g1 = TL.Add(C<T, TL>(1), b);
+            var factor = TL.Select(low, TL.Mul(TL.Sub(one, a), g1), Vector<T>.Zero - TL.Mul(a, g1));
+            var farGrad = TL.Mul(TL.Mul(Times<T, TL>(TL.Mul(factor, p), z, NonZero<T, TL>(factor), factor), k), k);
+            return TL.Select(far, farGrad, grad);
         }
     }
 

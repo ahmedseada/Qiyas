@@ -257,14 +257,55 @@ internal static partial class Ptx
             return y;
         }
 
+        /// <summary>σ by t = e^(−|x|): (x ≥ 0 ? 1 : t) / (t + 1), no e^(+large) (Funcs.Sigmoid's steps); a product with σ
+        /// takes SigmoidS.</summary>
         public static string Sigmoid(PtxBuilder b, Lane lane, string x)
         {
-            string op = lane.Op, nx = lane.NewReg(b), d = lane.NewReg(b), y = lane.NewReg(b);
-            b.L($"neg.{op} {nx}, {x};");
+
+            string op = lane.Op, nx = lane.NewReg(b), d = lane.NewReg(b), y = lane.NewReg(b), n = lane.NewReg(b), p = b.P();
+            b.L($"abs.{op} {nx}, {x};");
+            b.L($"neg.{op} {nx}, {nx};");
             string e = Codec.Exp(b, lane, nx);
             b.L($"add.rn.{op} {d}, {e}, {L(lane, 1)};");
-            b.L($"div.rn.{op} {y}, {L(lane, 1)}, {d};");
+            if (lane.Wide)
+            {
+                // x ≥ 0 by the sign bit (an integer test; −0 and a NaN take the other numerator to the same value).
+                string bits = b.RD();
+                b.L($"mov.b64 {bits}, {x};");
+                b.L($"setp.ge.s64 {p}, {bits}, 0;");
+            }
+            else b.L($"setp.ge.{op} {p}, {x}, {L(lane, 0)};");
+            b.L($"selp.{op} {n}, {L(lane, 1)}, {e}, {p};");
+            b.L($"div.rn.{op} {y}, {n}, {d};");
             return y;
+        }
+
+        /// <summary>σ(x) and σ(−x) from one t = e^(−|x|) (Sigmoid's steps for each: the same values), and t.</summary>
+        public static (string S, string Sn, string T) SigmoidPair(PtxBuilder b, Lane lane, string x)
+        {
+            string op = lane.Op, nx = lane.NewReg(b), d = lane.NewReg(b), s = lane.NewReg(b), sn = lane.NewReg(b), n1 = lane.NewReg(b), n2 = lane.NewReg(b), p = b.P(), q = b.P();
+            b.L($"abs.{op} {nx}, {x};");
+            b.L($"neg.{op} {nx}, {nx};");
+            string e = Codec.Exp(b, lane, nx);
+            b.L($"add.rn.{op} {d}, {e}, {L(lane, 1)};");
+            if (lane.Wide)
+            {
+                // By the sign bit: x's clear for σ(x)'s numerator 1, set (−x's clear) for σ(−x)'s.
+                string bits = b.RD();
+                b.L($"mov.b64 {bits}, {x};");
+                b.L($"setp.ge.s64 {p}, {bits}, 0;");
+                b.L($"setp.lt.s64 {q}, {bits}, 0;");
+            }
+            else
+            {
+                b.L($"setp.ge.{op} {p}, {x}, {L(lane, 0)};");
+                b.L($"setp.le.{op} {q}, {x}, {L(lane, 0)};");
+            }
+            b.L($"selp.{op} {n1}, {L(lane, 1)}, {e}, {p};");
+            b.L($"selp.{op} {n2}, {L(lane, 1)}, {e}, {q};");
+            b.L($"div.rn.{op} {s}, {n1}, {d};");
+            b.L($"div.rn.{op} {sn}, {n2}, {d};");
+            return (s, sn, e);
         }
 
         // erfc |x| past its bound: e^(−x²) (x² carried with its rounding) times, on the f64 lane, S(u)/x (Funcs.ErfcTail64:
@@ -333,6 +374,58 @@ internal static partial class Ptx
             b.L($"testp.notanumber.{op} {pn}, {x};");
             b.L($"selp.{op} {y}, {x}, {y}, {pn};");
             return y;
+        }
+
+        // f32 constants and an f32 register holding one.
+        private static string F32(float v) => "0f" + BitConverter.SingleToUInt32Bits(v).ToString("X8");
+
+        /// <summary>The f32 lane's σ(x) as σ_s·K·K (Funcs.SigmoidS): where x is below −87, σ_s = σ(x)·2^128, K = 2^−64.</summary>
+        public static (string S, string K) SigmoidS(PtxBuilder b, string x)
+        {
+            string ax = b.F(), d = b.F(), n = b.F(), s = b.F(), kk = b.F(), td = b.F(), neg = b.P(), big = b.P(), pos = b.P(), off = b.R();
+            b.L($"setp.lt.f32 {neg}, {x}, {F32(-87f)};");
+            b.L($"abs.f32 {ax}, {x};");
+            b.L($"setp.gt.f32 {big}, {ax}, {F32(87f)};");
+            b.L($"selp.s32 {off}, 128, 0, {big};");
+            b.L($"neg.f32 {ax}, {ax};");
+            string ts = Codec.ExpOff32(b, ax, off);
+            b.L($"selp.f32 {td}, 0f00000000, {ts}, {big};");
+            b.L($"add.rn.f32 {d}, {td}, 0f3F800000;");
+            b.L($"setp.ge.f32 {pos}, {x}, 0f00000000;");
+            b.L($"selp.f32 {n}, 0f3F800000, {ts}, {pos};");
+            b.L($"div.rn.f32 {s}, {n}, {d};");
+            b.L($"selp.f32 {kk}, {F32(5.421010862427522E-20f)}, 0f3F800000, {neg};");
+            return (s, kk);
+        }
+
+        /// <summary>The f32 lane's σ(v)·σ(−v) = t/(1 + t)², t = e^(−|v|), as F·K·K (Funcs.BellS).</summary>
+        public static (string F, string K) BellS(PtxBuilder b, string v)
+        {
+            string av = b.F(), d = b.F(), d2 = b.F(), f = b.F(), kk = b.F(), td = b.F(), big = b.P(), off = b.R();
+            b.L($"abs.f32 {av}, {v};");
+            b.L($"setp.gt.f32 {big}, {av}, {F32(87f)};");
+            b.L($"selp.s32 {off}, 128, 0, {big};");
+            b.L($"neg.f32 {av}, {av};");
+            string ts = Codec.ExpOff32(b, av, off);
+            b.L($"selp.f32 {td}, 0f00000000, {ts}, {big};");
+            b.L($"add.rn.f32 {d}, {td}, 0f3F800000;");
+            b.L($"mul.rn.f32 {d2}, {d}, {d};");
+            b.L($"div.rn.f32 {f}, {ts}, {d2};");
+            b.L($"selp.f32 {kk}, {F32(5.421010862427522E-20f)}, 0f3F800000, {big};");
+            return (f, kk);
+        }
+
+        /// <summary>σ(v)·σ(−v) = t/(1 + t)², t = e^(−|v|), as it is (BellS's form where |v| is at most 87).</summary>
+        public static string Bell(PtxBuilder b, string v)
+        {
+            string av = b.F(), d = b.F(), d2 = b.F(), f = b.F();
+            b.L($"abs.f32 {av}, {v};");
+            b.L($"neg.f32 {av}, {av};");
+            string t = Codec.Exp(b, Lane.F32, av);
+            b.L($"add.rn.f32 {d}, {t}, 0f3F800000;");
+            b.L($"mul.rn.f32 {d2}, {d}, {d};");
+            b.L($"div.rn.f32 {f}, {t}, {d2};");
+            return f;
         }
 
         public static string Sqrt(PtxBuilder b, Lane lane, string x)
@@ -447,6 +540,14 @@ internal static partial class Ptx
             return p;
         }
 
+        // x a NaN.
+        public string IsNan(string x)
+        {
+            string p = b.P();
+            b.L($"testp.notanumber.{_op} {p}, {x};");
+            return p;
+        }
+
         public string Less(string x, string y)
         {
             string p = b.P();
@@ -467,6 +568,71 @@ internal static partial class Ptx
             string p = b.P();
             b.L($"setp.{(_f ? "neu" : "ne")}.{_op} {p}, {x}, {lane.Literal(0)};");
             return p;
+        }
+
+        // In f64 the tests on the bits (integer tests at the full rate where the device's f64 compares run at its f64 rate:
+        // the same results).
+        private string Bits(string x)
+        {
+            string r = b.RD();
+            b.L($"mov.b64 {r}, {x};");
+            return r;
+        }
+
+        // |x| finite (false for a NaN).
+        public string Finite(string x)
+        {
+            string p = b.P();
+            if (lane.Wide)
+            {
+                string t = b.RD();
+                b.L($"and.b64 {t}, {Bits(x)}, 0x7FF0000000000000;");
+                b.L($"setp.ne.u64 {p}, {t}, 0x7FF0000000000000;");
+            }
+            else b.L($"testp.finite.{_op} {p}, {x};");
+            return p;
+        }
+
+        // x nonzero and not a NaN.
+        public string NonZero(string x)
+        {
+            string p = b.P();
+            if (lane.Wide)
+            {
+                string bits = Bits(x), t = b.RD(), q = b.P();
+                b.L($"shl.b64 {t}, {bits}, 1;");
+                b.L($"setp.ne.u64 {p}, {t}, 0;");
+                b.L($"and.b64 {t}, {bits}, 0x7FFFFFFFFFFFFFFF;");
+                b.L($"setp.le.u64 {q}, {t}, 0x7FF0000000000000;");
+                b.L($"and.pred {p}, {p}, {q};");
+            }
+            else b.L($"setp.ne.{_op} {p}, {x}, {lane.Literal(0)};");
+            return p;
+        }
+
+        public string Or(string p, string q)
+        {
+            string r = b.P();
+            b.L($"or.pred {r}, {p}, {q};");
+            return r;
+        }
+
+        // f·y for a factor f whose true value is nonzero where `nonzero`, of the sign of `sign`: where y is 0 or ±∞ the
+        // product is sign·y (±0, ±∞), not f·y (no 0·∞; Map.cs's Times).
+        public string Times(string f, string y, string nonzero, string sign)
+        {
+            string edge;
+            if (lane.Wide)
+            {
+                string bits = Bits(y), t = b.RD(), p = b.P(), q = b.P();
+                b.L($"shl.b64 {t}, {bits}, 1;");
+                b.L($"setp.eq.u64 {p}, {t}, 0;");
+                b.L($"and.b64 {t}, {bits}, 0x7FFFFFFFFFFFFFFF;");
+                b.L($"setp.eq.u64 {q}, {t}, 0x7FF0000000000000;");
+                edge = Or(p, q);
+            }
+            else edge = Or(Equal(y, C(0)), Equal(Abs(y), C(double.PositiveInfinity)));
+            return Select(And(nonzero, edge), Mul(sign, y), Mul(f, y));
         }
 
         public string Nan(string x)
@@ -506,6 +672,14 @@ internal static partial class Ptx
         public string Tanh(string x) => Fn.Tanh(b, lane, x);
         public string Atan(string x) => Fn.Atan(b, lane, x);
         public string Sigmoid(string x) => Fn.Sigmoid(b, lane, x);
+
+        // σ(v)·σ(−v) = t/(1 + t)², t = e^(−|v|): one exp and one division.
+        public string Bell(string v)
+        {
+            string t = Exp(Neg(Abs(v)));
+            string d = Add(t, C(1));
+            return Div(t, Mul(d, d));
+        }
         public string Erf(string x) => Fn.Erf(b, lane, x);
         public string Erfc(string x) => Fn.Erfc(b, lane, x);
         public string Phi(string x) => Mul(C(0.5), Erfc(Mul(x, C(-0.7071067811865476))));
@@ -548,15 +722,15 @@ internal static partial class Ptx
         {
             string x2 = Mul(x, x);
             string u2 = Mul(C(2 * 0.7978845608028654), Fma(Mul(C(0.044715), x2), x, x));
-            string s = Sigmoid(u2), sn = Sigmoid(Neg(u2));
+            var (s, sn, _) = Fn.SigmoidPair(b, lane, u2);
             string du = Mul(C(0.7978845608028654), Fma(C(3 * 0.044715), x2, C(1)));
             return Fma(Mul(Mul(C(2), x), Mul(s, sn)), du, s);
         }
 
         public string SiluGrad(string x)
         {
-            string s = Sigmoid(x);
-            return Mul(s, Fma(x, Sigmoid(Neg(x)), C(1)));
+            var (s, sn, _) = Fn.SigmoidPair(b, lane, x);
+            return Mul(s, Fma(x, sn, C(1)));
         }
 
         public string Pow(string x, string a)
@@ -574,9 +748,93 @@ internal static partial class Ptx
     }
 
     /// <summary>The result register of formula <paramref name="op"/> over lane registers x, y, z and parameters a, b.</summary>
+    // The f32 lane's forms whose factor may fall below the lane's normal numbers (the definition: Funcs' F32 forms; Vulkan's
+    // Scaled32): σ, its bell and e^x kept 2^128 from it, the product made, then brought back by K·K; Times for 0 and ±∞.
+    // Where an input is past ±87, or the plain product with Times' operand is a NaN (only there can Times' value differ
+    // from it), the forms as defined; elsewhere the same forms at scale 1 and the plain product (the same values).
+    // (A product with Times differs from it only where it is a NaN: f·0 and f·±∞ are Times' ±0 and ±∞ wherever they are
+    // not, f's sign being Times' sign's.)
+    private static string Far32(Emit e, string op, string x, string y, string a, string pb, string near)
+    {
+        string Big(string v) => e.Greater(e.Abs(v), e.C(87));
+        string Nan() => e.IsNan(near);
+        return op switch
+        {
+            "silu" or "silu_bwd" or "gated_silu_bwd_x" => Big(x),
+            "gated_silu" or "exp_bwd" or "sigmoid_bwd" or "gated_silu_bwd_y" => e.Or(Big(x), Nan()),
+            "tanh_bwd" => e.Or(Big(e.Mul(e.C(2), x)), Nan()),
+            "softcap_bwd" => e.Or(Big(e.Mul(e.C(2), e.Div(e.Mul(pb, x), a))), Nan()),
+            "gated_tanh_sigmoid_bwd_x" => e.Or(e.Or(Big(e.Mul(e.C(2), x)), Big(y)), Nan()),
+            "gated_tanh_sigmoid_bwd_y" => e.Or(Big(y), Nan()),
+            _ => throw new ArgumentException(op),
+        };
+    }
+
+    // far: the forms as defined (SigmoidS, BellS, ExpOff32, brought down by K·K; Times); else the same forms at scale 1 and
+    // the plain product.
+    private static string? Scaled32(PtxBuilder b, Emit e, string op, string x, string y, string z, string a, string pb, bool far)
+    {
+        string Down(string r, string? kk) => kk is null ? r : e.Mul(e.Mul(r, kk), kk);
+        string Sn(string v) => Fn.Sigmoid(b, Lane.F32, v);
+        (string, string?) Sig(string v) { if (far) { var (s, k1) = Fn.SigmoidS(b, v); return (s, k1); } return (Sn(v), null); }
+        (string, string?) BellOf(string v) { if (far) { var (f, k1) = Fn.BellS(b, v); return (f, k1); } return (Fn.Bell(b, v), null); }
+        string Tm(string f, string yv, Func<string> nonzero, string sign) => far ? e.Times(f, yv, nonzero(), sign) : e.Mul(f, yv);
+        switch (op)
+        {
+            case "silu": { var (s, kk) = Sig(x); return Down(e.Mul(x, s), kk); }
+            case "gated_silu": { var (s, kk) = Sig(x); return Down(Tm(e.Mul(x, s), y, () => e.And(e.Finite(x), e.NonZero(x)), x), kk); }
+            case "gated_silu_bwd_y": { var (s, kk) = Sig(x); return Down(Tm(e.Mul(x, s), z, () => e.And(e.Finite(x), e.NonZero(x)), x), kk); }
+            case "silu_bwd":
+            {
+                if (!far) { var (s0, sn0, _) = Fn.SigmoidPair(b, Lane.F32, x); return e.Mul(e.Mul(s0, e.Fma(x, sn0, e.C(1))), y); }
+                var (s, kk) = Sig(x);
+                return Down(e.Mul(e.Mul(s, e.Fma(x, Sn(e.Neg(x)), e.C(1))), y), kk);
+            }
+            case "gated_silu_bwd_x":
+            {
+                if (!far) { var (s0, sn0, _) = Fn.SigmoidPair(b, Lane.F32, x); return e.Mul(e.Mul(e.Mul(s0, e.Fma(x, sn0, e.C(1))), y), z); }
+                var (s, kk) = Sig(x);
+                return Down(e.Mul(e.Mul(e.Mul(s, e.Fma(x, Sn(e.Neg(x)), e.C(1))), y), z), kk);
+            }
+            case "exp_bwd":
+            {
+                if (!far) return Tm(e.Exp(x), y, () => e.Finite(x), e.C(1));
+                string low = e.Less(x, e.C(-87)), high = e.Greater(x, e.C(87)), off = b.R(), kk = b.F();
+                b.L($"selp.s32 {off}, -128, 0, {high};");
+                b.L($"selp.s32 {off}, 128, {off}, {low};");
+                b.L($"selp.f32 {kk}, 0f5F800000, 0f3F800000, {high};");
+                b.L($"selp.f32 {kk}, 0f1F800000, {kk}, {low};");
+                string t = Codec.ExpOff32(b, x, off);
+                return Down(Tm(t, y, () => e.Finite(x), e.C(1)), kk);
+            }
+            case "sigmoid_bwd": { var (f, kk) = BellOf(x); return Down(Tm(f, y, () => e.Finite(x), e.C(1)), kk); }
+            case "tanh_bwd": { var (f, kk) = BellOf(e.Mul(e.C(2), x)); return Down(Tm(e.Mul(e.C(4), f), y, () => e.Finite(x), e.C(1)), kk); }
+            case "softcap_bwd": { string u = e.Div(e.Mul(pb, x), a); var (f, kk) = BellOf(e.Mul(e.C(2), u)); return Down(Tm(e.Mul(e.Mul(e.C(4), f), pb), y, () => e.Finite(u), pb), kk); }
+            case "gated_tanh_sigmoid_bwd_x":
+            {
+                var (f, ka) = BellOf(e.Mul(e.C(2), x));
+                var (s, kb) = Sig(y);
+                return Down(Down(Tm(e.Mul(e.Mul(e.C(4), f), s), z, () => e.And(e.Finite(x), e.Greater(y, e.C(double.NegativeInfinity))), e.C(1)), ka), kb);
+            }
+            case "gated_tanh_sigmoid_bwd_y": { string t = e.Tanh(x); var (f, kk) = BellOf(y); return Down(Tm(e.Mul(t, f), z, () => e.And(e.NonZero(x), e.Finite(y)), t), kk); }
+            default: return null;
+        }
+    }
+
     private static string Formula(PtxBuilder b, Lane lane, string op, string x, string y, string z, string a, string pb)
     {
         var e = new Emit(b, lane);
+        if (lane.IsFloat && !lane.Wide && Scaled32(b, e, op, x, y, z, a, pb, false) is string near)
+        {
+            // The f32 lane's scaled forms where an input is past ±87 or the plain product is a NaN (Times'), the same forms at
+            // scale 1 and the plain product elsewhere (the same values): a warp none of whose values is far branches past them.
+            string result = b.F(), farLane = Far32(e, op, x, y, a, pb, near), skip = "NEAR_" + farLane.TrimStart('%');
+            b.L($"mov.f32 {result}, {near};");
+            b.L($"@!{farLane} bra {skip};");
+            b.L($"mov.f32 {result}, {Scaled32(b, e, op, x, y, z, a, pb, true)};");
+            b.Label(skip);
+            return result;
+        }
         string zero = lane.Literal(0);
         switch (op)
         {
@@ -625,22 +883,22 @@ internal static partial class Ptx
             case "erf": return e.Erf(x);
             case "gelu": return e.Gelu(x);
             case "gelu_erf": return e.Mul(x, e.Phi(x));
-            case "silu": return e.XSigmoid(x, x);
+            case "silu": return e.Mul(x, e.Sigmoid(x));
             case "leaky_relu": return e.Select(e.Greater(x, e.C(0)), x, e.Mul(a, x));
             case "pow": return e.Pow(x, a);
             case "mask_scale": return e.Select(e.NotZero(y), e.Mul(x, a), e.C(0));
-            case "gated_silu": return e.Mul(e.Mul(x, e.Sigmoid(x)), y);
+            case "gated_silu": return e.Times(e.Mul(x, e.Sigmoid(x)), y, e.And(e.Finite(x), e.NonZero(x)), x);
             case "gated_gelu": return e.Mul(e.Gelu(x), y);
             case "sqrt_bwd": return e.Div(y, e.Mul(e.C(2), e.Sqrt(x)));
             case "inv_sqrt_bwd": { string s = e.Add(x, a); string r = e.Div(e.C(1), e.Sqrt(s)); return e.Mul(e.Mul(e.C(-0.5), e.Div(r, s)), y); }
-            case "exp_bwd": return e.Mul(e.Exp(x), y);
+            case "exp_bwd": return e.Times(e.Exp(x), y, e.Finite(x), e.C(1));
             case "log_bwd": return e.Div(y, x);
             case "sin_bwd": return e.Mul(Fn.Cos(b, lane, x), y);
             case "cos_bwd": return e.Neg(e.Mul(Fn.Sin(b, lane, x), y));
-            case "tanh_bwd": { string s = e.Sigmoid(e.Mul(e.C(2), x)); return e.Mul(e.Mul(e.C(4), e.Mul(s, e.Sigmoid(e.Mul(e.C(-2), x)))), y); }
+            case "tanh_bwd": return e.Times(e.Mul(e.C(4), e.Bell(e.Mul(e.C(2), x))), y, e.Finite(x), e.C(1));
             case "softcap": return e.Mul(a, e.Tanh(e.Div(e.Mul(pb, x), a)));
-            case "softcap_bwd": { string u = e.Div(e.Mul(pb, x), a); string s = e.Sigmoid(e.Mul(e.C(2), u)); return e.Mul(e.Mul(e.Mul(e.C(4), e.Mul(s, e.Sigmoid(e.Mul(e.C(-2), u)))), pb), y); }
-            case "sigmoid_bwd": return e.Mul(e.Mul(e.Sigmoid(x), e.Sigmoid(e.Neg(x))), y);
+            case "softcap_bwd": { string u = e.Div(e.Mul(pb, x), a); return e.Times(e.Mul(e.Mul(e.C(4), e.Bell(e.Mul(e.C(2), u))), pb), y, e.Finite(u), pb); }
+            case "sigmoid_bwd": return e.Times(e.Bell(x), y, e.Finite(x), e.C(1));
             case "silu_bwd": return e.Mul(e.SiluGrad(x), y);
             case "gelu_bwd": return e.Mul(e.GeluGrad(x), y);
             case "gelu_erf_bwd":
@@ -652,12 +910,12 @@ internal static partial class Ptx
             case "leaky_relu_bwd": return e.Select(e.Greater(x, e.C(0)), y, e.Mul(a, y));
             case "pow_bwd": return e.Mul(e.Mul(a, e.Pow(x, e.Sub(a, e.C(1)))), y);
             case "gated_silu_bwd_x": return e.Mul(e.Mul(e.SiluGrad(x), y), z);
-            case "gated_silu_bwd_y": return e.Mul(e.Mul(x, e.Sigmoid(x)), z);
+            case "gated_silu_bwd_y": return e.Times(e.Mul(x, e.Sigmoid(x)), z, e.And(e.Finite(x), e.NonZero(x)), x);
             case "gated_gelu_bwd_x": return e.Mul(e.Mul(e.GeluGrad(x), y), z);
             case "gated_gelu_bwd_y": return e.Mul(e.Gelu(x), z);
             case "gated_tanh_sigmoid": return e.Mul(e.Tanh(x), e.Sigmoid(y));
-            case "gated_tanh_sigmoid_bwd_x": { string s = e.Sigmoid(e.Mul(e.C(2), x)); string sech2 = e.Mul(e.C(4), e.Mul(s, e.Sigmoid(e.Mul(e.C(-2), x)))); return e.Mul(e.Mul(sech2, e.Sigmoid(y)), z); }
-            case "gated_tanh_sigmoid_bwd_y": return e.Mul(e.Mul(e.Tanh(x), e.Mul(e.Sigmoid(y), e.Sigmoid(e.Neg(y)))), z);
+            case "gated_tanh_sigmoid_bwd_x": { string sech2 = e.Mul(e.C(4), e.Bell(e.Mul(e.C(2), x))); return e.Times(e.Mul(sech2, e.Sigmoid(y)), z, e.And(e.Finite(x), e.Greater(y, e.C(double.NegativeInfinity))), e.C(1)); }
+            case "gated_tanh_sigmoid_bwd_y": { string t = e.Tanh(x); return e.Times(e.Mul(t, e.Bell(y)), z, e.And(e.NonZero(x), e.Finite(y)), t); }
             case "add_gelu": return e.Gelu(e.Add(x, y));
             case "clip_factor": return e.Select(e.Greater(x, e.C(0)), e.Min(e.C(1), e.Div(a, e.Sqrt(x))), e.C(1));
             case "sigmoid_focal":
@@ -665,18 +923,53 @@ internal static partial class Ptx
             {
                 // Abstraction/Map.cs's parts: BCE with log1p by Goldberg's form, 1 − p_t, (1 − p_t)^γ (1 where γ is 0), α_t.
                 string one = e.C(1), nil = e.C(0);
-                string u0 = e.Exp(e.Neg(e.Abs(x))), w = e.Add(one, u0), dw = e.Sub(w, one);
+                var (s, sn, u0) = Fn.SigmoidPair(b, lane, x);             // σ(x), σ(−x) and the BCE's e^(−|x|): one exp
+                string w = e.Add(one, u0), dw = e.Sub(w, one);
                 string lp = e.Select(e.Greater(dw, nil), e.Div(e.Mul(e.Log(w), u0), dw), u0);
                 string ce = e.Add(e.Fma(e.Neg(x), y, e.Max(x, nil)), lp);
-                string s = e.Sigmoid(x), sn = e.Sigmoid(e.Neg(x)), u = e.Sub(one, y);
+                string u = e.Sub(one, y);
                 string q = e.Add(e.Mul(y, sn), e.Mul(u, s));
                 string qg = e.Select(e.Equal(pb, nil), one, e.Pow(q, pb));
                 string at = e.Add(e.Mul(a, y), e.Mul(e.Sub(one, a), u));
-                if (op == "sigmoid_focal") return e.Mul(e.Mul(at, qg), ce);
+                // A hard target the score is far past (Cpu/Map.cs's FocalFar): |x| past 20 in f32, 708 in f64.
+                string ax = e.Abs(x);
+                string beyond = e.Greater(ax, e.C(lane.Wide ? 708 : 20));
+                string low = e.And(e.And(beyond, e.Less(x, nil)), e.Equal(y, nil));
+                string far = e.Or(low, e.And(e.And(beyond, e.Greater(x, nil)), e.Equal(y, one)));
+                // e^(−(γ+1)|x|), in the f32 lane kept 2^128 above where below e^−87 and brought down last (K twice); made only
+                // where a value is far (a warp none of whose values is far branches past it).
+                (string P, string K) FarP()
+                {
+                    string v = e.Mul(e.Neg(e.Add(pb, one)), e.Abs(x));
+                    if (lane.Wide) return (e.Exp(v), one);
+                    string big = e.Less(v, e.C(-87)), off = b.R();
+                    b.L($"selp.s32 {off}, 128, 0, {big};");
+                    return (Codec.ExpOff32(b, v, off), e.Select(big, e.C(5.421010862427522E-20), one));
+                }
+
+                string result = lane.NewReg(b), skip = "NEAR_" + far.TrimStart('%'), mv = lane.Wide ? "mov.f64" : "mov.f32";
+                if (op == "sigmoid_focal")
+                {
+                    b.L($"{mv} {result}, {e.Mul(e.Mul(at, qg), ce)};");
+                    b.L($"@!{far} bra {skip};");
+                    var (p, kk) = FarP();
+                    b.L($"{mv} {result}, {e.Mul(e.Mul(e.Mul(e.Select(low, e.Sub(one, a), a), p), kk), kk)};");
+                    b.Label(skip);
+                    return result;
+                }
                 string d = e.Sub(e.Mul(u, s), e.Mul(y, sn));
                 string second = e.Mul(e.Mul(e.Mul(e.Mul(pb, ce), e.Div(qg, q)), e.Sub(e.Add(y, y), one)), e.Mul(s, sn));
                 second = e.Select(e.Equal(q, nil), nil, e.Select(e.Equal(pb, nil), nil, second));
-                return e.Mul(e.Mul(at, e.Sub(e.Mul(d, qg), second)), z);
+                b.L($"{mv} {result}, {e.Mul(e.Mul(at, e.Sub(e.Mul(d, qg), second)), z)};");
+                b.L($"@!{far} bra {skip};");
+                {
+                    var (p, kk) = FarP();
+                    string g1 = e.Add(one, pb);
+                    string factor = e.Select(low, e.Mul(e.Sub(one, a), g1), e.Neg(e.Mul(a, g1)));
+                    b.L($"{mv} {result}, {e.Mul(e.Mul(e.Times(e.Mul(factor, p), z, e.NonZero(factor), factor), kk), kk)};");
+                }
+                b.Label(skip);
+                return result;
             }
 
             default: throw new ArgumentException(op);

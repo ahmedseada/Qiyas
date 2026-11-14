@@ -247,6 +247,12 @@ public sealed unsafe class Vulkan : IDisposable
     /// reports them).</summary>
     public bool SubgroupShuffles { get; }
 
+    /// <summary>The device keeps f32 and f64 subnormal numbers in kernels (shaderDenormPreserveFloat32/64, as it reports
+    /// them); where it does not, a kernel's subnormal results may read as ±0 (the driver's own mode).</summary>
+    public bool KeepsSubnormals32 => Controls.Denorm32;
+
+    public bool KeepsSubnormals64 => Controls.Denorm64;
+
     public bool Storage16 { get; }
 
     /// <summary>The packed 4 × 8-bit integer dot product, accelerated by the device (VK_KHR_shader_integer_dot_product), for

@@ -14,6 +14,8 @@
 //            device; on the f32 lane e^(−x²)·t·S(t) (ErfcTail32) on the CPU and Vulkan, CUDA's the continued fraction
 //            erfc x = e^(−x²)/√π · 1/(x + ½/(x + 1/(x + 3/2/(x + …)))) evaluated bottom-up a fixed depth
 using System.Numerics;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace Adad.Abstraction;
 
@@ -220,7 +222,72 @@ public static class Funcs
         return Vector.ConditionalSelect(Vector.Equals(x, x), y, x);
     }
 
-    public static Vector<float> Sigmoid(Vector<float> x) => Vector<float>.One / (Vector<float>.One + Exps.Exp(-x));
+    /// <summary>σ by t = e^(−|x|): (x ≥ 0 ? 1 : t) / (t + 1), no e^(+large): σ(−100) = t = 3.8e-44, rounded once by Exp, not
+    /// 0. A product with σ takes SigmoidS (its factor kept a normal number).</summary>
+    public static Vector<float> Sigmoid(Vector<float> x)
+    {
+        var t = Exps.Exp(-Vector.Abs(x));
+        return OneOr(x, t) / (t + Vector<float>.One);
+    }
+
+    /// <summary>σ(x) and σ(−x) from one t = e^(−|x|): Sigmoid's steps for each (the same values), one exp.</summary>
+    public static (Vector<float> S, Vector<float> Sn) SigmoidPair(Vector<float> x)
+    {
+        var t = Exps.Exp(-Vector.Abs(x));
+        var d = t + Vector<float>.One;
+        return (OneOr(x, t) / d, OneOr(-x, t) / d);
+    }
+
+    public static (Vector<double> S, Vector<double> Sn) SigmoidPair(Vector<double> x)
+    {
+        var t = Exps.Exp(-Vector.Abs(x));
+        var d = Vector<double>.One + t;
+        return (OneOr(x, t) / d, OneOr(-x, t) / d);
+    }
+
+    /// <summary>x ≥ 0 ? 1 : t, where the lanes blend by a sign bit by x's (one blend, no compare; −0 takes t = e^0 = 1 and a
+    /// NaN gives a NaN either way: the same values).</summary>
+    private static Vector<float> OneOr(Vector<float> x, Vector<float> t) =>
+        Avx.IsSupported && Vector<float>.Count == 8
+            ? Avx.BlendVariable(Vector256<float>.One, t.AsVector256(), x.AsVector256()).AsVector()
+            : Vector.ConditionalSelect(Vector.GreaterThanOrEqual(x, Vector<float>.Zero), Vector<float>.One, t);
+
+    private static Vector<double> OneOr(Vector<double> x, Vector<double> t) =>
+        Avx.IsSupported && Vector<double>.Count == 4
+            ? Avx.BlendVariable(Vector256<double>.One, t.AsVector256(), x.AsVector256()).AsVector()
+            : Vector.ConditionalSelect(Vector.GreaterThanOrEqual(x, Vector<double>.Zero), Vector<double>.One, t);
+
+    /// <summary>2^−64: the f32 lane's scaled forms bring a factor kept 2^128 above down by it twice.</summary>
+    public const float Down64 = 5.421010862427522E-20f;
+
+    /// <summary>The f32 lane's σ(x) as σ_s·K·K: where x is below −87, σ_s = σ(x)·2^128 (from e^(−|x|)·2^128, a normal number,
+    /// Exps.ExpOff) and K = 2^−64; else σ_s = σ(x) and K = 1. The definition's form for every product with σ (the devices'
+    /// SigmoidS the same steps).</summary>
+    public static (Vector<float> S, Vector<float> K) SigmoidS(Vector<float> x)
+    {
+        var neg = Vector.LessThan(x, new Vector<float>(-87f));
+        var big = Vector.GreaterThan(Vector.Abs(x), new Vector<float>(87f));
+        var ts = Exps.ExpOff(-Vector.Abs(x), Vector.ConditionalSelect(big, new Vector<int>(128), Vector<int>.Zero));
+        var s = OneOr(x, ts) / (Vector.ConditionalSelect(big, Vector<float>.Zero, ts) + Vector<float>.One);
+        return (s, Vector.ConditionalSelect(neg, new Vector<float>(Down64), Vector<float>.One));
+    }
+
+    /// <summary>The f32 lane's σ(v)·σ(−v) = t/(1 + t)², t = e^(−|v|), as F·K·K: t kept 2^128 above where |v| is past 88.</summary>
+    /// <summary>σ(v)·σ(−v) = t/(1 + t)², t = e^(−|v|), as it is: BellS's value where |v| is at most 88.</summary>
+    public static Vector<float> Bell(Vector<float> v)
+    {
+        var t = Exps.Exp(-Vector.Abs(v));
+        var d = t + Vector<float>.One;
+        return t / (d * d);
+    }
+
+    public static (Vector<float> F, Vector<float> K) BellS(Vector<float> v)
+    {
+        var big = Vector.GreaterThan(Vector.Abs(v), new Vector<float>(87f));
+        var ts = Exps.ExpOff(-Vector.Abs(v), Vector.ConditionalSelect(big, new Vector<int>(128), Vector<int>.Zero));
+        var d = Vector.ConditionalSelect(big, Vector<float>.Zero, ts) + Vector<float>.One;
+        return (ts / (d * d), Vector.ConditionalSelect(big, new Vector<float>(Down64), Vector<float>.One));
+    }
 
     /// <summary>atan: u = |x| (1/|x| past 1), t = u or, past tan(π/12), (u√3 − 1)/(u + √3); the series in t²; π/6 and π/2 −
     /// added back; the sign of x (NaN kept, ±∞ to ±π/2).</summary>
@@ -406,7 +473,12 @@ public static class Funcs
         return Vector.ConditionalSelect(Vector.Equals(x, x), y, x);
     }
 
-    public static Vector<double> Sigmoid(Vector<double> x) => Vector<double>.One / (Vector<double>.One + Exps.Exp(-x));
+    /// <summary>σ by t = e^(−|x|): (x ≥ 0 ? 1 : t) / (1 + t), as the f32 lane's.</summary>
+    public static Vector<double> Sigmoid(Vector<double> x)
+    {
+        var t = Exps.Exp(-Vector.Abs(x));
+        return OneOr(x, t) / (Vector<double>.One + t);
+    }
 
     public static Vector<double> Atan(Vector<double> x)
     {

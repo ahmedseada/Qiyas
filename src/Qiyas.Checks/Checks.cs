@@ -2629,7 +2629,7 @@ internal static partial class Checks
     /// <summary>Each formula over 1001 values of each of its types, on the CPU (ops null) or the device, against the float64
     /// reference rounded as the type rounds: integer types exact; float types within one step of the type plus a few ulps of
     /// the lane (the transcendental functions' own error). With <paramref name="special"/>, each float type over NaN, ±∞,
-    /// ±0, values of each input's range and a negative one, ±1e4, in every combination of the inputs (SpecialInputs): a NaN or an
+    /// ±0, values of each input's range and a negative one, ±87.5, ±100, ±1e4, in every combination of the inputs (SpecialInputs): a NaN or an
     /// infinity exactly where the reference has one. Each formula at its catalogue parameters and its Variants.</summary>
     public static bool Maps(IDevice<ulong, ulong>? ops, string device = "device", bool special = false)
     {
@@ -2693,11 +2693,13 @@ internal static partial class Checks
                 {
                     double e, want = expected[i], v = got[i];
                     if (double.IsNaN(want) || double.IsInfinity(want)) { e = (double.IsNaN(v) && double.IsNaN(want)) || v == want ? 0 : double.PositiveInfinity; }
+                    else if (v == 0 && Math.Abs(want) < (laneMant == 52 ? 2.2250738585072014E-308 : 1.1754943508222875E-38) && FlushesSubnormals(ops, laneMant == 52)) e = 0;
                     else
                     {
                         double mag = op.ErrorScale(reference[i], xs?[i] ?? 0, ys?[i] ?? 0, zs?[i] ?? 0);
                         double scale = mag == 0 ? 1 : Math.Pow(2, Math.Floor(Math.Log2(mag)));
-                        double stepType = scale * Math.Pow(2, -mant), stepLane = scale * Math.Pow(2, -laneMant);
+                        // A step no finer than the type's and the lane's least subnormal (a result there is a multiple of it).
+                        double stepType = Math.Max(scale * Math.Pow(2, -mant), LeastSubnormal(type)), stepLane = Math.Max(scale * Math.Pow(2, -laneMant), laneMant == 52 ? double.Epsilon : Math.Pow(2, -149));
                         double tol = stepType + op.Ulps * stepLane, gap = Gap(v, want);
                         e = Off(gap, tol) ? Steps(gap, stepType) : 0;
                     }
@@ -2721,6 +2723,18 @@ internal static partial class Checks
         if (!special) ok &= IntegerDivisions(ops, where);
         return ok;
     }
+
+    // Whether the device's kernels may read a subnormal result as ±0 (Vulkan without the denormal preservation it reports:
+    // the driver's mode; the CPU and CUDA keep subnormals).
+    private static bool FlushesSubnormals(IDevice<ulong, ulong>? ops, bool wide) =>
+        ops is Adad.Vulkan.VulkanOps v && !(wide ? v.Vk.KeepsSubnormals64 : v.Vk.KeepsSubnormals32);
+
+    // The least positive value a float type stores (its subnormals' step).
+    private static double LeastSubnormal(string type) => type switch
+    {
+        "float64" => double.Epsilon, "float32" => Math.Pow(2, -149), "float16" => Math.Pow(2, -24), "bfloat16" => Math.Pow(2, -133),
+        "float8_e4m3" => Math.Pow(2, -9), "float8_e5m2" => Math.Pow(2, -16), _ => 0,
+    };
 
     // Map's div on every integer type by Ops.IntegerDivision, exactly: dividends the type's least and greatest values, the
     // one above its least, ±1, ±7 and 0, against divisors its least and greatest values, ±1, ±2, 3 and 0 (unsigned types
@@ -2784,16 +2798,17 @@ internal static partial class Checks
     }
 
     // NaN, +∞, −∞, +0, −0, the 0.2, 0.5 and 0.9 points of each input's range (x's XRange, y's and z's YRange) and the 0.9
-    // point negated (a negative value where the range has none), in every combination of the formula's inputs (9, 81 or 729
-    // values), stored as the type stores them.
+    // point negated (a negative value where the range has none) and the six past the range, in every combination of the
+    // formula's inputs (15, 225 or 3375 values), stored as the type stores them.
     private static (byte[]? X, byte[]? Y, byte[]? Z, int N) SpecialInputs(string type, MapOp op)
     {
-        // Past the range, ±1e4: finite values a formula's terms overflow at (gelu's and silu's e^(−t) in f32, which a
-        // product's epilogue reaches), where float64's own terms overflow or vanish too (the reference and the lane agree on
-        // ∞, 0 and NaN there; at ±100 they do not: e^100 is finite in float64, not in float32).
+        // Past the range, ±87.5, ±100 and ±1e4: finite values a formula's terms leave f32's normal numbers at (e^−87.5 and
+        // σ(−87.5) below them: the scaled forms' edge, 87) or overflow at in f32 (e^100; gelu's e^(−t), which a product's
+        // epilogue reaches) and at ±1e4 in float64 too: the stable forms (σ by e^(−|x|), no 0·∞) give the value wherever
+        // the lane holds it.
         static double[] Values((double Low, double High) r) => [double.NaN, double.PositiveInfinity, double.NegativeInfinity, 0.0, -0.0,
             r.Low + 0.2 * (r.High - r.Low), r.Low + 0.5 * (r.High - r.Low), r.Low + 0.9 * (r.High - r.Low), -(r.Low + 0.9 * (r.High - r.Low)),
-            -1e4, 1e4];
+            -87.5, 87.5, -100, 100, -1e4, 1e4];
         double[] vx = Values(op.XRange), vy = Values(op.YRange);
         int k = vx.Length, n = (int)Math.Pow(k, Math.Max(op.Inputs, 1));
         double[] xs = new double[n], ys = new double[n], zs = new double[n];

@@ -551,6 +551,34 @@ public readonly struct U16Dot : IDotLane<U16Dot, ushort, uint>
 
 internal static class Exps
 {
+    /// <summary>e^v·2^off in the f32 lane (off 128, 0 or −128: 128 only where v is below −87, −128 only above 87): Exp's
+    /// steps with the scale's exponent offset split between its halves (±64 each) and v held to [−192.6, 177.3], so the
+    /// result is a normal number wherever e^v·2^off is one.</summary>
+    public static Vector<float> ExpOff(Vector<float> v, Vector<int> off)
+    {
+        var c = Vector.Min(Vector.Max(v, new Vector<float>(-192.6f)), new Vector<float>(177.3f));
+        var n = Vector.Round(c * new Vector<float>(1.44269504f));
+        var r = Vector.FusedMultiplyAdd(n, new Vector<float>(-0.693359375f), c);
+        r = Vector.FusedMultiplyAdd(n, new Vector<float>(2.12194440e-4f), r);
+        var p = new Vector<float>(1f / 5040);
+        p = Vector.FusedMultiplyAdd(p, r, new Vector<float>(1f / 720));
+        p = Vector.FusedMultiplyAdd(p, r, new Vector<float>(1f / 120));
+        p = Vector.FusedMultiplyAdd(p, r, new Vector<float>(1f / 24));
+        p = Vector.FusedMultiplyAdd(p, r, new Vector<float>(1f / 6));
+        p = Vector.FusedMultiplyAdd(p, r, new Vector<float>(0.5f));
+        p = Vector.FusedMultiplyAdd(p, r, Vector<float>.One);
+        p = Vector.FusedMultiplyAdd(p, r, Vector<float>.One);
+        var ni = Vector.ConvertToInt32(n);
+        var half = ni >> 1;
+        var o2 = off >> 1;
+        var s1 = Vector.AsVectorSingle((half + o2 + new Vector<int>(127)) << 23);
+        var s2 = Vector.AsVectorSingle((ni - half + o2 + new Vector<int>(127)) << 23);
+        var y = p * s1 * s2;
+        y = Vector.ConditionalSelect(Vector.LessThan(v, new Vector<float>(-192.6f)), Vector<float>.Zero, y);
+        y = Vector.ConditionalSelect(Vector.GreaterThan(v, new Vector<float>(177.3f)), new Vector<float>(float.PositiveInfinity), y);
+        return Vector.ConditionalSelect(Vector.Equals(v, v), y, v);
+    }
+
     public static Vector<float> Exp(Vector<float> x)
     {
         var c = Vector.Min(Vector.Max(x, new Vector<float>(-103.9721f)), new Vector<float>(88.72283f));
