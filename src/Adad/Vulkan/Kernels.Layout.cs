@@ -336,24 +336,27 @@ internal static partial class VkKernels
     /// in workgroup memory: max pooling by First (Adad's order: the largest, a NaN where the window holds one), average
     /// pooling's sum (its terms' order the tree's), then divided by the window's size. The word packed and stored by the
     /// first invocation. Workgroups: the output's words (along x, then rows of them). The layout's slots.</summary>
-    public static SpvKernel AdaptivePool(Vulkan vk, Fmt f, Lane lane, bool max)
+    /// <param name="into">The output's format where it is not the input's (a block format's pools into lane storage,
+    /// LaneFormat, for its encoder).</param>
+    public static SpvKernel AdaptivePool(Vulkan vk, Fmt f, Lane lane, bool max, Fmt? into = null)
     {
         var k = Kinds.Of(lane);
-        var b = new Spv($"adaptive_pool_{(max ? "max" : "avg")}_{f.Name}_{lane.Name}", ReduceThreads, vk.Controls);
+        var fo = into ?? f;
+        var b = new Spv($"adaptive_pool_{(max ? "max" : "avg")}_{f.Name}_{lane.Name}{(into is null ? "" : "_to_" + into.Name)}", ReduceThreads, vk.Controls);
         var a = new LayoutIn(b);
         var p = a.P;
         V H = p[1], W = p[2], OH = p[3], OW = p[4];
         var tid = b.LocalIdX;
         var word = b.GroupY * b.GroupsX + b.GroupX;
-        var natural = f.Natural;
+        var natural = fo.Natural;
         var nk = Kinds.Of(natural);
-        var wk = Codec.WordKind(f);
+        var wk = Codec.WordKind(fo);
         var sv = b.Shared(k, ReduceThreads);
         var packed = b.CBits(wk, 0);
         var last = a.Count - 1;
-        for (int i = 0; i < f.Per; i++)
+        for (int i = 0; i < fo.Per; i++)
         {
-            var at = word * (double)f.Per + i;
+            var at = word * (double)fo.Per + i;
             var o = b.Min(at, last);
             var ow = o % OW;
             var r = o / OW;
@@ -372,11 +375,11 @@ internal static partial class VkKernels
                 ? GroupReduce(b, sv, tid, acc.V, (x, y) => First(b, x, y), ReduceThreads)
                 : GroupReduce(b, sv, tid, acc.V, (x, y) => x + y, ReduceThreads) / b.Convert(hl * wl, k);
             var stored = lane.Name == natural.Name ? value : Codec.Convert(b, lane, value, natural);
-            packed = Codec.Pack(b, f, b.Select(at < a.Count, stored, b.C(nk, 0)), natural, i, packed);
+            packed = Codec.Pack(b, fo, b.Select(at < a.Count, stored, b.C(nk, 0)), natural, i, packed);
         }
 
         var finalWord = packed;
-        b.If((tid == 0) & (word < WordCount(b, f, a.Count)), () => b.Store(b.At(a.Out, word, f.WordBits / 8), finalWord));
+        b.If((tid == 0) & (word < WordCount(b, fo, a.Count)), () => b.Store(b.At(a.Out, word, fo.WordBits / 8), finalWord));
         return b.Build();
     }
 

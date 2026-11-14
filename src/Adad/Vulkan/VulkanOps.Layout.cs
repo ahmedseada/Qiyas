@@ -66,9 +66,27 @@ public sealed partial class VulkanOps
                 if (windows > 0) vk.Launch(argmax, Groups(windows, VkKernels.Threads), 1, VkKernels.LayoutSlots(0, x2, 0, 0, aux, windows, 0, k.P));
             }
 
+            // A block format's adaptive pools: the windows by AdaptivePool into lane storage (a workgroup an output value),
+            // then the encoder from those values (each block's values once, not each value's window decoded in the encoder).
+            if (k.Count > 0 && f.IsBlock && k.Name is "adaptive_maxpool" or "adaptive_avgpool" && inFmt is null && k.Count <= (long)vk.MaxGroupsX * vk.MaxGroupsY)
+            {
+                var lf = VkKernels.LaneFormat(lane);
+                ulong lanes = vk.Rent(k.Count * (long)lane.Size);
+                try
+                {
+                    var pool = vk.Cached($"adaptive_pool:{k.Name}:{f.Name}:{lane.Name}:{lf.Name}", () => VkKernels.AdaptivePool(vk, f, lane, k.Name == "adaptive_maxpool", lf));
+                    uint px = (uint)Math.Min(k.Count, vk.MaxGroupsX), py = (uint)((k.Count + px - 1) / px);
+                    vk.Launch(pool, px, py, VkKernels.LayoutSlots(x, x2, idx, aux, lanes, k.Count, cols, k.P));
+                    Encode(f, k.Count, vk.Cached($"block_lanes:{lane.Name}:{f.Name}", () => VkKernels.BlockFromLanes(vk, lane, f)), output, lanes);
+                }
+                finally
+                {
+                    vk.Return(lanes);
+                }
+            }
             // A block format's encoder reads its sources alone: the output's slot is left empty, so only an output that is one
             // of the inputs makes the encoding go through a buffer of its own (Encode).
-            if (k.Count > 0 && f.IsBlock)
+            else if (k.Count > 0 && f.IsBlock)
                 Encode(f, k.Count, vk.Cached($"block_layout:{kn}:{f.Name}:{lane.Name}:{inFmt?.Name}", () => VkKernels.BlockLayout(vk, f, lane, kn, inFmt)), output, VkKernels.LayoutSlots(x, x2, idx, aux, 0, k.Count, cols, k.P));
             else if (k.Count > 0 && k.Name is "adaptive_maxpool" or "adaptive_avgpool" && inFmt is null && f.Words(k.Count) <= (long)vk.MaxGroupsX * vk.MaxGroupsY)
             {
